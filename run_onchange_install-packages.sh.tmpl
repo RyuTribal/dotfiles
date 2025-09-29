@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Install yay if missing
+if ! command -v yay &> /dev/null; then
+    echo "Installing yay..."
+    tmpdir=$(mktemp -d)
+    if git clone https://aur.archlinux.org/yay.git "$tmpdir"; then
+        cd "$tmpdir"
+        makepkg -si --noconfirm || { echo "Failed to install yay"; exit 1; }
+        cd ~
+        rm -rf "$tmpdir"
+    else
+        echo "Failed to clone yay repo"
+        exit 1
+    fi
+fi
+
+# Clone or update end-4 repo to access PKGBUILDs
+DOTS_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/dots-hyprland"
+if [[ ! -d "$DOTS_CACHE_DIR" ]]; then
+    echo "Cloning end-4 dots-hyprland repo..."
+    if ! git clone https://github.com/end-4/dots-hyprland.git "$DOTS_CACHE_DIR"; then
+        echo "Failed to clone end-4 repo"
+        exit 1
+    fi
+    cd "$DOTS_CACHE_DIR"
+    git branch --set-upstream-to=origin/main main || { echo "Failed to set upstream"; exit 1; }
+else
+    echo "Updating end-4 dots-hyprland repo..."
+    cd "$DOTS_CACHE_DIR"
+    git checkout main 2>/dev/null || git checkout master 2>/dev/null || { echo "Failed to checkout main/master"; exit 1; }
+    git branch --set-upstream-to=origin/main main 2>/dev/null || git branch --set-upstream-to=origin/master master 2>/dev/null || true
+    if ! git pull; then
+        echo "Warning: Failed to pull latest changes, continuing with existing repo state"
+    fi
+fi
+
+# Collect all dependencies from illogical-impulse-* PKGBUILDs
+declare -A all_deps  # Associative array to avoid duplicates
+cd "$DOTS_CACHE_DIR/arch-packages"
+for pkgbuild in illogical-impulse-*/PKGBUILD; do
+    if [[ -f "$pkgbuild" ]]; then
+        echo "Extracting dependencies from $pkgbuild..."
+        dir=$(dirname "$pkgbuild")
+        cd "$dir"
+        if source PKGBUILD 2>/dev/null; then
+            for dep in "${depends[@]:-}"; do
+                all_deps["$dep"]=1  # Store unique dependencies
+            done
+        else
+            echo "Warning: Failed to source $pkgbuild, skipping..."
+        fi
+        cd "$DOTS_CACHE_DIR/arch-packages"
+    fi
+done
+
+# Install all unique dependencies
+if [[ ${#all_deps[@]} -gt 0 ]]; then
+    echo "Installing system and AUR dependencies..."
+    yay -S --needed --noconfirm --asdeps "${!all_deps[@]}" || {
+        echo "Warning: Failed to install some dependencies, continuing..."
+    }
+else
+    echo "No dependencies found to install."
+fi
+
+echo "Package installation complete. Restart Hyprland or reboot to ensure everything loads."
+exit 0

@@ -1,0 +1,4 @@
+source = ~/.config/hypr/startup.conf
+source = ~/.config/hypr/monitors.conf
+source = ~/.config/hypr/keybindings.conf
+

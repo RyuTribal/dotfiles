@@ -1,0 +1,133 @@
+
+vim.o.termguicolors = true
+vim.cmd('hi clear')
+if vim.fn.exists('syntax_on') == 1 then
+  vim.cmd('syntax reset')
+end
+vim.g.colors_name = 'material_you'
+
+-- Path to your generated OSC palette
+local seq_path = (os.getenv("XDG_STATE_HOME") or (os.getenv("HOME").."/.local/state"))
+  .. "/quickshell/user/generated/terminal/sequences.txt"
+
+-- read file utility
+local function slurp(p)
+  local f = io.open(p, "rb")
+  if not f then return nil end
+  local s = f:read("*a")
+  f:close()
+  return s
+end
+
+local raw = slurp(seq_path)
+if not raw then
+  vim.notify("end4-term: missing "..seq_path, vim.log.levels.WARN)
+  return
+end
+
+-- Parse OSC 4;N;#RRGGBB (ANSI color definitions 0‑15), ignore others
+local C = {}
+for token in string.gmatch(raw:gsub("\027", "\n"), "[^\n]+") do
+  local i, hex = token:match("%]4;(%d+);#([A-Fa-f0-9][A-Fa-f0-9][A-Fa-f0-9][A-Fa-f0-9][A-Fa-f0-9][A-Fa-f0-9])")
+  if i and hex then
+    i = tonumber(i)
+    if i and i >= 0 and i <= 15 then
+      -- prefer lowercases or uppercase? you use “#” + hex directly
+      C["term"..i] = "#" .. hex:lower()
+    end
+  end
+end
+
+-- Fallback / error if missing any color
+for i = 0, 15 do
+  if not C["term"..i] then
+    vim.notify("end4-term: missing term"..i.." in sequences.txt", vim.log.levels.ERROR)
+    return
+  end
+end
+
+-- Set terminal color palette used inside Neovim terminal buffers
+for i = 0, 15 do
+  vim.g["terminal_color_"..i] = C["term"..i]
+end
+
+-- Helper alias
+local hl = vim.api.nvim_set_hl
+
+-- Core UI / backgrounds & basic
+-- Normal background/foreground matching fish / terminal:
+hl(0, 'Normal',        { fg = C.term7, bg = C.term0 })
+hl(0, 'NormalNC',      { fg = C.term7, bg = C.term0 })
+hl(0, 'NormalFloat',   { fg = C.term7, bg = C.term0 })
+hl(0, 'FloatBorder',   { fg = C.term7, bg = C.term0 })
+
+-- Cursor etc
+hl(0, 'Cursor',        { fg = C.term0,  bg = C.term7 })
+hl(0, 'TermCursor',    { fg = C.term0,  bg = C.term7 })
+
+-- Make selected / visual mode stand out more
+hl(0, 'Visual',        { fg = C.term0,  bg = C.term7, bold = true })
+
+-- Lines, tabs, status lines
+
+hl(0, 'LineNr',        { fg = C.term8,    bg = C.term0, bold = false })
+hl(0, 'CursorLine',    { bg = C.term0 })  -- maybe subtle highlight of current line?
+hl(0, 'CursorLineNr',  { fg = C.term15,   bg = C.term0, bold = true })
+
+hl(0, 'SignColumn',    { bg = C.term0 })
+
+hl(0, 'Pmenu',         { fg = C.term7,    bg = C.term0 })
+hl(0, 'PmenuSel',      { fg = C.term0,    bg = C.term7, bold = true })
+hl(0, 'PmenuSbar',     { bg = C.term0 })
+hl(0, 'PmenuThumb',    { bg = C.term8 })
+
+hl(0, 'StatusLine',    { fg = C.term0,    bg = C.term7, bold = true })
+hl(0, 'StatusLineNC',  { fg = C.term8,    bg = C.term0 })
+hl(0, 'TabLine',       { fg = C.term7,    bg = C.term0 })
+hl(0, 'TabLineSel',    { fg = C.term0,    bg = C.term7, bold = true })
+hl(0, 'TabLineFill',   { fg = C.term7,    bg = C.term0 })
+hl(0, 'VertSplit',     { fg = C.term8,    bg = C.term0 })
+
+-- Syntax token groups — boosted contrast + clarity
+
+hl(0, 'Comment',       { fg = C.term8,    italic = true,  bold = false })  -- less dominant
+hl(0, 'String',        { fg = C.term10,   bold = false })
+hl(0, 'Number',        { fg = C.term11,   bold = true })  -- make numbers stand out
+hl(0, 'Boolean',       { fg = C.term11,   bold = true })
+
+hl(0, 'Identifier',    { fg = C.term12,   bold = false })
+hl(0, 'Function',      { fg = C.term14,   bold = true })
+hl(0, 'Statement',     { fg = C.term9,    bold = true })
+hl(0, 'Keyword',       { fg = C.term13,   bold = true })
+hl(0, 'Type',          { fg = C.term12,   bold = true })
+hl(0, 'Operator',      { fg = C.term7,    bold = false })
+hl(0, 'Special',       { fg = C.term14,   bold = true })
+hl(0, 'Todo',          { fg = C.term0,    bg = C.term11, bold = true })
+
+hl(0, 'MatchParen',    { fg = C.term0,    bg = C.term14, bold = true })
+
+-- Diagnostics / LSP
+
+hl(0, 'DiagnosticError',   { fg = C.term9,    bg = C.term0, underline = true })
+hl(0, 'DiagnosticWarn',    { fg = C.term11,   bg = C.term0, underline = true })
+hl(0, 'DiagnosticInfo',    { fg = C.term12,   bg = C.term0, underline = true })
+hl(0, 'DiagnosticHint',    { fg = C.term14,   bg = C.term0, underline = true })
+
+-- Search and matching
+
+hl(0, 'Search',           { fg = C.term0,    bg = C.term11, bold = true })
+hl(0, 'IncSearch',        { fg = C.term0,    bg = C.term13, bold = true })
+hl(0, 'MatchParen',       { fg = C.term0,    bg = C.term14, bold = true })
+hl(0, 'CursorLine',       { bg = C.term1 })  -- subtle different bg for cursorline to help tracking
+
+-- Make sure non‑text (e.g. ~) is not distracting
+hl(0, 'NonText',          { fg = C.term8,    bg = C.term0, italic = true })
+hl(0, 'EndOfBuffer',       { fg = C.term8,    bg = C.term0 })
+
+-- Folded sections
+hl(0, 'Folded',          { fg = C.term8,    bg = C.term0, bold = false })
+
+-- Additional UI: statusline / win separators etc.
+hl(0, 'StatusLineSeparator', { fg = C.term8, bg = C.term0 })
+hl(0, 'TabLineSeparator',    { fg = C.term8, bg = C.term0 })
+

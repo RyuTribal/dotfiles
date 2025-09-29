@@ -1,0 +1,31 @@
+
+{
+  // Minimal theme file – only colors. Merged with fastfetch defaults.
+  // Foreground = term7, Background = term0 (matches OSC 10/11)
+  "display": {
+    "color": {
+      "keys":      "##$term13",   // headings / keys
+      "title":     "##$term7",    // big title
+      "output":    "##$term7",    // values
+      "separator": "##$term8"     // ":" etc.
+    },
+    // Percent color bands: use your ANSI-ish green/yellow/red
+    "percent": {
+      "type": 9,
+      "color": {
+        "green":  "##$term10",
+        "yellow": "##$term11",
+        "red":    "##$term9"
+      }
+    }
+  },
+
+  // Optional: logo recolor using the same palette
+  "logo": {
+    "color": {
+      "1": "##$term7",
+      "2": "##$term14",
+      "3": "##$term12"
+    }
+  }
+}

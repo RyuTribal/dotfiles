@@ -65,5 +65,14 @@ else
     echo "No dependencies found to install."
 fi
 
+# Install extra stuff
+
+yay -S --noconfirm brave-bin
+sudo pacman -S --noconfirm discord
+sudo pacman -S --noconfirm pavucontrols
+sudo pacman -S --noconfirm tmux
+sudo pacman -S --noconfirm fastfetch
+
+
 echo "Package installation complete. Restart Hyprland or reboot to ensure everything loads."
 exit 0

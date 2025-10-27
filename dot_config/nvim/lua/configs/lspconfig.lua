@@ -5,7 +5,7 @@ nvlsp.defaults()
 local servers = {
   "clangd", -- C/C++
   "lua_ls", -- Lua
-  "qmlls", -- QML
+  "qmlls",  -- QML
   "rust_analyzer",
   "bashls",
   "jsonls",
@@ -20,7 +20,7 @@ local servers = {
   -- "codebook",   -- <-- remove or replace; not an lspconfig server
 }
 
-local lspconfig = require "lspconfig"
+local lspconfig = (vim.lsp and vim.lsp.config) or require("lspconfig")
 
 -- tiny helper to skip unknown servers
 local function has_server(name)

@@ -2,7 +2,7 @@ import qs
 import qs.services
 import qs.modules.common
 import qs.modules.common.functions
-import "./notification_utils.js" as NotificationUtils
+import "notification_utils.js" as NotificationUtils
 import QtQuick
 import QtQuick.Layouts
 import Quickshell

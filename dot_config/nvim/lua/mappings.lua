@@ -19,11 +19,14 @@ end, { desc = "LSP: Fix all (if available)" })
 
 vim.keymap.set("n", "<leader>s", ":nohlsearch<CR>", { desc = "Clear search highlight" })
 
-local nomap = vim.keymap.del
-nomap("n", "<Tab>")
-nomap("n", "<S-Tab>")
-nomap("n", "<leader>h")
-nomap("n", "<leader>n")
+local function del_safe(mode, lhs)
+  pcall(vim.keymap.del, mode, lhs)
+end
+
+del_safe("n", "<Tab>")
+del_safe("n", "<S-Tab>")
+del_safe("n", "<leader>h")
+del_safe("n", "<leader>n")
 
 -- map("n", "<Tab>", "<Nop>", { desc = "disable tab buffer-next" })
 -- map("n", "<S-Tab>", "<Nop>", { desc = "disable shift-tab buffer-prev" })

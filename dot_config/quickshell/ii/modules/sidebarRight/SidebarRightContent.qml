@@ -2,9 +2,9 @@ import qs
 import qs.services
 import qs.modules.common
 import qs.modules.common.widgets
-import "./quickToggles/"
-import "./wifiNetworks/"
-import "./bluetoothDevices/"
+import qs.modules.sidebarRight.quickToggles
+import qs.modules.sidebarRight.wifiNetworks
+import qs.modules.sidebarRight.bluetoothDevices
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts

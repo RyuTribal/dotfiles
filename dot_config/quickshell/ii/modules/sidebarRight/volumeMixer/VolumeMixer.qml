@@ -3,7 +3,7 @@ import qs.modules.common.widgets
 import qs.modules.common.functions
 import qs.services
 import qs
-import "../quickToggles"
+import qs.modules.sidebarRight.quickToggles
 import Qt5Compat.GraphicalEffects
 import QtQuick
 import QtQuick.Controls

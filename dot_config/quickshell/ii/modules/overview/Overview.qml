@@ -58,6 +58,7 @@ Scope {
             Connections {
                 target: GlobalStates
                 function onOverviewOpenChanged() {
+                    grab.active = false;
                     if (!GlobalStates.overviewOpen) {
                         searchWidget.disableExpandAnimation();
                         overviewScope.dontAutoCancelSearch = false;
@@ -65,20 +66,34 @@ Scope {
                         if (!overviewScope.dontAutoCancelSearch) {
                             searchWidget.cancelSearch();
                         }
-                        delayedGrabTimer.start();
                     }
                 }
             }
 
-            Timer {
-                id: delayedGrabTimer
-                interval: Config.options.hacks.arbitraryRaceConditionDelay
-                repeat: false
-                onTriggered: {
-                    if (!grab.canBeActive)
-                        return;
-                    grab.active = GlobalStates.overviewOpen;
+            HoverHandler {
+                id: overviewHover
+                acceptedDevices: PointerDevice.AllPointerTypes
+                cursorShape: Qt.ArrowCursor
+                onHoveredChanged: {
+                    if (hovered && GlobalStates.overviewOpen && grab.canBeActive && !grab.active) {
+                        grab.active = true;
+                    }
                 }
+            }
+
+            onMonitorIsFocusedChanged: {
+                if (!root.monitorIsFocused) {
+                    grab.active = false;
+                } else if (GlobalStates.overviewOpen && overviewHover.hovered && !grab.active) {
+                    grab.active = true;
+                }
+            }
+
+            Shortcut {
+                sequences: [StandardKey.Cancel]
+                context: Qt.ApplicationShortcut
+                enabled: GlobalStates.overviewOpen
+                onActivated: GlobalStates.overviewOpen = false;
             }
 
             implicitWidth: columnLayout.implicitWidth

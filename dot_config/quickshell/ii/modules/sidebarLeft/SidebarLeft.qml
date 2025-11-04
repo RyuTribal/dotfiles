@@ -72,12 +72,19 @@ Scope { // Scope
             HyprlandFocusGrab { // Click outside to close
                 id: grab
                 windows: [ sidebarRoot ]
-                active: sidebarRoot.visible
+                active: false
                 onActiveChanged: { // Focus the selected tab
                     if (active) sidebarLeftBackground.children[0].focusActiveItem()
                 }
                 onCleared: () => {
                     if (!active) sidebarRoot.hide()
+                }
+            }
+
+            Connections {
+                target: GlobalStates
+                function onSidebarLeftOpenChanged() {
+                    grab.active = false;
                 }
             }
 
@@ -98,6 +105,15 @@ Scope { // Scope
                 border.width: 1
                 border.color: Appearance.colors.colLayer0Border
                 radius: Appearance.rounding.screenRounding - Appearance.sizes.hyprlandGapsOut + 1
+
+                HoverHandler {
+                    acceptedDevices: PointerDevice.AllPointerTypes
+                    onHoveredChanged: {
+                        if (hovered && GlobalStates.sidebarLeftOpen && !grab.active) {
+                            grab.active = true;
+                        }
+                    }
+                }
 
                 Behavior on width {
                     animation: Appearance.animation.elementMove.numberAnimation.createObject(this)

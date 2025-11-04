@@ -40,10 +40,26 @@ Scope {
         HyprlandFocusGrab {
             id: grab
             windows: [sidebarRoot]
-            active: GlobalStates.sidebarRightOpen
+            active: false
             onCleared: () => {
                 if (!active)
                     sidebarRoot.hide();
+            }
+        }
+
+        Connections {
+            target: GlobalStates
+            function onSidebarRightOpenChanged() {
+                grab.active = false;
+            }
+        }
+
+        HoverHandler {
+            acceptedDevices: PointerDevice.AllPointerTypes
+            onHoveredChanged: {
+                if (hovered && GlobalStates.sidebarRightOpen && !grab.active) {
+                    grab.active = true;
+                }
             }
         }
 

@@ -142,11 +142,30 @@ Scope {
             }
 
             HyprlandFocusGrab {
+                id: grab
                 windows: [mediaControlsRoot]
-                active: mediaControlsLoader.active
+                active: false
                 onCleared: () => {
                     if (!active) {
                         GlobalStates.mediaControlsOpen = false;
+                    }
+                }
+            }
+
+            HoverHandler {
+                acceptedDevices: PointerDevice.AllPointerTypes
+                onHoveredChanged: {
+                    if (hovered && GlobalStates.mediaControlsOpen && !grab.active) {
+                        grab.active = true;
+                    }
+                }
+            }
+
+            Connections {
+                target: GlobalStates
+                function onMediaControlsOpenChanged() {
+                    if (!GlobalStates.mediaControlsOpen) {
+                        grab.active = false;
                     }
                 }
             }

@@ -5,7 +5,7 @@ nvlsp.defaults()
 local servers = {
   "clangd", -- C/C++
   "lua_ls", -- Lua
-  "qmlls",  -- QML
+  "qmlls", -- QML
   "rust_analyzer",
   "bashls",
   "jsonls",
@@ -17,10 +17,15 @@ local servers = {
   "dockerls",
   "cmake",
   "gopls",
+  "glsl_analyzer",
   -- "codebook",   -- <-- remove or replace; not an lspconfig server
 }
 
-local lspconfig = (vim.lsp and vim.lsp.config) or require("lspconfig")
+local ok, lspconfig = pcall(require, "lspconfig")
+if not ok then
+  vim.notify("nvim-lspconfig not loaded", vim.log.levels.ERROR)
+  return
+end
 
 -- tiny helper to skip unknown servers
 local function has_server(name)

@@ -36,6 +36,7 @@ output_path = '~/.local/state/quickshell/user/generated/wallpaper/path.txt'
 [templates.nvim]
 input_path = '~/.config/nvim/pywal/matugen.lua'
 output_path = '~/.cache/wal/base46-dark.lua'
+post_hook = 'pkill -SIGUSR1 nvim'
 
 [templates.nvimlight]
 input_path = '~/.config/nvim/pywal/matugen.lua'

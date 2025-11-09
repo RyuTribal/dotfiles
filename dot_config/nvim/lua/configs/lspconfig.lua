@@ -21,44 +21,47 @@ local servers = {
   -- "codebook",   -- <-- remove or replace; not an lspconfig server
 }
 
-local lspconfig = vim.lsp and vim.lsp.config
-if not lspconfig then
-  local ok, legacy = pcall(require, "lspconfig")
-  if not ok then
-    vim.notify("vim.lsp.config unavailable (and nvim-lspconfig not loaded)", vim.log.levels.ERROR)
-    return
-  end
-  lspconfig = legacy
+local lsp = vim.lsp
+if not (lsp and lsp.config and lsp.enable) then
+  vim.notify("vim.lsp.config API unavailable (need Neovim 0.11+)", vim.log.levels.ERROR)
+  return
 end
 
--- tiny helper to skip unknown servers
+-- apply NvChad defaults to every LSP
+lsp.config("*", {
+  on_attach = nvlsp.on_attach,
+  capabilities = nvlsp.capabilities,
+})
+
+local per_server = {
+  clangd = {
+    cmd = {
+      "clangd",
+      "--pch-storage=disk",
+      "--malloc-trim",
+      "-j=2",
+      "--limit-results=100",
+      "--limit-references=500",
+      "--background-index",
+    },
+  },
+}
+
 local function has_server(name)
-  return type(lspconfig[name]) == "table" and type(lspconfig[name].setup) == "function"
+  local ok, cfg = pcall(function()
+    return lsp.config[name]
+  end)
+  return ok and type(cfg) == "table"
 end
 
 for _, srv in ipairs(servers) do
   if not has_server(srv) then
-    vim.notify(("lspconfig: unknown server '%s' (skipping)"):format(srv), vim.log.levels.WARN)
-  elseif srv == "clangd" then
-    -- per-server overrides + NvChad defaults
-    lspconfig.clangd.setup {
-      on_attach = nvlsp.on_attach,
-      capabilities = nvlsp.capabilities,
-      cmd = {
-        "clangd",
-        "--pch-storage=disk",
-        "--malloc-trim",
-        "-j=2",
-        "--limit-results=100",
-        "--limit-references=500",
-        "--background-index",
-      },
-    }
+    vim.notify(("vim.lsp.config: unknown server '%s' (skipping)"):format(srv), vim.log.levels.WARN)
   else
-    -- vanilla setup using NvChad defaults
-    lspconfig[srv].setup {
-      on_attach = nvlsp.on_attach,
-      capabilities = nvlsp.capabilities,
-    }
+    local override = per_server[srv]
+    if override then
+      lsp.config(srv, override)
+    end
+    lsp.enable(srv)
   end
 end

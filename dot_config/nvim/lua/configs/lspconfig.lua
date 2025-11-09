@@ -21,10 +21,14 @@ local servers = {
   -- "codebook",   -- <-- remove or replace; not an lspconfig server
 }
 
-local ok, lspconfig = pcall(require, "lspconfig")
-if not ok then
-  vim.notify("nvim-lspconfig not loaded", vim.log.levels.ERROR)
-  return
+local lspconfig = vim.lsp and vim.lsp.config
+if not lspconfig then
+  local ok, legacy = pcall(require, "lspconfig")
+  if not ok then
+    vim.notify("vim.lsp.config unavailable (and nvim-lspconfig not loaded)", vim.log.levels.ERROR)
+    return
+  end
+  lspconfig = legacy
 end
 
 -- tiny helper to skip unknown servers

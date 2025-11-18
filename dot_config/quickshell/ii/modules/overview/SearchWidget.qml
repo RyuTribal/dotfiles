@@ -146,6 +146,11 @@ Item { // Wrapper
         }
     }
 
+    function focusSearchInput() {
+        searchInput.forceActiveFocus();
+        searchInput.cursorPosition = searchInput.text.length;
+    }
+
     property var searchActions: [
         {
             action: "accentcolor",

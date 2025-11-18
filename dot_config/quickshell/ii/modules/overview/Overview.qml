@@ -58,14 +58,18 @@ Scope {
             Connections {
                 target: GlobalStates
                 function onOverviewOpenChanged() {
-                    grab.active = false;
                     if (!GlobalStates.overviewOpen) {
+                        grab.active = false;
                         searchWidget.disableExpandAnimation();
                         overviewScope.dontAutoCancelSearch = false;
-                    } else {
-                        if (!overviewScope.dontAutoCancelSearch) {
-                            searchWidget.cancelSearch();
-                        }
+                        return;
+                    }
+                    if (!overviewScope.dontAutoCancelSearch) {
+                        searchWidget.cancelSearch();
+                    }
+                    if (root.monitorIsFocused) {
+                        grab.active = true;
+                        searchWidget.focusSearchInput();
                     }
                 }
             }
@@ -84,8 +88,9 @@ Scope {
             onMonitorIsFocusedChanged: {
                 if (!root.monitorIsFocused) {
                     grab.active = false;
-                } else if (GlobalStates.overviewOpen && overviewHover.hovered && !grab.active) {
+                } else if (GlobalStates.overviewOpen && !grab.active) {
                     grab.active = true;
+                    searchWidget.focusSearchInput();
                 }
             }
 

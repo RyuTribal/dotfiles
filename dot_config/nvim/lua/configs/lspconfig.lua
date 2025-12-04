@@ -38,10 +38,6 @@ local per_server = {
     cmd = {
       "clangd",
       "--pch-storage=disk",
-      "--malloc-trim",
-      "-j=2",
-      "--limit-results=100",
-      "--limit-references=500",
       "--background-index",
     },
   },

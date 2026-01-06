@@ -51,16 +51,18 @@ Variants {
         property int wallpaperHeight: modelData.height // Some reasonable init value, to be updated
         property real movableXSpace: ((wallpaperWidth / wallpaperToScreenRatio * effectiveWallpaperScale) - screen.width) / 2
         property real movableYSpace: ((wallpaperHeight / wallpaperToScreenRatio * effectiveWallpaperScale) - screen.height) / 2
-        readonly property bool verticalParallax: (Config.options.background.parallax.autoVertical && wallpaperHeight > wallpaperWidth) || Config.options.background.parallax.vertical
         // Position
-        property real clockX: (modelData.width / 2) + ((Math.random() < 0.5 ? -1 : 1) * modelData.width)
-        property real clockY: (modelData.height / 2) + ((Math.random() < 0.5 ? -1 : 1) * modelData.height)
+        // The clock is positioned by `least_busy_region.py` script. If the script fails 
+        // (e.g. due to missing dependencies like opencv-python), the clock will be placed
+        // in the center of the screen as a fallback.
+        property real clockX: modelData.width / 2
+        property real clockY: modelData.height / 2
         property var textHorizontalAlignment: clockX < screen.width / 3 ? Text.AlignLeft :
             (clockX > screen.width * 2 / 3 ? Text.AlignRight : Text.AlignHCenter)
         // Colors
         property color dominantColor: Appearance.colors.colPrimary
         property bool dominantColorIsDark: dominantColor.hslLightness < 0.5
-        property color colText: CF.ColorUtils.colorWithLightness(Appearance.colors.colPrimary, (dominantColorIsDark ? 0.8 : 0.12))
+        property color colText: CF.ColorUtils.colorWithLightness(dominantColor, (dominantColorIsDark ? 0.8 : 0.12))
 
         // Layer props
         screen: modelData
@@ -146,12 +148,20 @@ Variants {
                 id: leastBusyRegionOutputCollector
                 onStreamFinished: {
                     const output = leastBusyRegionOutputCollector.text
-                    // console.log("[Background] Least busy region output:", output)
-                    if (output.length === 0) return;
+                    if (output.length === 0) {
+                        return;
+                    }
                     const parsedContent = JSON.parse(output)
                     bgRoot.clockX = parsedContent.center_x * bgRoot.effectiveWallpaperScale
                     bgRoot.clockY = parsedContent.center_y * bgRoot.effectiveWallpaperScale
-                    bgRoot.dominantColor = parsedContent.dominant_color || Appearance.colors.colPrimary
+                    dominantColor = parsedContent.dominant_color || Appearance.colors.colPrimary
+                }
+            }
+            stderr: StdioCollector {
+                id: leastBusyRegionErrorCollector
+                onStreamFinished: {
+                    const output = leastBusyRegionErrorCollector.text
+                    if (output.length === 0) return;
                 }
             }
         }

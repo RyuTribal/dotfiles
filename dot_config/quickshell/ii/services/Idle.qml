@@ -12,7 +12,6 @@ Singleton {
     id: root
 
     property alias inhibit: idleInhibitor.enabled
-    inhibit: Persistent.states.idle.inhibit
 
     function toggleInhibit() {
         Persistent.states.idle.inhibit = !Persistent.states.idle.inhibit
@@ -20,6 +19,7 @@ Singleton {
 
     IdleInhibitor {
         id: idleInhibitor
+        enabled: Persistent.states.idle.inhibit
         window: PanelWindow { // Inhibitor requires a "visible" surface
             // Actually not lol
             implicitWidth: 0

@@ -128,7 +128,6 @@ Item { // Wrapper
     }
 
     function cancelSearch() {
-        searchInput.selectAll();
         root.searchingText = "";
         searchWidthBehavior.enabled = true;
     }
@@ -136,6 +135,7 @@ Item { // Wrapper
     function setSearchingText(text) {
         searchInput.text = text;
         root.searchingText = text;
+        searchInput.selectAll();
         // If we get called by the toggle with a glyph prefix, build page 1 now if data is ready
         const glyphPrefix = Config?.options?.search?.prefix?.glyphs ?? ".";
         if (typeof text === "string" && text.startsWith(glyphPrefix)) {
@@ -148,7 +148,7 @@ Item { // Wrapper
 
     function focusSearchInput() {
         searchInput.forceActiveFocus();
-        searchInput.cursorPosition = searchInput.text.length;
+        searchInput.selectAll();
     }
 
     property var searchActions: [

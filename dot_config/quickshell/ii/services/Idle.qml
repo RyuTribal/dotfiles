@@ -22,8 +22,9 @@ Singleton {
         enabled: Persistent.states.idle.inhibit
         window: PanelWindow { // Inhibitor requires a "visible" surface
             // Actually not lol
-            implicitWidth: 0
-            implicitHeight: 0
+            implicitWidth: 1
+            implicitHeight: 1
+            visible: true
             color: "transparent"
             // Just in case...
             anchors {

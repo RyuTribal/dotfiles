@@ -7,6 +7,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import Quickshell.Hyprland
+import "hyprlandKeybindsCommand.js" as HyprlandKeybindsCommand
 
 /**
  * A service that provides access to Hyprland keybinds.
@@ -40,7 +41,7 @@ Singleton {
     Process {
         id: getDefaultKeybinds
         running: true
-        command: [root.keybindParserPath, "--path", root.defaultKeybindConfigPath]
+        command: HyprlandKeybindsCommand.build(root.keybindParserPath, root.defaultKeybindConfigPath)
         
         stdout: SplitParser {
             onRead: data => {
@@ -56,7 +57,7 @@ Singleton {
     Process {
         id: getUserKeybinds
         running: true
-        command: [root.keybindParserPath, "--path", root.userKeybindConfigPath]
+        command: HyprlandKeybindsCommand.build(root.keybindParserPath, root.userKeybindConfigPath)
         
         stdout: SplitParser {
             onRead: data => {
@@ -69,4 +70,3 @@ Singleton {
         }
     }
 }
-

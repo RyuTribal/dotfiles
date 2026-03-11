@@ -10,6 +10,7 @@ import Quickshell.Io
 import Quickshell
 import Quickshell.Wayland
 import Quickshell.Hyprland
+import "cheatsheetState.js" as CheatsheetState
 
 Scope { // Scope
     id: root
@@ -24,14 +25,37 @@ Scope { // Scope
         },
     ]
     property int selectedTab: 0
+    property var popupState: CheatsheetState.create()
+
+    function setPopupState(nextState) {
+        const shouldFinishOpenTick = nextState.ignoreClearedOnce && !root.popupState.ignoreClearedOnce;
+        root.popupState = nextState;
+        if (shouldFinishOpenTick) {
+            Qt.callLater(() => {
+                root.popupState = CheatsheetState.finishOpenTick(root.popupState);
+            });
+        }
+    }
+
+    function toggleCheatsheet() {
+        root.setPopupState(CheatsheetState.toggle(root.popupState));
+    }
+
+    function openCheatsheet() {
+        root.setPopupState(CheatsheetState.open(root.popupState));
+    }
+
+    function closeCheatsheet() {
+        root.setPopupState(CheatsheetState.close(root.popupState));
+    }
 
     Loader {
         id: cheatsheetLoader
-        active: false
+        active: root.popupState.isOpen
 
         sourceComponent: PanelWindow { // Window
             id: cheatsheetRoot
-            visible: cheatsheetLoader.active
+            visible: root.popupState.isOpen
 
             anchors {
                 top: true
@@ -41,7 +65,7 @@ Scope { // Scope
             }
 
             function hide() {
-                cheatsheetLoader.active = false;
+                root.closeCheatsheet();
             }
             exclusiveZone: 0
             implicitWidth: cheatsheetBackground.width + Appearance.sizes.elevationMargin * 2
@@ -58,10 +82,9 @@ Scope { // Scope
             HyprlandFocusGrab { // Click outside to close
                 id: grab
                 windows: [cheatsheetRoot]
-                active: cheatsheetRoot.visible
+                active: root.popupState.isOpen
                 onCleared: () => {
-                    if (!active)
-                        cheatsheetRoot.hide();
+                    root.setPopupState(CheatsheetState.handleCleared(root.popupState, active));
                 }
             }
 
@@ -195,15 +218,15 @@ Scope { // Scope
         target: "cheatsheet"
 
         function toggle(): void {
-            cheatsheetLoader.active = !cheatsheetLoader.active;
+            root.toggleCheatsheet();
         }
 
         function close(): void {
-            cheatsheetLoader.active = false;
+            root.closeCheatsheet();
         }
 
         function open(): void {
-            cheatsheetLoader.active = true;
+            root.openCheatsheet();
         }
     }
 
@@ -212,7 +235,7 @@ Scope { // Scope
         description: "Toggles cheatsheet on press"
 
         onPressed: {
-            cheatsheetLoader.active = !cheatsheetLoader.active;
+            root.toggleCheatsheet();
         }
     }
 
@@ -221,7 +244,7 @@ Scope { // Scope
         description: "Opens cheatsheet on press"
 
         onPressed: {
-            cheatsheetLoader.active = true;
+            root.openCheatsheet();
         }
     }
 
@@ -230,7 +253,7 @@ Scope { // Scope
         description: "Closes cheatsheet on press"
 
         onPressed: {
-            cheatsheetLoader.active = false;
+            root.closeCheatsheet();
         }
     }
 }

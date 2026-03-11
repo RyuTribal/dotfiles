@@ -10,22 +10,15 @@ STATE_DIR="$XDG_STATE_HOME/quickshell"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 term_alpha=100 #Set this to < 100 make all your terminals transparent
+terminal_palette_path="$STATE_DIR/user/generated/terminal_palette.json"
+terminal_sequences_path="$STATE_DIR/user/generated/terminal/sequences.txt"
 # sleep 0 # idk i wanted some delay or colors dont get applied properly
 if [ ! -d "$STATE_DIR"/user/generated ]; then
   mkdir -p "$STATE_DIR"/user/generated
 fi
 cd "$CONFIG_DIR" || exit
 
-colornames=''
-colorstrings=''
-colorlist=()
-colorvalues=()
-
-colornames=$(cat $STATE_DIR/user/generated/material_colors.scss | cut -d: -f1)
-colorstrings=$(cat $STATE_DIR/user/generated/material_colors.scss | cut -d: -f2 | cut -d ' ' -f2 | cut -d ";" -f1)
-IFS=$'\n'
-colorlist=($colornames)     # Array of color names
-colorvalues=($colorstrings) # Array of color values
+source "$SCRIPT_DIR/theme_helpers.sh"
 
 apply_term() {
   # Check if terminal escape sequence template exists
@@ -33,20 +26,39 @@ apply_term() {
     echo "Template file not found for Terminal. Skipping that."
     return
   fi
-  # Copy template
-  mkdir -p "$STATE_DIR"/user/generated/terminal
-  cp "$SCRIPT_DIR/terminal/sequences.txt" "$STATE_DIR"/user/generated/terminal/sequences.txt
-  # Apply colors
-  for i in "${!colorlist[@]}"; do
-    sed -i "s/${colorlist[$i]} #/${colorvalues[$i]#\#}/g" "$STATE_DIR"/user/generated/terminal/sequences.txt
-  done
 
-  sed -i "s/\$alpha/$term_alpha/g" "$STATE_DIR/user/generated/terminal/sequences.txt"
+  if [ -f "$terminal_palette_path" ]; then
+    render_terminal_sequences_file "$terminal_palette_path" "$SCRIPT_DIR/terminal/sequences.txt" "$terminal_sequences_path" "$term_alpha"
+  elif [ -f "$STATE_DIR/user/generated/material_colors.scss" ]; then
+    echo "[applycolor.sh] Warning: Falling back to legacy material_colors.scss terminal palette." >&2
+    local colornames=''
+    local colorstrings=''
+    local colorlist=()
+    local colorvalues=()
+    local i=0
+
+    colornames=$(cat "$STATE_DIR/user/generated/material_colors.scss" | cut -d: -f1)
+    colorstrings=$(cat "$STATE_DIR/user/generated/material_colors.scss" | cut -d: -f2 | cut -d ' ' -f2 | cut -d ";" -f1)
+    IFS=$'\n'
+    colorlist=($colornames)
+    colorvalues=($colorstrings)
+    unset IFS
+
+    mkdir -p "$STATE_DIR"/user/generated/terminal
+    cp "$SCRIPT_DIR/terminal/sequences.txt" "$terminal_sequences_path"
+    for i in "${!colorlist[@]}"; do
+      sed -i "s/${colorlist[$i]} #/${colorvalues[$i]#\#}/g" "$terminal_sequences_path"
+    done
+    sed -i "s/\$alpha/$term_alpha/g" "$terminal_sequences_path"
+  else
+    echo "[applycolor.sh] Warning: No terminal palette source found. Skipping terminal theming." >&2
+    return
+  fi
 
   for file in /dev/pts/*; do
     if [[ $file =~ ^/dev/pts/[0-9]+$ ]]; then
       {
-      cat "$STATE_DIR"/user/generated/terminal/sequences.txt >"$file"
+      cat "$terminal_sequences_path" >"$file"
       } & disown || true
     fi
   done

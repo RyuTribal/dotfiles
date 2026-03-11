@@ -25,6 +25,6 @@ source=workspaces.conf
 source=monitors.conf
 
 
-monitor=eDP-1,1920x1200@60.10,4672x0,1.00,vrr,1
-monitor=HDMI-A-1,1920x1080@60.00,2752x0,1.00
-monitor=DP-6,1920x1080@60.00,832x0,1.00
+monitor=eDP-1,1920x1200@60.10,4992x0,1.00,vrr,1
+monitor=HDMI-A-1,1920x1080@60.00,864x0,1.00
+monitor=DP-6,1920x1080@60.00,2912x0,1.00

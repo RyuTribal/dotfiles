@@ -11,6 +11,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SHELL_CONFIG_FILE="$XDG_CONFIG_HOME/illogical-impulse/config.json"
 MATUGEN_DIR="$XDG_CONFIG_HOME/matugen"
 terminalscheme="$SCRIPT_DIR/terminal/scheme-base.json"
+terminal_palette_path="$STATE_DIR/user/generated/terminal_palette.json"
+matugen_config_path="$SCRIPT_DIR/matugen.config.toml"
+
+source "$SCRIPT_DIR/theme_helpers.sh"
 
 handle_kde_material_you_colors() {
     # Check if Qt app theming is enabled in config
@@ -31,7 +35,7 @@ handle_kde_material_you_colors() {
             kde_scheme_variant="scheme-tonal-spot" # default
             ;;
     esac
-    "$XDG_CONFIG_HOME"/matugen/templates/kde/kde-material-you-colors-wrapper.sh --scheme-variant "$kde_scheme_variant"
+    "$SCRIPT_DIR"/kde_theme_bridge.sh --scheme-variant "$kde_scheme_variant"
 }
 
 pre_process() {
@@ -171,6 +175,8 @@ switch() {
     type_flag="$3"
     color_flag="$4"
     color="$5"
+    local theme_source_image=""
+    local matugen_command=()
     read scale screenx screeny screensizey < <(hyprctl monitors -j | jq '.[] | select(.focused) | .scale, .x, .y, .height' | xargs)
     cursorposx=$(hyprctl cursorpos -j | jq '.x' 2>/dev/null) || cursorposx=960
     cursorposx=$(bc <<< "scale=0; ($cursorposx - $screenx) * $scale / 1")
@@ -179,7 +185,6 @@ switch() {
     cursorposy_inverted=$((screensizey - cursorposy))
 
     if [[ "$color_flag" == "1" ]]; then
-        matugen_args=(color hex "$color")
         generate_colors_material_args=(--color "$color")
     else
         if [[ -z "$imgpath" ]]; then
@@ -237,7 +242,7 @@ switch() {
             set_thumbnail_path "$thumbnail"
 
             if [ -f "$thumbnail" ]; then
-                matugen_args=(image "$thumbnail")
+                theme_source_image="$thumbnail"
                 generate_colors_material_args=(--path "$thumbnail")
                 create_restore_script "$video_path"
             else
@@ -246,7 +251,7 @@ switch() {
                 exit 1
             fi
         else
-            matugen_args=(image "$imgpath")
+            theme_source_image="$imgpath"
             generate_colors_material_args=(--path "$imgpath")
             # Update wallpaper path in config
             set_wallpaper_path "$imgpath"
@@ -266,14 +271,13 @@ switch() {
 
     # enforce dark mode for terminal
     if [[ -n "$mode_flag" ]]; then
-        matugen_args+=(--mode "$mode_flag")
         if [[ $(jq -r '.appearance.wallpaperTheming.terminalGenerationProps.forceDarkMode' "$SHELL_CONFIG_FILE") == "true" ]]; then
             generate_colors_material_args+=(--mode "dark")
         else
             generate_colors_material_args+=(--mode "$mode_flag")
         fi
     fi
-    [[ -n "$type_flag" ]] && matugen_args+=(--type "$type_flag") && generate_colors_material_args+=(--scheme "$type_flag")
+    [[ -n "$type_flag" ]] && generate_colors_material_args+=(--scheme "$type_flag")
     generate_colors_material_args+=(--termscheme "$terminalscheme" --blend_bg_fg)
     generate_colors_material_args+=(--cache "$STATE_DIR/user/generated/color.txt")
 
@@ -298,12 +302,40 @@ switch() {
         [[ "$term_fg_boost" != "null" && -n "$term_fg_boost" ]] && generate_colors_material_args+=(--term_fg_boost "$term_fg_boost")
     fi
 
-    matugen "${matugen_args[@]}"
-    source "$(eval echo $ILLOGICAL_IMPULSE_VIRTUAL_ENV)/bin/activate"
-    python3 "$SCRIPT_DIR/generate_colors_material.py" "${generate_colors_material_args[@]}" \
-        > "$STATE_DIR"/user/generated/material_colors.scss
+    if ! build_matugen_theme_command matugen_command "$theme_source_image" "$mode_flag" "$type_flag" "$color"; then
+        echo "[switchwall.sh] Error: Failed to derive a wallpaper color for theme generation." >&2
+        return 1
+    fi
+
+    "${matugen_command[@]}" --config "$matugen_config_path" --continue-on-error
+
+    if ! write_terminal_palette_json_from_theme \
+        "$terminal_palette_path" \
+        "$theme_source_image" \
+        "$mode_flag" \
+        "$type_flag" \
+        "$color" \
+        "$terminalscheme" \
+        "${harmony:-0.8}" \
+        "${harmonize_threshold:-100}" \
+        "${term_fg_boost:-0.35}"; then
+        echo "[switchwall.sh] Warning: Failed to generate terminal palette JSON from the current theme seed." >&2
+    fi
+
     "$SCRIPT_DIR"/applycolor.sh
-    deactivate
+
+    local material_python=""
+    local material_colors_tmp="$STATE_DIR/user/generated/material_colors.scss.tmp"
+    if material_python="$(resolve_material_generator_python)"; then
+        if "$material_python" "$SCRIPT_DIR/generate_colors_material.py" "${generate_colors_material_args[@]}" > "$material_colors_tmp"; then
+            mv "$material_colors_tmp" "$STATE_DIR/user/generated/material_colors.scss"
+        else
+            rm -f "$material_colors_tmp"
+            echo "[switchwall.sh] Warning: Legacy material_colors.scss generation failed; shell templates were still updated via matugen." >&2
+        fi
+    else
+        echo "[switchwall.sh] Warning: Skipping legacy material_colors.scss generation; no Python interpreter with materialyoucolor and Pillow is available." >&2
+    fi
 
     # Pass screen width, height, and wallpaper path to post_process
     max_width_desired="$(hyprctl monitors -j | jq '([.[].width] | min)' | xargs)"

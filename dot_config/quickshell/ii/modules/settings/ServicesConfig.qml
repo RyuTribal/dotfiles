@@ -59,6 +59,60 @@ ContentPage {
     }
 
     ContentSection {
+        icon: "notifications"
+        title: Translation.tr("Notifications")
+
+        ConfigSwitch {
+            text: Translation.tr("Enable notification sounds")
+            checked: Config.options.notifications.sounds.enabled
+            onCheckedChanged: {
+                Config.options.notifications.sounds.enabled = checked;
+            }
+        }
+
+        MaterialTextArea {
+            Layout.fillWidth: true
+            placeholderText: Translation.tr("Default sound name or absolute file path")
+            text: Config.options.notifications.sounds.defaultSound
+            wrapMode: TextEdit.Wrap
+            onTextChanged: {
+                Config.options.notifications.sounds.defaultSound = text;
+            }
+        }
+
+        StyledText {
+            Layout.fillWidth: true
+            color: Appearance.colors.colSubtext
+            wrapMode: Text.Wrap
+            text: Translation.tr("Use a freedesktop sound name like <tt>message</tt> or <tt>message-new-instant</tt>, or an absolute file path like <tt>/home/me/Sounds/discord.oga</tt>.")
+        }
+
+        MaterialTextArea {
+            Layout.fillWidth: true
+            implicitHeight: 180
+            placeholderText: Translation.tr("[\n  {\"desktopEntry\": \"discord\", \"sound\": \"message-new-instant\"}\n]")
+            text: JSON.stringify(Config.options.notifications.sounds.overrides, null, 2)
+            wrapMode: TextEdit.Wrap
+            onTextChanged: {
+                try {
+                    const parsed = JSON.parse(text);
+                    if (Array.isArray(parsed)) {
+                        Config.options.notifications.sounds.overrides = parsed;
+                    }
+                } catch (error) {
+                }
+            }
+        }
+
+        StyledText {
+            Layout.fillWidth: true
+            color: Appearance.colors.colSubtext
+            wrapMode: Text.Wrap
+            text: Translation.tr("Overrides match exact <tt>desktopEntry</tt> and/or <tt>appName</tt>. Example: <tt>{\"desktopEntry\": \"discord\", \"sound\": \"message-new-instant\"}</tt>. If an app sends <tt>sound-name</tt> or <tt>sound-file</tt>, that is used when no override matches.")
+        }
+    }
+
+    ContentSection {
         icon: "search"
         title: Translation.tr("Search")
 

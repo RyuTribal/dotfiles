@@ -7,6 +7,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import Quickshell.Services.Notifications
+import "notificationSoundPolicy.js" as NotificationSoundPolicy
 
 /**
  * Provides extra features not in Quickshell.Services.Notifications:
@@ -28,6 +29,8 @@ Singleton {
         property string appIcon: notification?.appIcon ?? ""
         property string appName: notification?.appName ?? ""
         property string body: notification?.body ?? ""
+        property string desktopEntry: notification?.desktopEntry ?? ""
+        property var hints: notification?.hints ?? ({})
         property string image: notification?.image ?? ""
         property string summary: notification?.summary ?? ""
         property double time
@@ -161,6 +164,7 @@ Singleton {
                 "time": Date.now(),
             });
 			root.list = [...root.list, newNotifObject];
+            root.playNotificationSound(notification);
 
             // Popup
             if (!root.popupInhibited) {
@@ -248,6 +252,19 @@ Singleton {
 
     function refresh() {
         notifFileView.reload()
+    }
+
+    function playNotificationSound(notification) {
+        if (root.silent)
+            return;
+
+        const soundConfig = Config.options.notifications ? Config.options.notifications.sounds : null;
+        const sound = NotificationSoundPolicy.resolve(notification, soundConfig);
+        const command = NotificationSoundPolicy.buildCommand(sound);
+
+        if (command.length > 0) {
+            Quickshell.execDetached(command);
+        }
     }
 
     Component.onCompleted: {

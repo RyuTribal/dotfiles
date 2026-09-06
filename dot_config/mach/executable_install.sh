@@ -47,6 +47,29 @@ case ":$PATH:" in
   *) echo "NOTE: $BIN_DIR is not on your PATH — add it or the panel can't spawn sweepd." ;;
 esac
 
+# kb (phase 2) needs a running ollama with the embedding model pulled. This
+# is a soft check: kb itself degrades gracefully (clear error on add, warned
+# substring fallback on search) when ollama is missing, so an absent or
+# unconfigured ollama must not fail the whole install.
+check_ollama() {
+  if ! command -v ollama >/dev/null 2>&1; then
+    echo "NOTE: ollama not found — 'mach kb' needs it for embeddings (https://ollama.com)."
+    echo "      Install it, then run: ollama pull nomic-embed-text"
+    return
+  fi
+  if ollama list 2>/dev/null | awk '{print $1}' | grep -qx 'nomic-embed-text:latest\|nomic-embed-text'; then
+    echo "ollama: nomic-embed-text already present."
+  else
+    echo "ollama found but nomic-embed-text is missing — pulling it now..."
+    if ollama pull nomic-embed-text; then
+      echo "ollama: nomic-embed-text pulled."
+    else
+      echo "WARNING: 'ollama pull nomic-embed-text' failed — 'mach kb add'/'search' will error until this succeeds (is ollama serve running?)."
+    fi
+  fi
+}
+check_ollama
+
 echo
 echo "Done. Reload quickshell if running, then press SUPER+U."
 echo "Or test now:  qs -c ii ipc call sweep toggle"

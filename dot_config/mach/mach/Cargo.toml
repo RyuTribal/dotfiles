@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 sweep = { package = "sweep-engine", path = "../engines/sweep" }
+kb = { package = "kb-engine", path = "../engines/kb" }
 
 [[bin]]
 name = "mach"

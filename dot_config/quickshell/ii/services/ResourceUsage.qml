@@ -86,14 +86,66 @@ Singleton {
         onTriggered: tempProc.running = true
     }
 
-    // Disk polling: always on, but on a slower 60s cadence since df is
-    // heavier and disk usage doesn't move fast enough to need a 5s refresh.
+    // Disk polling: always on, but on a slower 60s cadence. Sourced from
+    // sweepd (the sweep disk-tool daemon, ~/.config/sweep) over its Unix
+    // socket instead of spawning df — one shared backend for the bar's disk
+    // stats and the SweepPanel inspector. Falls back to spawning the daemon
+    // if it isn't running yet.
     Timer {
         interval: 60000
         running: true
         repeat: true
         triggeredOnStart: true
-        onTriggered: diskProc.running = true
+        onTriggered: {
+            if (sweepSock.connected) {
+                sweepSock.write('{"op":"mounts"}\n');
+                sweepSock.flush();
+            } else {
+                sweepSock.connected = true;
+            }
+        }
+    }
+
+    Process {
+        id: sweepdProc
+        command: ["sweepd"]
+        running: false
+    }
+
+    Timer {
+        id: sweepRetryTimer
+        interval: 700
+        onTriggered: sweepSock.connected = true
+    }
+
+    Socket {
+        id: sweepSock
+        path: Quickshell.env("XDG_RUNTIME_DIR") + "/sweep.sock"
+        connected: false
+        parser: SplitParser {
+            onRead: msg => {
+                let r;
+                try { r = JSON.parse(msg); } catch (e) { return; }
+                if (r.mounts === undefined) return; // not for us
+                // Map daemon bytes to the df-shaped {target, pcent, avail(KB)}
+                // rows the bar/Stats consumers already expect.
+                mounts = r.mounts.map(m => ({
+                    target: m.target,
+                    pcent: m.pcent,
+                    avail: m.avail / 1024
+                }));
+            }
+        }
+        onConnectionStateChanged: {
+            if (connected) {
+                sweepSock.write('{"op":"mounts"}\n');
+                sweepSock.flush();
+            }
+        }
+        onError: {
+            sweepdProc.running = true;
+            sweepRetryTimer.start();
+        }
     }
 
     // Prefers the hwmon device actually named "coretemp" (Intel) or
@@ -118,37 +170,5 @@ Singleton {
         }
     }
 
-    Process {
-        id: diskProc
-        command: ["df", "--output=target,pcent,avail", "-x", "tmpfs", "-x", "devtmpfs", "-x", "efivarfs"]
-        stdout: StdioCollector {
-            id: diskCollector
-            onStreamFinished: {
-                // First line is the "Mounted on Use% Avail" header; each
-                // remaining line is "<target> <NN%> <avail>" (target can't
-                // contain whitespace on a real mount point), so a plain
-                // whitespace split lines up with the three requested
-                // --output columns.
-                const lines = diskCollector.text.split("\n").slice(1)
-                const parsed = []
-                for (const line of lines) {
-                    const trimmed = line.trim()
-                    if (!trimmed)
-                        continue
-                    const parts = trimmed.split(/\s+/)
-                    if (parts.length < 3)
-                        continue
-                    const avail = parts[parts.length - 1]
-                    const pcent = parts[parts.length - 2]
-                    const target = parts.slice(0, parts.length - 2).join(" ")
-                    parsed.push({
-                        target: target,
-                        pcent: parseInt(pcent) || 0,
-                        avail: avail
-                    })
-                }
-                mounts = parsed
-            }
-        }
-    }
+    // (df-based diskProc removed — mounts now come from sweepd above.)
 }

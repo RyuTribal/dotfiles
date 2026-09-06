@@ -16,11 +16,13 @@ Item {
     property int sidebarWidth: Appearance.sizes.sidebarWidth
     property int sidebarPadding: 12
     property string settingsQmlPath: Quickshell.shellPath("settings.qml")
+    property bool toolsPopupOpen: false
     Connections {
         target: GlobalStates
         function onSidebarRightOpenChanged() {
             if (!GlobalStates.sidebarRightOpen) {
                 centerWidgetGroup.closeDrillIn();
+                root.toolsPopupOpen = false;
             }
         }
     }
@@ -93,6 +95,16 @@ Item {
                         }
                         StyledToolTip {
                             content: Translation.tr("Reload Hyprland & Quickshell")
+                        }
+                    }
+                    QuickToggleButton {
+                        toggled: root.toolsPopupOpen
+                        buttonIcon: "construction"
+                        onClicked: {
+                            root.toolsPopupOpen = !root.toolsPopupOpen;
+                        }
+                        StyledToolTip {
+                            content: Translation.tr("Tools")
                         }
                     }
                     QuickToggleButton {
@@ -211,6 +223,12 @@ Item {
                 Layout.fillHeight: true
                 Layout.fillWidth: true
             }
+        }
+
+        // Placed after the ColumnLayout so it paints above the rest of the
+        // sidebar's content; only the header's tools button toggles it.
+        ToolsPopup {
+            open: root.toolsPopupOpen
         }
     }
 }

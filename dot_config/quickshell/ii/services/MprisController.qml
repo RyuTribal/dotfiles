@@ -5,6 +5,7 @@ pragma ComponentBehavior: Bound
 // It does not have a license, but the author is okay with redistribution.
 
 import qs
+import qs.modules.common
 import QtQml.Models
 import QtQuick
 import Quickshell
@@ -19,6 +20,72 @@ Singleton {
 	property MprisPlayer trackedPlayer: null;
 	property MprisPlayer activePlayer: trackedPlayer ?? Mpris.players.values[0] ?? null;
 	signal trackChanged(reverse: bool);
+
+	// Player-list filtering pipeline, lifted from MediaControls.qml so both
+	// the SUPER+M popup and the topMenu Media tab consume one shared list
+	// instead of keeping their own copies in sync by hand.
+	property bool hasPlasmaIntegration: false
+	Process {
+		id: plasmaIntegrationAvailabilityCheckProc
+		running: true
+		command: ["bash", "-c", "command -v plasma-browser-integration-host"]
+		onExited: (exitCode, exitStatus) => {
+			root.hasPlasmaIntegration = (exitCode === 0);
+		}
+	}
+
+	function isYouTubePreview(p) {
+		const u = (p.metadata["xesam:url"] || "").toString();
+		if (!(u.includes("youtube.com") || u.includes("youtu.be")))
+			return false;
+
+		// real watchables: watch/shorts/live/embed, and YT Music
+		const real = /youtube\.com\/(watch|shorts|live|embed)\b/.test(u) || /music\.youtube\.com\//.test(u) || /youtu\.be\//.test(u);
+
+		return !real;  // preview/home/feed/etc.
+	}
+	function isRealPlayer(player) {
+		if (!Config.options.media.filterDuplicatePlayers) {
+			return true;
+		}
+		return (
+			// Remove unecessary native buses from browsers if there's plasma integration
+			!(root.hasPlasmaIntegration && player.dbusName.startsWith('org.mpris.MediaPlayer2.firefox')) && !(root.hasPlasmaIntegration && player.dbusName.startsWith('org.mpris.MediaPlayer2.chromium')) &&
+			// playerctld just copies other buses and we don't need duplicates
+			!player.dbusName?.startsWith('org.mpris.MediaPlayer2.playerctld') &&
+			// Non-instance mpd bus
+			!(player.dbusName?.endsWith('.mpd') && !player.dbusName.endsWith('MediaPlayer2.mpd')));
+	}
+	function filterDuplicatePlayers(players) {
+		let filtered = [];
+		let used = new Set();
+
+		for (let i = 0; i < players.length; ++i) {
+			if (used.has(i))
+				continue;
+			let p1 = players[i];
+			let group = [i];
+
+			// Find duplicates by trackTitle prefix
+			for (let j = i + 1; j < players.length; ++j) {
+				let p2 = players[j];
+				if (p1.trackTitle && p2.trackTitle && (p1.trackTitle.includes(p2.trackTitle) || p2.trackTitle.includes(p1.trackTitle)) || (Math.abs(p1.position - p2.position) <= 2 && Math.abs(p1.length - p2.length) <= 2)) {
+					group.push(j);
+				}
+			}
+
+			// Pick the one with non-empty trackArtUrl, or fallback to the first
+			let chosenIdx = group.find(idx => players[idx].trackArtUrl && players[idx].trackArtUrl.length > 0);
+			if (chosenIdx === undefined)
+				chosenIdx = group[0];
+
+			filtered.push(players[chosenIdx]);
+			group.forEach(idx => used.add(idx));
+		}
+		return filtered;
+	}
+	readonly property var realPlayers: Mpris.players.values.filter(player => root.isRealPlayer(player) && player.playbackState !== MprisPlaybackState.Stopped && !root.isYouTubePreview(player))
+	readonly property var meaningfulPlayers: root.filterDuplicatePlayers(root.realPlayers)
 
 	property bool __reverse: false;
 

@@ -221,4 +221,17 @@ Singleton {
     function cleanCliphistEntry(str: string): string {
         return str.replace(/^\d+\t/, "");
     }
+
+    /**
+     * Formats a `df`-style raw-KB availability figure as GiB with one
+     * decimal, e.g. 7960000 -> "7.6G". Shared by the bar's ResourcesPopup
+     * disk row and the Stats tab's SystemPanel/per-mount list so both stay
+     * in sync instead of carrying independent copies.
+     * @param { number } availKb
+     * @returns { string }
+     */
+    function formatAvail(availKb) {
+        const gib = Number(availKb) / (1024 * 1024);
+        return gib.toFixed(1) + "G";
+    }
 }

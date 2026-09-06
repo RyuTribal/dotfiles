@@ -19,10 +19,10 @@ MouseArea {
     implicitHeight: Appearance.sizes.barHeight
     hoverEnabled: true
 
-    // Manual refresh (kept as-is)
+    // Jump to the Calendar tab, same as the other clickable bar widgets.
     onClicked: {
-        Weather.getData();
-        Quickshell.execDetached(["notify-send", Translation.tr("Weather"), Translation.tr("Refreshing (manually triggered)"), "-a", "Shell"]);
+        GlobalStates.topMenuTab = "calendar";
+        GlobalStates.topMenuOpen = true;
     }
 
     // Initial fetch on mount

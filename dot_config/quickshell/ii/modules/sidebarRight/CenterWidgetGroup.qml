@@ -3,6 +3,8 @@ import qs.modules.common.widgets
 import qs.services
 import qs.modules.sidebarRight.notifications
 import qs.modules.sidebarRight.volumeMixer
+import qs.modules.sidebarRight.wifiNetworks
+import qs.modules.sidebarRight.bluetoothDevices
 import qs
 import Qt5Compat.GraphicalEffects
 import QtQuick
@@ -14,33 +16,22 @@ Rectangle {
     radius: Appearance.rounding.normal
     color: Appearance.colors.colLayer1
 
-    property int selectedTab: 0
-    property var tabButtonList: [
-        {
-            "icon": "notifications",
-            "name": Translation.tr("Notifications")
-        },
-        {
-            "icon": "volume_up",
-            "name": Translation.tr("Audio")
-        }
-    ]
+    // "" shows the default view (notifications). Any other value drills
+    // into the matching page below, swapped in via the SwipeView the same
+    // way this area already swapped between tabs before this change.
+    property string activeDrillIn: ""
+    readonly property bool drillInActive: activeDrillIn !== ""
+
+    function openDrillIn(name) {
+        root.activeDrillIn = name;
+    }
+    function closeDrillIn() {
+        root.activeDrillIn = "";
+    }
 
     Keys.onPressed: event => {
-        if (event.key === Qt.Key_PageDown || event.key === Qt.Key_PageUp) {
-            if (event.key === Qt.Key_PageDown) {
-                root.selectedTab = Math.min(root.selectedTab + 1, root.tabButtonList.length - 1);
-            } else if (event.key === Qt.Key_PageUp) {
-                root.selectedTab = Math.max(root.selectedTab - 1, 0);
-            }
-            event.accepted = true;
-        }
-        if (event.modifiers === Qt.ControlModifier) {
-            if (event.key === Qt.Key_Tab) {
-                root.selectedTab = (root.selectedTab + 1) % root.tabButtonList.length;
-            } else if (event.key === Qt.Key_Backtab) {
-                root.selectedTab = (root.selectedTab - 1 + root.tabButtonList.length) % root.tabButtonList.length;
-            }
+        if (event.key === Qt.Key_Escape && root.drillInActive) {
+            root.closeDrillIn();
             event.accepted = true;
         }
     }
@@ -50,27 +41,14 @@ Rectangle {
         anchors.fill: parent
         spacing: 0
 
-        PrimaryTabBar {
-            id: tabBar
-            tabButtonList: root.tabButtonList
-            externalTrackedTab: root.selectedTab
-
-            function onCurrentIndexChanged(currentIndex) {
-                root.selectedTab = currentIndex;
-            }
-        }
-
         SwipeView {
             id: swipeView
-            Layout.topMargin: 5
             Layout.fillWidth: true
             Layout.fillHeight: true
-            spacing: 10
-            currentIndex: root.selectedTab
-            onCurrentIndexChanged: {
-                tabBar.enableIndicatorAnimation = true;
-                root.selectedTab = currentIndex;
-            }
+            // Drill-in pages are opened and closed through explicit triggers
+            // (chevron, back button), not by swiping between them.
+            interactive: false
+            currentIndex: root.drillInActive ? 1 : 0
 
             clip: true
             layer.enabled: true
@@ -83,7 +61,45 @@ Rectangle {
             }
 
             NotificationList {}
-            VolumeMixer {}
+
+            Loader {
+                active: root.drillInActive
+                sourceComponent: root.activeDrillIn === "mixer" ? mixerDrillIn : root.activeDrillIn === "wifi" ? wifiDrillIn : root.activeDrillIn === "bluetooth" ? bluetoothDrillIn : null
+            }
+        }
+    }
+
+    Component {
+        id: mixerDrillIn
+        DrillInView {
+            title: Translation.tr("Volume mixer")
+            onBack: root.closeDrillIn()
+            VolumeMixer {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+            }
+        }
+    }
+    Component {
+        id: wifiDrillIn
+        DrillInView {
+            title: Translation.tr("Wi-Fi networks")
+            onBack: root.closeDrillIn()
+            WifiNetworksView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+            }
+        }
+    }
+    Component {
+        id: bluetoothDrillIn
+        DrillInView {
+            title: Translation.tr("Bluetooth devices")
+            onBack: root.closeDrillIn()
+            BluetoothDevicesView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+            }
         }
     }
 }

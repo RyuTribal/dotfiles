@@ -37,7 +37,12 @@ Item {
             } else if (event.button === Qt.ForwardButton || event.button === Qt.RightButton) {
                 activePlayer.next();
             } else if (event.button === Qt.LeftButton) {
-                GlobalStates.mediaControlsOpen = !GlobalStates.mediaControlsOpen
+                // Left click jumps to the top menu's Media tab (batch 2). The
+                // mediaControls popup this used to toggle is still reachable
+                // through its own SUPER+M keybind (modules/mediaControls),
+                // untouched here.
+                GlobalStates.topMenuTab = "media";
+                GlobalStates.topMenuOpen = true;
             }
         }
     }

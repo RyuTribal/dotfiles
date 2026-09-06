@@ -10,7 +10,6 @@ pragma ComponentBehavior: Bound
 Singleton {
     id: root
     property bool barOpen: true
-    property bool sidebarLeftOpen: false
     property bool sidebarRightOpen: false
     property bool mediaControlsOpen: false
     property bool osdBrightnessOpen: false
@@ -24,11 +23,17 @@ Singleton {
     property bool sessionOpen: false
     property bool superDown: false
     property bool superReleaseMightTrigger: true
+    property bool topMenuOpen: false
+    // One-shot tab-jump target for the top menu: set to a tab name ("media",
+    // "calendar", "todo", "timer", "stats") to have TopMenuContent.qml switch
+    // to it, then reset to "" immediately after being consumed. See
+    // TopMenu.qml's IpcHandler.openTab and TopMenuContent.qml's Connections.
+    property string topMenuTab: ""
     property bool workspaceShowNumbers: false
 
     property real screenZoom: 1
     onScreenZoomChanged: {
-        Quickshell.execDetached(["hyprctl", "keyword", "cursor:zoom_factor", root.screenZoom.toString()]);
+        Quickshell.execDetached(["hyprctl", "eval", `hl.config({ cursor = { zoom_factor = ${root.screenZoom} } })`]);
     }
     Behavior on screenZoom {
         animation: Appearance.animation.elementMoveFast.numberAnimation.createObject(this)

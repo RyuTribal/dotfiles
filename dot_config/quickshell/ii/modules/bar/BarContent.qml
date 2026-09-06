@@ -62,9 +62,12 @@ Item { // Bar content region
         onScrollDown: root.brightnessMonitor.setBrightness(root.brightnessMonitor.brightness - 0.05)
         onScrollUp: root.brightnessMonitor.setBrightness(root.brightnessMonitor.brightness + 0.05)
         onMovedAway: GlobalStates.osdBrightnessOpen = false
+        // Left-click anywhere on the left strip opens/closes the top menu
+        // (no tab jump — batch 2's plain-toggle header click).
         onPressed: event => {
-            if (event.button === Qt.LeftButton)
-                GlobalStates.sidebarLeftOpen = !GlobalStates.sidebarLeftOpen;
+            if (event.button === Qt.LeftButton) {
+                GlobalStates.topMenuOpen = !GlobalStates.topMenuOpen;
+            }
         }
 
         // Visual content
@@ -80,17 +83,12 @@ Item { // Bar content region
         RowLayout {
             id: leftSectionRowLayout
             anchors.fill: parent
-            spacing: 10
-
-            LeftSidebarButton {
-                // Left sidebar button
-                Layout.alignment: Qt.AlignVCenter
-                Layout.leftMargin: Appearance.rounding.screenRounding
-                colBackground: barLeftSideMouseArea.hovered ? Appearance.colors.colLayer1Hover : ColorUtils.transparentize(Appearance.colors.colLayer1Hover, 1)
-            }
+            // spacing dropped: ActiveWindow is the only child now that the
+            // sidebarLeft removal took the other entries with it.
 
             ActiveWindow {
                 visible: root.useShortenedForm === 0
+                Layout.leftMargin: Appearance.rounding.screenRounding
                 Layout.rightMargin: Appearance.rounding.screenRounding
                 Layout.fillWidth: true
                 Layout.fillHeight: true
@@ -117,9 +115,17 @@ Item { // Bar content region
                 Layout.fillWidth: root.useShortenedForm === 2
             }
 
+            ClaudeIndicator {
+                visible: root.useShortenedForm < 2
+            }
+
             Media {
                 visible: root.useShortenedForm < 2
                 Layout.fillWidth: true
+                // Extra breathing room beyond BarGroup's default 4px
+                // columnSpacing: without it, "No media" sits flush against
+                // the Claude indicator with no visible gap.
+                Layout.leftMargin: 12
             }
         }
 
@@ -158,8 +164,21 @@ Item { // Bar content region
             implicitHeight: rightCenterGroupContent.implicitHeight
             Layout.preferredWidth: root.centerSideModuleWidth
 
+            // Clicking the clock jumps straight to the top menu's Calendar
+            // tab (batch 2), closing the menu again on a second click rather
+            // than re-jumping tabs while it's already open. The right
+            // sidebar keeps its own dedicated affordances elsewhere in this
+            // bar (barRightSideMouseArea's left-click over the whole right
+            // section, plus the explicit rightSidebarButton toggle button),
+            // so this area doesn't need to double as a sidebarRight trigger
+            // as well.
             onPressed: {
-                GlobalStates.sidebarRightOpen = !GlobalStates.sidebarRightOpen;
+                if (GlobalStates.topMenuOpen) {
+                    GlobalStates.topMenuOpen = false;
+                } else {
+                    GlobalStates.topMenuTab = "calendar";
+                    GlobalStates.topMenuOpen = true;
+                }
             }
 
             BarGroup {

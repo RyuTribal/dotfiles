@@ -133,7 +133,7 @@ ShellRoot {
             })
             readonly property list<var> layerRegions: {
                 const layersOfThisMonitor = root.layers[panelWindow.hyprlandMonitor.name]
-                const topLayers = layersOfThisMonitor.levels["2"]
+                const topLayers = layersOfThisMonitor?.levels?.["2"] ?? []
                 const nonBarTopLayers = topLayers
                     .filter(layer => !(layer.namespace.includes(":bar") || layer.namespace.includes(":verticalBar") || layer.namespace.includes(":dock")))
                     .map(layer => {
@@ -295,6 +295,10 @@ ShellRoot {
                 command: ["bash", "-c", `mkdir -p '${StringUtils.shellSingleQuoteEscape(root.screenshotDir)}' && grim -o '${StringUtils.shellSingleQuoteEscape(modelData.name)}' '${StringUtils.shellSingleQuoteEscape(panelWindow.screenshotPath)}'`]
                 onExited: (exitCode, exitStatus) => {
                     panelWindow.visible = true;
+                    // Load the freshly-captured frame only after grim has written it.
+                    // cache:false + reassigning forces a disk reload (path is reused each launch).
+                    backdropImage.source = "";
+                    backdropImage.source = "file://" + panelWindow.screenshotPath;
                     imageDetectionProcess.running = true;
                 }
             }
@@ -333,10 +337,13 @@ ShellRoot {
                     + `| ${panelWindow.mouseButton === Qt.LeftButton ? "wl-copy" : "swappy -f -"}`]
             }
 
-            ScreencopyView {
+            Image {
+                id: backdropImage
                 anchors.fill: parent
-                live: false
-                captureSource: modelData
+                source: ""
+                fillMode: Image.Stretch
+                cache: false
+                asynchronous: false
 
                 focus: panelWindow.visible
                 Keys.onPressed: (event) => { // Esc to close

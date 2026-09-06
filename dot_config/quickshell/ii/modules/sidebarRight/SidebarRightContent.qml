@@ -3,8 +3,6 @@ import qs.services
 import qs.modules.common
 import qs.modules.common.widgets
 import qs.modules.sidebarRight.quickToggles
-import qs.modules.sidebarRight.wifiNetworks
-import qs.modules.sidebarRight.bluetoothDevices
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
@@ -18,15 +16,21 @@ Item {
     property int sidebarWidth: Appearance.sizes.sidebarWidth
     property int sidebarPadding: 12
     property string settingsQmlPath: Quickshell.shellPath("settings.qml")
-    property bool showWifiDialog: false
-    property bool showBluetoothDialog: false
     Connections {
         target: GlobalStates
         function onSidebarRightOpenChanged() {
             if (!GlobalStates.sidebarRightOpen) {
-                root.showWifiDialog = false;
-                root.showBluetoothDialog = false;
+                centerWidgetGroup.closeDrillIn();
             }
+        }
+    }
+    Connections {
+        target: centerWidgetGroup
+        function onActiveDrillInChanged() {
+            // Stop discovering whenever we're not looking at the Bluetooth
+            // drill-in, mirroring the old dialog's dismiss behaviour.
+            if (centerWidgetGroup.activeDrillIn !== "bluetooth" && Bluetooth.defaultAdapter)
+                Bluetooth.defaultAdapter.discovering = false;
         }
     }
 
@@ -125,90 +129,87 @@ Item {
                     altAction: () => {
                         Network.enableWifi();
                         Network.rescanWifi();
-                        root.showWifiDialog = true;
+                        centerWidgetGroup.openDrillIn("wifi");
                     }
                 }
                 BluetoothToggle {
                     altAction: () => {
-                        Bluetooth.defaultAdapter.enabled = true;
-                        Bluetooth.defaultAdapter.discovering = true;
-                        root.showBluetoothDialog = true;
+                        if (Bluetooth.defaultAdapter) {
+                            Bluetooth.defaultAdapter.enabled = true;
+                            Bluetooth.defaultAdapter.discovering = true;
+                        }
+                        centerWidgetGroup.openDrillIn("bluetooth");
                     }
                 }
                 NightLight {}
                 GameMode {}
+                PowerMode {}
                 IdleInhibitor {}
                 EasyEffectsToggle {}
                 CloudflareWarp {}
             }
 
+            ColumnLayout {
+                id: slidersColumn
+                Layout.fillWidth: true
+                Layout.margins: 5
+                spacing: 8
+
+                property var focusedScreen: Quickshell.screens.find(s => s.name === Hyprland.focusedMonitor?.name)
+                property var brightnessMonitor: Brightness.getMonitorForScreen(focusedScreen)
+
+                RowLayout { // Volume
+                    Layout.fillWidth: true
+                    spacing: 10
+
+                    MaterialSymbol {
+                        iconSize: Appearance.font.pixelSize.larger
+                        text: Audio.materialSymbol
+                        color: Appearance.colors.colOnLayer0
+                    }
+                    StyledSlider {
+                        Layout.fillWidth: true
+                        value: Audio.ready ? Audio.sink.audio.volume : 0
+                        onValueChanged: {
+                            if (Audio.ready)
+                                Audio.setVolumeLinear(value);
+                        }
+                    }
+                    QuickToggleButton {
+                        toggled: false
+                        buttonIcon: "chevron_right"
+                        onClicked: centerWidgetGroup.openDrillIn("mixer")
+                        StyledToolTip {
+                            content: Translation.tr("Volume mixer")
+                        }
+                    }
+                }
+
+                RowLayout { // Brightness
+                    Layout.fillWidth: true
+                    spacing: 10
+
+                    MaterialSymbol {
+                        iconSize: Appearance.font.pixelSize.larger
+                        text: "light_mode"
+                        color: Appearance.colors.colOnLayer0
+                    }
+                    StyledSlider {
+                        Layout.fillWidth: true
+                        value: slidersColumn.brightnessMonitor?.brightness ?? 0
+                        onValueChanged: {
+                            if (slidersColumn.brightnessMonitor?.ready)
+                                slidersColumn.brightnessMonitor.setBrightness(value);
+                        }
+                    }
+                }
+            }
+
             CenterWidgetGroup {
+                id: centerWidgetGroup
                 Layout.alignment: Qt.AlignHCenter
                 Layout.fillHeight: true
                 Layout.fillWidth: true
-            }
-
-            BottomWidgetGroup {
-                Layout.alignment: Qt.AlignHCenter
-                Layout.fillHeight: false
-                Layout.fillWidth: true
-                Layout.preferredHeight: implicitHeight
-            }
-        }
-    }
-
-    onShowWifiDialogChanged: if (showWifiDialog)
-        wifiDialogLoader.active = true
-    Loader {
-        id: wifiDialogLoader
-        anchors.fill: parent
-
-        active: root.showWifiDialog || item.visible
-        onActiveChanged: {
-            if (active) {
-                item.show = true;
-                item.forceActiveFocus();
-            }
-        }
-
-        sourceComponent: WifiDialog {
-            onDismiss: {
-                show = false;
-                root.showWifiDialog = false;
-            }
-            onVisibleChanged: {
-                if (!visible && !root.showWifiDialog)
-                    wifiDialogLoader.active = false;
-            }
-        }
-    }
-
-    onShowBluetoothDialogChanged: {
-        if (showBluetoothDialog)
-            bluetoothDialogLoader.active = true;
-        else
-            Bluetooth.defaultAdapter.discovering = false;
-    }
-    Loader {
-        id: bluetoothDialogLoader
-        anchors.fill: parent
-
-        active: root.showBluetoothDialog || item.visible
-        onActiveChanged: {
-            if (active) {
-                item.show = true;
-                item.forceActiveFocus();
-            }
-        }
-
-        sourceComponent: BluetoothDialog {
-            onDismiss: {
-                show = false;
-                root.showBluetoothDialog = false;
-            }
-            onVisibleChanged: {
-                if (!visible && !root.showBluetoothDialog)
-                    bluetoothDialogLoader.active = false;
             }
         }
     }

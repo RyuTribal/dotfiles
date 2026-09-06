@@ -16,13 +16,11 @@ Item {
     property int sidebarWidth: Appearance.sizes.sidebarWidth
     property int sidebarPadding: 12
     property string settingsQmlPath: Quickshell.shellPath("settings.qml")
-    property bool toolsPopupOpen: false
     Connections {
         target: GlobalStates
         function onSidebarRightOpenChanged() {
             if (!GlobalStates.sidebarRightOpen) {
                 centerWidgetGroup.closeDrillIn();
-                root.toolsPopupOpen = false;
             }
         }
     }
@@ -98,10 +96,16 @@ Item {
                         }
                     }
                     QuickToggleButton {
-                        toggled: root.toolsPopupOpen
+                        toggled: GlobalStates.toolsOpen
                         buttonIcon: "construction"
                         onClicked: {
-                            root.toolsPopupOpen = !root.toolsPopupOpen;
+                            // Tools now opens as its own centered modal
+                            // (ToolsModal.qml, a full-screen layer like
+                            // SessionScreen's), not a popup living inside
+                            // the sidebar - so close the sidebar first,
+                            // same as the Settings button below does.
+                            GlobalStates.sidebarRightOpen = false;
+                            GlobalStates.toolsOpen = true;
                         }
                         StyledToolTip {
                             content: Translation.tr("Tools")
@@ -223,12 +227,6 @@ Item {
                 Layout.fillHeight: true
                 Layout.fillWidth: true
             }
-        }
-
-        // Placed after the ColumnLayout so it paints above the rest of the
-        // sidebar's content; only the header's tools button toggles it.
-        ToolsPopup {
-            open: root.toolsPopupOpen
         }
     }
 }

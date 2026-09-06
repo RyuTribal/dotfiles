@@ -23,6 +23,7 @@ Singleton {
     property bool sessionOpen: false
     property bool superDown: false
     property bool superReleaseMightTrigger: true
+    property bool toolsOpen: false
     property bool topMenuOpen: false
     // One-shot tab-jump target for the top menu: set to a tab name ("media",
     // "calendar", "todo", "timer", "stats") to have TopMenuContent.qml switch

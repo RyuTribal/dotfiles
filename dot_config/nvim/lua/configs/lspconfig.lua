@@ -39,6 +39,17 @@ local per_server = {
       "clangd",
       "--pch-storage=disk",
       "--background-index",
+      "--log=error",
+    },
+    -- Pin one encoding on BOTH negotiation channels. nvim-lspconfig's clangd
+    -- config advertises the deprecated `offsetEncoding` extension and then
+    -- overrides the client encoding from it, while nvim core negotiates the
+    -- standard `positionEncodings` — when they disagree (utf-8 vs utf-16),
+    -- didChange offsets desync and clangd drops the document
+    -- ("non-added document" / preamble errors).
+    capabilities = {
+      offsetEncoding = { "utf-16" },
+      general = { positionEncodings = { "utf-16" } },
     },
   },
 }

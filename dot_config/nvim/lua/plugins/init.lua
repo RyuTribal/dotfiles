@@ -70,6 +70,10 @@ return {
 
   {
     "nvim-treesitter/nvim-treesitter",
+    -- master branch is frozen and incompatible with nvim 0.12
+    -- (conceal_line "attempt to call method 'range'" crash); NvChad's
+    -- autocmds already use the main-branch install API.
+    branch = "main",
     opts = {
       ensure_installed = {
         "vim",
@@ -77,6 +81,8 @@ return {
         "vimdoc",
         "html",
         "css",
+        "c",
+        "cpp",
       },
     },
   },

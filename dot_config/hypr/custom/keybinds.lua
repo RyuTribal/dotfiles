@@ -20,3 +20,5 @@ hl.bind("CTRL+SUPER+SHIFT + BracketRight", hl.dsp.exec_cmd("~/.config/hypr/custo
 hl.bind("CTRL+SUPER+SHIFT + BracketLeft", hl.dsp.exec_cmd("~/.config/hypr/custom/scripts/move_current_workspace_to_monitor.sh prev"), { description = "Move workspace to previous monitor" }) -- Move current workspace to previous monitor
 
 hl.bind("CTRL+SUPER+SHIFT + C", hl.dsp.exec_cmd("kitty \"python3\""), { description = "open python" })
+
+hl.bind("SUPER + U", hl.dsp.exec_cmd("qs -c $qsConfig ipc call sweep toggle"), { description = "Disk usage inspector (sweep)" }) -- Disk usage inspector

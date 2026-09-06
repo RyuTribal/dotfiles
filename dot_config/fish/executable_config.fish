@@ -22,8 +22,11 @@ if status is-interactive # Commands to run in interactive sessions can go here
     end
 
     # Aliases
-    alias ls 'eza --icons'
+    # --icons takes an optional WHEN, so bare `--icons` swallows the next arg:
+    # `ls .config` became `eza --icons .config`. Attach the value with `=`.
+    alias ls 'eza --icons=auto'
     alias clear "printf '\033[2J\033[3J\033[1;1H'"
     alias q 'qs -c ii'
+    alias ssh 'kitten ssh'
     
 end

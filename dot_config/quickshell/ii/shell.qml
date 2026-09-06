@@ -48,6 +48,7 @@ ShellRoot {
     property bool enableScreenCorners: true
     property bool enableSessionScreen: true
     property bool enableSidebarRight: true
+    property bool enableSweepPanel: true
     property bool enableTopMenu: true
     property bool enableVerticalBar: true
     property bool enableWallpaperSelector: true
@@ -76,6 +77,7 @@ ShellRoot {
     LazyLoader { active: enableScreenCorners; component: ScreenCorners {} }
     LazyLoader { active: enableSessionScreen; component: SessionScreen {} }
     LazyLoader { active: enableSidebarRight; component: SidebarRight {} }
+    LazyLoader { active: enableSweepPanel; component: SweepPanel {} }
     LazyLoader { active: enableTopMenu; component: TopMenu {} }
     LazyLoader { active: enableVerticalBar && Config.ready && Config.options.bar.vertical; component: VerticalBar {} }
     LazyLoader { active: enableWallpaperSelector; component: WallpaperSelector {} }

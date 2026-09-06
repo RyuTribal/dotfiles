@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Daemon installer: runs each chezmoi-managed daemon's install.sh (marked
+# with a "# chezmoi-daemon" sentinel). Re-runs when any install.sh changes:
+{{ range glob (joinPath .chezmoi.homeDir ".config/*/install.sh") -}}
+# {{ . }} hash: {{ include . | sha256sum }}
+{{ end -}}
+set -euo pipefail
+for script in "$HOME"/.config/*/install.sh; do
+    [ -f "$script" ] || continue
+    grep -q '^# chezmoi-daemon' "$script" || continue
+    echo "==> Running $script"
+    bash "$script"
+done

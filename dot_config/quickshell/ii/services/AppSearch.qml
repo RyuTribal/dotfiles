@@ -43,8 +43,14 @@ Singleton {
     readonly property list<DesktopEntry> list: Array.from(DesktopEntries.applications.values)
         .sort((a, b) => a.name.localeCompare(b.name))
 
+    // Matched keys: name (primary), plus genericName and keywords so an
+    // entry like Sweep's Keywords=disk;diagnostics;... surfaces on those
+    // terms too, not just its literal Name. Keywords is a QString list on
+    // DesktopEntry, so it's joined into one searchable string here.
     readonly property var preppedNames: list.map(a => ({
         name: Fuzzy.prepare(`${a.name} `),
+        genericName: Fuzzy.prepare(`${a.genericName} `),
+        keywords: Fuzzy.prepare(`${(a.keywords ?? []).join(" ")} `),
         entry: a
     }))
 
@@ -66,10 +72,18 @@ Singleton {
 
         return Fuzzy.go(search, preppedNames, {
             all: true,
-            key: "name"
+            keys: ["name", "genericName", "keywords"]
         }).map(r => {
             return r.obj.entry
         });
+    }
+
+    // Desktop entries that follow this shell's tool convention: Categories
+    // contains Utility and Keywords contains "tools" (see sweep.desktop).
+    // Used by the overview search's tools prefix instead of fuzzy matching -
+    // it's a fixed membership filter, not a ranked query.
+    function toolsQuery(): var {
+        return list.filter(a => (a.categories ?? []).includes("Utility") && (a.keywords ?? []).includes("tools"));
     }
 
     function iconExists(iconName) {

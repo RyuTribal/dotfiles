@@ -533,6 +533,16 @@ Item { // Wrapper
                                     };
                                 }).filter(Boolean);
                             }
+                        } else if (root.searchingText.startsWith(Config.options.search.prefix.tools)) {
+                            // Fixed membership filter, not fuzzy-ranked: every
+                            // desktop entry following the tool convention
+                            // (Categories has Utility, Keywords has "tools" -
+                            // see AppSearch.toolsQuery and sweep.desktop).
+                            return AppSearch.toolsQuery().map(entry => {
+                                entry.clickActionName = Translation.tr("Launch");
+                                entry.type = Translation.tr("Tool");
+                                return entry;
+                            });
                         }
 
                         ////////////////// Init ///////////////////

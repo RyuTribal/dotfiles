@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Sweep
+GenericName=Disk Usage Inspector
+Comment=Disk usage diagnostics and cleanup
+Icon=drive-harddisk
+Exec=qs -c ii ipc call sweep toggle
+Terminal=false
+Categories=Utility;System;
+Keywords=disk;diagnostics;tools;storage;cleanup;usage;

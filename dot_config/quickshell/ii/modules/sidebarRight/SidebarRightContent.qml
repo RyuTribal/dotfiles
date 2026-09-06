@@ -96,22 +96,6 @@ Item {
                         }
                     }
                     QuickToggleButton {
-                        toggled: GlobalStates.toolsOpen
-                        buttonIcon: "construction"
-                        onClicked: {
-                            // Tools now opens as its own centered modal
-                            // (ToolsModal.qml, a full-screen layer like
-                            // SessionScreen's), not a popup living inside
-                            // the sidebar - so close the sidebar first,
-                            // same as the Settings button below does.
-                            GlobalStates.sidebarRightOpen = false;
-                            GlobalStates.toolsOpen = true;
-                        }
-                        StyledToolTip {
-                            content: Translation.tr("Tools")
-                        }
-                    }
-                    QuickToggleButton {
                         toggled: false
                         buttonIcon: "settings"
                         onClicked: {

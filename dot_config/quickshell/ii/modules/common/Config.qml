@@ -275,6 +275,7 @@ Singleton {
                     property string glyphs: "|"
                     property string math: "="
                     property string shellCommand: "$"
+                    property string tools: ">"
                     property string webSearch: "?"
                 }
             }

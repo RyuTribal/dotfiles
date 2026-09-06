@@ -1,11 +1,42 @@
+# mach
+
+A multi-feature machine daemon workspace. Phase 1 restructures the old
+standalone `sweep` project into a Cargo workspace so future features (a
+knowledge-bank engine, in phase 2) live alongside it under one `mach` CLI
+and one `machd` daemon host — without changing anything about how sweep
+behaves today.
+
+## Layout
+
+```
+mach/
+  Cargo.toml          workspace root
+  engines/
+    sweep/            the sweep engine — lib (scan/store logic) + cli
+                       (TUI, shared by the `sweep` binary and `mach sweep`)
+                       + the `sweepd` socket daemon binary
+  machd/               machine daemon host — phase 1 placeholder, hosts no
+                       subsystems yet (see machd/src/main.rs for the plan)
+  mach/                unified CLI: `mach sweep <args>`, `mach kb` (phase 2)
+  quickshell/
+    SweepPanel.qml     template copy for wiring the panel into a quickshell
+                       config — NOT the live panel (that lives at
+                       ~/.config/quickshell/ii/SweepPanel.qml and is
+                       chezmoi-managed separately)
+  install.sh           builds and installs mach, machd, sweep, sweepd
+```
+
 sweep — disk usage inspector + staged deleter
-=============================================
+==============================================
 
 Three parts, one shared Rust engine:
 
   target/release/sweep    terminal TUI (ncdu-style) + `--top N` one-shot mode
   target/release/sweepd   daemon: JSON protocol over $XDG_RUNTIME_DIR/sweep.sock
   quickshell/SweepPanel.qml  Quickshell popup panel (talks to sweepd)
+
+`mach sweep <args>` behaves exactly like the standalone `sweep` binary —
+both call into the same `sweep::cli::run` function in the sweep engine.
 
 Deletion model (both UIs)
 -------------------------
@@ -17,8 +48,7 @@ them back instantly. Quitting without committing restores everything.
 Build
 -----
   cargo build --release
-  install -Dm755 target/release/sweep  ~/.local/bin/sweep
-  install -Dm755 target/release/sweepd ~/.local/bin/sweepd
+  bash install.sh
 
 Quickshell integration
 ----------------------
@@ -50,6 +80,9 @@ Daemon protocol (newline-delimited JSON on the socket)
   {"op":"restore_all"}               restore everything staged
   {"op":"commit"}                    PERMANENTLY delete staged items
   {"op":"quit"}                      restore staged, shutdown, cleanup
+
+sweepd also answers `{"op":"mounts"}` with a df-equivalent list of real
+block-device mounts and their usage.
 
 TUI keys
 --------

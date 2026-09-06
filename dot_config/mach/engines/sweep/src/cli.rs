@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use sweep::{human, scan_dir, Progress, RawNode, Store};
+use crate::{human, scan_dir, Progress, RawNode, Store};
 
 #[derive(PartialEq)]
 enum Mode { Browse, Confirm }
@@ -161,10 +161,12 @@ fn run_top(root_path: &std::path::Path, top: usize) {
     }
 }
 
-fn main() -> io::Result<()> {
+/// Runs the sweep TUI/CLI given the arguments following the program name
+/// (or, from `mach`, the arguments following the `sweep` subcommand).
+pub fn run(args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut path = PathBuf::from(".");
     let mut top: Option<usize> = None;
-    let mut args = env::args().skip(1);
+    let mut args = args;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--top" => top = Some(args.next().and_then(|v| v.parse().ok()).unwrap_or(20)),

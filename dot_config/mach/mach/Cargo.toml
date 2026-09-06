@@ -1,0 +1,11 @@
+[package]
+name = "mach"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sweep = { package = "sweep-engine", path = "../engines/sweep" }
+
+[[bin]]
+name = "mach"
+path = "src/main.rs"

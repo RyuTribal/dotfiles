@@ -1,5 +1,10 @@
 
 //! Shared scan engine, tree arena, and staging-trash logic.
+//!
+//! `cli` holds the interactive TUI, shared by the standalone `sweep` binary
+//! and `mach sweep` in the mach CLI.
+pub mod cli;
+
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;

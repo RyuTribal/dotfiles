@@ -99,13 +99,16 @@ for h in hits:
     source = h.get("source") or "unknown"
     date = (h.get("created_at") or "")[:10]
     if h.get("derived"):
-        # An insight from `mach kb reflect`, not a raw stored memory — a
-        # belief derived from >= 2 memories, not something the user said
-        # verbatim. Flag it distinctly so it is not mistaken for a direct
-        # quote or fact the way a plain memory recall would be treated.
+        # An insight (or, at level 2, a theme across several insights) from
+        # `mach kb reflect`, not a raw stored memory — a belief derived
+        # from >= 2 memories (or >= 2 insights, for a theme), not something
+        # the user said verbatim. Flag it distinctly so it is not mistaken
+        # for a direct quote or fact the way a plain memory recall would be
+        # treated, and further distinguish a theme from a plain insight.
         confidence = h.get("confidence")
         conf_str = " (confidence {:.2})".format(confidence) if isinstance(confidence, (int, float)) else ""
-        lines.append("- [derived belief, {}]{} {}".format(date, conf_str, content))
+        label = "derived theme" if h.get("level") == 2 else "derived belief"
+        lines.append("- [{}, {}]{} {}".format(label, date, conf_str, content))
     else:
         lines.append("- [{}, {}] {}".format(source, date, content))
 

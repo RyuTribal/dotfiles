@@ -97,6 +97,11 @@ pub struct Insight {
     pub invalidated_at: Option<String>,
     pub flagged_at: Option<String>,
     pub last_verified_at: Option<String>,
+    /// 1 = a plain insight derived from raw memories; 2 = a theme derived
+    /// from >= 2 level-1 insights (a "meta-reflection" — see
+    /// `cli::run_meta_pass`). The tower caps at two derived stories on top
+    /// of the memory leaves, so no level higher than 2 is ever produced.
+    pub level: i64,
 }
 
 impl Insight {
@@ -106,6 +111,10 @@ impl Insight {
 
     pub fn is_flagged(&self) -> bool {
         self.flagged_at.is_some()
+    }
+
+    pub fn is_theme(&self) -> bool {
+        self.level >= 2
     }
 }
 
@@ -151,7 +160,8 @@ fn init_schema(conn: &Connection) -> Result<(), KbError> {
             embedding BLOB,
             invalidated_at TEXT,
             flagged_at TEXT,
-            last_verified_at TEXT
+            last_verified_at TEXT,
+            level INTEGER NOT NULL DEFAULT 1
         );
         CREATE TABLE IF NOT EXISTS reflect_state (
             id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -217,6 +227,32 @@ fn migrate_v1_to_v2(conn: &Connection) -> Result<(), KbError> {
     Ok(())
 }
 
+fn existing_insight_columns(conn: &Connection) -> Result<Vec<String>, KbError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(insights)")?;
+    let cols = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(cols)
+}
+
+/// `PRAGMA user_version`-gated, idempotent 2 -> 3 migration: adds the
+/// meta-reflection level column to `insights` (level 1 = a plain insight
+/// derived from raw memories, level 2 = a theme derived from >= 2 level-1
+/// insights — the tower caps at three levels total counting the memory
+/// leaves). `init_schema`'s `CREATE TABLE IF NOT EXISTS` already creates a
+/// fresh `insights` table with this column present, so the only real work
+/// here is backfilling a pre-existing table that predates it — every
+/// existing row is, by definition, a plain (level 1) insight, which is
+/// exactly the column's default.
+fn migrate_v2_to_v3(conn: &Connection) -> Result<(), KbError> {
+    let cols = existing_insight_columns(conn)?;
+    if !cols.iter().any(|c| c == "level") {
+        conn.execute("ALTER TABLE insights ADD COLUMN level INTEGER NOT NULL DEFAULT 1", [])?;
+    }
+    conn.execute("PRAGMA user_version = 3", [])?;
+    Ok(())
+}
+
 /// Runs every migration step whose version gate hasn't been cleared yet.
 /// Runs on every `open`, but the version gate makes every call after the
 /// first one a single cheap `PRAGMA` read.
@@ -227,6 +263,9 @@ fn migrate(conn: &Connection) -> Result<(), KbError> {
     }
     if version < 2 {
         migrate_v1_to_v2(conn)?;
+    }
+    if version < 3 {
+        migrate_v2_to_v3(conn)?;
     }
     Ok(())
 }
@@ -771,10 +810,12 @@ fn row_to_insight(row: &rusqlite::Row) -> rusqlite::Result<Insight> {
         invalidated_at: row.get("invalidated_at")?,
         flagged_at: row.get("flagged_at")?,
         last_verified_at: row.get("last_verified_at")?,
+        level: row.get("level")?,
     })
 }
 
-/// Inserts a new insight (current time as `created_at`) and returns its id.
+/// Inserts a new level-1 insight (current time as `created_at`) and returns
+/// its id.
 pub fn insert_insight(
     conn: &Connection,
     text: &str,
@@ -782,14 +823,40 @@ pub fn insert_insight(
     source_ids: &[String],
     embedding: Option<&[f32]>,
 ) -> Result<i64, KbError> {
+    insert_insight_leveled(conn, text, confidence, source_ids, embedding, 1)
+}
+
+/// Inserts a level-2 theme — same shape as a plain insight, just tagged
+/// `level = 2`. Citation validity (>= 2 level-1 insights, never another
+/// theme) is enforced by the caller (`cli::run_meta_pass`, via
+/// `reflect::parse_theme`'s `known_insight_ids` check) before this is ever
+/// called — this function itself does not re-validate `source_ids`.
+pub fn insert_theme(
+    conn: &Connection,
+    text: &str,
+    confidence: f64,
+    source_ids: &[String],
+    embedding: Option<&[f32]>,
+) -> Result<i64, KbError> {
+    insert_insight_leveled(conn, text, confidence, source_ids, embedding, 2)
+}
+
+fn insert_insight_leveled(
+    conn: &Connection,
+    text: &str,
+    confidence: f64,
+    source_ids: &[String],
+    embedding: Option<&[f32]>,
+    level: i64,
+) -> Result<i64, KbError> {
     let created_at = now_rfc3339();
     let source_ids_json =
         serde_json::to_string(source_ids).map_err(|e| KbError::Other(format!("encoding source_ids: {}", e)))?;
     let blob = embedding.map(encode_embedding);
     conn.execute(
-        "INSERT INTO insights (text, created_at, confidence, source_ids, embedding)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![text, created_at, confidence, source_ids_json, blob],
+        "INSERT INTO insights (text, created_at, confidence, source_ids, embedding, level)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![text, created_at, confidence, source_ids_json, blob, level],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -991,6 +1058,108 @@ pub fn update_reflect_state(conn: &Connection, last_run_at: &str, last_memory_id
         params![last_run_at, last_memory_id],
     )?;
     Ok(())
+}
+
+// --- meta-reflection: level-2 themes ---
+
+/// Count of active (non-invalidated) insights at exactly `level` — the
+/// meta-reflection trigger's evidence-count input
+/// (`reflect::should_run_meta_pass`).
+pub fn count_active_insights_level(conn: &Connection, level: i64) -> Result<i64, KbError> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM insights WHERE level = ?1 AND invalidated_at IS NULL",
+        params![level],
+        |r| r.get(0),
+    )
+    .map_err(Into::into)
+}
+
+/// The newest active level-2 theme (highest id), if any — `None` means no
+/// theme has ever been derived yet.
+pub fn newest_active_theme(conn: &Connection) -> Result<Option<Insight>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM insights WHERE level = 2 AND invalidated_at IS NULL ORDER BY id DESC LIMIT 1",
+    )?;
+    Ok(stmt.query_row([], row_to_insight).optional()?)
+}
+
+/// Count of active level-1 insights created after `after_id`. Insights and
+/// themes share one `id` sequence (same table), so "how many level-1
+/// insights have accumulated since the newest theme" is simply "how many
+/// have `id` greater than the theme's `id`."
+pub fn count_active_level1_created_after(conn: &Connection, after_id: i64) -> Result<i64, KbError> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM insights WHERE level = 1 AND invalidated_at IS NULL AND id > ?1",
+        params![after_id],
+        |r| r.get(0),
+    )
+    .map_err(Into::into)
+}
+
+/// Active insights at exactly `level`, unordered — the meta-reflection
+/// clustering pool (level 1) and `mach kb tree`'s theme/insight listings
+/// (levels 2 and 1 respectively) both read from here.
+pub fn active_insights_by_level(conn: &Connection, level: i64) -> Result<Vec<Insight>, KbError> {
+    let mut stmt = conn.prepare("SELECT * FROM insights WHERE level = ?1 AND invalidated_at IS NULL")?;
+    let rows = stmt.query_map(params![level], row_to_insight)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Every level-1 insight id already cited (as an `i<id>` source) by some
+/// active level-2 theme — the meta-reflection pass's "unthemed" filter, so
+/// a theme's own member insights are never pulled into a later pass's
+/// clustering (a level-1 insight belongs to at most one theme).
+pub fn themed_insight_ids(conn: &Connection) -> Result<std::collections::HashSet<i64>, KbError> {
+    let mut stmt = conn.prepare("SELECT source_ids FROM insights WHERE level = 2 AND invalidated_at IS NULL")?;
+    let rows: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<_, _>>()?;
+    let mut set = std::collections::HashSet::new();
+    for json in rows {
+        let ids: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
+        for s in ids {
+            if let Some(rest) = s.strip_prefix('i').or_else(|| s.strip_prefix('I')) {
+                if let Ok(id) = rest.parse::<i64>() {
+                    set.insert(id);
+                }
+            }
+        }
+    }
+    Ok(set)
+}
+
+/// Recurrence reinforcement: appends `new_memory_ids` to an insight's
+/// `source_ids` (deduped against what's already there), bumps `confidence`
+/// by `0.05` per new id (capped at `0.9`, the same ceiling fresh insights
+/// are capped at — see `reflect::compute_confidence`), and sets
+/// `last_verified_at = now`. Used when stage 2's evidence re-confirms an
+/// existing insight (`Stage2Result::Reinforce`) rather than yielding a new
+/// one. Returns `false` if `id` doesn't exist — never panics on a stale or
+/// hallucinated citation.
+pub fn reinforce_insight(conn: &Connection, id: i64, new_memory_ids: &[i64], now: &str) -> Result<bool, KbError> {
+    let insight = match get_insight(conn, id)? {
+        Some(i) => i,
+        None => return Ok(false),
+    };
+    let mut ids = insight.source_ids;
+    let mut new_count: usize = 0;
+    for mid in new_memory_ids {
+        let s = mid.to_string();
+        if !ids.contains(&s) {
+            ids.push(s);
+            new_count += 1;
+        }
+    }
+    let confidence = (insight.confidence + 0.05 * new_count as f64).min(0.9);
+    let source_ids_json =
+        serde_json::to_string(&ids).map_err(|e| KbError::Other(format!("encoding source_ids: {}", e)))?;
+    let n = conn.execute(
+        "UPDATE insights SET source_ids = ?1, confidence = ?2, last_verified_at = ?3 WHERE id = ?4",
+        params![source_ids_json, confidence, now, id],
+    )?;
+    Ok(n > 0)
 }
 
 #[cfg(test)]
@@ -1389,11 +1558,12 @@ mod tests {
         init_schema(&conn).unwrap();
         migrate(&conn).unwrap();
 
-        // From v0, migrate() runs both steps in one call: v0->v1 (the
-        // memories column backfill this test is about) then v1->v2
-        // (reflection tables), landing at the current version.
+        // From v0, migrate() runs every step in one call: v0->v1 (the
+        // memories column backfill this test is about), v1->v2 (reflection
+        // tables), then v2->v3 (the insights `level` column), landing at
+        // the current version.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1);
@@ -1413,7 +1583,7 @@ mod tests {
     }
 
     // (fresh-database version-landing is covered by
-    // fresh_database_lands_at_user_version_2 in the reflection tests below)
+    // fresh_database_lands_at_user_version_3 in the reflection tests below)
 
     // --- supersession apply_verdict ---
 
@@ -1540,7 +1710,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3, "v1->v2 (reflection tables) then v2->v3 (insights level column) both run");
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -1558,10 +1728,10 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_lands_at_user_version_2() {
+    fn fresh_database_lands_at_user_version_3() {
         let conn = mem_conn();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
     }
 
     #[test]
@@ -1720,5 +1890,163 @@ mod tests {
         let ins = get_insight(&conn, insight).unwrap().unwrap();
         assert!(ins.last_verified_at.is_none());
         assert!(ins.flagged_at.is_none());
+    }
+
+    // --- meta-reflection: level-2 themes ---
+
+    #[test]
+    fn insert_insight_defaults_to_level_1_insert_theme_to_level_2() {
+        let conn = mem_conn();
+        let ins_id = insert_insight(&conn, "a plain insight", 0.5, &["1".into(), "2".into()], None).unwrap();
+        let theme_id = insert_theme(&conn, "a unifying theme", 0.5, &[format!("i{}", ins_id), "3".into()], None).unwrap();
+
+        let ins = get_insight(&conn, ins_id).unwrap().unwrap();
+        assert_eq!(ins.level, 1);
+        assert!(!ins.is_theme());
+
+        let theme = get_insight(&conn, theme_id).unwrap().unwrap();
+        assert_eq!(theme.level, 2);
+        assert!(theme.is_theme());
+    }
+
+    #[test]
+    fn migration_v2_to_v3_backfills_level_column_defaulting_existing_rows_to_1() {
+        // Build a v2-era database by hand: insights table without the
+        // `level` column, user_version = 2.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id INTEGER PRIMARY KEY, content TEXT NOT NULL, source TEXT, project TEXT,
+                created_at TEXT NOT NULL, reviewed INTEGER NOT NULL DEFAULT 1, embedding BLOB,
+                importance INTEGER NOT NULL DEFAULT 5, stability REAL, access_count INTEGER NOT NULL DEFAULT 0,
+                first_accessed_at TEXT, last_accessed_at TEXT, valid_from TEXT, invalidated_at TEXT,
+                superseded_by INTEGER
+            );
+            CREATE TABLE insights (
+                id INTEGER PRIMARY KEY, text TEXT NOT NULL, created_at TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.5, source_ids TEXT NOT NULL, embedding BLOB,
+                invalidated_at TEXT, flagged_at TEXT, last_verified_at TEXT
+            );
+            CREATE TABLE reflect_state (id INTEGER PRIMARY KEY CHECK (id = 1), last_run_at TEXT, last_memory_id INTEGER);
+            INSERT INTO insights (text, created_at, confidence, source_ids)
+            VALUES ('a pre-existing insight', '2026-01-01T00:00:00Z', 0.6, '[\"1\",\"2\"]');
+            PRAGMA user_version = 2;",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 3);
+
+        let rows = list_insights(&conn, false).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].level, 1, "pre-existing insight must backfill to level 1");
+
+        // idempotent on repeat
+        migrate(&conn).unwrap();
+        assert_eq!(list_insights(&conn, false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn count_active_insights_level_filters_by_level_and_excludes_invalidated() {
+        let conn = mem_conn();
+        insert_insight(&conn, "a", 0.5, &["1".into(), "2".into()], None).unwrap();
+        insert_insight(&conn, "b", 0.5, &["1".into(), "2".into()], None).unwrap();
+        let invalidated_id = insert_insight(&conn, "c", 0.5, &["1".into(), "2".into()], None).unwrap();
+        conn.execute(
+            "UPDATE insights SET invalidated_at = ?1 WHERE id = ?2",
+            params![now_rfc3339(), invalidated_id],
+        )
+        .unwrap();
+        insert_theme(&conn, "a theme", 0.5, &["i1".into(), "i2".into(), "3".into()], None).unwrap();
+
+        assert_eq!(count_active_insights_level(&conn, 1).unwrap(), 2, "invalidated row excluded");
+        assert_eq!(count_active_insights_level(&conn, 2).unwrap(), 1);
+    }
+
+    #[test]
+    fn newest_active_theme_is_none_until_one_exists_then_tracks_highest_id() {
+        let conn = mem_conn();
+        assert!(newest_active_theme(&conn).unwrap().is_none());
+
+        let _first = insert_theme(&conn, "first theme", 0.5, &["i1".into(), "i2".into(), "3".into()], None).unwrap();
+        let second = insert_theme(&conn, "second theme", 0.5, &["i1".into(), "i2".into(), "3".into()], None).unwrap();
+
+        let newest = newest_active_theme(&conn).unwrap().expect("a theme exists");
+        assert_eq!(newest.id, second);
+    }
+
+    #[test]
+    fn count_active_level1_created_after_counts_only_newer_ids() {
+        let conn = mem_conn();
+        let a = insert_insight(&conn, "a", 0.5, &["1".into(), "2".into()], None).unwrap();
+        insert_insight(&conn, "b", 0.5, &["1".into(), "2".into()], None).unwrap();
+        insert_insight(&conn, "c", 0.5, &["1".into(), "2".into()], None).unwrap();
+
+        assert_eq!(count_active_level1_created_after(&conn, a).unwrap(), 2);
+        assert_eq!(count_active_level1_created_after(&conn, 0).unwrap(), 3);
+    }
+
+    #[test]
+    fn active_insights_by_level_separates_insights_from_themes() {
+        let conn = mem_conn();
+        insert_insight(&conn, "a", 0.5, &["1".into(), "2".into()], None).unwrap();
+        insert_insight(&conn, "b", 0.5, &["1".into(), "2".into()], None).unwrap();
+        insert_theme(&conn, "a theme", 0.5, &["i1".into(), "i2".into(), "3".into()], None).unwrap();
+
+        assert_eq!(active_insights_by_level(&conn, 1).unwrap().len(), 2);
+        assert_eq!(active_insights_by_level(&conn, 2).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn themed_insight_ids_collects_i_refs_from_active_themes_only() {
+        let conn = mem_conn();
+        let a = insert_insight(&conn, "a", 0.5, &["1".into(), "2".into()], None).unwrap();
+        let b = insert_insight(&conn, "b", 0.5, &["1".into(), "2".into()], None).unwrap();
+        let c = insert_insight(&conn, "c", 0.5, &["1".into(), "2".into()], None).unwrap();
+        insert_theme(&conn, "theme 1", 0.5, &[format!("i{}", a), format!("i{}", b), "5".into()], None).unwrap();
+        let invalidated_theme =
+            insert_theme(&conn, "theme 2", 0.5, &[format!("i{}", c), "i1".into(), "6".into()], None).unwrap();
+        conn.execute(
+            "UPDATE insights SET invalidated_at = ?1 WHERE id = ?2",
+            params![now_rfc3339(), invalidated_theme],
+        )
+        .unwrap();
+
+        let themed = themed_insight_ids(&conn).unwrap();
+        assert!(themed.contains(&a));
+        assert!(themed.contains(&b));
+        assert!(!themed.contains(&c), "c is only cited by an invalidated theme");
+    }
+
+    #[test]
+    fn reinforce_insight_appends_new_ids_dedupes_bumps_confidence_and_sets_verified() {
+        let conn = mem_conn();
+        let id = insert_insight(&conn, "the user prefers X", 0.5, &["1".into(), "2".into()], None).unwrap();
+        let now = now_rfc3339();
+
+        assert!(reinforce_insight(&conn, id, &[3, 1], &now).unwrap(), "1 already cited, 3 is new");
+        let ins = get_insight(&conn, id).unwrap().unwrap();
+        assert_eq!(ins.source_ids, vec!["1", "2", "3"], "no duplicate id, new one appended");
+        assert!((ins.confidence - 0.55).abs() < 1e-9, "+0.05 per NEW row — only 1 of the 2 cited ids was new");
+        assert_eq!(ins.last_verified_at.as_deref(), Some(now.as_str()));
+    }
+
+    #[test]
+    fn reinforce_insight_confidence_caps_at_point_nine() {
+        let conn = mem_conn();
+        let id = insert_insight(&conn, "heavily reinforced", 0.8, &["1".into(), "2".into()], None).unwrap();
+        let now = now_rfc3339();
+        assert!(reinforce_insight(&conn, id, &[3, 4, 5, 6], &now).unwrap());
+        let ins = get_insight(&conn, id).unwrap().unwrap();
+        assert_eq!(ins.confidence, 0.9, "0.8 + 4*0.05 = 1.0, must cap at 0.9");
+    }
+
+    #[test]
+    fn reinforce_insight_missing_id_returns_false() {
+        let conn = mem_conn();
+        assert!(!reinforce_insight(&conn, 999, &[1, 2], &now_rfc3339()).unwrap());
     }
 }

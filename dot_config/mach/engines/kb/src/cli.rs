@@ -2,7 +2,7 @@
 //! kb — subcommand dispatch for `mach kb ...`, matching the hand-rolled
 //! arg-parsing style the sweep engine's `cli` module already uses (no
 //! clap).
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, IsTerminal, Read, Write};
 
 use rusqlite::Connection;
@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::classify::{self, Classifier, Verdict};
 use crate::embed::{Embedder, OllamaEmbedder};
-use crate::reflect::{self, ProcessReflectLlm, ReflectLlm, Stage2Result, TIMEOUT_HAIKU, TIMEOUT_SONNET};
+use crate::reflect::{self, ProcessReflectLlm, ReflectLlm, Stage2Result, ThemeResult, TIMEOUT_HAIKU, TIMEOUT_SONNET};
 use crate::store::{self, AddOutcome, Insight, InsightHit, KbError, Memory, RankedHit};
 
 fn to_io(e: KbError) -> io::Error {
@@ -38,10 +38,13 @@ fn print_help() {
     println!("  list [--limit N] [--superseded]");
     println!("                          most recent memories (--superseded: audit view)");
     println!("  forget <id>             permanently delete a memory");
-    println!("  reflect                 examine new memories, derive durable insights,");
-    println!("                          re-verify a sample of existing ones");
-    println!("  insights [--flagged]    list derived insights (confidence + source ids)");
-    println!("  insight-forget <id>     permanently delete an insight");
+    println!("  reflect [--meta]        examine new memories, derive/reinforce durable");
+    println!("                          insights, re-verify a sample of existing ones,");
+    println!("                          and (when triggered, or forced via --meta) find");
+    println!("                          themes across insights");
+    println!("  insights [--flagged]    list derived insights and themes (confidence + source ids)");
+    println!("  insight-forget <id>     permanently delete an insight or theme");
+    println!("  tree                    render the theme -> insight -> memory hierarchy");
 }
 
 /// Runs the kb CLI given the arguments following `kb` in `mach kb ...`.
@@ -56,6 +59,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Some("reflect") => cmd_reflect(args),
         Some("insights") => cmd_insights(args),
         Some("insight-forget") => cmd_insight_forget(args),
+        Some("tree") => cmd_tree(args),
         Some("-h") | Some("--help") => {
             print_help();
             Ok(())
@@ -208,6 +212,10 @@ struct SearchHit {
     derived: bool,
     // Only meaningful when `derived` is true.
     confidence: Option<f64>,
+    // Only meaningful when `derived` is true: 1 = a plain insight, 2 = a
+    // level-2 theme. `None` on plain memory hits — lets `kb-recall.sh`
+    // distinguish "[derived belief]" from "[derived theme]".
+    level: Option<i64>,
 }
 
 fn to_hit(h: RankedHit) -> SearchHit {
@@ -225,6 +233,7 @@ fn to_hit(h: RankedHit) -> SearchHit {
         superseded: h.superseded,
         derived: false,
         confidence: None,
+        level: None,
     }
 }
 
@@ -244,6 +253,7 @@ fn insight_to_hit(h: InsightHit) -> SearchHit {
         superseded: flagged,
         derived: true,
         confidence: Some(h.insight.confidence),
+        level: Some(h.insight.level),
     }
 }
 
@@ -350,7 +360,8 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
             let flag = if h.derived { 'D' } else { ' ' };
             let sup = if h.superseded { '!' } else { ' ' };
             let label = if h.derived {
-                format!("#i{:<4}", h.id)
+                let prefix = if h.level == Some(2) { 't' } else { 'i' };
+                format!("#{}{:<4}", prefix, h.id)
             } else {
                 format!("#{:<5}", h.id)
             };
@@ -589,12 +600,20 @@ const REFLECT_EVIDENCE_PER_QUESTION: usize = 8;
 const REFLECT_EXISTING_INSIGHTS_CONTEXT: usize = 3;
 const REFLECT_VERIFICATION_SAMPLE: usize = 5;
 const REFLECT_VERIFICATION_CANDIDATES: usize = 5;
+const META_EVIDENCE_PER_CLUSTER: usize = 6;
 
 fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut force_meta = false;
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--meta" => force_meta = true,
             "-h" | "--help" => {
-                println!("usage: mach kb reflect");
+                println!("usage: mach kb reflect [--meta]");
+                println!(
+                    "       --meta forces the meta-reflection (theme) pass to run this time \
+                     regardless of its normal trigger conditions — for manual inspection, not \
+                     routine use."
+                );
                 return Ok(());
             }
             other => {
@@ -611,7 +630,13 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
 
     // Step 1: input selection.
     let new_memories = store::memories_since(&conn, last_id).map_err(to_io)?;
-    if new_memories.is_empty() {
+    let has_new = !new_memories.is_empty();
+    // A --meta-only invocation (e.g. for manual testing once enough
+    // insights already exist) must still be able to run even when there is
+    // nothing new to examine — this is the only early exit in the whole
+    // function, everything below it is reachable whenever there's either
+    // new material or a forced meta pass to attempt.
+    if !has_new && !force_meta {
         println!("mach kb reflect: nothing new");
         return Ok(());
     }
@@ -619,100 +644,159 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let embedder = OllamaEmbedder::new();
     let llm = ProcessReflectLlm::new();
 
-    // Working set: the new memories, bridged with each one's top-3
-    // neighbors from the whole active store (reviewed and unreviewed
-    // alike) so a fresh fact can connect to an older pattern. Deduped by
-    // id via the BTreeMap; capped at 60, most-recent-first when over.
-    let mut working: BTreeMap<i64, Memory> = BTreeMap::new();
-    for m in &new_memories {
-        working.insert(m.id, m.clone());
-    }
-    for m in &new_memories {
-        if let Some(emb) = &m.embedding {
-            if let Ok(neighbors) = store::top_similar_active(&conn, emb, REFLECT_NEIGHBORS_PER_MEMORY) {
-                for (nm, _) in neighbors {
-                    working.entry(nm.id).or_insert(nm);
+    let mut examined = 0usize;
+    let mut questions_count = 0usize;
+    let mut insights_added = 0usize;
+    let mut reinforced = 0usize;
+
+    if has_new {
+        // Working set: the new memories, bridged with each one's top-3
+        // neighbors from the whole active store (reviewed and unreviewed
+        // alike) so a fresh fact can connect to an older pattern. Deduped by
+        // id via the BTreeMap; capped at 60, most-recent-first when over.
+        let mut working: BTreeMap<i64, Memory> = BTreeMap::new();
+        for m in &new_memories {
+            working.insert(m.id, m.clone());
+        }
+        for m in &new_memories {
+            if let Some(emb) = &m.embedding {
+                if let Ok(neighbors) = store::top_similar_active(&conn, emb, REFLECT_NEIGHBORS_PER_MEMORY) {
+                    for (nm, _) in neighbors {
+                        working.entry(nm.id).or_insert(nm);
+                    }
                 }
             }
         }
-    }
-    let mut working_vec: Vec<Memory> = working.into_values().collect();
-    if working_vec.len() > REFLECT_WORKING_SET_CAP {
-        working_vec.sort_by(|a, b| b.id.cmp(&a.id));
-        working_vec.truncate(REFLECT_WORKING_SET_CAP);
-    }
-    working_vec.sort_by_key(|m| m.id);
-    let examined = working_vec.len();
-
-    // Step 2 (stage 1): salient questions, one haiku call over the whole
-    // working set.
-    let question_lines: Vec<(i64, String)> = working_vec.iter().map(|m| (m.id, m.content.clone())).collect();
-    let q_prompt = reflect::build_questions_prompt(&question_lines);
-    let questions: Vec<String> = match llm.call("haiku", &q_prompt, TIMEOUT_HAIKU) {
-        Ok(out) => reflect::parse_questions(&out),
-        Err(_) => Vec::new(),
-    };
-
-    // Step 3 (stage 2): one durable insight per question, sonnet — only
-    // when the evidence actually supports it.
-    let mut insights_added = 0usize;
-    for question in &questions {
-        let q_emb = match embedder.embed(question) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let evidence = match store::top_similar_active(&conn, &q_emb, REFLECT_EVIDENCE_PER_QUESTION) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if evidence.len() < 2 {
-            // Can never clear the 2-citation floor regardless of what the
-            // model says — skip the sonnet call entirely.
-            continue;
+        let mut working_vec: Vec<Memory> = working.into_values().collect();
+        if working_vec.len() > REFLECT_WORKING_SET_CAP {
+            working_vec.sort_by(|a, b| b.id.cmp(&a.id));
+            working_vec.truncate(REFLECT_WORKING_SET_CAP);
         }
-        let existing_near =
-            store::top_similar_insights(&conn, &q_emb, REFLECT_EXISTING_INSIGHTS_CONTEXT).unwrap_or_default();
+        working_vec.sort_by_key(|m| m.id);
+        examined = working_vec.len();
 
-        let evidence_pairs: Vec<(i64, String)> = evidence.iter().map(|(m, _)| (m.id, m.content.clone())).collect();
-        let existing_pairs: Vec<(i64, String)> =
-            existing_near.iter().map(|(ins, _)| (ins.id, ins.text.clone())).collect();
-        let prompt = reflect::build_insight_prompt(question, &evidence_pairs, &existing_pairs);
-
-        let raw = match llm.call("sonnet", &prompt, TIMEOUT_SONNET) {
-            Ok(out) => out,
-            Err(_) => continue,
+        // Step 2 (stage 1): salient questions, one haiku call over the
+        // whole working set.
+        let question_lines: Vec<(i64, String)> = working_vec.iter().map(|m| (m.id, m.content.clone())).collect();
+        let q_prompt = reflect::build_questions_prompt(&question_lines);
+        let questions: Vec<String> = match llm.call("haiku", &q_prompt, TIMEOUT_HAIKU) {
+            Ok(out) => reflect::parse_questions(&out),
+            Err(_) => Vec::new(),
         };
+        questions_count = questions.len();
 
-        if let Stage2Result::Insight { text, memory_ids } = reflect::parse_stage2(&raw) {
-            // Defensive cross-check: citations must be real evidence rows
-            // we actually showed the model, not hallucinated ids — a
-            // fabricated id must not let a claim slip past the floor.
-            let evidence_ids: std::collections::HashSet<i64> = evidence.iter().map(|(m, _)| m.id).collect();
-            let mut valid_ids: Vec<i64> = memory_ids.into_iter().filter(|id| evidence_ids.contains(id)).collect();
-            valid_ids.sort_unstable();
-            valid_ids.dedup();
-            if valid_ids.len() < 2 {
+        // Step 3 (stage 2): one durable insight — or a reinforcement of an
+        // existing one — per question, sonnet, only when the evidence
+        // actually supports it.
+        for question in &questions {
+            let q_emb = match embedder.embed(question) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let evidence = match store::top_similar_active(&conn, &q_emb, REFLECT_EVIDENCE_PER_QUESTION) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if evidence.len() < 2 {
+                // Can never clear the 2-citation floor regardless of what
+                // the model says — skip the sonnet call entirely.
                 continue;
             }
-            let confidence = reflect::compute_confidence(valid_ids.len());
-            let source_ids: Vec<String> = valid_ids.iter().map(|id| id.to_string()).collect();
-            let text_embedding = embedder.embed(&text).ok();
-            if store::insert_insight(&conn, &text, confidence, &source_ids, text_embedding.as_deref()).is_ok() {
-                insights_added += 1;
+            let existing_near =
+                store::top_similar_insights(&conn, &q_emb, REFLECT_EXISTING_INSIGHTS_CONTEXT).unwrap_or_default();
+
+            let evidence_pairs: Vec<(i64, String)> = evidence.iter().map(|(m, _)| (m.id, m.content.clone())).collect();
+            let existing_pairs: Vec<(i64, String)> =
+                existing_near.iter().map(|(ins, _)| (ins.id, ins.text.clone())).collect();
+            let prompt = reflect::build_insight_prompt(question, &evidence_pairs, &existing_pairs);
+
+            let raw = match llm.call("sonnet", &prompt, TIMEOUT_SONNET) {
+                Ok(out) => out,
+                Err(_) => continue,
+            };
+
+            let evidence_ids: HashSet<i64> = evidence.iter().map(|(m, _)| m.id).collect();
+            match reflect::parse_stage2(&raw) {
+                Stage2Result::Insight { text, memory_ids } => {
+                    // Defensive cross-check: citations must be real
+                    // evidence rows we actually showed the model, not
+                    // hallucinated ids — a fabricated id must not let a
+                    // claim slip past the floor.
+                    let mut valid_ids: Vec<i64> = memory_ids.into_iter().filter(|id| evidence_ids.contains(id)).collect();
+                    valid_ids.sort_unstable();
+                    valid_ids.dedup();
+                    if valid_ids.len() < 2 {
+                        continue;
+                    }
+                    let confidence = reflect::compute_confidence(valid_ids.len());
+                    let source_ids: Vec<String> = valid_ids.iter().map(|id| id.to_string()).collect();
+                    let text_embedding = embedder.embed(&text).ok();
+                    if store::insert_insight(&conn, &text, confidence, &source_ids, text_embedding.as_deref()).is_ok()
+                    {
+                        insights_added += 1;
+                    }
+                }
+                Stage2Result::Reinforce { insight_id, memory_ids } => {
+                    // Same defensive cross-check against real evidence ids,
+                    // then a second one: the citations must include at
+                    // least one memory id NOT already in the insight's
+                    // source_ids — reinforcing with only already-cited ids
+                    // is a no-op the model shouldn't get credit for.
+                    let mut valid_ids: Vec<i64> = memory_ids.into_iter().filter(|id| evidence_ids.contains(id)).collect();
+                    valid_ids.sort_unstable();
+                    valid_ids.dedup();
+                    if valid_ids.is_empty() {
+                        continue;
+                    }
+                    match store::get_insight(&conn, insight_id) {
+                        Ok(Some(target)) if target.is_active() => {
+                            let existing_raw: HashSet<i64> =
+                                target.source_ids.iter().filter_map(|s| s.parse::<i64>().ok()).collect();
+                            let new_ids: Vec<i64> =
+                                valid_ids.into_iter().filter(|id| !existing_raw.contains(id)).collect();
+                            if new_ids.is_empty() {
+                                continue; // only already-cited ids — reject
+                            }
+                            if store::reinforce_insight(&conn, insight_id, &new_ids, &now).is_ok() {
+                                reinforced += 1;
+                            }
+                        }
+                        _ => continue, // stale/hallucinated target id — never crash, just skip
+                    }
+                }
+                Stage2Result::None | Stage2Result::Rejected => {}
             }
         }
     }
 
     // Step 4: re-verification, same run — up to 5 oldest insights by
     // last_verified_at (never-verified first). Never deletes, only flags.
+    // Runs across BOTH levels (level-2 themes share this table and this
+    // query), so a theme is just as due for a check as a plain insight.
     let mut flagged = 0usize;
     let mut verified = 0usize;
     let stale = store::insights_due_for_verification(&conn, REFLECT_VERIFICATION_SAMPLE).map_err(to_io)?;
     for insight in &stale {
         let mut broken_citation = false;
         for sid in &insight.source_ids {
-            if sid.starts_with('i') || sid.starts_with('I') {
-                continue; // insight references aren't re-checked here
+            if let Some(rest) = sid.strip_prefix('i').or_else(|| sid.strip_prefix('I')) {
+                // An `i<id>` citation — most commonly a theme citing one of
+                // its level-1 insights. Now actually resolved and checked:
+                // if the cited insight is gone, invalidated, or flagged,
+                // the citing row (the theme) is flagged too — a theme is
+                // only as sound as the insights it names.
+                let ok = match rest.parse::<i64>() {
+                    Ok(cid) => matches!(
+                        store::get_insight(&conn, cid),
+                        Ok(Some(ci)) if ci.is_active() && !ci.is_flagged()
+                    ),
+                    Err(_) => false,
+                };
+                if !ok {
+                    broken_citation = true;
+                    break;
+                }
+                continue;
             }
             let still_active = match sid.parse::<i64>() {
                 Ok(mid) => matches!(store::get(&conn, mid), Ok(Some(m)) if m.invalidated_at.is_none()),
@@ -755,20 +839,115 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         }
     }
 
-    // Step 5: advance the watermark to the newest memory id actually
-    // examined this run (not the bridged neighbors, which may be older).
-    let new_watermark = new_memories.iter().map(|m| m.id).max();
-    store::update_reflect_state(&conn, &now, new_watermark).map_err(to_io)?;
+    // Step 5: meta-reflection (theme) pass — only when triggered, or
+    // forced via --meta for manual runs.
+    let level1_active = store::count_active_insights_level(&conn, 1).map_err(to_io)?;
+    let newest_theme = store::newest_active_theme(&conn).map_err(to_io)?;
+    let since_newest_theme = match &newest_theme {
+        Some(t) => store::count_active_level1_created_after(&conn, t.id).map_err(to_io)?,
+        None => 0,
+    };
+    let meta_trigger = reflect::should_run_meta_pass(level1_active, newest_theme.is_some(), since_newest_theme);
+    let mut themes_added = 0usize;
+    if meta_trigger || force_meta {
+        themes_added = run_meta_pass(&conn, &embedder, &llm).map_err(to_io)?;
+    }
+
+    // Step 6: advance the watermark to the newest memory id actually
+    // examined this run (not the bridged neighbors, which may be older) —
+    // only when there was anything new; a --meta-only invocation with
+    // nothing new must never clobber the existing watermark back to NULL.
+    if has_new {
+        let new_watermark = new_memories.iter().map(|m| m.id).max();
+        store::update_reflect_state(&conn, &now, new_watermark).map_err(to_io)?;
+    }
 
     println!(
-        "mach kb reflect: examined={} questions={} insights_added={} flagged={} verified={}",
-        examined,
-        questions.len(),
-        insights_added,
-        flagged,
-        verified
+        "mach kb reflect: examined={} questions={} insights_added={} reinforced={} \
+         themes_added={} flagged={} verified={}",
+        examined, questions_count, insights_added, reinforced, themes_added, flagged, verified
     );
     Ok(())
+}
+
+/// The meta-reflection (theme) pass: clusters active, not-yet-themed
+/// level-1 insights by embedding similarity and asks one sonnet call per
+/// cluster for a single unifying theme statement. Returns the count of
+/// themes actually inserted. Never touches the watermark or the per-memory
+/// reinforcement/insight logic above — this is a self-contained extra
+/// pass over the insights table.
+fn run_meta_pass(conn: &Connection, embedder: &OllamaEmbedder, llm: &ProcessReflectLlm) -> Result<usize, KbError> {
+    let themed = store::themed_insight_ids(conn)?;
+    let mut pool: Vec<Insight> =
+        store::active_insights_by_level(conn, 1)?.into_iter().filter(|i| !themed.contains(&i.id)).collect();
+    pool.sort_by_key(|i| i.id); // oldest first — clustering's seed order
+
+    let items: Vec<(i64, Vec<f32>)> =
+        pool.iter().filter_map(|i| i.embedding.clone().map(|e| (i.id, e))).collect();
+    let clusters = reflect::cluster_insights_by_similarity(&items);
+    let by_id: BTreeMap<i64, &Insight> = pool.iter().map(|i| (i.id, i)).collect();
+
+    let mut themes_added = 0usize;
+    for cluster in clusters {
+        let cluster_insights: Vec<&Insight> = cluster.iter().filter_map(|id| by_id.get(id).copied()).collect();
+        if cluster_insights.len() < 2 {
+            continue;
+        }
+        let known_ids: HashSet<i64> = cluster_insights.iter().map(|i| i.id).collect();
+        let insight_pairs: Vec<(i64, String)> = cluster_insights.iter().map(|i| (i.id, i.text.clone())).collect();
+
+        // Top evidence for the cluster: pool each member insight's own
+        // raw-memory citations (deduped, insertion order), cap at
+        // META_EVIDENCE_PER_CLUSTER, resolve to current content.
+        let mut evidence_ids: Vec<i64> = Vec::new();
+        for ins in &cluster_insights {
+            for sid in &ins.source_ids {
+                if let Ok(mid) = sid.parse::<i64>() {
+                    if !evidence_ids.contains(&mid) {
+                        evidence_ids.push(mid);
+                    }
+                }
+            }
+        }
+        evidence_ids.truncate(META_EVIDENCE_PER_CLUSTER);
+        let mut evidence_pairs: Vec<(i64, String)> = Vec::new();
+        for mid in &evidence_ids {
+            if let Ok(Some(m)) = store::get(conn, *mid) {
+                evidence_pairs.push((m.id, m.content));
+            }
+        }
+        if evidence_pairs.is_empty() {
+            continue; // never a theme without at least one raw memory row
+        }
+
+        let prompt = reflect::build_theme_prompt(&insight_pairs, &evidence_pairs);
+        let raw = match llm.call("sonnet", &prompt, TIMEOUT_SONNET) {
+            Ok(out) => out,
+            Err(_) => continue,
+        };
+
+        if let ThemeResult::Theme { text, insight_ids, memory_ids } = reflect::parse_theme(&raw, &known_ids) {
+            // Defensive cross-check, same pattern as stage 2: raw citations
+            // must be real rows actually shown to the model this call.
+            let valid_evidence: HashSet<i64> = evidence_pairs.iter().map(|(id, _)| *id).collect();
+            let mut valid_memory_ids: Vec<i64> = memory_ids.into_iter().filter(|id| valid_evidence.contains(id)).collect();
+            valid_memory_ids.sort_unstable();
+            valid_memory_ids.dedup();
+            let cited_confidences: Vec<f64> =
+                insight_ids.iter().filter_map(|id| by_id.get(id).map(|i| i.confidence)).collect();
+            if valid_memory_ids.is_empty() || cited_confidences.len() < 2 {
+                continue;
+            }
+            let confidence = cited_confidences.iter().cloned().fold(f64::INFINITY, f64::min);
+            let mut source_ids: Vec<String> = insight_ids.iter().map(|id| format!("i{}", id)).collect();
+            source_ids.extend(valid_memory_ids.iter().map(|id| id.to_string()));
+            let text_embedding = embedder.embed(&text).ok();
+            if store::insert_theme(conn, &text, confidence, &source_ids, text_embedding.as_deref()).is_ok() {
+                themes_added += 1;
+            }
+        }
+    }
+    Ok(themes_added)
 }
 
 fn cmd_insights(mut args: impl Iterator<Item = String>) -> io::Result<()> {
@@ -794,9 +973,11 @@ fn cmd_insights(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     }
     for ins in &rows {
         let flag = if ins.is_flagged() { '!' } else { ' ' };
+        let prefix = if ins.is_theme() { 't' } else { 'i' };
         println!(
-            "{}i{:<5} {}  (confidence {:.2}, sources: {})",
+            "{}{}{:<5} {}  (confidence {:.2}, sources: {})",
             flag,
+            prefix,
             ins.id,
             truncate(&ins.text, 80),
             ins.confidence,
@@ -834,4 +1015,93 @@ fn cmd_insight_forget(mut args: impl Iterator<Item = String>) -> io::Result<()> 
         eprintln!("mach kb insight-forget: no insight with id {}", id);
         std::process::exit(1);
     }
+}
+
+// --- tree: render the theme -> insight -> memory hierarchy ---
+
+fn print_insight_node(conn: &Connection, ins: &Insight, indent: &str) {
+    let flag = if ins.is_flagged() { " [FLAGGED]" } else { "" };
+    println!("{}i{}  (confidence {:.2}){}", indent, ins.id, ins.confidence, flag);
+    let leaf_indent = format!("{}  ", indent);
+    for sid in &ins.source_ids {
+        if let Ok(mid) = sid.parse::<i64>() {
+            if let Ok(Some(m)) = store::get(conn, mid) {
+                println!("{}{:<6} {}", leaf_indent, mid, truncate(&m.content, 70));
+            }
+        }
+    }
+}
+
+fn cmd_tree(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "-h" | "--help" => {
+                println!("usage: mach kb tree");
+                return Ok(());
+            }
+            other => {
+                eprintln!("mach kb tree: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let conn = store::open().map_err(to_io)?;
+
+    let mut themes = store::active_insights_by_level(&conn, 2).map_err(to_io)?;
+    themes.sort_by_key(|t| t.id);
+    let mut level1 = store::active_insights_by_level(&conn, 1).map_err(to_io)?;
+    level1.sort_by_key(|i| i.id);
+
+    if themes.is_empty() && level1.is_empty() {
+        println!("mach kb tree: no insights yet — run `mach kb reflect`");
+        return Ok(());
+    }
+
+    let by_id: BTreeMap<i64, &Insight> = level1.iter().map(|i| (i.id, i)).collect();
+    let themed = store::themed_insight_ids(&conn).map_err(to_io)?;
+
+    // Every raw memory id cited by ANY active insight or theme — the
+    // complement (over active memories) is the "uncategorized" trailing
+    // count, never listed individually.
+    let mut cited_memory_ids: HashSet<i64> = HashSet::new();
+    for ins in level1.iter().chain(themes.iter()) {
+        for sid in &ins.source_ids {
+            if let Ok(mid) = sid.parse::<i64>() {
+                cited_memory_ids.insert(mid);
+            }
+        }
+    }
+
+    for theme in &themes {
+        let flag = if theme.is_flagged() { " [FLAGGED]" } else { "" };
+        println!("{}  (confidence {:.2}){}", truncate(&theme.text, 90), theme.confidence, flag);
+        for sid in &theme.source_ids {
+            if let Some(rest) = sid.strip_prefix('i').or_else(|| sid.strip_prefix('I')) {
+                if let Ok(iid) = rest.parse::<i64>() {
+                    if let Some(ins) = by_id.get(&iid) {
+                        print_insight_node(&conn, ins, "  ");
+                    }
+                }
+            }
+        }
+        println!();
+    }
+
+    let unthemed: Vec<&Insight> = level1.iter().filter(|i| !themed.contains(&i.id)).collect();
+    if !unthemed.is_empty() {
+        println!("(unthemed)");
+        for ins in &unthemed {
+            print_insight_node(&conn, ins, "  ");
+        }
+        println!();
+    }
+
+    let active_memory_ids: HashSet<i64> = store::list(&conn, None, false).map_err(to_io)?.iter().map(|m| m.id).collect();
+    let uncategorized = active_memory_ids.difference(&cited_memory_ids).count();
+    if uncategorized > 0 {
+        println!("... and {} uncategorized memories", uncategorized);
+    }
+
+    Ok(())
 }

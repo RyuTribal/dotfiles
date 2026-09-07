@@ -1,10 +1,27 @@
 // NotePanel.qml — quick note capture for Quickshell (illogical-impulse)
 // Toggle from anywhere:  qs -c ii ipc call note toggle
 //
-// Mirrors SweepPanel.qml's shape: a Scope holding all state/process/IPC
-// logic (so an in-flight `mach note` classify call survives the panel
-// being closed early), with a LazyLoader'd FloatingWindow underneath that
-// is purely a view over that state.
+// Notes must go away fast: Enter fires the classification job and closes
+// the panel in the same tick — no "classifying…" state, no result
+// display, nothing to wait on. Classification happens on a Process that
+// lives on this Scope (never inside the LazyLoader below), so it keeps
+// running to completion even after the FloatingWindow is gone — same
+// principle SweepPanel.qml uses for its own long-lived state, just with
+// nothing left for the UI to show once fired. Every submission spawns its
+// own dynamically-created Process (see `classifyProcComponent`) rather
+// than reusing one shared id, so rapid consecutive jots each get an
+// independent classification job: nothing here can block, drop, or
+// collide with another still in flight (the kb store's WAL journal mode
+// plus a 3s busy_timeout on the SQLite side, set once in
+// `store::open_with_path`, is what makes concurrent writers from several
+// of these processes safe at the storage layer).
+//
+// All success/failure/fallback reporting has moved to `mach note`
+// itself: run with `--quiet`, it prints nothing on a clean success and
+// fires a desktop notification (via notify-send) only when something
+// went wrong or had to fall back — see `note.rs`'s `Notifier`/
+// `NoteOutcome`. This panel no longer parses stdout or shows an error
+// banner at all.
 pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Layouts
@@ -29,20 +46,16 @@ Scope {
     // longer than this capture.
     property string tempImagePath: Quickshell.env("XDG_RUNTIME_DIR") + "/mach-note-paste-" + imageVersion + ".png"
 
-    // ---------- submission state ----------
-    // idle -> submitting -> done (auto-closes) or error (stays, keeps text)
-    property string state: "idle"
-    property string resultFiledLine: ""
-    property string resultReferLine: ""
-    property var resultFacts: []
-    property string resultWarning: ""
-    property string errorSnippet: ""
-
     IpcHandler {
         target: "note"
         function toggle(): void { rootScope.panelVisible = !rootScope.panelVisible; }
         function open(): void { rootScope.panelVisible = true; }
         function close(): void { rootScope.panelVisible = false; }
+        // Files `text` exactly as pressing Enter would, without ever
+        // opening the panel — lets rapid-fire concurrency be exercised
+        // from a script (`qs -c ii ipc call note submit "..."`) instead
+        // of driving the GUI.
+        function submit(text: string): void { rootScope.fireClassification(text, false, ""); }
     }
 
     GlobalShortcut {
@@ -62,45 +75,25 @@ Scope {
     }
 
     onPanelVisibleChanged: {
-        if (panelVisible) {
-            rootScope.handleOpened();
-        } else {
+        if (!rootScope.panelVisible) {
             rootScope.handleClosed();
         }
     }
 
-    // A stale finished draft (success already shown, or a past failure)
-    // must not greet the next open — but a submission still in flight
-    // keeps showing "classifying…" across a close/reopen since it's
-    // still true.
-    function handleOpened() {
-        if (rootScope.state === "done" || rootScope.state === "error") {
-            rootScope.resetDraft();
-        }
-    }
-
-    // Esc (or any close) discards the draft only if nothing was ever sent
-    // to `mach note` yet. A submission in flight, or a just-shown
-    // done/error state, is left completely alone: the classify call keeps
-    // running to completion in the background even after the window is
-    // gone (it lives on this Scope, not inside the LazyLoader), and a
-    // failed attempt's text is not wiped out from under the user.
+    // Esc (or any other close) discards the draft. `submitNote()` already
+    // clears `noteText`/`hasImage` and cleans up the temp image itself
+    // before it sets `panelVisible = false`, so by the time this runs
+    // after a real submission there is nothing left to discard — this
+    // only ever does real work after an Esc-style close of an
+    // un-submitted draft. Never-lose-text only applies to text that was
+    // actually handed to `mach note`; an Esc'd draft was never sent
+    // anywhere, so discarding it here is correct, not a loss.
     function handleClosed() {
-        if (rootScope.state === "idle") {
+        if (rootScope.hasImage) {
             rootScope.cleanupTempImage();
-            rootScope.resetDraft();
         }
-    }
-
-    function resetDraft() {
         rootScope.noteText = "";
         rootScope.hasImage = false;
-        rootScope.state = "idle";
-        rootScope.resultFiledLine = "";
-        rootScope.resultReferLine = "";
-        rootScope.resultFacts = [];
-        rootScope.resultWarning = "";
-        rootScope.errorSnippet = "";
     }
 
     function cleanupTempImage() {
@@ -147,80 +140,80 @@ Scope {
         }
     }
 
+    // ---------- detached classification ----------
+    // One dynamically-created Process per submission (via
+    // `classifyProcComponent.createObject`), parented to this Scope —
+    // never the LazyLoader'd FloatingWindow below — so it survives the
+    // panel closing (which happens in the very same tick this fires) and
+    // never collides with another still-running classification: each
+    // submission gets its own independent object and its own independent
+    // OS process, nothing shared or reused between them.
+    function fireClassification(text, hasImage, imgPath) {
+        if (text.trim().length === 0 && !hasImage) return;
+
+        classifyProcComponent.createObject(rootScope, {
+            "draftText": text,
+            "imagePath": hasImage ? imgPath : "",
+        });
+    }
+
+    Component {
+        id: classifyProcComponent
+
+        Process {
+            id: classifyProc
+            // Set once at creation, read by `command` below and by
+            // `onRunningChanged`/`onExited` — never mutated afterward.
+            property string draftText: ""
+            property string imagePath: ""
+
+            stdinEnabled: true
+            command: classifyProc.imagePath.length > 0
+                ? ["mach", "note", "--quiet", "--image", classifyProc.imagePath, "-"]
+                : ["mach", "note", "--quiet", "-"]
+
+            Component.onCompleted: classifyProc.running = true
+
+            onRunningChanged: {
+                if (classifyProc.running) {
+                    classifyProc.write(classifyProc.draftText);
+                    classifyProc.stdinEnabled = false; // end input stream
+                }
+            }
+
+            // `mach note --quiet` never prints on success and reports any
+            // failure or fallback itself via a desktop notification (see
+            // note.rs) — nothing here needs to inspect the exit code.
+            // Only cleanup remains: delete the copy-source clipboard
+            // image (the permanent, content-addressed copy was already
+            // made inside `mach note` before it could possibly have
+            // exited), then drop this now-finished dynamic object.
+            onExited: (exitCode, exitStatus) => {
+                if (classifyProc.imagePath.length > 0) {
+                    Quickshell.execDetached(["rm", "-f", classifyProc.imagePath]);
+                }
+                classifyProc.destroy();
+            }
+        }
+    }
+
     // ---------- submission ----------
     function submitNote() {
-        if (rootScope.state === "submitting") return;
         if (rootScope.noteText.trim().length === 0 && !rootScope.hasImage) return;
 
-        rootScope.state = "submitting";
-        const args = ["mach", "note"];
-        if (rootScope.hasImage) {
-            args.push("--image", rootScope.tempImagePath);
-        }
-        submissionProc.command = args;
-        submissionProc.stdinEnabled = true;
-        submissionProc.running = true;
-    }
+        const text = rootScope.noteText;
+        const hasImage = rootScope.hasImage;
+        const imgPath = rootScope.tempImagePath;
 
-    function parseResult(text) {
-        const lines = text.split("\n");
-        let filedLine = "", referLine = "", warningLine = "";
-        let facts = [];
-        for (const raw of lines) {
-            const line = raw.trim();
-            if (line.length === 0) continue;
-            if (line.startsWith("warning:")) warningLine = line;
-            else if (line.startsWith("filed ")) filedLine = line;
-            else if (line.startsWith("refer to it as:")) referLine = line;
-            else if (line.startsWith("- ")) facts.push(line.substring(2));
-        }
-        return { filedLine: filedLine, referLine: referLine, facts: facts, warningLine: warningLine };
-    }
+        rootScope.fireClassification(text, hasImage, imgPath);
 
-    function applySuccess(stdoutText) {
-        const parsed = rootScope.parseResult(stdoutText);
-        rootScope.resultFiledLine = parsed.filedLine;
-        rootScope.resultReferLine = parsed.referLine;
-        rootScope.resultFacts = parsed.facts;
-        rootScope.resultWarning = parsed.warningLine;
-        rootScope.state = "done";
-        autoCloseTimer.restart();
-    }
-
-    function applyFailure(stderrText, exitCode) {
-        const trimmed = stderrText.trim();
-        rootScope.errorSnippet = trimmed.length > 0
-            ? trimmed.split("\n").slice(0, 6).join("\n")
-            : ("mach note exited with code " + exitCode);
-        rootScope.state = "error";
-    }
-
-    Process {
-        id: submissionProc
-        stdout: StdioCollector { id: submissionStdout }
-        stderr: StdioCollector { id: submissionStderr }
-        onRunningChanged: {
-            if (submissionProc.running) {
-                submissionProc.write(rootScope.noteText);
-                submissionProc.stdinEnabled = false; // end input stream
-            }
-        }
-        onExited: (exitCode, exitStatus) => {
-            if (rootScope.hasImage) {
-                rootScope.cleanupTempImage();
-            }
-            if (exitCode === 0) {
-                rootScope.applySuccess(submissionStdout.text);
-            } else {
-                rootScope.applyFailure(submissionStderr.text, exitCode);
-            }
-        }
-    }
-
-    Timer {
-        id: autoCloseTimer
-        interval: 5000
-        onTriggered: rootScope.panelVisible = false
+        // Close immediately — no classifying state, no result display.
+        // The dynamically-created Process above outlives this Scope's
+        // draft state entirely; only a failure or fallback notification
+        // (fired by `mach note --quiet` itself) will ever surface again.
+        rootScope.noteText = "";
+        rootScope.hasImage = false;
+        rootScope.panelVisible = false;
     }
 
     LazyLoader {
@@ -253,7 +246,6 @@ Scope {
                     }
                     Item { Layout.fillWidth: true }
                     Text {
-                        visible: rootScope.state === "idle"
                         text: rootScope.noteText.length + " chars"
                         color: Appearance.colors.colSubtext
                         font { pixelSize: Appearance.font.pixelSize.smallest; family: Appearance.font.family.monospace }
@@ -263,7 +255,7 @@ Scope {
                 // attached-image chip
                 RowLayout {
                     Layout.fillWidth: true
-                    visible: rootScope.hasImage && (rootScope.state === "idle" || rootScope.state === "submitting")
+                    visible: rootScope.hasImage
                     spacing: 8
 
                     Rectangle {
@@ -293,7 +285,6 @@ Scope {
                     Item { Layout.fillWidth: true }
                     NoteButton {
                         label: "remove"
-                        enabled: rootScope.state === "idle"
                         onClicked: {
                             rootScope.hasImage = false;
                             rootScope.cleanupTempImage();
@@ -301,13 +292,10 @@ Scope {
                     }
                 }
 
-                // input surface — present through idle/submitting/error so
-                // the text is always there to read, copy, or keep editing;
-                // hidden only once a success result is shown.
+                // input surface
                 Rectangle {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    visible: rootScope.state !== "done"
                     radius: Appearance.rounding.small
                     color: Appearance.colors.colLayer1
                     border.width: noteInput.activeFocus ? 1 : 0
@@ -320,8 +308,6 @@ Scope {
                         wrapMode: TextArea.Wrap
                         placeholderText: "Jot a note — Enter files it, Shift+Enter newline, Esc discards"
                         text: rootScope.noteText
-                        readOnly: rootScope.state === "submitting"
-                        opacity: rootScope.state === "submitting" ? 0.5 : 1
                         onTextChanged: rootScope.noteText = text
 
                         Keys.onPressed: (event) => {
@@ -342,92 +328,6 @@ Scope {
                         }
                     }
                 }
-
-                // classifying indicator
-                Text {
-                    Layout.fillWidth: true
-                    visible: rootScope.state === "submitting"
-                    text: "classifying…"
-                    color: Appearance.colors.colSubtext
-                    font { pixelSize: Appearance.font.pixelSize.smaller; family: Appearance.font.family.main }
-                }
-
-                // error banner — text stays in the input box above
-                ColumnLayout {
-                    Layout.fillWidth: true
-                    visible: rootScope.state === "error"
-                    spacing: 4
-                    Text {
-                        Layout.fillWidth: true
-                        text: "mach note failed — your text is kept above, copy it or press Enter to retry"
-                        color: Appearance.m3colors.m3error
-                        wrapMode: Text.Wrap
-                        font { pixelSize: Appearance.font.pixelSize.smaller; family: Appearance.font.family.main; weight: Font.DemiBold }
-                    }
-                    Text {
-                        Layout.fillWidth: true
-                        text: rootScope.errorSnippet
-                        color: Appearance.colors.colSubtext
-                        wrapMode: Text.Wrap
-                        maximumLineCount: 6
-                        elide: Text.ElideRight
-                        font { pixelSize: Appearance.font.pixelSize.smallest; family: Appearance.font.family.monospace }
-                    }
-                }
-
-                // success result
-                ColumnLayout {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    visible: rootScope.state === "done"
-                    spacing: 6
-                    clip: true
-
-                    Text {
-                        Layout.fillWidth: true
-                        text: rootScope.resultFiledLine
-                        color: Appearance.colors.colOnLayer0
-                        wrapMode: Text.Wrap
-                        font { pixelSize: Appearance.font.pixelSize.normal; family: Appearance.font.family.main }
-                    }
-                    Text {
-                        Layout.fillWidth: true
-                        text: rootScope.resultReferLine
-                        color: Appearance.colors.colPrimary
-                        wrapMode: Text.Wrap
-                        font { pixelSize: Appearance.font.pixelSize.small; family: Appearance.font.family.main; weight: Font.DemiBold }
-                    }
-                    ColumnLayout {
-                        Layout.fillWidth: true
-                        spacing: 2
-                        Repeater {
-                            model: rootScope.resultFacts
-                            delegate: Text {
-                                required property string modelData
-                                Layout.fillWidth: true
-                                text: "• " + modelData
-                                color: Appearance.colors.colOnLayer1
-                                wrapMode: Text.Wrap
-                                font { pixelSize: Appearance.font.pixelSize.smaller; family: Appearance.font.family.main }
-                            }
-                        }
-                    }
-                    Text {
-                        Layout.fillWidth: true
-                        visible: rootScope.resultWarning.length > 0
-                        text: rootScope.resultWarning
-                        color: Appearance.m3colors.m3error
-                        wrapMode: Text.Wrap
-                        font { pixelSize: Appearance.font.pixelSize.smallest; family: Appearance.font.family.main }
-                    }
-                    Item { Layout.fillHeight: true }
-                    Text {
-                        Layout.fillWidth: true
-                        text: "closing shortly…"
-                        color: Appearance.colors.colSubtext
-                        font { pixelSize: Appearance.font.pixelSize.smallest; family: Appearance.font.family.main }
-                    }
-                }
             }
         }
     }
@@ -440,8 +340,7 @@ Scope {
         implicitWidth: btnText.implicitWidth + 20
         implicitHeight: 26
         radius: Appearance.rounding.full
-        opacity: enabled ? 1 : 0.45
-        color: btnArea.containsMouse && btn.enabled ? Appearance.colors.colLayer2Hover : Appearance.colors.colLayer2
+        color: btnArea.containsMouse ? Appearance.colors.colLayer2Hover : Appearance.colors.colLayer2
 
         Text {
             id: btnText
@@ -454,7 +353,6 @@ Scope {
             id: btnArea
             anchors.fill: parent
             hoverEnabled: true
-            enabled: btn.enabled
             onClicked: btn.clicked()
         }
     }

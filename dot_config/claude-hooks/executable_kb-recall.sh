@@ -132,6 +132,34 @@ except Exception:
 if not isinstance(hits, list):
     sys.exit(0)
 
+# Session-deduped injection: a memory id that was already injected within
+# the LAST 10 recall-log entries (a sliding window over the current session
+# log, one entry per prompt that injected anything) is suppressed this time
+# -- re-showing the same top memories on every prompt is pure token waste.
+# The window slides, not a one-shot "seen ever" flag: once a memory has been
+# out of the last 10 entries for a while it is fair game to surface again.
+# Read BEFORE the entry for this prompt is appended (that append happens in
+# the bash below, after this script exits), so "last 10" here means the 10
+# most recent *prior* prompts. A missing/unreadable/corrupt log, or any
+# unparseable line within it, just means an empty suppression set -- never
+# worth failing recall over.
+suppressed = set()
+log_path = sys.argv[3] if len(sys.argv) > 3 else ""
+if log_path:
+    try:
+        with open(log_path, "r") as f:
+            log_lines = [ln for ln in f if ln.strip()]
+    except Exception:
+        log_lines = []
+    for ln in log_lines[-10:]:
+        try:
+            entry = json.loads(ln)
+        except Exception:
+            continue
+        for n in entry.get("ids") or []:
+            if isinstance(n, int):
+                suppressed.add(n)
+
 lines = []
 ids = []
 for h in hits:
@@ -157,15 +185,18 @@ for h in hits:
         # Insights/themes are never touched by engagement-gated
         # reinforcement either (see store::search_insights_ranked — no
         # strength term to begin with), so their ids are deliberately
-        # excluded from the recall log below.
+        # excluded from the recall log below, and never subject to the
+        # session-dedupe window either (there is no id here to dedupe on).
         confidence = h.get("confidence")
         conf_str = " (confidence {:.2})".format(confidence) if isinstance(confidence, (int, float)) else ""
         label = "derived theme" if h.get("level") == 2 else "derived belief"
         lines.append("- [{}, {}]{} {}".format(label, date, conf_str, content))
     else:
+        mem_id = h.get("id")
+        if isinstance(mem_id, int) and mem_id in suppressed:
+            continue
         phrase = source_phrase(h.get("source"))
         lines.append("- [{}] {} ({})".format(date, content, phrase))
-        mem_id = h.get("id")
         if isinstance(mem_id, int):
             ids.append(mem_id)
 
@@ -174,9 +205,12 @@ if lines:
     for l in lines:
         print(l)
 
+# Only ids that were actually rendered above are logged here (a suppressed
+# id never reaches `ids`) -- the engagement sweep (`mach kb ingest-sessions`)
+# depends on this log meaning "shown", not "considered".
 with open(sys.argv[2], "w") as f:
     json.dump(ids, f)
-' "$out_file" "$ids_file" 2>/dev/null)"
+' "$out_file" "$ids_file" "${session_id:+$RECALL_LOG_DIR/$session_id.jsonl}" 2>/dev/null)"
 
 [ -n "$context" ] && printf '%s\n' "$context"
 

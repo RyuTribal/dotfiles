@@ -266,6 +266,12 @@ pub fn build_prompt(note: &str, existing_topics: &[String], today: &str) -> Stri
          a later session.\n\n",
     );
     s.push_str(
+        "When the note attributes a want, statement, or commitment to a named person or project \
+         ('Moses wants X', 'for the umoja project'), PRESERVE that attribution and project name \
+         inside each fact -- 'Moses wants satellite ownership delegation in Umoja (2026-09-07)' \
+         beats 'satellite delegation should exist'. Prefer the mentioned project as the topic.\n\n",
+    );
+    s.push_str(
         "Also judge, once for the whole note (not per fact), how likely it is to matter in a \
          future, unrelated session: WORTH durable means real preferences, project facts, \
          people, or commitments that would still matter later; WORTH dubious means a vague \
@@ -1046,6 +1052,20 @@ mod tests {
     }
 
     #[test]
+    fn build_prompt_instructs_to_preserve_named_attribution_and_project() {
+        // Prompt-contract test: the classifier must be told, in-prompt, to
+        // keep a named person's/project's attribution inside each fact
+        // instead of flattening it away (e.g. "Moses wants X" must not
+        // become "X should exist") -- and to prefer a mentioned project as
+        // the topic. Guards against this instruction silently regressing
+        // out of `build_prompt` later.
+        let prompt = build_prompt("a note", &[], "2026-09-07");
+        assert!(prompt.contains("PRESERVE that attribution and project name"));
+        assert!(prompt.contains("Moses wants satellite ownership delegation in Umoja"));
+        assert!(prompt.contains("Prefer the mentioned project as the topic"));
+    }
+
+    #[test]
     fn slugify_lowercases_and_hyphenates() {
         assert_eq!(slugify("Helios RHI descriptor design"), "helios-rhi-descriptor-design");
     }
@@ -1318,6 +1338,34 @@ mod tests {
         assert_eq!(stored.len(), 2);
         assert!(stored.iter().all(|m| m.project.as_deref() == Some("t")));
         assert!(stored.iter().all(|m| m.source.as_deref() == Some("note:a-title")));
+    }
+
+    #[test]
+    fn file_note_preserves_named_attribution_and_project_from_a_mocked_classifier_reply() {
+        // Mocked e2e test for the attribution fix: a voice note attributing
+        // a want to a named person and project ("Moses wants satellite
+        // delegation in umoja") must survive into the stored fact and the
+        // fact's topic -- this exercises the full file_note pipeline
+        // (classify reply -> parse -> embed -> store) with a FakeNoteLlm
+        // standing in for a classifier that already followed the new
+        // attribution-preserving instruction, the same shape a real
+        // `claude -p --model haiku` reply would take.
+        let conn = scratch_conn();
+        let llm = FakeNoteLlm {
+            reply: "TOPIC: umoja\nTITLE: Moses wants satellite delegation\n\
+                    FACT: Moses wants satellite ownership delegation in Umoja (2026-09-07).\n"
+                .to_string(),
+        };
+        let filed = file_note(&conn, &llm, &FakeEmbedder, "Moses wants satellite delegation in umoja", None, 6).unwrap();
+
+        assert_eq!(filed.topic, "umoja");
+        assert_eq!(filed.facts, vec!["Moses wants satellite ownership delegation in Umoja (2026-09-07).".to_string()]);
+
+        let stored = store::list(&conn, None, false).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].content.contains("Moses"));
+        assert!(stored[0].content.contains("Umoja"));
+        assert_eq!(stored[0].project.as_deref(), Some("umoja"));
     }
 
     #[test]

@@ -12,6 +12,11 @@
 # other failure degrades to silence, not an error.
 
 MACH_BIN="${MACH_BIN:-mach}"
+# This is the only caller that should pass --touch: it's the recall path,
+# so a hit surfacing here is an actual injection, not just a manual query.
+# --min-score applies the threshold engine-side (post-limit) so reinforcement
+# only ever touches rows that clear it, not every row the ranked search
+# happened to return before this script's own filter below runs.
 SCORE_THRESHOLD="0.45"
 MIN_PROMPT_LEN=12
 
@@ -45,7 +50,8 @@ out_file="$(mktemp 2>/dev/null)" || exit 0
 err_file="$(mktemp 2>/dev/null)" || { rm -f "$out_file"; exit 0; }
 trap 'rm -f "$out_file" "$err_file"' EXIT
 
-timeout 2s "$MACH_BIN" kb search "$prompt" --limit 4 --json >"$out_file" 2>"$err_file"
+timeout 2s "$MACH_BIN" kb search "$prompt" --limit 4 --json --touch --min-score "$SCORE_THRESHOLD" \
+    >"$out_file" 2>"$err_file"
 rc=$?
 
 # Nonzero exit (including a timeout kill) means recall didn't complete
@@ -63,6 +69,9 @@ fi
 context="$(python3 -c '
 import json, sys
 
+# "score" is now the ranked blend (0.70*sim + 0.20*recency + 0.10*strength),
+# not plain cosine — same field name, already-filtered by --min-score above,
+# so this is a redundant-but-harmless second check.
 THRESHOLD = 0.45
 
 try:

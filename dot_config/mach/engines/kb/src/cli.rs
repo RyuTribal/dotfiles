@@ -7,8 +7,9 @@ use std::io::{self, IsTerminal, Read, Write};
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::classify::{self, Classifier, Verdict};
 use crate::embed::{Embedder, OllamaEmbedder};
-use crate::store::{self, KbError, Memory};
+use crate::store::{self, AddOutcome, KbError, RankedHit};
 
 fn to_io(e: KbError) -> io::Error {
     io::Error::other(e.to_string())
@@ -21,11 +22,19 @@ fn print_help() {
     println!();
     println!("subcommands:");
     println!("  add \"<content>\" [--source S] [--project P] [--unreviewed]");
-    println!("                          embed + store a memory (content \"-\" reads stdin)");
-    println!("  search \"<query>\" [--limit N] [--json] [--all]");
-    println!("                          cosine top-N search (--all includes unreviewed)");
+    println!("      [--importance N] [--no-classify]");
+    println!("                          embed + store a memory (content \"-\" reads stdin);");
+    println!("                          N is 1-10, default 5. A close (>0.75 sim) existing");
+    println!("                          memory triggers a classifier verdict unless --no-classify.");
+    println!("  search \"<query>\" [--limit N] [--json] [--all] [--touch]");
+    println!("      [--include-superseded] [--min-score F]");
+    println!("                          ranked top-N search (sim/recency/strength blend);");
+    println!("                          --touch reinforces the rows actually returned");
+    println!("  supersede <old_id> <new_id>");
+    println!("                          tombstone <old_id> in favor of <new_id>");
     println!("  review                  interactive review of unreviewed candidates");
-    println!("  list [--limit N]        most recent memories");
+    println!("  list [--limit N] [--superseded]");
+    println!("                          most recent memories (--superseded: audit view)");
     println!("  forget <id>             permanently delete a memory");
 }
 
@@ -34,6 +43,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     match args.next().as_deref() {
         Some("add") => cmd_add(args),
         Some("search") => cmd_search(args),
+        Some("supersede") => cmd_supersede(args),
         Some("review") => cmd_review(args),
         Some("list") => cmd_list(args),
         Some("forget") => cmd_forget(args),
@@ -58,14 +68,27 @@ fn cmd_add(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut source: Option<String> = None;
     let mut project: Option<String> = None;
     let mut unreviewed = false;
+    let mut importance: i64 = 5;
+    let mut no_classify = false;
 
     while let Some(a) = args.next() {
         match a.as_str() {
             "--source" => source = args.next(),
             "--project" => project = args.next(),
             "--unreviewed" => unreviewed = true,
+            "--importance" => {
+                importance = args
+                    .next()
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(5)
+                    .clamp(1, 10);
+            }
+            "--no-classify" => no_classify = true,
             "-h" | "--help" => {
-                println!("usage: mach kb add \"<content>\" [--source S] [--project P] [--unreviewed]");
+                println!(
+                    "usage: mach kb add \"<content>\" [--source S] [--project P] [--unreviewed] \
+                     [--importance N] [--no-classify]"
+                );
                 println!("       mach kb add - [--source S] [--project P]   (reads content from stdin)");
                 return Ok(());
             }
@@ -109,16 +132,50 @@ fn cmd_add(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         }
     };
 
-    let id = store::insert(
+    // Save-time supersession check (Mem0-classifier / Graphiti-tombstone):
+    // k-NN top-5 over active memories; a close match (>0.75 cosine) asks a
+    // small non-interactive `claude -p` call for a verdict. Skipped
+    // entirely with --no-classify (the session-digest hook uses this —
+    // n x LLM calls per digest would be wasteful, and digest facts land
+    // unreviewed anyway, so `mach kb review` is the curation point).
+    let mut best_match_id: Option<i64> = None;
+    let verdict = if no_classify {
+        Verdict::Add
+    } else {
+        let similar = store::top_similar(&conn, &embedding, 5).map_err(to_io)?;
+        best_match_id = similar.first().map(|(m, _)| m.id);
+        match similar.first() {
+            Some((_, best_sim)) if *best_sim > 0.75 => {
+                let pairs: Vec<(i64, String)> = similar.iter().map(|(m, _)| (m.id, m.content.clone())).collect();
+                let classifier = classify::ProcessClassifier::new();
+                classifier.classify(&content, &pairs)
+            }
+            _ => Verdict::Add,
+        }
+    };
+
+    let now = store::now_rfc3339();
+    let outcome = store::apply_verdict(
         &conn,
+        verdict,
         &content,
         source.as_deref(),
         project.as_deref(),
         !unreviewed,
-        Some(&embedding),
+        &embedding,
+        importance,
+        &now,
+        best_match_id,
     )
     .map_err(to_io)?;
-    println!("stored memory #{}", id);
+
+    match outcome {
+        AddOutcome::Added { id } => println!("stored memory #{}", id),
+        AddOutcome::AddedAndTombstoned { new_id, old_id, verb } => {
+            println!("stored memory #{} ({} memory #{})", new_id, verb, old_id);
+        }
+        AddOutcome::Skipped { reason } => println!("mach kb add: skipped — {}", reason),
+    }
     Ok(())
 }
 
@@ -130,16 +187,26 @@ struct SearchHit {
     project: Option<String>,
     created_at: String,
     score: f32,
+    sim: f32,
+    recency: f32,
+    strength: f32,
+    importance: i64,
+    superseded: bool,
 }
 
-fn to_hit((m, score): (Memory, f32)) -> SearchHit {
+fn to_hit(h: RankedHit) -> SearchHit {
     SearchHit {
-        id: m.id,
-        content: m.content,
-        source: m.source,
-        project: m.project,
-        created_at: m.created_at,
-        score,
+        id: h.memory.id,
+        content: h.memory.content,
+        source: h.memory.source,
+        project: h.memory.project,
+        created_at: h.memory.created_at,
+        score: h.score,
+        sim: h.sim,
+        recency: h.recency,
+        strength: h.strength,
+        importance: h.memory.importance,
+        superseded: h.superseded,
     }
 }
 
@@ -148,14 +215,23 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut limit: usize = 10;
     let mut json = false;
     let mut all = false;
+    let mut include_superseded = false;
+    let mut touch = false;
+    let mut min_score: f32 = 0.0;
 
     while let Some(a) = args.next() {
         match a.as_str() {
             "--limit" => limit = args.next().and_then(|v| v.parse().ok()).unwrap_or(10),
             "--json" => json = true,
             "--all" => all = true,
+            "--include-superseded" => include_superseded = true,
+            "--touch" => touch = true,
+            "--min-score" => min_score = args.next().and_then(|v| v.parse().ok()).unwrap_or(0.0),
             "-h" | "--help" => {
-                println!("usage: mach kb search \"<query>\" [--limit N] [--json] [--all]");
+                println!(
+                    "usage: mach kb search \"<query>\" [--limit N] [--json] [--all] [--touch] \
+                     [--include-superseded] [--min-score F]"
+                );
                 return Ok(());
             }
             other => {
@@ -178,17 +254,31 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     };
 
     let conn = store::open().map_err(to_io)?;
+    let now = store::now_rfc3339();
     let embedder = OllamaEmbedder::new();
-    let hits: Vec<(Memory, f32)> = match embedder.embed(&query) {
-        Ok(q_emb) => store::search(&conn, &q_emb, limit, all).map_err(to_io)?,
+    let hits: Vec<RankedHit> = match embedder.embed(&query) {
+        Ok(q_emb) => {
+            store::search_ranked(&conn, &q_emb, limit, all, include_superseded, min_score, &now).map_err(to_io)?
+        }
         Err(e) => {
             eprintln!(
                 "mach kb search: warning: {} — falling back to substring match",
                 e
             );
-            store::search_substring(&conn, &query, limit, all).map_err(to_io)?
+            let subs = store::search_substring(&conn, &query, limit, all, include_superseded).map_err(to_io)?;
+            subs.into_iter()
+                .map(|(m, score)| {
+                    let superseded = m.is_superseded();
+                    RankedHit { memory: m, score, sim: score, recency: 0.0, strength: 0.0, superseded }
+                })
+                .collect()
         }
     };
+
+    if touch {
+        let ids: Vec<i64> = hits.iter().map(|h| h.memory.id).collect();
+        store::touch(&conn, &ids, &now).map_err(to_io)?;
+    }
 
     if json {
         let out: Vec<SearchHit> = hits.into_iter().map(to_hit).collect();
@@ -196,15 +286,22 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     } else if hits.is_empty() {
         println!("no matches");
     } else {
-        for (m, score) in hits {
-            let flag = if m.reviewed { ' ' } else { '*' };
+        let mut any_superseded = false;
+        for h in &hits {
+            any_superseded |= h.superseded;
+            let flag = if h.memory.reviewed { ' ' } else { '*' };
+            let sup = if h.superseded { '!' } else { ' ' };
             println!(
-                "{}{:>6.3}  #{:<5} {}",
+                "{}{}{:>6.3}  #{:<5} {}",
                 flag,
-                score,
-                m.id,
-                truncate(&m.content, 90)
+                sup,
+                h.score,
+                h.memory.id,
+                truncate(&h.memory.content, 90)
             );
+        }
+        if any_superseded {
+            println!("\n(! = superseded — scored ×0.1, shown via --include-superseded)");
         }
     }
     Ok(())
@@ -217,6 +314,42 @@ fn truncate(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
         out.push('…');
         out
+    }
+}
+
+fn cmd_supersede(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let old_id: i64 = match args.next().and_then(|s| s.parse().ok()) {
+        Some(v) => v,
+        None => {
+            eprintln!("mach kb supersede: missing or invalid <old_id>");
+            std::process::exit(1);
+        }
+    };
+    let new_id: i64 = match args.next().and_then(|s| s.parse().ok()) {
+        Some(v) => v,
+        None => {
+            eprintln!("mach kb supersede: missing or invalid <new_id>");
+            std::process::exit(1);
+        }
+    };
+
+    let conn = store::open().map_err(to_io)?;
+    if store::get(&conn, old_id).map_err(to_io)?.is_none() {
+        eprintln!("mach kb supersede: no memory with id {}", old_id);
+        std::process::exit(1);
+    }
+    if store::get(&conn, new_id).map_err(to_io)?.is_none() {
+        eprintln!("mach kb supersede: no memory with id {}", new_id);
+        std::process::exit(1);
+    }
+
+    let now = store::now_rfc3339();
+    if store::supersede(&conn, old_id, new_id, &now).map_err(to_io)? {
+        println!("superseded memory #{} -> #{}", old_id, new_id);
+        Ok(())
+    } else {
+        eprintln!("mach kb supersede: memory #{} is already superseded", old_id);
+        std::process::exit(1);
     }
 }
 
@@ -309,11 +442,13 @@ fn cmd_review(_args: impl Iterator<Item = String>) -> io::Result<()> {
 
 fn cmd_list(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut limit: usize = 20;
+    let mut superseded_only = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--limit" => limit = args.next().and_then(|v| v.parse().ok()).unwrap_or(20),
+            "--superseded" => superseded_only = true,
             "-h" | "--help" => {
-                println!("usage: mach kb list [--limit N]");
+                println!("usage: mach kb list [--limit N] [--superseded]");
                 return Ok(());
             }
             other => {
@@ -323,16 +458,21 @@ fn cmd_list(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         }
     }
     let conn: Connection = store::open().map_err(to_io)?;
-    let rows = store::list(&conn, Some(limit)).map_err(to_io)?;
+    let rows = store::list(&conn, Some(limit), superseded_only).map_err(to_io)?;
     if rows.is_empty() {
-        println!("no memories stored yet");
+        println!(
+            "{}",
+            if superseded_only { "no superseded memories" } else { "no memories stored yet" }
+        );
         return Ok(());
     }
-    for m in rows {
+    for m in &rows {
         let flag = if m.reviewed { ' ' } else { '*' };
+        let sup = if m.is_superseded() { '!' } else { ' ' };
         println!(
-            "{}{:>5}  {}  {:<10} {:<12}  {}",
+            "{}{}{:>5}  {}  {:<10} {:<12}  {}",
             flag,
+            sup,
             m.id,
             m.created_at,
             m.source.as_deref().unwrap_or("-"),
@@ -340,7 +480,7 @@ fn cmd_list(mut args: impl Iterator<Item = String>) -> io::Result<()> {
             truncate(&m.content, 70)
         );
     }
-    println!("\n(* = awaiting review — run `mach kb review`)");
+    println!("\n(* = awaiting review — run `mach kb review`; ! = superseded — run `mach kb list --superseded`)");
     Ok(())
 }
 

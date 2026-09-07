@@ -66,7 +66,11 @@ facts="$(printf '%s\n\n---TRANSCRIPT TAIL---\n%s\n' "$digest_prompt" "$tail_cont
 printf '%s\n' "$facts" | while IFS= read -r line; do
     line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
     [ -z "$line" ] && continue
-    printf '%s' "$line" | "$MACH_BIN" kb add - --source "session-digest" --unreviewed >/dev/null 2>&1
+    # --no-classify: a digest can produce several facts per session, and
+    # each would otherwise trigger its own classifier subprocess call on a
+    # close match — n x LLM calls for facts that land unreviewed anyway.
+    # `mach kb review` is the curation point for these, not save-time.
+    printf '%s' "$line" | "$MACH_BIN" kb add - --source "session-digest" --unreviewed --no-classify >/dev/null 2>&1
 done
 
 exit 0

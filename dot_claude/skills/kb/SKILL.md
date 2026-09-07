@@ -14,15 +14,24 @@ context — this skill is for *deliberate* saves and searches you do yourself.
 ## Saving a fact
 
 ```
-mach kb add "<fact>" --source "<context>" --project "<project>"
+mach kb add "<fact>" --source "<context>" --project "<project>" --importance 6
 ```
 
 - `--source` and `--project` are optional but cheap context for later —
   use them (e.g. `--source "conversation"`, `--project "mach"`).
+- `--importance N` is 1-10 (default 5) and sets how slowly the memory
+  decays — it seeds the initial forgetting-curve stability. Deliberate
+  saves through this skill should pass `--importance 6`; save higher only
+  for things that matter well beyond the current conversation.
 - Deliberate saves through this skill are reviewed by default (no
   `--unreviewed` flag) — you decided the fact is worth keeping, so it
   doesn't need to sit in the `mach kb review` queue first. `--unreviewed`
   exists for the automated session-digest hook, not for this path.
+- If the new fact closely matches (>0.75 similarity) an existing memory,
+  `add` automatically asks a small classifier call whether to add it
+  alongside, treat it as an update/replacement of the old one, or skip it
+  as a duplicate — no need to check for similar existing memories yourself
+  first.
 - Convert relative dates to absolute ones before saving (e.g. "next
   Friday" → "2026-09-12", not "next Friday" — a fact read back next month
   needs to still make sense).
@@ -35,7 +44,11 @@ mach kb search "<query>" --json
 
 Add `--limit N` to control result count and `--all` to include unreviewed
 candidates. Read `score` in the JSON output — treat anything below ~0.45
-as noise.
+as noise. `score` is a blend of similarity, recency, and how reinforced the
+memory is (the JSON also breaks these out individually as `sim`, `recency`,
+`strength`). Don't pass `--touch` here — that reinforces a memory as if it
+were actually recalled and injected as context, and belongs only to the
+automated recall hook, not a manual search you run yourself.
 
 ## What qualifies as worth saving
 

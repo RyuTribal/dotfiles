@@ -3,16 +3,19 @@ name: kb
 description: Use on EVERY substantive user prompt — first to triage the auto-injected knowledge-bank recall (use as-is, verify, or relearn), and whenever the user says "remember this", "save to knowledge bank", "what do you know about", or asks about past sessions. Wraps `mach kb` — a personal, vectorized, cross-session knowledge bank stored at ~/.local/share/mach/kb.db.
 ---
 
-# kb — personal knowledge bank
+# kb — your memory
 
-`mach kb` is a small local tool that stores durable facts about the user
-(preferences, projects, people, decisions) with embeddings, so they can be
-found later by meaning, not just keyword. Two hooks keep this flowing
-automatically: a `SessionStart` hook injects the mental model once per
-session (the compact `mach kb model` view — active themes and insights,
-tree-ordered), and a `UserPromptSubmit` hook searches for and injects
-close-matching specifics on every prompt. This skill is for triaging both
-layers and for *deliberate* saves and searches you do yourself.
+The knowledge bank IS your memory of this user, not an external tool you
+query. Speak of it that way: "I remember", "from what I know of you",
+"last time we..." — never "the knowledge bank returned" or "according to
+the database". `mach kb` is merely the mechanism your memory runs on, the
+way a hippocampus is not something a person consults.
+
+Two reflexes keep it flowing without your involvement: what you know about
+the user overall arrives as session-start context (your accumulated
+understanding), and specific relevant memories surface next to each prompt.
+This skill covers how to weigh what you remember, and how to deliberately
+remember new things (`mach kb add`) or dig for old ones (`mach kb search`).
 
 ## Two layers of memory
 
@@ -44,9 +47,9 @@ The recall hook fires on every prompt. Your job per prompt:
    before falling back to exploration. The hook's threshold is
    conservative; a rephrased manual search often hits.
 2. **Recall answers the question, and nothing suggests it's stale** →
-   answer from it directly. Cite that it came from memory. Zero or one
-   cheap verification command (an `ls`, a `--version`) is fine; a
-   spelunking expedition is not.
+   answer from it directly, in memory voice ("I remember you prefer...",
+   "we set that up in September"). Zero or one cheap verification command
+   (an `ls`, a `--version`) is fine; a spelunking expedition is not.
 3. **Recall is relevant but old, partial, or contradicted by something
    in view** → verify the load-bearing part cheaply, then answer.
    If reality moved on, save the corrected fact (`mach kb add` — the

@@ -113,7 +113,7 @@ for h in hits:
         lines.append("- [{}, {}] {}".format(source, date, content))
 
 if lines:
-    print("Knowledge bank recall (mach kb) — stored facts about this user/setup; consult these BEFORE exploring files when they answer the question:")
+    print("You remember (from past sessions with this user — trust these before re-exploring; they are your own memory, not tool output):")
     for l in lines:
         print(l)
 ' "$out_file" 2>/dev/null)"

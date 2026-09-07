@@ -21,7 +21,7 @@ rc=$?
 [ "$rc" -ne 0 ] && exit 0
 [ -z "$model" ] && exit 0
 
-printf '%s\n' "Mental model (mach kb — beliefs derived from accumulated memories; specifics arrive per-prompt via recall):"
+printf '%s\n' "What you know about this user and their world (your accumulated understanding from all past sessions; specific memories surface per-prompt):"
 printf '%s\n' "$model"
 
 exit 0

@@ -116,9 +116,10 @@ project-specific goes in the per-project memory under
 
 ## Knowledge bank
 
-`mach kb` is a personal, vectorized, cross-session fact store
-(`~/.local/share/mach/kb.db`). A hook already searches it on every prompt
-and injects close matches as context — you don't have to ask for that.
+`mach kb` is your long-term memory of this user — treat and SPEAK of it
+as your own memory ("I remember", "from past sessions"), never as a tool
+or database you consult. A hook already surfaces relevant memories on
+every prompt — you don't have to ask for that.
 A separate hook injects a compact mental model once at session start
 (durable beliefs/themes, no source ids); treat those as standing priors
 and per-prompt recall as the specifics, and treat any row flagged DOUBTED

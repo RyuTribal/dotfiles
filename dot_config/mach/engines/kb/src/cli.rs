@@ -45,6 +45,8 @@ fn print_help() {
     println!("  insights [--flagged]    list derived insights and themes (confidence + source ids)");
     println!("  insight-forget <id>     permanently delete an insight or theme");
     println!("  tree                    render the theme -> insight -> memory hierarchy");
+    println!("  model [--json]          compact mental-model view (active themes/insights only,");
+    println!("                          no source ids or memory leaves) for context injection");
 }
 
 /// Runs the kb CLI given the arguments following `kb` in `mach kb ...`.
@@ -60,6 +62,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Some("insights") => cmd_insights(args),
         Some("insight-forget") => cmd_insight_forget(args),
         Some("tree") => cmd_tree(args),
+        Some("model") => cmd_model(args),
         Some("-h") | Some("--help") => {
             print_help();
             Ok(())
@@ -1104,4 +1107,112 @@ fn cmd_tree(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+// --- model: compact always-on mental-model view for context injection ---
+
+/// Renders one `mach kb model` line for a single row: kind and confidence
+/// up front for quick scanning, doubted rows keep their line but gain a
+/// trailing marker rather than being hidden — a doubted belief is still a
+/// belief worth surfacing, just one to treat as a hypothesis.
+fn format_model_row(row: &store::ModelRow) -> String {
+    let kind = match row.kind {
+        store::ModelKind::Theme => "theme",
+        store::ModelKind::Belief => "belief",
+    };
+    let indent = if row.nested { "  " } else { "" };
+    let doubt = if row.doubted { " [DOUBTED — evidence under review]" } else { "" };
+    format!("{}- [{}, confidence {:.2}] {}{}", indent, kind, row.confidence, row.text, doubt)
+}
+
+#[derive(Serialize)]
+struct ModelRowJson {
+    kind: &'static str,
+    confidence: f64,
+    text: String,
+    doubted: bool,
+    nested: bool,
+}
+
+fn to_model_row_json(row: &store::ModelRow) -> ModelRowJson {
+    ModelRowJson {
+        kind: match row.kind {
+            store::ModelKind::Theme => "theme",
+            store::ModelKind::Belief => "belief",
+        },
+        confidence: row.confidence,
+        text: row.text.clone(),
+        doubted: row.doubted,
+        nested: row.nested,
+    }
+}
+
+fn cmd_model(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut json = false;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--json" => json = true,
+            "-h" | "--help" => {
+                println!("usage: mach kb model [--json]");
+                println!(
+                    "       compact mental-model view: all active (non-invalidated) insights and \
+                     themes, tree-ordered — no source ids, no memory leaves. Empty store prints \
+                     nothing. Meant for cheap always-on context injection (see \
+                     ~/.config/claude-hooks/kb-model.sh); use `mach kb tree` or `mach kb insights` \
+                     for the full picture with citations."
+                );
+                return Ok(());
+            }
+            other => {
+                eprintln!("mach kb model: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let conn = store::open().map_err(to_io)?;
+    let rows = store::mental_model(&conn).map_err(to_io)?;
+
+    if json {
+        let json_rows: Vec<ModelRowJson> = rows.iter().map(to_model_row_json).collect();
+        println!("{}", serde_json::to_string(&json_rows)?);
+    } else {
+        for row in &rows {
+            println!("{}", format_model_row(row));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(kind: store::ModelKind, confidence: f64, text: &str, doubted: bool, nested: bool) -> store::ModelRow {
+        store::ModelRow { kind, confidence, text: text.to_string(), doubted, nested }
+    }
+
+    #[test]
+    fn format_model_row_renders_theme_and_belief_with_confidence() {
+        let theme = row(store::ModelKind::Theme, 0.8, "a recurring pattern", false, false);
+        assert_eq!(format_model_row(&theme), "- [theme, confidence 0.80] a recurring pattern");
+
+        let belief = row(store::ModelKind::Belief, 0.55, "the user prefers X", false, false);
+        assert_eq!(format_model_row(&belief), "- [belief, confidence 0.55] the user prefers X");
+    }
+
+    #[test]
+    fn format_model_row_indents_nested_rows_one_level() {
+        let nested = row(store::ModelKind::Belief, 0.6, "nested insight", false, true);
+        assert_eq!(format_model_row(&nested), "  - [belief, confidence 0.60] nested insight");
+    }
+
+    #[test]
+    fn format_model_row_appends_doubted_marker_but_keeps_the_line() {
+        let doubted = row(store::ModelKind::Belief, 0.5, "a shaky belief", true, false);
+        assert_eq!(
+            format_model_row(&doubted),
+            "- [belief, confidence 0.50] a shaky belief [DOUBTED — evidence under review]"
+        );
+    }
 }

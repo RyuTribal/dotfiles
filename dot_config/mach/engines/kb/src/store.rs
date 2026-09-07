@@ -1130,6 +1130,79 @@ pub fn themed_insight_ids(conn: &Connection) -> Result<std::collections::HashSet
     Ok(set)
 }
 
+/// Kind of a `mental_model` row — mirrors the literal words `mach kb model`
+/// prints (`theme` / `belief`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelKind {
+    Theme,
+    Belief,
+}
+
+/// One row of the mental-model view (`mach kb model`): a theme or a
+/// level-1 insight, stripped down to what's worth spending tokens on for
+/// always-on context injection — no source ids, no memory leaves. `nested`
+/// marks an insight printed under the theme that folded it in.
+#[derive(Debug, Clone)]
+pub struct ModelRow {
+    pub kind: ModelKind,
+    pub confidence: f64,
+    pub text: String,
+    pub doubted: bool,
+    pub nested: bool,
+}
+
+/// Builds the tree-ordered mental model over all active insights and
+/// themes: themes first (by id), each immediately followed by its own
+/// level-1 insights (in the theme's `source_ids` order), then any level-1
+/// insights not yet folded into a theme (by id). Same shape `mach kb tree`
+/// renders, minus the memory citations — this view exists to be cheap
+/// enough to inject on every session start, not to support investigation.
+pub fn mental_model(conn: &Connection) -> Result<Vec<ModelRow>, KbError> {
+    let mut themes = active_insights_by_level(conn, 2)?;
+    themes.sort_by_key(|t| t.id);
+    let mut level1 = active_insights_by_level(conn, 1)?;
+    level1.sort_by_key(|i| i.id);
+    let themed = themed_insight_ids(conn)?;
+
+    let mut rows = Vec::new();
+    for theme in &themes {
+        rows.push(ModelRow {
+            kind: ModelKind::Theme,
+            confidence: theme.confidence,
+            text: theme.text.clone(),
+            doubted: theme.is_flagged(),
+            nested: false,
+        });
+        for sid in &theme.source_ids {
+            if let Some(rest) = sid.strip_prefix('i').or_else(|| sid.strip_prefix('I')) {
+                if let Ok(iid) = rest.parse::<i64>() {
+                    if let Some(ins) = level1.iter().find(|i| i.id == iid) {
+                        rows.push(ModelRow {
+                            kind: ModelKind::Belief,
+                            confidence: ins.confidence,
+                            text: ins.text.clone(),
+                            doubted: ins.is_flagged(),
+                            nested: true,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    for ins in level1.iter().filter(|i| !themed.contains(&i.id)) {
+        rows.push(ModelRow {
+            kind: ModelKind::Belief,
+            confidence: ins.confidence,
+            text: ins.text.clone(),
+            doubted: ins.is_flagged(),
+            nested: false,
+        });
+    }
+
+    Ok(rows)
+}
+
 /// Recurrence reinforcement: appends `new_memory_ids` to an insight's
 /// `source_ids` (deduped against what's already there), bumps `confidence`
 /// by `0.05` per new id (capped at `0.9`, the same ceiling fresh insights
@@ -2019,6 +2092,72 @@ mod tests {
         assert!(themed.contains(&a));
         assert!(themed.contains(&b));
         assert!(!themed.contains(&c), "c is only cited by an invalidated theme");
+    }
+
+    #[test]
+    fn mental_model_is_empty_for_an_empty_store() {
+        let conn = mem_conn();
+        assert!(mental_model(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mental_model_orders_themes_before_their_insights_then_unthemed_insights() {
+        let conn = mem_conn();
+        let a = insert_insight(&conn, "insight a", 0.5, &["1".into(), "2".into()], None).unwrap();
+        let b = insert_insight(&conn, "insight b", 0.6, &["1".into(), "2".into()], None).unwrap();
+        let unthemed = insert_insight(&conn, "unthemed insight", 0.7, &["1".into(), "2".into()], None).unwrap();
+        insert_theme(&conn, "a theme", 0.55, &[format!("i{}", a), format!("i{}", b), "3".into()], None).unwrap();
+
+        let rows = mental_model(&conn).unwrap();
+        assert_eq!(rows.len(), 4, "1 theme + 2 nested insights + 1 unthemed insight");
+
+        assert_eq!(rows[0].kind, ModelKind::Theme);
+        assert_eq!(rows[0].text, "a theme");
+        assert!(!rows[0].nested);
+
+        assert_eq!(rows[1].kind, ModelKind::Belief);
+        assert_eq!(rows[1].text, "insight a");
+        assert!(rows[1].nested, "insight a is nested under its theme");
+
+        assert_eq!(rows[2].kind, ModelKind::Belief);
+        assert_eq!(rows[2].text, "insight b");
+        assert!(rows[2].nested, "insight b is nested under its theme");
+
+        assert_eq!(rows[3].kind, ModelKind::Belief);
+        assert_eq!(rows[3].text, "unthemed insight");
+        assert!(!rows[3].nested, "not folded into any theme");
+        assert_eq!(rows[3].confidence, 0.7);
+        let _ = unthemed; // id only asserted via ordering/content above
+    }
+
+    #[test]
+    fn mental_model_marks_flagged_rows_as_doubted_at_both_levels() {
+        let conn = mem_conn();
+        let a = insert_insight(&conn, "a flagged insight", 0.5, &["1".into(), "2".into()], None).unwrap();
+        let theme_id =
+            insert_theme(&conn, "a flagged theme", 0.5, &[format!("i{}", a), "3".into()], None).unwrap();
+        let now = now_rfc3339();
+        flag_insight(&conn, a, &now).unwrap();
+        flag_insight(&conn, theme_id, &now).unwrap();
+
+        let rows = mental_model(&conn).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].doubted, "theme was flagged");
+        assert!(rows[1].doubted, "nested insight was flagged");
+    }
+
+    #[test]
+    fn mental_model_excludes_invalidated_insights_and_themes() {
+        let conn = mem_conn();
+        let a = insert_insight(&conn, "still active", 0.5, &["1".into(), "2".into()], None).unwrap();
+        let gone = insert_insight(&conn, "invalidated", 0.5, &["1".into(), "2".into()], None).unwrap();
+        let now = now_rfc3339();
+        conn.execute("UPDATE insights SET invalidated_at = ?1 WHERE id = ?2", params![now, gone]).unwrap();
+
+        let rows = mental_model(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "still active");
+        let _ = a;
     }
 
     #[test]

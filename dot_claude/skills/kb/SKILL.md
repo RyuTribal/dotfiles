@@ -7,10 +7,32 @@ description: Use on EVERY substantive user prompt — first to triage the auto-i
 
 `mach kb` is a small local tool that stores durable facts about the user
 (preferences, projects, people, decisions) with embeddings, so they can be
-found later by meaning, not just keyword. A `UserPromptSubmit` hook already
-searches it automatically on every prompt and injects any close matches as
-context — this skill is for triaging that recall and for *deliberate*
-saves and searches you do yourself.
+found later by meaning, not just keyword. Two hooks keep this flowing
+automatically: a `SessionStart` hook injects the mental model once per
+session (the compact `mach kb model` view — active themes and insights,
+tree-ordered), and a `UserPromptSubmit` hook searches for and injects
+close-matching specifics on every prompt. This skill is for triaging both
+layers and for *deliberate* saves and searches you do yourself.
+
+## Two layers of memory
+
+- **Mental model (session start, once).** Coarse, durable beliefs and
+  themes derived from many memories over time — "what kind of user/project
+  is this, generally." Treat these as your standing priors for the whole
+  session, not something to re-derive.
+- **Recall (per prompt).** Specific memories and insights relevant to
+  *this* prompt. This is where detail and citations live — the model layer
+  deliberately omits them to stay cheap enough to inject every session.
+
+A row in the model marked `[DOUBTED — evidence under review]` is a
+**hypothesis, not a fact** — re-verification flagged it because the
+evidence no longer clearly supports it. Weigh it accordingly: useful
+context to keep in mind, not something to assert or act on as settled. If
+this session's own evidence confirms, contradicts, or refines a doubted
+(or any) belief, say so plainly and save the correcting fact (`mach kb
+add`) rather than silently overriding it — the next `mach kb reflect` /
+re-verification pass reconciles the belief itself; you don't edit insights
+directly.
 
 ## Memory-first protocol (every prompt)
 
@@ -35,7 +57,8 @@ The recall hook fires on every prompt. Your job per prompt:
    remember, never re-derive a third time.
 
 Never invoke exploration skills to re-establish what an injected recall
-already states.
+already states, and never re-establish what the session-start mental model
+already states either.
 
 ## Saving a fact
 

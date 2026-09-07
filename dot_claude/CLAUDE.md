@@ -119,7 +119,11 @@ project-specific goes in the per-project memory under
 `mach kb` is a personal, vectorized, cross-session fact store
 (`~/.local/share/mach/kb.db`). A hook already searches it on every prompt
 and injects close matches as context — you don't have to ask for that.
-Save durable user-facts deliberately, don't wait to be asked: `mach kb add
+A separate hook injects a compact mental model once at session start
+(durable beliefs/themes, no source ids); treat those as standing priors
+and per-prompt recall as the specifics, and treat any row flagged DOUBTED
+as a hypothesis to weigh, not a settled fact. Save durable user-facts
+deliberately, don't wait to be asked: `mach kb add
 "<fact>" --source "<context>"`. The `kb` skill covers what qualifies. Same
 rule as everywhere else in this file: **never store secrets or
 credentials in it.** Auto-extracted candidates land unreviewed —

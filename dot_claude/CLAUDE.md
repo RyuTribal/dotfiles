@@ -128,3 +128,10 @@ When a prompt arrives with injected kb recall that already answers it,
 answer from the recall first — don't reach for file exploration to
 rediscover what the bank just told you. Explore to VERIFY or extend,
 not to re-derive.
+
+**This outranks skill auto-triggering.** For "what is this project /
+what do you know about X" questions where the injected recall block
+already covers the answer: do NOT invoke exploration skills
+(caveman-explore, Explore agents, cold-start mapping) first. User
+instructions take precedence over skill trigger descriptions — this is
+one of them. Recall first, then explore only for what recall lacks.

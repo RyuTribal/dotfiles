@@ -194,6 +194,10 @@ Item { // Bar content region
                     Layout.fillWidth: true
                 }
 
+                RecordingIndicator {
+                    Layout.alignment: Qt.AlignVCenter
+                }
+
                 ClockWidget {
                     showDate: (Config.options.bar.verbose && root.useShortenedForm < 2)
                     Layout.alignment: Qt.AlignVCenter

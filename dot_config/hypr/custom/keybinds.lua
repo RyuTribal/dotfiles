@@ -26,3 +26,8 @@ hl.bind("SUPER + U", hl.dsp.exec_cmd("qs -c $qsConfig ipc call sweep toggle"), {
 -- J instead (mnemonic: Jot a note). Real GlobalShortcut (quickshell:noteToggle),
 -- unlike sweep's direct ipc-call exec_cmd above.
 hl.bind("SUPER+SHIFT + J", hl.dsp.global("quickshell:noteToggle"), { description = "Jot a note" }) -- Jot a note
+
+-- SUPER+SHIFT+M was already bound (Toggle mute, hyprland/keybinds.lua) and
+-- SUPER+ALT+M too (Toggle mic) -- used R instead (mnemonic: Record a
+-- meeting; also free, unlike the ALT+R screen-recording binds above).
+hl.bind("SUPER+SHIFT + R", hl.dsp.global("quickshell:meetingsToggle"), { description = "Meetings" }) -- Meetings

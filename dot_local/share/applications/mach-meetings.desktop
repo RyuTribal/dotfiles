@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Meetings
+Comment=Record and review meetings
+Icon=accessories-text-editor
+Exec=qs -c ii ipc call meetings toggle
+Terminal=false
+Categories=Utility;
+Keywords=meeting;record;tools;transcribe;

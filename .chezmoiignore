@@ -1,2 +1,9 @@
 .config/mach/target
 .local/share/mach/backups
+# Telegram bridge secret + its runtime state -- neither ever belongs under
+# chezmoi management (see mach/telegram.toml.example / install.sh's
+# onboarding block). Defensive: these paths already live outside
+# ~/.config/mach and dot_local's own subtree, so this line is a belt-and-
+# suspenders guard, not something normally reachable.
+.local/share/mach/telegram.toml
+.local/share/mach/telegram-state.json

@@ -41,6 +41,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 use crate::classify::run_claude;
@@ -48,7 +49,10 @@ use crate::embed::{Embedder, OllamaEmbedder};
 use crate::store::{self, KbError};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_IMPORTANCE: i64 = 6;
+/// Exposed (rather than kept private) so other callers of `file_note` /
+/// `file_note_with_image` -- namely `engines/telegram`'s bridge -- default
+/// to the exact same importance a plain `mach note` would.
+pub const DEFAULT_IMPORTANCE: i64 = 6;
 
 pub trait NoteLlm {
     fn call(&self, prompt: &str) -> Result<String, String>;
@@ -538,6 +542,140 @@ fn describe_image(claude_bin: &str, path: &Path, caption: &str) -> Option<String
     }
 }
 
+/// Outcome of running one note through the classify+embed+store pipeline —
+/// the reusable core of `run` below, factored out so a caller other than
+/// this CLI (the `engines/telegram` bridge) can file a note programmatically
+/// and compose its own confirmation/failure message instead of `run`'s
+/// stdout/notify-send behavior. Mirrors the fields `run` used to compute
+/// inline: classification result plus whether either soft-degradation path
+/// (`FallbackRaw` / `MissingEmbedding`) was hit and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FiledNote {
+    pub topic: String,
+    pub title: String,
+    pub facts: Vec<String>,
+    pub used_fallback: bool,
+    pub fallback_reason: Option<String>,
+    pub any_missing_embedding: bool,
+    pub embed_reason: Option<String>,
+}
+
+/// Classifies `note` (via `llm`), embeds each resulting fact (via
+/// `embedder`), and stores each directly on `conn` — exactly the pipeline
+/// `run` drives inline, extracted so it's callable without going through
+/// argv/stdin/$EDITOR at all. `image_stored_path`, when given, is appended
+/// as an `[image: PATH]` provenance suffix on each stored fact's content
+/// (never on the embedded text, nor on the facts reported back in
+/// `FiledNote` — those stay the classifier's plain wording); the image
+/// itself must already be copied into the permanent store by the caller
+/// (see `store_image`) before this is called.
+///
+/// A hard error here (`conn`/store failure) is the only way a note can be
+/// lost from this function's own logic — everything the classifier or
+/// embedder can do short of that degrades to `used_fallback` /
+/// `any_missing_embedding` instead, same as `run`'s inline version always
+/// guaranteed.
+pub fn file_note(
+    conn: &Connection,
+    llm: &dyn NoteLlm,
+    embedder: &dyn Embedder,
+    note: &str,
+    image_stored_path: Option<&Path>,
+    importance: i64,
+) -> Result<FiledNote, KbError> {
+    let existing_topics = store::distinct_projects(conn)?;
+    let today_full = store::now_rfc3339();
+    let today = today_full.get(0..10).unwrap_or(&today_full);
+
+    // A failed classifier call (spawn error, timeout, non-zero exit) is
+    // captured here (rather than discarded) purely so a "filed raw" report
+    // can say why — `parse_classification_verbose` treats the resulting
+    // empty output exactly like a malformed reply either way, so the note
+    // itself is never at risk from this.
+    let (output, llm_err) = match llm.call(&build_prompt(note, &existing_topics, today)) {
+        Ok(s) => (s, None),
+        Err(e) => (String::new(), Some(e)),
+    };
+    let (classification, used_fallback) = parse_classification_verbose(&output, note);
+
+    let slug = slugify(&classification.title);
+    let source = format!("note:{}", slug);
+
+    let mut any_missing_embedding = false;
+    let mut embed_err: Option<String> = None;
+    for fact in &classification.facts {
+        // Embed the fact's own semantic text (a trailing path would only
+        // dilute the vector), but store it with the image's permanent path
+        // appended for provenance -- an image-derived fact must always be
+        // traceable back to the source picture, whether or not the
+        // classifier's own wording happened to mention it.
+        let embedding = match embedder.embed(fact) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                any_missing_embedding = true;
+                if embed_err.is_none() {
+                    embed_err = Some(e.to_string());
+                }
+                None
+            }
+        };
+        let content = match image_stored_path {
+            Some(stored) => format!("{} [image: {}]", fact, stored.display()),
+            None => fact.clone(),
+        };
+        // Direct store call, not `mach kb add`'s subprocess/classifier
+        // path: a note is fresh, deliberate input (reviewed, not
+        // unreviewed) and the save-time supersession classifier is
+        // deliberately skipped — that's `mach kb reflect`'s job later.
+        store::insert(conn, &content, Some(&source), Some(&classification.topic), true, embedding.as_deref(), importance)?;
+    }
+
+    Ok(FiledNote {
+        topic: classification.topic,
+        title: classification.title,
+        facts: classification.facts,
+        used_fallback,
+        fallback_reason: if used_fallback {
+            Some(llm_err.unwrap_or_else(|| "classifier reply was empty or malformed".to_string()))
+        } else {
+            None
+        },
+        any_missing_embedding,
+        embed_reason: if any_missing_embedding {
+            Some(embed_err.unwrap_or_else(|| "could not reach ollama for embeddings".to_string()))
+        } else {
+            None
+        },
+    })
+}
+
+/// Same pipeline as `file_note`, but for an image note: describes
+/// `stored_image_path` (already copied into the permanent store by the
+/// caller — see `store_image`) with one vision call, folds `caption` (the
+/// text alongside the image, empty if none) into the same combined-note
+/// text `run`'s `--image` branch builds, and files the result through
+/// `file_note`. Used by the telegram bridge's photo handling so it gets a
+/// topic/title/facts exactly like `mach note --image` does, without going
+/// through argv/stdin at all.
+pub fn file_note_with_image(
+    conn: &Connection,
+    llm: &dyn NoteLlm,
+    embedder: &dyn Embedder,
+    claude_bin: &str,
+    stored_image_path: &Path,
+    caption: &str,
+    importance: i64,
+) -> Result<FiledNote, KbError> {
+    let description = describe_image(claude_bin, stored_image_path, caption).unwrap_or_else(|| UNDESCRIBED_IMAGE.to_string());
+    let mut combined = String::new();
+    if !caption.trim().is_empty() {
+        combined.push_str(caption.trim());
+        combined.push_str("\n\n");
+    }
+    combined.push_str(&format!("Image note: {}. Image stored at {}.", description, stored_image_path.display()));
+    file_note(conn, llm, embedder, &combined, Some(stored_image_path), importance)
+}
+
 /// Runs `mach note ...` (also reachable as `note ...` via the argv0
 /// dispatch in `mach`'s main). Content comes from a positional argument, or
 /// — bare `mach note` — from stdin if piped, else `$EDITOR`. `--image PATH`
@@ -671,94 +809,45 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
             return Err(to_io(e));
         }
     };
-    let existing_topics = match store::distinct_projects(&conn) {
-        Ok(t) => t,
+
+    let llm = ProcessNoteLlm::new();
+    let embedder = OllamaEmbedder::new();
+    let filed = match file_note(&conn, &llm, &embedder, &note, image_stored_path.as_deref(), importance) {
+        Ok(f) => f,
         Err(e) => {
             maybe_notify(&notifier, quiet, &NoteOutcome::HardFailure { reason: e.to_string() }, &note);
             return Err(to_io(e));
         }
     };
-    let today = store::now_rfc3339();
-    let today = today.get(0..10).unwrap_or(&today);
-
-    let llm = ProcessNoteLlm::new();
-    // A failed classifier call (spawn error, timeout, non-zero exit) is
-    // captured here (rather than discarded) purely so a "filed raw"
-    // notification below can say why — `parse_classification_verbose`
-    // treats the resulting empty output exactly like a malformed reply
-    // either way, so the note itself is never at risk from this.
-    let (output, llm_err) = match llm.call(&build_prompt(&note, &existing_topics, today)) {
-        Ok(s) => (s, None),
-        Err(e) => (String::new(), Some(e)),
-    };
-    let (classification, used_fallback) = parse_classification_verbose(&output, &note);
-
-    let slug = slugify(&classification.title);
-    let source = format!("note:{}", slug);
-
-    let embedder = OllamaEmbedder::new();
-    let mut any_missing_embedding = false;
-    let mut embed_err: Option<String> = None;
-    for fact in &classification.facts {
-        // Embed the fact's own semantic text (a trailing path would only
-        // dilute the vector), but store it with the image's permanent
-        // path appended for provenance -- an image-derived fact must
-        // always be traceable back to the source picture, whether or not
-        // the classifier's own wording happened to mention it.
-        let embedding = match embedder.embed(fact) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                any_missing_embedding = true;
-                if embed_err.is_none() {
-                    embed_err = Some(e.to_string());
-                }
-                None
-            }
-        };
-        let content = match &image_stored_path {
-            Some(stored) => format!("{} [image: {}]", fact, stored.display()),
-            None => fact.clone(),
-        };
-        // Direct store call, not `mach kb add`'s subprocess/classifier
-        // path: a note is fresh, deliberate input (reviewed, not
-        // unreviewed) and the save-time supersession classifier is
-        // deliberately skipped — that's `mach kb reflect`'s job later.
-        if let Err(e) =
-            store::insert(&conn, &content, Some(&source), Some(&classification.topic), true, embedding.as_deref(), importance)
-        {
-            maybe_notify(&notifier, quiet, &NoteOutcome::HardFailure { reason: e.to_string() }, &note);
-            return Err(to_io(e));
-        }
-    }
 
     // Exactly one of these fires (or none, on a clean success): a raw-
     // storage fallback is the more significant degradation, so it takes
     // priority over a same-note missing-embedding notice if somehow both
     // happened at once.
-    if used_fallback {
-        let reason = llm_err.unwrap_or_else(|| "classifier reply was empty or malformed".to_string());
+    if filed.used_fallback {
+        let reason = filed.fallback_reason.clone().unwrap_or_else(|| "classifier reply was empty or malformed".to_string());
         maybe_notify(&notifier, quiet, &NoteOutcome::FallbackRaw { reason }, &note);
-    } else if any_missing_embedding {
-        let reason = embed_err.unwrap_or_else(|| "could not reach ollama for embeddings".to_string());
+    } else if filed.any_missing_embedding {
+        let reason = filed.embed_reason.clone().unwrap_or_else(|| "could not reach ollama for embeddings".to_string());
         maybe_notify(&notifier, quiet, &NoteOutcome::MissingEmbedding { reason }, &note);
     }
 
     // Success = silence under --quiet: none of the stdout below runs, and
     // (per the branch above) nothing was notified either.
     if !quiet {
-        if any_missing_embedding {
+        if filed.any_missing_embedding {
             println!(
                 "warning: could not reach ollama for embeddings — stored without them; \
                  recall will find these by keyword only until re-embedded"
             );
         }
 
-        let n = classification.facts.len();
-        println!("filed {} {} under \"{}\"", n, if n == 1 { "memory" } else { "memories" }, classification.topic);
-        println!("  refer to it as: \"{}\"", classification.title);
-        for fact in &classification.facts {
-            // Mirrors exactly what got stored (see the insert loop above):
-            // an image-derived fact's provenance suffix included.
+        let n = filed.facts.len();
+        println!("filed {} {} under \"{}\"", n, if n == 1 { "memory" } else { "memories" }, filed.topic);
+        println!("  refer to it as: \"{}\"", filed.title);
+        for fact in &filed.facts {
+            // Mirrors exactly what got stored (see `file_note`'s insert
+            // loop): an image-derived fact's provenance suffix included.
             match &image_stored_path {
                 Some(stored) => println!("  - {} [image: {}]", fact, stored.display()),
                 None => println!("  - {}", fact),
@@ -1000,5 +1089,114 @@ mod tests {
         let calls = quiet.calls.borrow();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0], (Urgency::Normal, "Note saved unembedded (ollama down)".to_string()));
+    }
+
+    // ---------- file_note: the reusable programmatic pipeline ----------
+
+    struct FakeEmbedder;
+
+    impl Embedder for FakeEmbedder {
+        fn embed(&self, text: &str) -> Result<Vec<f32>, KbError> {
+            Ok(text.bytes().map(|b| b as f32).collect())
+        }
+    }
+
+    struct FailingEmbedder;
+
+    impl Embedder for FailingEmbedder {
+        fn embed(&self, _text: &str) -> Result<Vec<f32>, KbError> {
+            Err(KbError::Embed("ollama unreachable".to_string()))
+        }
+    }
+
+    fn scratch_conn() -> Connection {
+        store::open_with_path(Path::new(":memory:")).unwrap()
+    }
+
+    #[test]
+    fn file_note_stores_every_fact_and_reports_no_degradation_on_a_clean_reply() {
+        let conn = scratch_conn();
+        let llm = FakeNoteLlm { reply: "TOPIC: t\nTITLE: a title\nFACT: fact one\nFACT: fact two\n".to_string() };
+        let filed = file_note(&conn, &llm, &FakeEmbedder, "irrelevant raw note", None, 6).unwrap();
+
+        assert_eq!(filed.topic, "t");
+        assert_eq!(filed.title, "a title");
+        assert_eq!(filed.facts, vec!["fact one".to_string(), "fact two".to_string()]);
+        assert!(!filed.used_fallback);
+        assert!(filed.fallback_reason.is_none());
+        assert!(!filed.any_missing_embedding);
+        assert!(filed.embed_reason.is_none());
+
+        let stored = store::list(&conn, None, false).unwrap();
+        assert_eq!(stored.len(), 2);
+        assert!(stored.iter().all(|m| m.project.as_deref() == Some("t")));
+        assert!(stored.iter().all(|m| m.source.as_deref() == Some("note:a-title")));
+    }
+
+    #[test]
+    fn file_note_appends_image_provenance_to_stored_content_but_not_to_reported_facts() {
+        let conn = scratch_conn();
+        let llm = FakeNoteLlm { reply: "TOPIC: t\nTITLE: a title\nFACT: the fact\n".to_string() };
+        let image_path = Path::new("/tmp/some-image.png");
+        let filed = file_note(&conn, &llm, &FakeEmbedder, "a note", Some(image_path), 6).unwrap();
+
+        assert_eq!(filed.facts, vec!["the fact".to_string()]);
+        let stored = store::list(&conn, None, false).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].content.contains("the fact"));
+        assert!(stored[0].content.contains("/tmp/some-image.png"));
+    }
+
+    #[test]
+    fn file_note_reports_fallback_on_a_malformed_classifier_reply_but_still_stores_the_raw_note() {
+        let conn = scratch_conn();
+        let llm = FakeNoteLlm { reply: "not a valid reply".to_string() };
+        let filed = file_note(&conn, &llm, &FakeEmbedder, "remember to buy milk", None, 6).unwrap();
+
+        assert!(filed.used_fallback);
+        assert_eq!(filed.fallback_reason.as_deref(), Some("classifier reply was empty or malformed"));
+        assert_eq!(filed.topic, "notes");
+        assert_eq!(filed.facts, vec!["remember to buy milk".to_string()]);
+
+        let stored = store::list(&conn, None, false).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].content, "remember to buy milk");
+    }
+
+    #[test]
+    fn file_note_reports_missing_embedding_but_still_stores_unembedded() {
+        let conn = scratch_conn();
+        let llm = FakeNoteLlm { reply: "TOPIC: t\nTITLE: a title\nFACT: the fact\n".to_string() };
+        let filed = file_note(&conn, &llm, &FailingEmbedder, "a note", None, 6).unwrap();
+
+        assert!(filed.any_missing_embedding);
+        assert_eq!(filed.embed_reason.as_deref(), Some("ollama unreachable"));
+        let stored = store::list(&conn, None, false).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].embedding.is_none());
+    }
+
+    #[test]
+    fn file_note_with_image_combines_caption_and_description_and_files_through_file_note() {
+        let conn = scratch_conn();
+        let llm = FakeNoteLlm { reply: "TOPIC: t\nTITLE: a title\nFACT: the fact\n".to_string() };
+        // No real `claude` binary needed: an unresolvable path makes
+        // `describe_image`'s spawn fail, which is exactly the "never lose
+        // the note" fallback path (`UNDESCRIBED_IMAGE`) this test exercises.
+        let filed = file_note_with_image(
+            &conn,
+            &llm,
+            &FakeEmbedder,
+            "/nonexistent/definitely-not-claude-xyz",
+            Path::new("/tmp/photo.jpg"),
+            "my new desk setup",
+            6,
+        )
+        .unwrap();
+
+        assert_eq!(filed.topic, "t");
+        let stored = store::list(&conn, None, false).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].content.contains("/tmp/photo.jpg"));
     }
 }

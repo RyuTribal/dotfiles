@@ -3,6 +3,14 @@ name = "machd"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+telegram = { package = "telegram-engine", path = "../engines/telegram" }
+# Already resolved transitively in this workspace's Cargo.lock (ratatui's
+# crossterm backend pulls it in for terminal resize handling), so adding it
+# here as a direct dependency for SIGTERM/SIGINT handling costs nothing new
+# to build.
+signal-hook = "0.3"
+
 [[bin]]
 name = "machd"
 path = "src/main.rs"

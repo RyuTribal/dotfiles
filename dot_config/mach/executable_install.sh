@@ -129,6 +129,102 @@ install_kb_backup_timer() {
 }
 install_kb_backup_timer
 
+# whisper.cpp (telegram voice-note transcription) — pacman first, per the
+# user's package install discipline: this script never pip/npm/cargo-installs
+# a transcription tool itself, only checks for one and reports how to get it.
+# Soft check: a missing binary must not fail the whole install -- the
+# telegram bridge's voice path degrades gracefully (audio saved untranscribed,
+# a clear reply to the user) when whisper.cpp isn't there. The multilingual
+# ggml-base model (~142MB) is auto-downloaded to ~/.local/share/mach/whisper/
+# on first actual use, not here -- this only warns about that size up front.
+check_whisper() {
+  local bin=""
+  for candidate in whisper-cli whisper-cpp whisper; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      bin="$candidate"
+      break
+    fi
+  done
+  if [ -n "$bin" ]; then
+    echo "whisper.cpp: found '$bin' on PATH — telegram voice notes will be transcribed."
+    echo "             (first voice note triggers a ~142MB model download to ~/.local/share/mach/whisper/)"
+    return
+  fi
+  echo "NOTE: no whisper.cpp binary (whisper-cli/whisper-cpp/whisper) found on PATH."
+  echo "      Telegram voice notes will still be saved, just untranscribed, until this is installed."
+  if pacman -Si whisper.cpp >/dev/null 2>&1; then
+    echo "      Install it with:  sudo pacman -S whisper.cpp"
+  else
+    echo "      Not in the official repos on this system — check the AUR:  paru -S whisper.cpp-git (or similar)"
+  fi
+  if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "      Also missing: ffmpeg (needed to convert Telegram's voice/audio format for whisper.cpp) —  sudo pacman -S ffmpeg"
+  fi
+}
+check_whisper
+
+# mach-telegramd (Telegram note bridge) — same soft-install treatment as the
+# other systemd units: a non-systemd environment must not fail the whole
+# install. Unlike the reflect/backup timers this is a persistent long-poll
+# daemon (Type=simple), not a periodic oneshot, so there is exactly one unit,
+# no timer. Its own ConditionPathExists means enabling it before a real
+# telegram.toml exists is safe and expected — it simply won't start yet.
+install_telegramd_unit() {
+  local unit_dir="$HOME/.config/systemd/user"
+  install -Dm644 "$HERE/systemd/mach-telegramd.service" "$unit_dir/mach-telegramd.service"
+  echo "installed: $unit_dir/mach-telegramd.service"
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "NOTE: systemctl not found — unit installed but not enabled. Run 'machd --foreground' by hand instead."
+    return
+  fi
+  if ! systemctl --user list-units >/dev/null 2>&1; then
+    echo "NOTE: no systemd --user session available here — unit installed but not enabled."
+    return
+  fi
+  systemctl --user daemon-reload
+  if systemctl --user enable --now mach-telegramd.service >/dev/null 2>&1; then
+    echo "enabled: mach-telegramd.service (starts once ~/.local/share/mach/telegram.toml exists — see below if it doesn't yet)"
+  else
+    echo "WARNING: 'systemctl --user enable --now mach-telegramd.service' failed — enable it by hand once mach is on PATH."
+  fi
+}
+install_telegramd_unit
+
+# Telegram config onboarding — non-interactive (this runs unattended under
+# chezmoi apply too), so it only ever prints instructions and never blocks
+# or prompts. The real config deliberately lives outside this chezmoi-
+# managed repo (~/.local/share/mach/telegram.toml, not ~/.config/mach/...)
+# because it holds a secret bot token -- see the global secrets-handling
+# rule this install script otherwise never touches.
+telegram_config_onboarding() {
+  local cfg="$HOME/.local/share/mach/telegram.toml"
+  if [ -f "$cfg" ]; then
+    return
+  fi
+  echo
+  echo "=========================================================================="
+  echo " Telegram note bridge: not configured yet"
+  echo "=========================================================================="
+  echo " mach-telegramd is installed (and enabled, if systemd is available) but"
+  echo " won't start until you give it a bot token. Three steps:"
+  echo
+  echo " 1. Create a bot: message @BotFather on Telegram, send /newbot, follow"
+  echo "    its prompts. It gives you a token like '123456:ABC-def...'."
+  echo " 2. Get your own numeric user id: message @userinfobot on Telegram."
+  echo " 3. Create the real config (OUTSIDE this repo — it holds a secret, so"
+  echo "    it must never live under ~/.config where chezmoi can pick it up):"
+  echo
+  echo "      mkdir -p ~/.local/share/mach"
+  echo "      cp $HERE/mach/telegram.toml.example $cfg"
+  echo "      \$EDITOR $cfg"
+  echo
+  echo " Then start the bridge:  systemctl --user restart mach-telegramd.service"
+  echo " (or run 'machd --foreground' by hand to watch it directly)."
+  echo "=========================================================================="
+}
+telegram_config_onboarding
+
 echo
 echo "Done. Reload quickshell if running, then press SUPER+U."
 echo "Or test now:  qs -c ii ipc call sweep toggle"

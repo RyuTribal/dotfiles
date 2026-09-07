@@ -1,0 +1,21 @@
+[package]
+name = "telegram-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kb = { package = "kb-engine", path = "../kb" }
+# Same version/feature kb-engine already builds with (bundled sqlite3) --
+# needed directly here only for the `rusqlite::Connection` type in
+# `pipeline`'s signatures; Cargo unifies the actual build either way.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# "tls" (rustls) is required here unlike kb-engine's ureq use (which only
+# ever talks to a local, plain-http ollama) -- api.telegram.org is https-only.
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[lib]
+name = "telegram"
+path = "src/lib.rs"

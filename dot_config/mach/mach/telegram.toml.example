@@ -1,0 +1,28 @@
+# Example config for the Telegram note bridge (mach-telegramd).
+#
+# This is a TEMPLATE, checked into the repo with placeholder values only.
+# The REAL file with your real bot token belongs OUTSIDE this chezmoi-
+# managed tree, at:
+#
+#     ~/.local/share/mach/telegram.toml
+#
+# ...never under ~/.config -- a bot token is a secret, and anything under
+# ~/.config here gets synced/committed by chezmoi. Copy this file there and
+# fill in real values:
+#
+#     mkdir -p ~/.local/share/mach
+#     cp mach/telegram.toml.example ~/.local/share/mach/telegram.toml
+#     $EDITOR ~/.local/share/mach/telegram.toml
+#
+# See install.sh's onboarding output for how to get a bot token (@BotFather)
+# and your own numeric user id (@userinfobot).
+
+# The bot token @BotFather gives you when you create the bot, in its
+# original "<digits>:<random string>" form. Never share this -- anyone who
+# has it can act as your bot.
+bot_token = "CHANGEME_BOT_TOKEN"
+
+# Your own numeric Telegram user id (from @userinfobot), as a string. This
+# is the ONLY sender mach-telegramd will ever process messages from --
+# everyone else is silently dropped.
+allowed_user_id = "CHANGEME_ALLOWED_USER_ID"

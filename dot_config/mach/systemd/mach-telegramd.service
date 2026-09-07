@@ -1,0 +1,25 @@
+[Unit]
+Description=mach-telegramd — Telegram note bridge daemon
+# Config-gated: a missing/unconfigured telegram.toml means the unit doesn't
+# even start (rather than starting and immediately clean-exiting, which
+# Restart=on-failure would otherwise never retry anyway since a clean exit
+# isn't a failure -- ConditionPathExists just avoids the pointless attempt
+# and shows up as "condition failed", not "failed", in systemctl status).
+# See mach/telegram.toml.example and install.sh's onboarding block.
+ConditionPathExists=%h/.local/share/mach/telegram.toml
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/machd
+# The long-poll loop itself backs off (30s -> 5min cap) on a repeatedly
+# failing getUpdates call -- offline/asleep laptop, DNS hiccup, a Telegram
+# outage -- so it does not crash-loop on its own. This Restart=on-failure
+# is the outer safety net for the daemon PROCESS dying outright (panic,
+# OOM-kill, a bug), not for ordinary connectivity loss.
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

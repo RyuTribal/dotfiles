@@ -183,6 +183,11 @@ fn init_schema(conn: &Connection) -> Result<(), KbError> {
             id INTEGER PRIMARY KEY CHECK (id = 1),
             last_run_at TEXT,
             last_memory_id INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS dedupe_seen (
+            id_a INTEGER NOT NULL,
+            id_b INTEGER NOT NULL,
+            PRIMARY KEY (id_a, id_b)
         );",
     )?;
     Ok(())
@@ -285,6 +290,16 @@ fn migrate_v3_to_v4(conn: &Connection) -> Result<(), KbError> {
     Ok(())
 }
 
+/// `PRAGMA user_version`-gated, idempotent 4 -> 5 migration: the nightly
+/// dedupe pass's `dedupe_seen` table. `init_schema`'s `CREATE TABLE IF NOT
+/// EXISTS` already creates it on any database (fresh or pre-existing)
+/// before `migrate` ever runs, so the only work left here is bumping the
+/// version.
+fn migrate_v4_to_v5(conn: &Connection) -> Result<(), KbError> {
+    conn.execute("PRAGMA user_version = 5", [])?;
+    Ok(())
+}
+
 /// Runs every migration step whose version gate hasn't been cleared yet.
 /// Runs on every `open`, but the version gate makes every call after the
 /// first one a single cheap `PRAGMA` read.
@@ -301,6 +316,9 @@ fn migrate(conn: &Connection) -> Result<(), KbError> {
     }
     if version < 4 {
         migrate_v3_to_v4(conn)?;
+    }
+    if version < 5 {
+        migrate_v4_to_v5(conn)?;
     }
     Ok(())
 }
@@ -1430,6 +1448,109 @@ pub fn reinforce_insight(conn: &Connection, id: i64, new_memory_ids: &[i64], now
     Ok(n > 0)
 }
 
+// --- nightly dedupe pass ---
+
+/// Normalizes a candidate pair into `(min, max)` order — `dedupe_seen`'s
+/// storage and lookup key, so `(a, b)` and `(b, a)` are always the same row.
+fn normalize_pair(a: i64, b: i64) -> (i64, i64) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Records that a dedupe candidate pair was judged genuinely `DISTINCT` —
+/// never asked about again on a future reflect run. Deliberately NOT called
+/// for a malformed judge reply or a failed `claude` call: those get a fresh
+/// chance next run instead of being silenced forever (see
+/// `reflect::DedupeVerdict::Malformed`). A pair that instead resolves to a
+/// tombstone never needs this either — the loser drops out of the active
+/// pool that candidate generation scans, so it can't resurface as a pair.
+pub fn mark_dedupe_seen(conn: &Connection, id_a: i64, id_b: i64) -> Result<(), KbError> {
+    let (a, b) = normalize_pair(id_a, id_b);
+    conn.execute("INSERT OR IGNORE INTO dedupe_seen (id_a, id_b) VALUES (?1, ?2)", params![a, b])?;
+    Ok(())
+}
+
+/// Every pair ever recorded by `mark_dedupe_seen`, as normalized `(min,
+/// max)` tuples — loaded once per reflect run so candidate generation
+/// (`reflect::dedupe_candidate_pairs`) can exclude them with a plain set
+/// lookup instead of a query per pair.
+pub fn dedupe_seen_pairs(conn: &Connection) -> Result<std::collections::HashSet<(i64, i64)>, KbError> {
+    let mut stmt = conn.prepare("SELECT id_a, id_b FROM dedupe_seen")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let mut out = std::collections::HashSet::new();
+    for r in rows {
+        out.insert(r?);
+    }
+    Ok(out)
+}
+
+/// Merges a dedupe loser's earned reinforcement into its winner, then
+/// tombstones the loser via the ordinary `supersede` mechanics: `winner`'s
+/// `access_count` absorbs `loser`'s (summed, so reinforcement earned by
+/// either copy survives), and `stability` becomes the max of the two
+/// (`effective_stability`, so a NULL column on either side still compares
+/// sanely). Returns `false` — without merging or tombstoning anything — if
+/// either id doesn't exist or `loser_id` is already tombstoned, mirroring
+/// `supersede`'s own no-op contract.
+pub fn merge_and_supersede(conn: &Connection, loser_id: i64, winner_id: i64, now: &str) -> Result<bool, KbError> {
+    let loser = match get(conn, loser_id)? {
+        Some(m) => m,
+        None => return Ok(false),
+    };
+    if loser.is_superseded() {
+        return Ok(false);
+    }
+    let winner = match get(conn, winner_id)? {
+        Some(m) => m,
+        None => return Ok(false),
+    };
+    let merged_access_count = winner.access_count + loser.access_count;
+    let merged_stability = winner.effective_stability().max(loser.effective_stability());
+    conn.execute(
+        "UPDATE memories SET access_count = ?1, stability = ?2 WHERE id = ?3",
+        params![merged_access_count, merged_stability, winner_id],
+    )?;
+    supersede(conn, loser_id, winner_id, now)
+}
+
+/// Re-points every insight/theme's raw-memory citation of `old_id` to
+/// `new_id` — called right after a dedupe merge tombstones `old_id`, so
+/// provenance follows the merge: an insight that cited the loser now cites
+/// the winner instead. Operates over every insight row regardless of
+/// active/invalidated/flagged status (a provenance fix, not a currency
+/// judgment). A citation already naming `new_id` collapses with the
+/// re-pointed one rather than appearing twice (dedup preserves the first
+/// occurrence's position; an untouched row's relative citation order is
+/// otherwise left exactly as it was). Returns the number of insight rows
+/// actually updated.
+pub fn repoint_insight_citations(conn: &Connection, old_id: i64, new_id: i64) -> Result<usize, KbError> {
+    let old_s = old_id.to_string();
+    let new_s = new_id.to_string();
+    let mut stmt = conn.prepare("SELECT id, source_ids FROM insights")?;
+    let rows: Vec<(i64, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    let mut updated = 0usize;
+    for (id, json) in rows {
+        let ids: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
+        if !ids.iter().any(|s| *s == old_s) {
+            continue;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let repointed: Vec<String> = ids
+            .into_iter()
+            .map(|s| if s == old_s { new_s.clone() } else { s })
+            .filter(|s| seen.insert(s.clone()))
+            .collect();
+        let repointed_json =
+            serde_json::to_string(&repointed).map_err(|e| KbError::Other(format!("encoding source_ids: {}", e)))?;
+        conn.execute("UPDATE insights SET source_ids = ?1 WHERE id = ?2", params![repointed_json, id])?;
+        updated += 1;
+    }
+    Ok(updated)
+}
+
 // --- export/import support (mach kb export / mach kb import) ---
 
 /// Every memory row, in every state (reviewed or not, tombstoned, dormant),
@@ -1988,10 +2109,11 @@ mod tests {
 
         // From v0, migrate() runs every step in one call: v0->v1 (the
         // memories column backfill this test is about), v1->v2 (reflection
-        // tables), v2->v3 (the insights `level` column), then v3->v4 (the
-        // memories `dormant_at` column), landing at the current version.
+        // tables), v2->v3 (the insights `level` column), v3->v4 (the
+        // memories `dormant_at` column), then v4->v5 (the `dedupe_seen`
+        // table), landing at the current version.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1);
@@ -2140,8 +2262,9 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 4,
-            "v1->v2 (reflection tables), v2->v3 (insights level column), v3->v4 (dormant_at) all run"
+            version, 5,
+            "v1->v2 (reflection tables), v2->v3 (insights level column), v3->v4 (dormant_at), \
+             v4->v5 (dedupe_seen) all run"
         );
 
         let rows = list(&conn, None, false).unwrap();
@@ -2160,10 +2283,10 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_lands_at_user_version_4() {
+    fn fresh_database_lands_at_current_user_version() {
         let conn = mem_conn();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     #[test]
@@ -2370,7 +2493,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 4, "v2->v3 (level column) then v3->v4 (dormant_at) both run");
+        assert_eq!(version, 5, "v2->v3 (level column), v3->v4 (dormant_at), v4->v5 (dedupe_seen) all run");
 
         let rows = list_insights(&conn, false).unwrap();
         assert_eq!(rows.len(), 1);
@@ -2410,12 +2533,55 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5, "v3->v4 (dormant_at), then v4->v5 (dedupe_seen) both run");
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
         assert!(rows[0].dormant_at.is_none(), "pre-existing row must backfill to active (not dormant)");
         assert!(!rows[0].is_dormant());
+
+        // idempotent on repeat
+        migrate(&conn).unwrap();
+        assert_eq!(list(&conn, None, false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migration_v4_to_v5_creates_dedupe_seen_table_and_keeps_rows() {
+        // Build a v4-era database by hand: every table up through
+        // `dormant_at`, but no `dedupe_seen` table, user_version = 4.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id INTEGER PRIMARY KEY, content TEXT NOT NULL, source TEXT, project TEXT,
+                created_at TEXT NOT NULL, reviewed INTEGER NOT NULL DEFAULT 1, embedding BLOB,
+                importance INTEGER NOT NULL DEFAULT 5, stability REAL, access_count INTEGER NOT NULL DEFAULT 0,
+                first_accessed_at TEXT, last_accessed_at TEXT, valid_from TEXT, invalidated_at TEXT,
+                superseded_by INTEGER, dormant_at TEXT
+            );
+            CREATE TABLE insights (
+                id INTEGER PRIMARY KEY, text TEXT NOT NULL, created_at TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.5, source_ids TEXT NOT NULL, embedding BLOB,
+                invalidated_at TEXT, flagged_at TEXT, last_verified_at TEXT, level INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE reflect_state (id INTEGER PRIMARY KEY CHECK (id = 1), last_run_at TEXT, last_memory_id INTEGER);
+            INSERT INTO memories (content, created_at, valid_from, stability)
+            VALUES ('a v4 memory', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 35.0);
+            PRAGMA user_version = 4;",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 5);
+
+        // The table exists and behaves — round-trips through the store
+        // functions that use it.
+        mark_dedupe_seen(&conn, 3, 1).unwrap();
+        assert_eq!(dedupe_seen_pairs(&conn).unwrap(), [(1, 3)].into_iter().collect());
+
+        assert_eq!(list(&conn, None, false).unwrap().len(), 1, "existing memory row must survive the migration");
 
         // idempotent on repeat
         migrate(&conn).unwrap();
@@ -2587,6 +2753,118 @@ mod tests {
     fn reinforce_insight_missing_id_returns_false() {
         let conn = mem_conn();
         assert!(!reinforce_insight(&conn, 999, &[1, 2], &now_rfc3339()).unwrap());
+    }
+
+    // --- nightly dedupe pass ---
+
+    #[test]
+    fn mark_dedupe_seen_and_dedupe_seen_pairs_roundtrip_normalized() {
+        let conn = mem_conn();
+        mark_dedupe_seen(&conn, 5, 2).unwrap(); // reversed order on input
+        let seen = dedupe_seen_pairs(&conn).unwrap();
+        assert_eq!(seen, [(2, 5)].into_iter().collect());
+    }
+
+    #[test]
+    fn mark_dedupe_seen_is_idempotent() {
+        let conn = mem_conn();
+        mark_dedupe_seen(&conn, 2, 5).unwrap();
+        mark_dedupe_seen(&conn, 2, 5).unwrap();
+        mark_dedupe_seen(&conn, 5, 2).unwrap(); // same pair, reversed
+        assert_eq!(dedupe_seen_pairs(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn merge_and_supersede_sums_access_count_and_takes_max_stability() {
+        let conn = mem_conn();
+        let winner = insert(&conn, "the user likes tea", None, None, true, None, 5).unwrap();
+        let loser = insert(&conn, "the user is fond of tea", None, None, true, None, 5).unwrap();
+        let now = now_rfc3339();
+        touch(&conn, &[winner], &now).unwrap(); // access_count 1, stability 35*1.3=45.5
+        touch(&conn, &[loser], &now).unwrap();
+        touch(&conn, &[loser], &now).unwrap(); // access_count 2, stability higher than winner's
+
+        let winner_before = get(&conn, winner).unwrap().unwrap();
+        let loser_before = get(&conn, loser).unwrap().unwrap();
+        assert!(loser_before.effective_stability() > winner_before.effective_stability());
+
+        assert!(merge_and_supersede(&conn, loser, winner, &now).unwrap());
+        let winner_after = get(&conn, winner).unwrap().unwrap();
+        assert_eq!(
+            winner_after.access_count,
+            winner_before.access_count + loser_before.access_count,
+            "winner absorbs the loser's access_count (summed)"
+        );
+        assert_eq!(
+            winner_after.effective_stability(),
+            loser_before.effective_stability(),
+            "stability becomes the max of the two — here the loser's"
+        );
+    }
+
+    #[test]
+    fn merge_and_supersede_tombstones_the_loser() {
+        let conn = mem_conn();
+        let winner = insert(&conn, "fact A", None, None, true, None, 5).unwrap();
+        let loser = insert(&conn, "fact A, restated", None, None, true, None, 5).unwrap();
+        let now = now_rfc3339();
+        assert!(merge_and_supersede(&conn, loser, winner, &now).unwrap());
+        let loser_after = get(&conn, loser).unwrap().unwrap();
+        assert!(loser_after.is_superseded());
+        assert_eq!(loser_after.superseded_by, Some(winner));
+        let winner_after = get(&conn, winner).unwrap().unwrap();
+        assert!(!winner_after.is_superseded());
+    }
+
+    #[test]
+    fn merge_and_supersede_is_a_noop_when_loser_missing_or_already_gone() {
+        let conn = mem_conn();
+        let winner = insert(&conn, "fact A", None, None, true, None, 5).unwrap();
+        let now = now_rfc3339();
+        assert!(!merge_and_supersede(&conn, 999, winner, &now).unwrap(), "loser id doesn't exist");
+
+        let loser = insert(&conn, "fact A, restated", None, None, true, None, 5).unwrap();
+        let other = insert(&conn, "fact A, restated again", None, None, true, None, 5).unwrap();
+        assert!(supersede(&conn, loser, other, &now).unwrap()); // already tombstoned by something else
+        assert!(!merge_and_supersede(&conn, loser, winner, &now).unwrap(), "already-tombstoned loser is a no-op");
+    }
+
+    #[test]
+    fn merge_and_supersede_is_a_noop_when_winner_missing() {
+        let conn = mem_conn();
+        let loser = insert(&conn, "fact A", None, None, true, None, 5).unwrap();
+        assert!(!merge_and_supersede(&conn, loser, 999, &now_rfc3339()).unwrap());
+        assert!(!get(&conn, loser).unwrap().unwrap().is_superseded(), "never tombstoned against a missing winner");
+    }
+
+    #[test]
+    fn repoint_insight_citations_rewrites_matching_raw_ids_only() {
+        let conn = mem_conn();
+        let id = insert_insight(&conn, "an insight", 0.6, &["3".into(), "12".into(), "i2".into()], None).unwrap();
+        let updated = repoint_insight_citations(&conn, 12, 40).unwrap();
+        assert_eq!(updated, 1);
+        let ins = get_insight(&conn, id).unwrap().unwrap();
+        assert_eq!(ins.source_ids, vec!["3", "40", "i2"], "only the raw id 12 is rewritten, i2 left alone");
+    }
+
+    #[test]
+    fn repoint_insight_citations_dedupes_when_winner_already_cited() {
+        let conn = mem_conn();
+        let id = insert_insight(&conn, "an insight", 0.6, &["12".into(), "40".into()], None).unwrap();
+        let updated = repoint_insight_citations(&conn, 12, 40).unwrap();
+        assert_eq!(updated, 1);
+        let ins = get_insight(&conn, id).unwrap().unwrap();
+        assert_eq!(ins.source_ids, vec!["40"], "12 rewritten to 40 collapses with the already-cited 40");
+    }
+
+    #[test]
+    fn repoint_insight_citations_leaves_non_citing_insights_untouched() {
+        let conn = mem_conn();
+        let id = insert_insight(&conn, "unrelated insight", 0.6, &["7".into(), "8".into()], None).unwrap();
+        let updated = repoint_insight_citations(&conn, 12, 40).unwrap();
+        assert_eq!(updated, 0);
+        let ins = get_insight(&conn, id).unwrap().unwrap();
+        assert_eq!(ins.source_ids, vec!["7", "8"]);
     }
 
     // --- dormancy (forgetting) ---

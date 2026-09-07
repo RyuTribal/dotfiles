@@ -1,9 +1,19 @@
 [Unit]
 Description=Run mach kb reflect periodically
 
+# Opportunistic cadence for a laptop that's frequently off at 04:00,
+# suspended, or without wifi: OnCalendar is a nightly anchor, but
+# OnUnitInactiveSec re-arms 3h after every completed run regardless of
+# calendar time, so a machine that's merely awake and online gets a run
+# within a few hours no matter when it last woke up. Frequency is free
+# here because `mach kb reflect` itself cheaply exits (no network touched)
+# when there's nothing new, nothing due for re-verification, and no
+# dedupe candidates — see reflect::claude_reachable and the pre-checks in
+# cli.rs's cmd_reflect.
 [Timer]
 OnBootSec=10min
 OnCalendar=*-*-* 04:00:00
+OnUnitInactiveSec=3h
 Persistent=true
 RandomizedDelaySec=15min
 

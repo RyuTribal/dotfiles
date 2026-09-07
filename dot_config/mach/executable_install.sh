@@ -96,7 +96,7 @@ install_reflect_timer() {
   fi
   systemctl --user daemon-reload
   if systemctl --user enable --now mach-reflect.timer >/dev/null 2>&1; then
-    echo "enabled: mach-reflect.timer (daily 04:00, +10min after boot, +/-15min jitter)"
+    echo "enabled: mach-reflect.timer (daily 04:00 anchor, +10min after boot, re-arms 3h after each run, +/-15min jitter)"
   else
     echo "WARNING: 'systemctl --user enable --now mach-reflect.timer' failed — enable it by hand once mach is on PATH."
   fi

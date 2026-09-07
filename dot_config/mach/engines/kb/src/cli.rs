@@ -686,18 +686,47 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     // Step 1: input selection.
     let new_memories = store::memories_since(&conn, last_id).map_err(to_io)?;
     let has_new = !new_memories.is_empty();
-    // A --meta-only invocation (e.g. for manual testing once enough
-    // insights already exist) must still be able to run even when there is
-    // nothing new to examine — this is the only early exit in the whole
-    // function, everything below it is reachable whenever there's either
-    // new material or a forced meta pass to attempt.
-    if !has_new && !force_meta {
+
+    // Cheap, DB-only pre-check — no network, no `claude` spawn — so an
+    // early exit costs nothing on a laptop merely waking up opportunistically
+    // (see the timer's OnUnitInactiveSec re-arm). `insights_due_for_verification`
+    // returns up to REFLECT_VERIFICATION_SAMPLE active insights
+    // unconditionally (it has no staleness filter of its own — see its own
+    // doc comment), so "empty" here precisely means zero active insights
+    // exist yet, not merely that none happen to be old enough to re-check.
+    // The nightly dedupe pass needs no separate check here: every candidate
+    // pair requires at least one side to be "new" (see
+    // `reflect::dedupe_candidate_pairs`), so `!has_new` already rules its
+    // queue out too. A --meta-only invocation (e.g. for manual testing once
+    // enough insights already exist) must still be able to run even when
+    // there's nothing new or due — this is the only early exit before the
+    // connectivity guard below.
+    let verification_queue = store::insights_due_for_verification(&conn, REFLECT_VERIFICATION_SAMPLE).map_err(to_io)?;
+    if !has_new && !force_meta && verification_queue.is_empty() {
         println!("mach kb reflect: nothing new");
+        return Ok(());
+    }
+
+    // Connectivity guard: everything from here on may spawn `claude -p`
+    // (stage 1/2, re-verification's contradiction check, dormancy
+    // consolidation, the nightly dedupe judge, meta-reflection). Local
+    // `ollama` embedding calls are unaffected by wifi and need no such
+    // guard — only a `claude` call ever leaves the machine. A laptop that's
+    // asleep, suspended, or off wifi must defer the whole pass rather than
+    // burn through a string of 30s-60s timeouts and, worse, partially
+    // advance state it never finished examining.
+    if !reflect::claude_reachable() {
+        println!("mach kb reflect: offline, deferring");
         return Ok(());
     }
 
     let embedder = OllamaEmbedder::new();
     let llm = ProcessReflectLlm::new();
+    // Set on any `claude` call failing mid-run (a network drop after the
+    // connectivity guard above passed, a spawn error, a timeout) — gates
+    // the watermark advance at the very end so a degraded run stays fully
+    // retry-able next time instead of orphaning whatever it never got to.
+    let mut llm_failed = false;
 
     let mut examined = 0usize;
     let mut questions_count = 0usize;
@@ -736,7 +765,10 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         let q_prompt = reflect::build_questions_prompt(&question_lines);
         let questions: Vec<String> = match llm.call("haiku", &q_prompt, TIMEOUT_HAIKU) {
             Ok(out) => reflect::parse_questions(&out),
-            Err(_) => Vec::new(),
+            Err(_) => {
+                llm_failed = true;
+                Vec::new()
+            }
         };
         questions_count = questions.len();
 
@@ -767,7 +799,10 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
 
             let raw = match llm.call("sonnet", &prompt, TIMEOUT_SONNET) {
                 Ok(out) => out,
-                Err(_) => continue,
+                Err(_) => {
+                    llm_failed = true;
+                    continue;
+                }
             };
 
             let evidence_ids: HashSet<i64> = evidence.iter().map(|(m, _)| m.id).collect();
@@ -825,12 +860,14 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     }
 
     // Step 4: re-verification, same run — up to 5 oldest insights by
-    // last_verified_at (never-verified first). Never deletes, only flags.
-    // Runs across BOTH levels (level-2 themes share this table and this
-    // query), so a theme is just as due for a check as a plain insight.
+    // last_verified_at (never-verified first; reuses the sample already
+    // fetched by the cheap pre-check above rather than querying twice).
+    // Never deletes, only flags. Runs across BOTH levels (level-2 themes
+    // share this table and this query), so a theme is just as due for a
+    // check as a plain insight.
     let mut flagged = 0usize;
     let mut verified = 0usize;
-    let stale = store::insights_due_for_verification(&conn, REFLECT_VERIFICATION_SAMPLE).map_err(to_io)?;
+    let stale = verification_queue;
     for insight in &stale {
         let mut broken_citation = false;
         for sid in &insight.source_ids {
@@ -869,6 +906,7 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
             continue;
         }
 
+        let mut call_failed = false;
         let contradicted = match embedder.embed(&insight.text) {
             Ok(emb) => match store::top_similar_active(&conn, &emb, REFLECT_VERIFICATION_CANDIDATES) {
                 Ok(candidates) if !candidates.is_empty() => {
@@ -877,13 +915,25 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
                     let prompt = reflect::build_contradiction_prompt(&insight.text, &pairs);
                     match llm.call("haiku", &prompt, TIMEOUT_HAIKU) {
                         Ok(out) => reflect::parse_contradiction(&out).is_some(),
-                        Err(_) => false,
+                        Err(_) => {
+                            call_failed = true;
+                            false
+                        }
                     }
                 }
                 _ => false,
             },
             Err(_) => false,
         };
+
+        if call_failed {
+            // The judge call itself failed (offline mid-run, spawn error,
+            // timeout) — leave this insight's verification state exactly
+            // as it was rather than crediting a check that never actually
+            // happened; it stays due and gets retried on a later run.
+            llm_failed = true;
+            continue;
+        }
 
         if contradicted {
             store::flag_insight(&conn, insight.id, &now).map_err(to_io)?;
@@ -900,7 +950,17 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     // facts where a cluster of them shares something worth keeping. Runs
     // every invocation regardless of has_new/force_meta — it's a nightly
     // sweep over the whole active store, not gated on new material.
-    let (dormant, consolidated) = run_dormancy_pass(&conn, &embedder, &llm, &now).map_err(to_io)?;
+    let (dormant, consolidated, dormancy_llm_failed) = run_dormancy_pass(&conn, &embedder, &llm, &now).map_err(to_io)?;
+    llm_failed = llm_failed || dormancy_llm_failed;
+
+    // Step 4.6: nightly dedupe — fast capture paths (`mach note`, digests)
+    // deliberately skip save-time dedupe classification, so near-duplicate
+    // raw memories accumulate; this catches them here, where LLM time is
+    // free. Only pairs touching a memory created since the last reflect
+    // run are considered, capped at reflect::DEDUPE_MAX_PAIRS_PER_RUN.
+    let new_ids: HashSet<i64> = new_memories.iter().map(|m| m.id).collect();
+    let (deduped, dedupe_llm_failed) = run_dedupe_pass(&conn, &llm, &new_ids, &now).map_err(to_io)?;
+    llm_failed = llm_failed || dedupe_llm_failed;
 
     // Step 5: meta-reflection (theme) pass — only when triggered, or
     // forced via --meta for manual runs.
@@ -913,22 +973,38 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let meta_trigger = reflect::should_run_meta_pass(level1_active, newest_theme.is_some(), since_newest_theme);
     let mut themes_added = 0usize;
     if meta_trigger || force_meta {
-        themes_added = run_meta_pass(&conn, &embedder, &llm).map_err(to_io)?;
+        let (added, meta_llm_failed) = run_meta_pass(&conn, &embedder, &llm).map_err(to_io)?;
+        themes_added = added;
+        llm_failed = llm_failed || meta_llm_failed;
     }
 
     // Step 6: advance the watermark to the newest memory id actually
     // examined this run (not the bridged neighbors, which may be older) —
-    // only when there was anything new; a --meta-only invocation with
-    // nothing new must never clobber the existing watermark back to NULL.
-    if has_new {
+    // only when there was anything new AND nothing failed along the way:
+    // a --meta-only invocation with nothing new must never clobber the
+    // existing watermark back to NULL, and a run that went offline or hit
+    // a spawn/timeout partway through must leave its unexamined remainder
+    // fully retry-able next time rather than orphaning it behind an
+    // advanced watermark.
+    if reflect::should_advance_watermark(has_new, llm_failed) {
         let new_watermark = new_memories.iter().map(|m| m.id).max();
         store::update_reflect_state(&conn, &now, new_watermark).map_err(to_io)?;
     }
 
     println!(
         "mach kb reflect: examined={} questions={} insights_added={} reinforced={} \
-         themes_added={} flagged={} verified={} dormant={} consolidated={}",
-        examined, questions_count, insights_added, reinforced, themes_added, flagged, verified, dormant, consolidated
+         themes_added={} flagged={} verified={} dormant={} consolidated={} deduped={}{}",
+        examined,
+        questions_count,
+        insights_added,
+        reinforced,
+        themes_added,
+        flagged,
+        verified,
+        dormant,
+        consolidated,
+        deduped,
+        if llm_failed { " (degraded: some claude calls failed — watermark not advanced)" } else { "" }
     );
     Ok(())
 }
@@ -940,14 +1016,20 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
 /// `DORMANCY_CONSOLIDATION_MIN_CLUSTER`) and asks one haiku call per
 /// cluster for a single consolidated fact, stored as a new active memory
 /// (source `consolidation:<id>,<id>,...`). Returns `(dormant_count,
-/// consolidated_count)`. Never deletes anything — dormancy is a status
-/// flag, and a consolidation summary is an addition, not a replacement.
+/// consolidated_count, any_llm_call_failed)`. Never deletes anything —
+/// dormancy is a status flag, and a consolidation summary is an addition,
+/// not a replacement. Marking memories dormant needs no network at all;
+/// only the consolidation sub-step's haiku call can fail (offline mid-run,
+/// spawn error, timeout) — when it does, that cluster is simply skipped
+/// (as before) and the caller is told via the third return value so the
+/// watermark doesn't advance on a degraded run.
 fn run_dormancy_pass(
     conn: &Connection,
     embedder: &OllamaEmbedder,
     llm: &ProcessReflectLlm,
     now: &str,
-) -> Result<(usize, usize), KbError> {
+) -> Result<(usize, usize, bool), KbError> {
+    let mut llm_failed = false;
     let cited = store::cited_memory_ids(conn)?;
     let pool = store::active_memories_for_dormancy(conn)?;
     let mut newly_dormant: Vec<i64> = Vec::new();
@@ -986,7 +1068,10 @@ fn run_dormancy_pass(
             let prompt = reflect::build_consolidation_prompt(&pairs);
             let raw = match llm.call("haiku", &prompt, TIMEOUT_HAIKU) {
                 Ok(out) => out,
-                Err(_) => continue,
+                Err(_) => {
+                    llm_failed = true;
+                    continue;
+                }
             };
             if let Some(fact) = reflect::parse_consolidation(&raw) {
                 let cluster_ids: Vec<String> = cluster_rows.iter().map(|m| m.id.to_string()).collect();
@@ -999,16 +1084,16 @@ fn run_dormancy_pass(
         }
     }
 
-    Ok((dormant_count, consolidated))
+    Ok((dormant_count, consolidated, llm_failed))
 }
 
 /// The meta-reflection (theme) pass: clusters active, not-yet-themed
 /// level-1 insights by embedding similarity and asks one sonnet call per
-/// cluster for a single unifying theme statement. Returns the count of
-/// themes actually inserted. Never touches the watermark or the per-memory
+/// cluster for a single unifying theme statement. Returns `(themes_added,
+/// any_llm_call_failed)`. Never touches the watermark or the per-memory
 /// reinforcement/insight logic above — this is a self-contained extra
 /// pass over the insights table.
-fn run_meta_pass(conn: &Connection, embedder: &OllamaEmbedder, llm: &ProcessReflectLlm) -> Result<usize, KbError> {
+fn run_meta_pass(conn: &Connection, embedder: &OllamaEmbedder, llm: &ProcessReflectLlm) -> Result<(usize, bool), KbError> {
     let themed = store::themed_insight_ids(conn)?;
     let mut pool: Vec<Insight> =
         store::active_insights_by_level(conn, 1)?.into_iter().filter(|i| !themed.contains(&i.id)).collect();
@@ -1019,6 +1104,7 @@ fn run_meta_pass(conn: &Connection, embedder: &OllamaEmbedder, llm: &ProcessRefl
     let clusters = reflect::cluster_insights_by_similarity(&items);
     let by_id: BTreeMap<i64, &Insight> = pool.iter().map(|i| (i.id, i)).collect();
 
+    let mut llm_failed = false;
     let mut themes_added = 0usize;
     for cluster in clusters {
         let cluster_insights: Vec<&Insight> = cluster.iter().filter_map(|id| by_id.get(id).copied()).collect();
@@ -1055,7 +1141,10 @@ fn run_meta_pass(conn: &Connection, embedder: &OllamaEmbedder, llm: &ProcessRefl
         let prompt = reflect::build_theme_prompt(&insight_pairs, &evidence_pairs);
         let raw = match llm.call("sonnet", &prompt, TIMEOUT_SONNET) {
             Ok(out) => out,
-            Err(_) => continue,
+            Err(_) => {
+                llm_failed = true;
+                continue;
+            }
         };
 
         if let ThemeResult::Theme { text, insight_ids, memory_ids } = reflect::parse_theme(&raw, &known_ids) {
@@ -1079,7 +1168,86 @@ fn run_meta_pass(conn: &Connection, embedder: &OllamaEmbedder, llm: &ProcessRefl
             }
         }
     }
-    Ok(themes_added)
+    Ok((themes_added, llm_failed))
+}
+
+/// The nightly dedupe pass (runs inside `mach kb reflect`, after
+/// dormancy): finds ACTIVE memory pairs at `>= reflect::DEDUPE_MIN_SIM`
+/// cosine where at least one side was created since the last reflect run,
+/// asks one haiku call per pair (capped at `reflect::DEDUPE_MAX_PAIRS_PER_RUN`,
+/// oldest-first) for a DUPLICATE/SUPERSEDES/DISTINCT verdict, and applies
+/// it:
+///
+/// - `Duplicate`/`Supersedes` merges the loser's earned reinforcement into
+///   the winner and tombstones the loser via the ordinary supersession
+///   mechanics, then re-points any insight citing the loser to the winner.
+/// - `Distinct` is recorded in `dedupe_seen` so the pair is never re-asked.
+/// - `Malformed` (or the judge call itself failing) does nothing — no
+///   merge, no `dedupe_seen` entry — so the pair gets a fresh chance on a
+///   later run instead of being silenced by a bad or missing reply.
+///
+/// Returns `(pairs_merged, any_judge_call_failed)`. Generic over
+/// `ReflectLlm` so it's exercised in tests against a fake that can fail on
+/// demand, without spawning a real `claude` process.
+fn run_dedupe_pass<L: ReflectLlm>(
+    conn: &Connection,
+    llm: &L,
+    new_ids: &HashSet<i64>,
+    now: &str,
+) -> Result<(usize, bool), KbError> {
+    if new_ids.is_empty() {
+        return Ok((0, false));
+    }
+    let pool = store::active_memories_for_dormancy(conn)?;
+    let items: Vec<(i64, Vec<f32>)> = pool.iter().filter_map(|m| m.embedding.clone().map(|e| (m.id, e))).collect();
+    let seen = store::dedupe_seen_pairs(conn)?;
+    let pairs =
+        reflect::dedupe_candidate_pairs(&items, new_ids, &seen, reflect::DEDUPE_MIN_SIM, reflect::DEDUPE_MAX_PAIRS_PER_RUN);
+
+    let mut deduped = 0usize;
+    let mut llm_failed = false;
+    for (id_a, id_b) in pairs {
+        let (mem_a, mem_b) = match (store::get(conn, id_a)?, store::get(conn, id_b)?) {
+            (Some(a), Some(b)) => (a, b),
+            _ => continue, // one side vanished between candidate generation and now
+        };
+        let prompt = reflect::build_dedupe_prompt(
+            (mem_a.id, mem_a.content.as_str(), mem_a.source.as_deref()),
+            (mem_b.id, mem_b.content.as_str(), mem_b.source.as_deref()),
+        );
+        let raw = match llm.call("haiku", &prompt, TIMEOUT_HAIKU) {
+            Ok(out) => out,
+            Err(_) => {
+                // The judge call itself failed — never destructive, and
+                // deliberately NOT recorded in dedupe_seen either (unlike a
+                // genuine Malformed reply, this pair was never actually
+                // asked about): retry it next run.
+                llm_failed = true;
+                continue;
+            }
+        };
+        match reflect::parse_dedupe_verdict(&raw, id_a, id_b) {
+            reflect::DedupeVerdict::Duplicate { keep_id } | reflect::DedupeVerdict::Supersedes { winner_id: keep_id } => {
+                let (winner_id, loser_id) = if keep_id == id_a { (id_a, id_b) } else { (id_b, id_a) };
+                if store::merge_and_supersede(conn, loser_id, winner_id, now)? {
+                    store::repoint_insight_citations(conn, loser_id, winner_id)?;
+                    deduped += 1;
+                }
+                // Never recorded in dedupe_seen either way: a successful
+                // merge drops the loser out of the active pool (it can't
+                // resurface as a pair), and a no-op merge (loser already
+                // gone) needs no record for the same reason.
+            }
+            reflect::DedupeVerdict::Distinct => {
+                store::mark_dedupe_seen(conn, id_a, id_b)?;
+            }
+            reflect::DedupeVerdict::Malformed => {
+                // Safe default, but deliberately not final — see the
+                // Malformed variant's own doc comment.
+            }
+        }
+    }
+    Ok((deduped, llm_failed))
 }
 
 fn cmd_insights(mut args: impl Iterator<Item = String>) -> io::Result<()> {
@@ -1443,5 +1611,134 @@ mod tests {
             format_model_row(&doubted),
             "- [belief, confidence 0.50] a shaky belief [DOUBTED — evidence under review]"
         );
+    }
+
+    // --- run_dedupe_pass: offline safety + apply mechanics ---
+
+    use std::path::Path;
+
+    fn mem_conn() -> Connection {
+        store::open_with_path(Path::new(":memory:")).expect("open in-memory store")
+    }
+
+    fn unit_vec(dims: usize, hot: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; dims];
+        v[hot] = 1.0;
+        v
+    }
+
+    fn insert_pair(conn: &Connection) -> (i64, i64) {
+        // Two near-duplicate memories sharing an embedding direction, so
+        // they always clear reflect::DEDUPE_MIN_SIM regardless of which
+        // one the test names "new".
+        let a = store::insert(conn, "the user drinks tea", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        let b = store::insert(conn, "the user is fond of tea", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        (a, b)
+    }
+
+    /// A `ReflectLlm` test double that always returns a fixed reply, or
+    /// always fails — never spawns a real process.
+    struct FixedReflectLlm {
+        reply: Result<&'static str, &'static str>,
+    }
+
+    impl ReflectLlm for FixedReflectLlm {
+        fn call(&self, _model: &str, _prompt: &str, _timeout: std::time::Duration) -> Result<String, String> {
+            self.reply.map(|s| s.to_string()).map_err(|e| e.to_string())
+        }
+    }
+
+    #[test]
+    fn run_dedupe_pass_skips_entirely_when_nothing_is_new() {
+        let conn = mem_conn();
+        let (a, _b) = insert_pair(&conn);
+        let llm = FixedReflectLlm { reply: Ok("DISTINCT") };
+        let (deduped, failed) = run_dedupe_pass(&conn, &llm, &HashSet::new(), &store::now_rfc3339()).unwrap();
+        assert_eq!(deduped, 0);
+        assert!(!failed);
+        let _ = a;
+    }
+
+    #[test]
+    fn run_dedupe_pass_failed_judge_call_is_never_recorded_as_seen() {
+        let conn = mem_conn();
+        let (a, b) = insert_pair(&conn);
+        let llm = FixedReflectLlm { reply: Err("offline") };
+        let new_ids: HashSet<i64> = [a].into_iter().collect();
+        let (deduped, failed) = run_dedupe_pass(&conn, &llm, &new_ids, &store::now_rfc3339()).unwrap();
+        assert_eq!(deduped, 0, "never merges on a failed call");
+        assert!(failed, "caller must freeze the watermark");
+        assert!(store::dedupe_seen_pairs(&conn).unwrap().is_empty(), "a transport failure must not be recorded as seen");
+        assert!(!store::get(&conn, a).unwrap().unwrap().is_superseded());
+        assert!(!store::get(&conn, b).unwrap().unwrap().is_superseded());
+    }
+
+    #[test]
+    fn run_dedupe_pass_malformed_reply_is_never_recorded_as_seen() {
+        let conn = mem_conn();
+        let (a, b) = insert_pair(&conn);
+        let llm = FixedReflectLlm { reply: Ok("I'm not sure about this one.") };
+        let new_ids: HashSet<i64> = [a].into_iter().collect();
+        let (deduped, failed) = run_dedupe_pass(&conn, &llm, &new_ids, &store::now_rfc3339()).unwrap();
+        assert_eq!(deduped, 0);
+        assert!(!failed, "the call itself succeeded — only its content was malformed");
+        assert!(store::dedupe_seen_pairs(&conn).unwrap().is_empty(), "malformed -> retry next run, not silenced");
+        assert!(!store::get(&conn, a).unwrap().unwrap().is_superseded());
+        assert!(!store::get(&conn, b).unwrap().unwrap().is_superseded());
+    }
+
+    #[test]
+    fn run_dedupe_pass_genuine_distinct_is_recorded_as_seen() {
+        let conn = mem_conn();
+        let (a, b) = insert_pair(&conn);
+        let llm = FixedReflectLlm { reply: Ok("DISTINCT") };
+        let new_ids: HashSet<i64> = [a].into_iter().collect();
+        let (deduped, failed) = run_dedupe_pass(&conn, &llm, &new_ids, &store::now_rfc3339()).unwrap();
+        assert_eq!(deduped, 0);
+        assert!(!failed);
+        let seen = store::dedupe_seen_pairs(&conn).unwrap();
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        assert_eq!(seen, [(lo, hi)].into_iter().collect());
+    }
+
+    /// A `ReflectLlm` test double carrying an owned reply — `FixedReflectLlm`
+    /// above only holds a `&'static str`, too rigid for a reply built with
+    /// `format!` from an id only known at test run time.
+    struct OwnedReplyLlm {
+        reply: String,
+    }
+
+    impl ReflectLlm for OwnedReplyLlm {
+        fn call(&self, _model: &str, _prompt: &str, _timeout: std::time::Duration) -> Result<String, String> {
+            Ok(self.reply.clone())
+        }
+    }
+
+    #[test]
+    fn run_dedupe_pass_duplicate_merges_tombstones_and_repoints_citations() {
+        let conn = mem_conn();
+        let (a, b) = insert_pair(&conn);
+        // b's earned reinforcement must survive the merge into a.
+        let now = store::now_rfc3339();
+        store::touch(&conn, &[b], &now).unwrap();
+        store::touch(&conn, &[b], &now).unwrap();
+        let insight_id = store::insert_insight(&conn, "an insight citing the loser", 0.5, &[b.to_string()], None).unwrap();
+
+        let llm = OwnedReplyLlm { reply: format!("DUPLICATE {}", a) };
+        let new_ids: HashSet<i64> = [a].into_iter().collect();
+        let (deduped, failed) = run_dedupe_pass(&conn, &llm, &new_ids, &now).unwrap();
+        assert_eq!(deduped, 1);
+        assert!(!failed);
+
+        let winner = store::get(&conn, a).unwrap().unwrap();
+        let loser = store::get(&conn, b).unwrap().unwrap();
+        assert!(loser.is_superseded());
+        assert_eq!(loser.superseded_by, Some(a));
+        assert_eq!(winner.access_count, 2, "winner absorbs the loser's earned reinforcement");
+
+        let ins = store::get_insight(&conn, insight_id).unwrap().unwrap();
+        assert_eq!(ins.source_ids, vec![a.to_string()], "citation of the tombstoned loser follows the merge to the winner");
+
+        assert!(store::dedupe_seen_pairs(&conn).unwrap().is_empty(), "a merged pair needs no dedupe_seen record");
     }
 }

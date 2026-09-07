@@ -535,6 +535,185 @@ pub fn should_run_meta_pass(level1_active_count: i64, has_active_theme: bool, le
     level1_since_newest_theme >= META_TRIGGER_GROWTH
 }
 
+// --- opportunistic scheduling: offline safety ---
+
+/// Cheap, no-`claude`-spawn reachability probe: a plain TCP connect (with
+/// DNS resolution) to `api.anthropic.com:443`, 2s timeout per resolved
+/// address. Not a guarantee a real `claude -p` call will succeed (a
+/// captive portal or a misbehaving proxy can still pass this and fail the
+/// real call), but cheap enough to run on every opportunistic timer
+/// wakeup, and precise enough to skip a laptop that's asleep, suspended,
+/// or off wifi before ever spawning `claude` and eating one of its
+/// 30s-60s timeouts. Local `ollama` embedding calls need no such guard —
+/// only a `claude` call ever leaves the machine. Not unit-tested (real
+/// DNS/network, like `ProcessReflectLlm`'s own process-spawning path) —
+/// exercised by a live run instead.
+pub fn claude_reachable() -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    match "api.anthropic.com:443".to_socket_addrs() {
+        Ok(addrs) => addrs.into_iter().any(|a| TcpStream::connect_timeout(&a, Duration::from_secs(2)).is_ok()),
+        Err(_) => false,
+    }
+}
+
+/// Whether `mach kb reflect` should advance its watermark (`last_run_at` +
+/// `last_memory_id`) this run: never when there was nothing new to
+/// examine in the first place (unchanged, long-standing rule — a
+/// `--meta`-only invocation must never clobber it back to NULL), and never
+/// when any `claude` call failed partway through this run (offline mid-run,
+/// a spawn error, a timeout) — a partial run leaves some of this run's new
+/// material, or a dedupe/verification candidate, unexamined, and the
+/// watermark must not claim otherwise. Both fields move together or not at
+/// all: an offline or degraded run must be fully retry-able next time, not
+/// have some of its queues silently orphaned behind an advanced watermark.
+pub fn should_advance_watermark(has_new: bool, llm_failed: bool) -> bool {
+    has_new && !llm_failed
+}
+
+// --- nightly dedupe pass ---
+
+/// Minimum cosine similarity for two active memories to be considered a
+/// candidate near-duplicate pair by the nightly dedupe pass.
+pub const DEDUPE_MIN_SIM: f32 = 0.85;
+/// At most this many candidate pairs are sent to the dedupe judge per
+/// `mach kb reflect` run — keeps a single run's LLM cost bounded even if a
+/// large backlog of near-duplicates has accumulated (fast capture paths
+/// like `mach note` and digests deliberately skip save-time dedupe
+/// classification, so it can).
+pub const DEDUPE_MAX_PAIRS_PER_RUN: usize = 10;
+
+/// Finds this run's dedupe candidate pairs: `(a, b)` with `a < b`, cosine
+/// similarity `>= min_sim`, at least one of the pair in `new_ids` (created
+/// since the last reflect run — mirrors the reflection working set's own
+/// "new-vs-all" shape rather than rescanning the whole store nightly), and
+/// not already recorded in `seen`. Capped at `cap`, oldest-first among
+/// qualifying pairs (sorted by the smaller id in each pair, which is
+/// already how each tuple is normalized) so a backlog drains in a stable
+/// order across runs instead of being reshuffled by whatever happens to
+/// embed together this time.
+///
+/// `pool` must hold every active memory with a stored embedding (id order
+/// doesn't matter — this does its own O(n^2) scan, acceptable at the
+/// reflection working set's scale); `new_ids` and `seen` are lookup sets
+/// the caller builds once per run.
+pub fn dedupe_candidate_pairs(
+    pool: &[(i64, Vec<f32>)],
+    new_ids: &HashSet<i64>,
+    seen: &HashSet<(i64, i64)>,
+    min_sim: f32,
+    cap: usize,
+) -> Vec<(i64, i64)> {
+    let mut out: Vec<(i64, i64)> = Vec::new();
+    for i in 0..pool.len() {
+        for j in (i + 1)..pool.len() {
+            let (id_a, id_b) = if pool[i].0 < pool[j].0 { (pool[i].0, pool[j].0) } else { (pool[j].0, pool[i].0) };
+            if !new_ids.contains(&id_a) && !new_ids.contains(&id_b) {
+                continue;
+            }
+            if seen.contains(&(id_a, id_b)) {
+                continue;
+            }
+            if cosine(&pool[i].1, &pool[j].1) >= min_sim {
+                out.push((id_a, id_b));
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out.truncate(cap);
+    out
+}
+
+/// Outcome of parsing the nightly dedupe judge's reply for one candidate
+/// pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupeVerdict {
+    /// Both memories describe the same fact — `keep_id` (one of the pair)
+    /// names the richer/newer copy; the other is the loser.
+    Duplicate { keep_id: i64 },
+    /// One memory updates or corrects the other — `winner_id` (one of the
+    /// pair) names the one that now holds true; the other is the loser.
+    Supersedes { winner_id: i64 },
+    /// The judge explicitly declined: similar topic, different facts —
+    /// leave both alone. Recorded in `dedupe_seen` so this exact pair is
+    /// never re-asked.
+    Distinct,
+    /// Empty/prose output, an unrecognized line, a missing id, or a cited
+    /// id that isn't one of the two pair members. Never destructive (never
+    /// merges) — but deliberately distinct from `Distinct`: this pair is
+    /// NOT recorded as seen, so a transient bad reply (or, upstream, a
+    /// `claude` call that failed outright) gets a fresh chance on a later
+    /// run instead of being silenced forever.
+    Malformed,
+}
+
+/// Parses the nightly dedupe judge's reply for the pair `(id_a, id_b)`.
+/// Scans line by line (tolerating leading chatter and a `#` prefix on the
+/// id, like `classify::parse_verdict`) for `DUPLICATE <id>`, `SUPERSEDES
+/// <id>`, or a bare `DISTINCT`. Strict about the cited id: it must be one
+/// of the two pair members, or the whole reply is `Malformed` rather than
+/// silently accepting a hallucinated third id.
+pub fn parse_dedupe_verdict(output: &str, id_a: i64, id_b: i64) -> DedupeVerdict {
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let upper = line.to_uppercase();
+        if upper == "DISTINCT" {
+            return DedupeVerdict::Distinct;
+        }
+        if let Some(rest) = upper.strip_prefix("DUPLICATE") {
+            if let Some(id) = extract_dedupe_id(rest) {
+                return if id == id_a || id == id_b {
+                    DedupeVerdict::Duplicate { keep_id: id }
+                } else {
+                    DedupeVerdict::Malformed
+                };
+            }
+        }
+        if let Some(rest) = upper.strip_prefix("SUPERSEDES") {
+            if let Some(id) = extract_dedupe_id(rest) {
+                return if id == id_a || id == id_b {
+                    DedupeVerdict::Supersedes { winner_id: id }
+                } else {
+                    DedupeVerdict::Malformed
+                };
+            }
+        }
+    }
+    DedupeVerdict::Malformed
+}
+
+fn extract_dedupe_id(rest: &str) -> Option<i64> {
+    rest.trim().trim_start_matches('#').split_whitespace().next()?.parse().ok()
+}
+
+/// Builds the nightly dedupe pass's one-haiku-call prompt (same invocation
+/// pattern as `classify::build_prompt`): both memories' full content and
+/// source, asking for a verdict among `DUPLICATE <id>` (same fact — keep
+/// the richer/newer copy), `SUPERSEDES <id>` (one updates or corrects the
+/// other), or `DISTINCT` (similar topic, different facts — leave both).
+/// `a`/`b` are `(id, content, source)`.
+pub fn build_dedupe_prompt(a: (i64, &str, Option<&str>), b: (i64, &str, Option<&str>)) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "You are checking a personal knowledge bank for near-duplicate memories. Two memories \
+         embedded close together are shown below -- decide the single correct relationship \
+         between them.\n\n",
+    );
+    s.push_str(&format!("Memory #{} (source: {}):\n{}\n\n", a.0, a.2.unwrap_or("unknown"), a.1));
+    s.push_str(&format!("Memory #{} (source: {}):\n{}\n\n", b.0, b.2.unwrap_or("unknown"), b.1));
+    s.push_str(
+        "Reply with exactly one line and no other text: DUPLICATE <id>, SUPERSEDES <id>, or DISTINCT.\n\
+         DUPLICATE <id> -- both describe the same fact; <id> names the richer or newer copy to keep.\n\
+         SUPERSEDES <id> -- one memory updates or corrects the other; <id> names the winner (the \
+         one that now holds true).\n\
+         DISTINCT -- similar topic but different facts; keep both.\n",
+    );
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1026,6 +1205,114 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- opportunistic scheduling: watermark-advance predicate ---
+
+    #[test]
+    fn should_advance_watermark_requires_new_material() {
+        assert!(!should_advance_watermark(false, false), "nothing new -- never advance, even if nothing failed");
+    }
+
+    #[test]
+    fn should_advance_watermark_frozen_when_any_llm_call_failed() {
+        assert!(!should_advance_watermark(true, true), "offline/degraded mid-run -- must stay retry-able");
+    }
+
+    #[test]
+    fn should_advance_watermark_true_only_when_new_and_nothing_failed() {
+        assert!(should_advance_watermark(true, false));
+    }
+
+    // --- nightly dedupe pass: candidate selection ---
+
+    #[test]
+    fn dedupe_candidate_pairs_respects_similarity_threshold() {
+        let pool = vec![(1, unit_vec(4, 0)), (2, unit_vec(4, 0)), (3, unit_vec(4, 1))];
+        let new_ids: HashSet<i64> = [2].into_iter().collect();
+        let seen: HashSet<(i64, i64)> = HashSet::new();
+        // 1 vs 2 share a direction (sim 1.0, clears 0.85); 2 vs 3 are
+        // orthogonal (sim 0.0) and must not appear.
+        let pairs = dedupe_candidate_pairs(&pool, &new_ids, &seen, 0.85, 10);
+        assert_eq!(pairs, vec![(1, 2)]);
+    }
+
+    #[test]
+    fn dedupe_candidate_pairs_requires_at_least_one_side_new() {
+        let pool = vec![(1, unit_vec(4, 0)), (2, unit_vec(4, 0))];
+        let seen: HashSet<(i64, i64)> = HashSet::new();
+        // Both old (neither in new_ids) -- even though they're similar,
+        // this pair must never surface: rescanning the whole store nightly
+        // is exactly what this pass is meant to avoid.
+        let pairs = dedupe_candidate_pairs(&pool, &HashSet::new(), &seen, 0.85, 10);
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn dedupe_candidate_pairs_excludes_already_seen_pairs() {
+        let pool = vec![(1, unit_vec(4, 0)), (2, unit_vec(4, 0))];
+        let new_ids: HashSet<i64> = [2].into_iter().collect();
+        let seen: HashSet<(i64, i64)> = [(1, 2)].into_iter().collect();
+        assert!(dedupe_candidate_pairs(&pool, &new_ids, &seen, 0.85, 10).is_empty());
+    }
+
+    #[test]
+    fn dedupe_candidate_pairs_caps_and_orders_oldest_first() {
+        // Every id shares a direction with every other -- 3 ids yields the
+        // 3 pairwise combinations, all qualifying; the cap of 2 must keep
+        // the two whose smaller id is lowest, i.e. (1,2) and (1,3), not (2,3).
+        let pool = vec![(1, unit_vec(4, 0)), (2, unit_vec(4, 0)), (3, unit_vec(4, 0))];
+        let new_ids: HashSet<i64> = [1, 2, 3].into_iter().collect();
+        let seen: HashSet<(i64, i64)> = HashSet::new();
+        let pairs = dedupe_candidate_pairs(&pool, &new_ids, &seen, 0.85, 2);
+        assert_eq!(pairs, vec![(1, 2), (1, 3)]);
+    }
+
+    // --- nightly dedupe pass: verdict parsing ---
+
+    #[test]
+    fn parse_dedupe_verdict_accepts_duplicate_naming_either_pair_member() {
+        assert_eq!(parse_dedupe_verdict("DUPLICATE 12", 12, 45), DedupeVerdict::Duplicate { keep_id: 12 });
+        assert_eq!(parse_dedupe_verdict("duplicate #45", 12, 45), DedupeVerdict::Duplicate { keep_id: 45 });
+    }
+
+    #[test]
+    fn parse_dedupe_verdict_accepts_supersedes() {
+        assert_eq!(parse_dedupe_verdict("SUPERSEDES 7", 7, 9), DedupeVerdict::Supersedes { winner_id: 7 });
+    }
+
+    #[test]
+    fn parse_dedupe_verdict_accepts_distinct_case_insensitively() {
+        assert_eq!(parse_dedupe_verdict("DISTINCT", 1, 2), DedupeVerdict::Distinct);
+        assert_eq!(parse_dedupe_verdict("  distinct  \n", 1, 2), DedupeVerdict::Distinct);
+    }
+
+    #[test]
+    fn parse_dedupe_verdict_scans_past_leading_chatter() {
+        let out = "Sure, here's my answer:\nDUPLICATE 12";
+        assert_eq!(parse_dedupe_verdict(out, 12, 45), DedupeVerdict::Duplicate { keep_id: 12 });
+    }
+
+    #[test]
+    fn parse_dedupe_verdict_rejects_id_outside_the_pair() {
+        // A hallucinated third id must never be accepted as a keep/winner.
+        assert_eq!(parse_dedupe_verdict("DUPLICATE 99", 12, 45), DedupeVerdict::Malformed);
+    }
+
+    #[test]
+    fn parse_dedupe_verdict_malformed_on_empty_prose_or_missing_id() {
+        assert_eq!(parse_dedupe_verdict("", 1, 2), DedupeVerdict::Malformed);
+        assert_eq!(parse_dedupe_verdict("I'm not sure.", 1, 2), DedupeVerdict::Malformed);
+        assert_eq!(parse_dedupe_verdict("DUPLICATE", 1, 2), DedupeVerdict::Malformed);
+        assert_eq!(parse_dedupe_verdict("SUPERSEDES banana", 1, 2), DedupeVerdict::Malformed);
+    }
+
+    #[test]
+    fn build_dedupe_prompt_includes_both_memories_and_sources() {
+        let p = build_dedupe_prompt((1, "likes tea", Some("note")), (2, "likes tea a lot", None));
+        assert!(p.contains("Memory #1 (source: note):\nlikes tea"));
+        assert!(p.contains("Memory #2 (source: unknown):\nlikes tea a lot"));
+        assert!(p.contains("DISTINCT"));
     }
 
     #[test]

@@ -151,7 +151,13 @@ pub fn build_prompt(meeting: &Meeting, transcript: &str) -> String {
          FACTS:\n\
          <up to 8 durable facts worth remembering long-term from this meeting, each a self-contained \
          bullet point starting with \"-\", each naming the meeting's date so it still makes sense out \
-         of context. If nothing here is durable enough to remember, write exactly \"none\".>\n",
+         of context. ATTRIBUTE statements to people by name inside the fact itself whenever the \
+         transcript supports it -- \"Moses said the Q4 report should focus on retention (2026-09-05 \
+         meeting)\", \"Ivar committed to shipping the RHI redesign\" -- appending \"(name inferred)\" \
+         when the identification comes from context rather than an explicit introduction. A fact that \
+         says who said it is worth far more to a future reader than an anonymous one; fall back to \
+         \"the user\"/\"the other participant\" only when no name is supportable. If nothing here is \
+         durable enough to remember, write exactly \"none\".>\n",
     );
     s
 }

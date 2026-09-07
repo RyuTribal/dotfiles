@@ -1,6 +1,6 @@
 ---
 name: kb
-description: Use when the user says "remember this", "save to knowledge bank", "what do you know about", or asks Claude to recall something from a past session. Wraps `mach kb` — a personal, vectorized, cross-session knowledge bank stored at ~/.local/share/mach/kb.db.
+description: Use on EVERY substantive user prompt — first to triage the auto-injected knowledge-bank recall (use as-is, verify, or relearn), and whenever the user says "remember this", "save to knowledge bank", "what do you know about", or asks about past sessions. Wraps `mach kb` — a personal, vectorized, cross-session knowledge bank stored at ~/.local/share/mach/kb.db.
 ---
 
 # kb — personal knowledge bank
@@ -9,7 +9,33 @@ description: Use when the user says "remember this", "save to knowledge bank", "
 (preferences, projects, people, decisions) with embeddings, so they can be
 found later by meaning, not just keyword. A `UserPromptSubmit` hook already
 searches it automatically on every prompt and injects any close matches as
-context — this skill is for *deliberate* saves and searches you do yourself.
+context — this skill is for triaging that recall and for *deliberate*
+saves and searches you do yourself.
+
+## Memory-first protocol (every prompt)
+
+The recall hook fires on every prompt. Your job per prompt:
+
+1. **No recall block injected?** For substantive questions (about the
+   user, their projects, people, past work — not one-off code mechanics),
+   run `mach kb search "<reformulated query>" --json` yourself once
+   before falling back to exploration. The hook's threshold is
+   conservative; a rephrased manual search often hits.
+2. **Recall answers the question, and nothing suggests it's stale** →
+   answer from it directly. Cite that it came from memory. Zero or one
+   cheap verification command (an `ls`, a `--version`) is fine; a
+   spelunking expedition is not.
+3. **Recall is relevant but old, partial, or contradicted by something
+   in view** → verify the load-bearing part cheaply, then answer.
+   If reality moved on, save the corrected fact (`mach kb add` — the
+   classifier will supersede the stale one).
+4. **Recall is thin or off-target** → investigate normally (explore,
+   spelunk, read the project). Afterwards, if you learned durable
+   user-facts, save them — that's the "relearning" loop: explore once,
+   remember, never re-derive a third time.
+
+Never invoke exploration skills to re-establish what an injected recall
+already states.
 
 ## Saving a fact
 

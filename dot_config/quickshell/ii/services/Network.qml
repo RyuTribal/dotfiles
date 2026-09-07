@@ -193,7 +193,11 @@ Singleton {
     Process {
         id: updateNetworkStrength
         running: true
-        command: ["sh", "-c", "nmcli -f IN-USE,SIGNAL,SSID device wifi | awk '/^\*/{if (NR!=1) {print $2}}'"]
+        // Terse mode with an exact field match: the human-readable variant
+        // needed a regex on the IN-USE asterisk, and QML string escaping
+        // mangled /^\*/ into /^*/ (matches every row), feeding parseInt the
+        // last row's SSID instead of the active row's signal.
+        command: ["sh", "-c", "nmcli -t -f IN-USE,SIGNAL device wifi | awk -F: '$1==\"*\"{print $2; exit}'"]
         stdout: SplitParser {
             onRead: data => {
                 root.networkStrength = parseInt(data);

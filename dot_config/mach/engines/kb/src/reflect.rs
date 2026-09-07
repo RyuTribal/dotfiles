@@ -626,14 +626,22 @@ pub fn dedupe_candidate_pairs(
 
 /// Outcome of parsing the nightly dedupe judge's reply for one candidate
 /// pair.
+///
+/// `DUPLICATE <id>` and `SUPERSEDES <id>` used to be two separate variants
+/// here, both naming the winner id — but `run_dedupe_pass` (in `cli.rs`)
+/// has always applied them identically (merge the loser's stats into the
+/// winner, then tombstone the loser), so the distinction was cosmetic and
+/// bought nothing except a second copy of the exact "which one is the
+/// winner" grammar the contradiction judge's own `SUPERSEDES <id>` was
+/// found to invert (see `build_contradiction_pass_prompt`'s doc comment).
+/// Collapsed into one `KEEP <id>` token: same apply-time behavior, and one
+/// fewer grammar for a model to misread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DedupeVerdict {
-    /// Both memories describe the same fact — `keep_id` (one of the pair)
-    /// names the richer/newer copy; the other is the loser.
-    Duplicate { keep_id: i64 },
-    /// One memory updates or corrects the other — `winner_id` (one of the
-    /// pair) names the one that now holds true; the other is the loser.
-    Supersedes { winner_id: i64 },
+    /// Both memories describe the same fact, or one updates/corrects the
+    /// other — either way, `keep_id` (one of the pair) names the copy to
+    /// keep; the other is the loser.
+    Keep { keep_id: i64 },
     /// The judge explicitly declined: similar topic, different facts —
     /// leave both alone. Recorded in `dedupe_seen` so this exact pair is
     /// never re-asked.
@@ -649,10 +657,10 @@ pub enum DedupeVerdict {
 
 /// Parses the nightly dedupe judge's reply for the pair `(id_a, id_b)`.
 /// Scans line by line (tolerating leading chatter and a `#` prefix on the
-/// id, like `classify::parse_verdict`) for `DUPLICATE <id>`, `SUPERSEDES
-/// <id>`, or a bare `DISTINCT`. Strict about the cited id: it must be one
-/// of the two pair members, or the whole reply is `Malformed` rather than
-/// silently accepting a hallucinated third id.
+/// id, like `classify::parse_verdict`) for `KEEP <id>` or a bare
+/// `DISTINCT`. Strict about the cited id: it must be one of the two pair
+/// members, or the whole reply is `Malformed` rather than silently
+/// accepting a hallucinated third id.
 pub fn parse_dedupe_verdict(output: &str, id_a: i64, id_b: i64) -> DedupeVerdict {
     for raw_line in output.lines() {
         let line = raw_line.trim();
@@ -663,19 +671,10 @@ pub fn parse_dedupe_verdict(output: &str, id_a: i64, id_b: i64) -> DedupeVerdict
         if upper == "DISTINCT" {
             return DedupeVerdict::Distinct;
         }
-        if let Some(rest) = upper.strip_prefix("DUPLICATE") {
+        if let Some(rest) = upper.strip_prefix("KEEP") {
             if let Some(id) = extract_dedupe_id(rest) {
                 return if id == id_a || id == id_b {
-                    DedupeVerdict::Duplicate { keep_id: id }
-                } else {
-                    DedupeVerdict::Malformed
-                };
-            }
-        }
-        if let Some(rest) = upper.strip_prefix("SUPERSEDES") {
-            if let Some(id) = extract_dedupe_id(rest) {
-                return if id == id_a || id == id_b {
-                    DedupeVerdict::Supersedes { winner_id: id }
+                    DedupeVerdict::Keep { keep_id: id }
                 } else {
                     DedupeVerdict::Malformed
                 };
@@ -691,10 +690,10 @@ fn extract_dedupe_id(rest: &str) -> Option<i64> {
 
 /// Builds the nightly dedupe pass's one-haiku-call prompt (same invocation
 /// pattern as `classify::build_prompt`): both memories' full content and
-/// source, asking for a verdict among `DUPLICATE <id>` (same fact — keep
-/// the richer/newer copy), `SUPERSEDES <id>` (one updates or corrects the
-/// other), or `DISTINCT` (similar topic, different facts — leave both).
-/// `a`/`b` are `(id, content, source)`.
+/// source, asking for a verdict among `KEEP <id>` (same fact, or one
+/// updates/corrects the other — either way, keep this one) or `DISTINCT`
+/// (similar topic, different facts — leave both). `a`/`b` are `(id,
+/// content, source)`.
 pub fn build_dedupe_prompt(a: (i64, &str, Option<&str>), b: (i64, &str, Option<&str>)) -> String {
     let mut s = String::new();
     s.push_str(
@@ -705,11 +704,312 @@ pub fn build_dedupe_prompt(a: (i64, &str, Option<&str>), b: (i64, &str, Option<&
     s.push_str(&format!("Memory #{} (source: {}):\n{}\n\n", a.0, a.2.unwrap_or("unknown"), a.1));
     s.push_str(&format!("Memory #{} (source: {}):\n{}\n\n", b.0, b.2.unwrap_or("unknown"), b.1));
     s.push_str(
-        "Reply with exactly one line and no other text: DUPLICATE <id>, SUPERSEDES <id>, or DISTINCT.\n\
-         DUPLICATE <id> -- both describe the same fact; <id> names the richer or newer copy to keep.\n\
-         SUPERSEDES <id> -- one memory updates or corrects the other; <id> names the winner (the \
-         one that now holds true).\n\
+        "Reply with exactly one line and no other text: KEEP <id> or DISTINCT.\n\
+         KEEP <id> -- these describe the same fact, or one updates or corrects the other; <id> \
+         names the copy to keep (the richer, newer, or now-correct one) -- the other will be removed.\n\
          DISTINCT -- similar topic but different facts; keep both.\n",
+    );
+    s
+}
+
+// --- contradiction patrol ---
+
+/// Minimum cosine similarity for two active memories to be considered a
+/// contradiction-patrol candidate pair: below this, two memories are
+/// similar only in a coincidental, surface way and aren't worth a judge
+/// call.
+pub const CONTRADICTION_MIN_SIM: f32 = 0.60;
+/// Similarity at or above this belongs to the nightly dedupe pass instead
+/// (`DEDUPE_MIN_SIM`) — the contradiction band is deliberately the strip
+/// just below it: semantic siblings (same rough topic) that are textually
+/// different enough that dedupe's own classifier never sees them as a
+/// candidate pair, yet close enough that one may be a stale version of the
+/// other (e.g. "Moses is the user's boss" vs. "the user's boss Ivar
+/// approved the RHI redesign" — around 0.6-0.8 similarity, nowhere near
+/// dedupe's 0.85 floor, so the stale fact would otherwise just sit there
+/// accumulating reinforcement forever).
+pub const CONTRADICTION_MAX_SIM: f32 = 0.85;
+/// At most this many candidate pairs are sent to the contradiction judge
+/// per `mach kb reflect` run — same bounded-cost rationale as
+/// `DEDUPE_MAX_PAIRS_PER_RUN`.
+pub const CONTRADICTION_MAX_PAIRS_PER_RUN: usize = 10;
+
+/// Finds this run's contradiction-patrol candidate pairs: `(a, b)` with `a <
+/// b`, cosine similarity in `[min_sim, max_sim)` — semantic siblings,
+/// textually different, sitting just below the dedupe band rather than
+/// overlapping it — at least one side in `new_ids` (created since the last
+/// reflect run), and not already recorded in `seen` (the caller's own union
+/// of `dedupe_seen` and `contradiction_seen`: a pair either judge has
+/// already ruled on needs no second opinion). Capped at `cap`,
+/// **newest-first** (by the larger id in each pair, which is already how
+/// each tuple is normalized) — the opposite order from
+/// `dedupe_candidate_pairs`'s oldest-first drain: a fresh contradiction (a
+/// new fact quietly conflicting with an old one) is exactly the case this
+/// pass exists to catch quickly, so it shouldn't wait behind a long backlog
+/// of older near-duplicate pairs.
+pub fn contradiction_candidate_pairs(
+    pool: &[(i64, Vec<f32>)],
+    new_ids: &HashSet<i64>,
+    seen: &HashSet<(i64, i64)>,
+    min_sim: f32,
+    max_sim: f32,
+    cap: usize,
+) -> Vec<(i64, i64)> {
+    let mut out: Vec<(i64, i64)> = Vec::new();
+    for i in 0..pool.len() {
+        for j in (i + 1)..pool.len() {
+            let (id_a, id_b) = if pool[i].0 < pool[j].0 { (pool[i].0, pool[j].0) } else { (pool[j].0, pool[i].0) };
+            if !new_ids.contains(&id_a) && !new_ids.contains(&id_b) {
+                continue;
+            }
+            if seen.contains(&(id_a, id_b)) {
+                continue;
+            }
+            let sim = cosine(&pool[i].1, &pool[j].1);
+            if sim >= min_sim && sim < max_sim {
+                out.push((id_a, id_b));
+            }
+        }
+    }
+    // Newest-first: id_b is always the larger of the normalized pair, so
+    // sorting on it descending (tie-broken on id_a descending) is enough —
+    // no need to compute a separate max().
+    out.sort_by(|x, y| y.1.cmp(&x.1).then(y.0.cmp(&x.0)));
+    out.dedup();
+    out.truncate(cap);
+    out
+}
+
+/// Outcome of parsing the contradiction judge's reply for one candidate
+/// pair. Carries no id: unlike an earlier version of this verdict, which
+/// asked the model to name a `SUPERSEDES <id>` winner, the winner is now
+/// resolved entirely in Rust via `newer_wins` — see
+/// `build_contradiction_pass_prompt`'s doc comment for why the model is
+/// never asked to name one.
+///
+/// `Conflict` and `ConflictRetro` both mean the two memories describe the
+/// same role/attribute/state and disagree — the split is *which one
+/// describes the current state*, a judgment the model has to make, not
+/// arithmetic on timestamps. Record time and event time are not the same
+/// thing: someone can jot down a retrospective note (`"Moses was my boss
+/// before Ivar"`) well after the fact, in which case the newer-*recorded*
+/// memory is the one that's stale about *now*, even though it's the more
+/// recent row. That's exactly the case `ConflictRetro` exists to catch —
+/// see its own doc comment for how it's applied differently from a plain
+/// `Conflict`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContradictionVerdict {
+    /// The two facts conflict about the same thing — a role, attribute, or
+    /// state that changed over time — AND the newer-recorded memory is the
+    /// one describing the current state (the ordinary case: a change is
+    /// learned of and written down close to when it happened). The caller
+    /// resolves which one wins via `newer_wins` (newer record wins) and
+    /// tombstones the other.
+    Conflict,
+    /// Same disagreement, but the newer-*recorded* memory is itself
+    /// describing a *past* state retrospectively — the older-recorded
+    /// memory is the one that actually holds true now. This is not "the
+    /// retrospective note is wrong" (it may be a perfectly accurate piece
+    /// of history) — it's simply not the *current* fact to surface, so the
+    /// caller tombstones the newer-recorded memory under the older one
+    /// (`newer_wins`'s output consumed with winner/loser swapped from the
+    /// plain `Conflict` case) — it leaves active recall but stays
+    /// queryable, same as any other tombstoned row.
+    ConflictRetro,
+    /// Both facts are compatible: different subjects, or explicitly both
+    /// still true. Recorded in `contradiction_seen` so this exact pair is
+    /// never re-asked.
+    BothHold,
+    /// The judge couldn't tell, or its reply was empty or unrecognized —
+    /// never recorded either way, so this pair gets a fresh chance on a
+    /// later run (same offline discipline the nightly dedupe pass already
+    /// follows for its own `Malformed`).
+    Unclear,
+}
+
+/// Given two `(id, recorded_at)` pairs, resolves which one was recorded more
+/// recently, as `(later_id, earlier_id)`. A plain string compare is exact
+/// for this store's fixed-width RFC3339 timestamps (same trick
+/// `store::memory_last_modified` relies on); a tie favors `b`. Shared by
+/// the prompt builder (for its informational note) and
+/// `cli::apply_contradiction_verdict`, which consumes this same ordering
+/// two different ways depending on the verdict: for a plain `Conflict` the
+/// later-recorded id is the winner (as returned); for `ConflictRetro` the
+/// caller swaps it — the later-recorded id is retrospective and loses,
+/// the earlier-recorded id is the one that's actually current. Naming this
+/// `(later_id, earlier_id)` rather than `(winner_id, loser_id)` reflects
+/// that this function only ever resolves record order, never who "wins" —
+/// that judgment now depends on which verdict the model returned.
+pub fn newer_wins(a: (i64, &str), b: (i64, &str)) -> (i64, i64) {
+    if b.1 >= a.1 {
+        (b.0, a.0)
+    } else {
+        (a.0, b.0)
+    }
+}
+
+/// Parses the contradiction judge's reply. Scans line by line (tolerating
+/// leading chatter, like every other judge parser in this module) for
+/// exactly one of four whole-line tokens: `CONFLICT`, `CONFLICT_RETRO`,
+/// `BOTH_HOLD`, or `UNCLEAR`. Deliberately strict — no id is ever parsed
+/// here (see `ContradictionVerdict`'s own doc comment for why), so a line
+/// like `CONFLICT 12` matches none of the four tokens and is simply skipped
+/// like any other unrecognized line; reaching the end of the reply without
+/// a match is `Unclear`, matching the module-wide rule that a bad or
+/// unparseable reply is never destructive.
+pub fn parse_contradiction_verdict(output: &str) -> ContradictionVerdict {
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match line.to_uppercase().as_str() {
+            "CONFLICT" => return ContradictionVerdict::Conflict,
+            "CONFLICT_RETRO" => return ContradictionVerdict::ConflictRetro,
+            "BOTH_HOLD" => return ContradictionVerdict::BothHold,
+            "UNCLEAR" => return ContradictionVerdict::Unclear,
+            _ => continue,
+        }
+    }
+    ContradictionVerdict::Unclear
+}
+
+/// Builds the contradiction judge's one-haiku-call prompt: both memories'
+/// content and recorded date, asking for a verdict among `CONFLICT`,
+/// `CONFLICT_RETRO`, `BOTH_HOLD`, or `UNCLEAR`. `a`/`b` are `(id, content,
+/// date)`.
+///
+/// The model is never asked to name a winner id. An earlier version of this
+/// verdict asked for `SUPERSEDES <id>` — first leaving the model to work out
+/// *which* id was newer from the raw dates (live testing against real haiku
+/// replies showed it reliably favored whichever memory *reads* as the more
+/// direct, plain statement of the role, even with the dates right there and
+/// an explicit "always pick the later one" instruction — a wording bias that
+/// silently overrode recency), then, after precomputing the winner in Rust
+/// and spelling it out as `output SUPERSEDES {winner_id}` in the instruction
+/// itself, STILL inverting it: asked three times to output `SUPERSEDES 134`
+/// (the precomputed, spelled-out winner), haiku replied `SUPERSEDES 133`
+/// (the loser) every time. The grammar itself is ambiguous — "SUPERSEDES
+/// <id>" reads in ordinary English as "<id> is the one that gets
+/// superseded," i.e. the loser, the opposite of what the parser expected —
+/// and no amount of surrounding instruction reliably overrides that reading.
+/// The fix removes the id from the model's task entirely.
+///
+/// What the model still has to decide, though, is which memory describes
+/// the *current* state — that's a judgment call, not arithmetic: record
+/// time and event time can diverge (a retrospective note written well after
+/// the fact is a newer *row* about an *older* state). `CONFLICT_RETRO`
+/// exists so the model can say so explicitly rather than the timestamp
+/// alone silently (and sometimes wrongly) picking a winner. The raw
+/// timestamp comparison (`newer_wins`) still lives entirely in Rust either
+/// way — the model never states or is asked to state an id, only which of
+/// the four fixed-shape verdicts applies.
+pub fn build_contradiction_pass_prompt(a: (i64, &str, &str), b: (i64, &str, &str)) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "You are checking a personal knowledge bank for contradictions between two semantically \
+         related but textually different memories -- decide the single correct relationship \
+         between them.\n\n",
+    );
+    s.push_str(&format!("Memory #{} (recorded {}):\n{}\n\n", a.0, a.2, a.1));
+    s.push_str(&format!("Memory #{} (recorded {}):\n{}\n\n", b.0, b.2, b.1));
+    let (later_id, earlier_id) = newer_wins((a.0, a.2), (b.0, b.2));
+    s.push_str(&format!(
+        "Note: memory #{} was recorded more recently than memory #{}. This is only when each memory \
+         was WRITTEN, not necessarily which one describes the more current state -- a memory can be a \
+         retrospective note about the past, recorded well after the fact.\n\n",
+        later_id, earlier_id
+    ));
+    s.push_str(
+        "Reply with exactly one line and no other text: CONFLICT, CONFLICT_RETRO, BOTH_HOLD, or UNCLEAR.\n\
+         CONFLICT -- both memories name who or what currently holds the same role, attribute, or state, \
+         they disagree, AND the more recently recorded memory is describing the CURRENT state (the \
+         ordinary case: a change happened and was written down close to when it happened). You don't \
+         need to say which one wins; the more recently recorded memory will automatically be treated as \
+         current.\n\
+         CONFLICT_RETRO -- same disagreement, but the more recently recorded memory is itself describing \
+         a PAST state retrospectively (reminiscing, or giving historical context), while the OLDER-recorded \
+         memory is the one that actually describes what's true now. Use this when the newer note reads as \
+         being about the past, not as an update to the present.\n\
+         BOTH_HOLD -- these are genuinely different subjects, or both are still true at once; keep both.\n\
+         UNCLEAR -- you cannot tell from what's shown.\n",
+    );
+    s
+}
+
+// --- strength review sampler ---
+
+/// Outcome of parsing the strength-review judge's reply for one sampled
+/// memory checked against its top-3 semantic neighbors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrengthVerdict {
+    /// Nothing among the neighbors casts doubt — bump `last_verified_at`.
+    Stands,
+    /// The memory is aging or weakening but isn't directly contradicted by
+    /// any neighbor shown — halve its `stability` (so it decays faster)
+    /// without tombstoning it; actual supersession stays the contradiction
+    /// patrol's job, not this sampler's.
+    Stale,
+    /// A neighbor directly contradicts the memory — `with_id` names it, so
+    /// the caller can route the pair into the exact same judge the
+    /// contradiction patrol itself uses, rather than deciding supersession
+    /// here.
+    Conflict { with_id: i64 },
+    /// Empty/prose output, an unrecognized line, or a `CONFLICT` naming an
+    /// id outside the shown neighbors — never recorded either way, so this
+    /// memory stays due and gets resampled on a later run.
+    Malformed,
+}
+
+/// Parses the strength-review judge's reply for a memory checked against
+/// `neighbor_ids`. Scans line by line for `STANDS`, `STALE`, or `CONFLICT
+/// <id>` (tolerating leading chatter and a `#`-prefixed id, like the other
+/// judges in this module); a `CONFLICT` naming an id outside
+/// `neighbor_ids` — a hallucinated or stale reference — is `Malformed`
+/// rather than trusted.
+pub fn parse_strength_verdict(output: &str, neighbor_ids: &[i64]) -> StrengthVerdict {
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let upper = line.to_uppercase();
+        if upper == "STANDS" {
+            return StrengthVerdict::Stands;
+        }
+        if upper == "STALE" {
+            return StrengthVerdict::Stale;
+        }
+        if let Some(rest) = upper.strip_prefix("CONFLICT") {
+            if let Some(id) = extract_dedupe_id(rest) {
+                return if neighbor_ids.contains(&id) {
+                    StrengthVerdict::Conflict { with_id: id }
+                } else {
+                    StrengthVerdict::Malformed
+                };
+            }
+        }
+    }
+    StrengthVerdict::Malformed
+}
+
+/// Builds the strength-review sampler's one-haiku-call prompt: the sampled
+/// memory (with its recorded date) and its top-3 semantic neighbors, asking
+/// whether any of them shows newer evidence that the memory is stale or
+/// wrong.
+pub fn build_strength_review_prompt(claim: &str, claim_date: &str, neighbors: &[(i64, String)]) -> String {
+    let mut s = String::new();
+    s.push_str("A durable memory from a personal knowledge bank is due for a periodic strength check.\n\n");
+    s.push_str(&format!("Memory (recorded {}):\n{}\n\n", claim_date, claim));
+    s.push_str("Its closest related memories currently in the store:\n");
+    for (id, content) in neighbors {
+        s.push_str(&format!("[{}] {}\n", id, content));
+    }
+    s.push_str(
+        "\nDoes any of these show newer evidence that the memory above is stale or wrong? Reply with \
+         exactly one line and nothing else: STANDS (still holds), STALE (aging or weakening, but not \
+         directly contradicted by any memory shown), or CONFLICT <id> (that memory directly \
+         contradicts it -- name its id).\n",
     );
     s
 }
@@ -1271,14 +1571,9 @@ mod tests {
     // --- nightly dedupe pass: verdict parsing ---
 
     #[test]
-    fn parse_dedupe_verdict_accepts_duplicate_naming_either_pair_member() {
-        assert_eq!(parse_dedupe_verdict("DUPLICATE 12", 12, 45), DedupeVerdict::Duplicate { keep_id: 12 });
-        assert_eq!(parse_dedupe_verdict("duplicate #45", 12, 45), DedupeVerdict::Duplicate { keep_id: 45 });
-    }
-
-    #[test]
-    fn parse_dedupe_verdict_accepts_supersedes() {
-        assert_eq!(parse_dedupe_verdict("SUPERSEDES 7", 7, 9), DedupeVerdict::Supersedes { winner_id: 7 });
+    fn parse_dedupe_verdict_accepts_keep_naming_either_pair_member() {
+        assert_eq!(parse_dedupe_verdict("KEEP 12", 12, 45), DedupeVerdict::Keep { keep_id: 12 });
+        assert_eq!(parse_dedupe_verdict("keep #45", 12, 45), DedupeVerdict::Keep { keep_id: 45 });
     }
 
     #[test]
@@ -1289,22 +1584,22 @@ mod tests {
 
     #[test]
     fn parse_dedupe_verdict_scans_past_leading_chatter() {
-        let out = "Sure, here's my answer:\nDUPLICATE 12";
-        assert_eq!(parse_dedupe_verdict(out, 12, 45), DedupeVerdict::Duplicate { keep_id: 12 });
+        let out = "Sure, here's my answer:\nKEEP 12";
+        assert_eq!(parse_dedupe_verdict(out, 12, 45), DedupeVerdict::Keep { keep_id: 12 });
     }
 
     #[test]
     fn parse_dedupe_verdict_rejects_id_outside_the_pair() {
         // A hallucinated third id must never be accepted as a keep/winner.
-        assert_eq!(parse_dedupe_verdict("DUPLICATE 99", 12, 45), DedupeVerdict::Malformed);
+        assert_eq!(parse_dedupe_verdict("KEEP 99", 12, 45), DedupeVerdict::Malformed);
     }
 
     #[test]
     fn parse_dedupe_verdict_malformed_on_empty_prose_or_missing_id() {
         assert_eq!(parse_dedupe_verdict("", 1, 2), DedupeVerdict::Malformed);
         assert_eq!(parse_dedupe_verdict("I'm not sure.", 1, 2), DedupeVerdict::Malformed);
-        assert_eq!(parse_dedupe_verdict("DUPLICATE", 1, 2), DedupeVerdict::Malformed);
-        assert_eq!(parse_dedupe_verdict("SUPERSEDES banana", 1, 2), DedupeVerdict::Malformed);
+        assert_eq!(parse_dedupe_verdict("KEEP", 1, 2), DedupeVerdict::Malformed);
+        assert_eq!(parse_dedupe_verdict("KEEP banana", 1, 2), DedupeVerdict::Malformed);
     }
 
     #[test]
@@ -1312,6 +1607,7 @@ mod tests {
         let p = build_dedupe_prompt((1, "likes tea", Some("note")), (2, "likes tea a lot", None));
         assert!(p.contains("Memory #1 (source: note):\nlikes tea"));
         assert!(p.contains("Memory #2 (source: unknown):\nlikes tea a lot"));
+        assert!(p.contains("KEEP"));
         assert!(p.contains("DISTINCT"));
     }
 
@@ -1324,5 +1620,197 @@ mod tests {
         };
         assert_eq!(llm.call("haiku", "prompt", TIMEOUT_HAIKU).unwrap(), "What does the user do?");
         assert_eq!(llm.call("sonnet", "prompt", TIMEOUT_SONNET).unwrap(), "NONE");
+    }
+
+    // --- contradiction patrol: band selection ---
+
+    #[test]
+    fn contradiction_candidate_pairs_respects_the_band_below_dedupe() {
+        // Cosine similarity between two unit vectors at a known angle: build
+        // a pair that lands at exactly 0.0 (orthogonal, below the band), a
+        // pair at 1.0 (identical direction, above the band), and check the
+        // band boundaries themselves with hand-picked vectors.
+        let below = vec![(1, unit_vec(4, 0)), (2, unit_vec(4, 1))]; // sim 0.0 -- below CONTRADICTION_MIN_SIM
+        let above = vec![(3, unit_vec(4, 0)), (4, unit_vec(4, 0))]; // sim 1.0 -- at/above CONTRADICTION_MAX_SIM
+        let new_ids: HashSet<i64> = [1, 2, 3, 4].into_iter().collect();
+        let seen: HashSet<(i64, i64)> = HashSet::new();
+
+        assert!(contradiction_candidate_pairs(&below, &new_ids, &seen, CONTRADICTION_MIN_SIM, CONTRADICTION_MAX_SIM, 10)
+            .is_empty());
+        assert!(contradiction_candidate_pairs(&above, &new_ids, &seen, CONTRADICTION_MIN_SIM, CONTRADICTION_MAX_SIM, 10)
+            .is_empty());
+    }
+
+    #[test]
+    fn contradiction_candidate_pairs_accepts_a_mid_band_pair() {
+        // Two vectors at a 45-degree angle -- cosine ~0.707, squarely inside
+        // [0.60, 0.85).
+        let a = vec![1.0f32, 0.0];
+        let b = vec![1.0f32, 1.0];
+        let pool = vec![(1, a), (2, b)];
+        let new_ids: HashSet<i64> = [1].into_iter().collect();
+        let seen: HashSet<(i64, i64)> = HashSet::new();
+        let pairs =
+            contradiction_candidate_pairs(&pool, &new_ids, &seen, CONTRADICTION_MIN_SIM, CONTRADICTION_MAX_SIM, 10);
+        assert_eq!(pairs, vec![(1, 2)]);
+    }
+
+    #[test]
+    fn contradiction_candidate_pairs_requires_at_least_one_side_new() {
+        let a = vec![1.0f32, 0.0];
+        let b = vec![1.0f32, 1.0];
+        let pool = vec![(1, a), (2, b)];
+        let seen: HashSet<(i64, i64)> = HashSet::new();
+        assert!(contradiction_candidate_pairs(&pool, &HashSet::new(), &seen, CONTRADICTION_MIN_SIM, CONTRADICTION_MAX_SIM, 10)
+            .is_empty());
+    }
+
+    #[test]
+    fn contradiction_candidate_pairs_excludes_already_seen_pairs() {
+        let a = vec![1.0f32, 0.0];
+        let b = vec![1.0f32, 1.0];
+        let pool = vec![(1, a), (2, b)];
+        let new_ids: HashSet<i64> = [1].into_iter().collect();
+        let seen: HashSet<(i64, i64)> = [(1, 2)].into_iter().collect();
+        assert!(
+            contradiction_candidate_pairs(&pool, &new_ids, &seen, CONTRADICTION_MIN_SIM, CONTRADICTION_MAX_SIM, 10)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn contradiction_candidate_pairs_caps_and_orders_newest_first() {
+        // Three ids all at the same mid-band angle to a common seed
+        // direction -- every pairing with id 1 qualifies; newest-first means
+        // the cap of 2 keeps the pairs with the largest id_b, i.e. (1,4) and
+        // (1,3), not (1,2).
+        let seed = vec![1.0f32, 0.0];
+        let mid = vec![1.0f32, 1.0];
+        let pool = vec![(1, seed), (2, mid.clone()), (3, mid.clone()), (4, mid)];
+        let new_ids: HashSet<i64> = [1, 2, 3, 4].into_iter().collect();
+        let seen: HashSet<(i64, i64)> = HashSet::new();
+        let pairs =
+            contradiction_candidate_pairs(&pool, &new_ids, &seen, CONTRADICTION_MIN_SIM, CONTRADICTION_MAX_SIM, 2);
+        assert_eq!(pairs, vec![(1, 4), (1, 3)]);
+    }
+
+    // --- contradiction patrol: verdict parsing ---
+
+    #[test]
+    fn parse_contradiction_verdict_accepts_conflict() {
+        assert_eq!(parse_contradiction_verdict("CONFLICT"), ContradictionVerdict::Conflict);
+        assert_eq!(parse_contradiction_verdict("  conflict  \n"), ContradictionVerdict::Conflict);
+    }
+
+    #[test]
+    fn parse_contradiction_verdict_accepts_conflict_retro() {
+        assert_eq!(parse_contradiction_verdict("CONFLICT_RETRO"), ContradictionVerdict::ConflictRetro);
+        assert_eq!(parse_contradiction_verdict("  conflict_retro  \n"), ContradictionVerdict::ConflictRetro);
+    }
+
+    #[test]
+    fn parse_contradiction_verdict_accepts_both_hold_case_insensitively() {
+        assert_eq!(parse_contradiction_verdict("BOTH_HOLD"), ContradictionVerdict::BothHold);
+        assert_eq!(parse_contradiction_verdict("  both_hold  \n"), ContradictionVerdict::BothHold);
+    }
+
+    #[test]
+    fn parse_contradiction_verdict_scans_past_leading_chatter() {
+        let out = "Sure, here's my answer:\nCONFLICT";
+        assert_eq!(parse_contradiction_verdict(out), ContradictionVerdict::Conflict);
+    }
+
+    #[test]
+    fn parse_contradiction_verdict_rejects_a_token_with_a_trailing_id() {
+        // The whole point of the id-free grammar: a line like "CONFLICT 12"
+        // is not an exact match for any of the four tokens, so it's simply
+        // skipped like any other unrecognized line, never parsed as if it
+        // named a winner.
+        assert_eq!(parse_contradiction_verdict("CONFLICT 12"), ContradictionVerdict::Unclear);
+        assert_eq!(parse_contradiction_verdict("CONFLICT_RETRO 12"), ContradictionVerdict::Unclear);
+    }
+
+    #[test]
+    fn parse_contradiction_verdict_malformed_or_explicit_unclear_both_yield_unclear() {
+        assert_eq!(parse_contradiction_verdict("UNCLEAR"), ContradictionVerdict::Unclear);
+        assert_eq!(parse_contradiction_verdict(""), ContradictionVerdict::Unclear);
+        assert_eq!(parse_contradiction_verdict("I'm not sure."), ContradictionVerdict::Unclear);
+        assert_eq!(parse_contradiction_verdict("SUPERSEDES 12"), ContradictionVerdict::Unclear, "the old grammar is gone");
+    }
+
+    // --- contradiction patrol: newer_wins ---
+
+    #[test]
+    fn newer_wins_favors_the_later_timestamp() {
+        assert_eq!(newer_wins((1, "2026-03-01T00:00:00Z"), (2, "2026-09-01T00:00:00Z")), (2, 1));
+        assert_eq!(newer_wins((2, "2026-09-01T00:00:00Z"), (1, "2026-03-01T00:00:00Z")), (2, 1));
+    }
+
+    #[test]
+    fn newer_wins_ties_favor_b() {
+        assert_eq!(newer_wins((1, "2026-03-01T00:00:00Z"), (2, "2026-03-01T00:00:00Z")), (2, 1));
+    }
+
+    #[test]
+    fn build_contradiction_pass_prompt_includes_both_memories_dates_and_instructions() {
+        let p = build_contradiction_pass_prompt(
+            (1, "Moses is the user's boss", "2026-03-01T00:00:00Z"),
+            (2, "the user's boss Ivar approved the RHI redesign", "2026-09-01T00:00:00Z"),
+        );
+        assert!(p.contains("Memory #1 (recorded 2026-03-01T00:00:00Z):\nMoses is the user's boss"));
+        assert!(p.contains("Memory #2 (recorded 2026-09-01T00:00:00Z):\nthe user's boss Ivar approved the RHI redesign"));
+        assert!(p.contains("Note: memory #2 was recorded more recently than memory #1"));
+        assert!(p.contains("CONFLICT"));
+        assert!(p.contains("CONFLICT_RETRO"));
+        assert!(p.contains("BOTH_HOLD"));
+        assert!(p.contains("UNCLEAR"));
+        assert!(!p.contains("SUPERSEDES"), "the model must never be asked to name a winner id");
+    }
+
+    // --- strength review sampler: verdict parsing ---
+
+    #[test]
+    fn parse_strength_verdict_accepts_stands_and_stale() {
+        assert_eq!(parse_strength_verdict("STANDS", &[1, 2, 3]), StrengthVerdict::Stands);
+        assert_eq!(parse_strength_verdict("  stale  \n", &[1, 2, 3]), StrengthVerdict::Stale);
+    }
+
+    #[test]
+    fn parse_strength_verdict_accepts_conflict_naming_a_known_neighbor() {
+        assert_eq!(parse_strength_verdict("CONFLICT 2", &[1, 2, 3]), StrengthVerdict::Conflict { with_id: 2 });
+        assert_eq!(parse_strength_verdict("conflict #3", &[1, 2, 3]), StrengthVerdict::Conflict { with_id: 3 });
+    }
+
+    #[test]
+    fn parse_strength_verdict_scans_past_leading_chatter() {
+        let out = "Sure, here's my answer:\nSTANDS";
+        assert_eq!(parse_strength_verdict(out, &[1, 2, 3]), StrengthVerdict::Stands);
+    }
+
+    #[test]
+    fn parse_strength_verdict_rejects_conflict_naming_an_unknown_neighbor() {
+        assert_eq!(parse_strength_verdict("CONFLICT 99", &[1, 2, 3]), StrengthVerdict::Malformed);
+    }
+
+    #[test]
+    fn parse_strength_verdict_malformed_on_empty_prose_or_missing_id() {
+        assert_eq!(parse_strength_verdict("", &[1, 2, 3]), StrengthVerdict::Malformed);
+        assert_eq!(parse_strength_verdict("I'm not sure.", &[1, 2, 3]), StrengthVerdict::Malformed);
+        assert_eq!(parse_strength_verdict("CONFLICT", &[1, 2, 3]), StrengthVerdict::Malformed);
+        assert_eq!(parse_strength_verdict("CONFLICT banana", &[1, 2, 3]), StrengthVerdict::Malformed);
+    }
+
+    #[test]
+    fn build_strength_review_prompt_includes_claim_date_and_neighbors() {
+        let p = build_strength_review_prompt(
+            "the user's boss is Moses",
+            "2026-03-01T00:00:00Z",
+            &[(7, "the user's boss is now Ivar".to_string())],
+        );
+        assert!(p.contains("Memory (recorded 2026-03-01T00:00:00Z):\nthe user's boss is Moses"));
+        assert!(p.contains("[7] the user's boss is now Ivar"));
+        assert!(p.contains("STANDS"));
+        assert!(p.contains("STALE"));
+        assert!(p.contains("CONFLICT"));
     }
 }

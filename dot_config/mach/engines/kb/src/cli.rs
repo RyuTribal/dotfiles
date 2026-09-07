@@ -656,6 +656,11 @@ const REFLECT_EXISTING_INSIGHTS_CONTEXT: usize = 3;
 const REFLECT_VERIFICATION_SAMPLE: usize = 5;
 const REFLECT_VERIFICATION_CANDIDATES: usize = 5;
 const META_EVIDENCE_PER_CLUSTER: usize = 6;
+// Strength review sampler (extends re-verification to raw memories, not
+// just insights — see `run_strength_review_pass`).
+const REFLECT_STRENGTH_SAMPLE: usize = 5;
+const STRENGTH_MIN_IMPORTANCE: i64 = 6;
+const STRENGTH_NEIGHBORS: usize = 3;
 
 fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut force_meta = false;
@@ -944,23 +949,56 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         }
     }
 
-    // Step 4.5: dormancy — put stale, low-importance, uncited memories (and
-    // any never-curated digest row past its own 30-day floor) to sleep,
-    // then consolidate this run's freshly-dormant rows into new durable
-    // facts where a cluster of them shares something worth keeping. Runs
-    // every invocation regardless of has_new/force_meta — it's a nightly
-    // sweep over the whole active store, not gated on new material.
-    let (dormant, consolidated, dormancy_llm_failed) = run_dormancy_pass(&conn, &embedder, &llm, &now).map_err(to_io)?;
-    llm_failed = llm_failed || dormancy_llm_failed;
-
-    // Step 4.6: nightly dedupe — fast capture paths (`mach note`, digests)
+    // Step 4.5: nightly dedupe — fast capture paths (`mach note`, digests)
     // deliberately skip save-time dedupe classification, so near-duplicate
     // raw memories accumulate; this catches them here, where LLM time is
     // free. Only pairs touching a memory created since the last reflect
     // run are considered, capped at reflect::DEDUPE_MAX_PAIRS_PER_RUN.
+    // Deliberately runs BEFORE dormancy (below): a memory old/stale/uncited
+    // enough to qualify for dormancy this very run is exactly the kind of
+    // long-neglected fact a dedupe or contradiction pair most needs to
+    // catch — dormancy would otherwise drop it out of
+    // `active_memories_for_dormancy`'s pool (dormant rows are excluded from
+    // it) before either judge ever got a look at it.
     let new_ids: HashSet<i64> = new_memories.iter().map(|m| m.id).collect();
     let (deduped, dedupe_llm_failed) = run_dedupe_pass(&conn, &llm, &new_ids, &now).map_err(to_io)?;
     llm_failed = llm_failed || dedupe_llm_failed;
+
+    // Step 4.55: contradiction patrol (after dedupe) — catches the case the
+    // nightly dedupe pass's own similarity band never sees: two memories
+    // about the same changing thing (e.g. a changed boss) that are similar
+    // enough to be semantic siblings but too textually different to ever
+    // land at dedupe's >= 0.85 floor, so the stale fact would otherwise
+    // just sit there accumulating reinforcement forever. Only pairs
+    // touching a memory created since the last reflect run are considered,
+    // same "new-vs-all" shape as the dedupe pass, capped at
+    // reflect::CONTRADICTION_MAX_PAIRS_PER_RUN. Same before-dormancy
+    // rationale as the dedupe pass above.
+    let (contradictions, contradiction_llm_failed) = run_contradiction_pass(&conn, &llm, &new_ids, &now).map_err(to_io)?;
+    llm_failed = llm_failed || contradiction_llm_failed;
+
+    // Step 4.6: strength review — extends re-verification (step 4, above)
+    // from insights to raw memories themselves: samples up to
+    // REFLECT_STRENGTH_SAMPLE oldest-verified ACTIVE memories at importance
+    // >= STRENGTH_MIN_IMPORTANCE and checks each against its own top-3
+    // semantic neighbors, routing any genuine conflict through the same
+    // judge the contradiction patrol above uses. Also runs before dormancy
+    // for the same reason.
+    let (mem_verified, mem_stale, mem_routed, strength_llm_failed) =
+        run_strength_review_pass(&conn, &llm, &now).map_err(to_io)?;
+    llm_failed = llm_failed || strength_llm_failed;
+
+    // Step 4.65: dormancy — put stale, low-importance, uncited memories (and
+    // any never-curated digest row past its own 30-day floor) to sleep,
+    // then consolidate this run's freshly-dormant rows into new durable
+    // facts where a cluster of them shares something worth keeping. Runs
+    // every invocation regardless of has_new/force_meta — it's a nightly
+    // sweep over the whole active store, not gated on new material. Runs
+    // last among these sweeps so a memory the contradiction patrol just
+    // tombstoned above is already excluded from its pool (tombstoned rows
+    // never qualify for dormancy in the first place) rather than racing it.
+    let (dormant, consolidated, dormancy_llm_failed) = run_dormancy_pass(&conn, &embedder, &llm, &now).map_err(to_io)?;
+    llm_failed = llm_failed || dormancy_llm_failed;
 
     // Step 5: meta-reflection (theme) pass — only when triggered, or
     // forced via --meta for manual runs.
@@ -993,7 +1031,8 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
 
     println!(
         "mach kb reflect: examined={} questions={} insights_added={} reinforced={} \
-         themes_added={} flagged={} verified={} dormant={} consolidated={} deduped={}{}",
+         themes_added={} flagged={} verified={} dormant={} consolidated={} deduped={} \
+         contradictions={} mem_verified={} mem_stale={} mem_routed={}{}",
         examined,
         questions_count,
         insights_added,
@@ -1004,6 +1043,10 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         dormant,
         consolidated,
         deduped,
+        contradictions,
+        mem_verified,
+        mem_stale,
+        mem_routed,
         if llm_failed { " (degraded: some claude calls failed — watermark not advanced)" } else { "" }
     );
     Ok(())
@@ -1175,12 +1218,12 @@ fn run_meta_pass(conn: &Connection, embedder: &OllamaEmbedder, llm: &ProcessRefl
 /// dormancy): finds ACTIVE memory pairs at `>= reflect::DEDUPE_MIN_SIM`
 /// cosine where at least one side was created since the last reflect run,
 /// asks one haiku call per pair (capped at `reflect::DEDUPE_MAX_PAIRS_PER_RUN`,
-/// oldest-first) for a DUPLICATE/SUPERSEDES/DISTINCT verdict, and applies
+/// oldest-first) for a KEEP/DISTINCT verdict, and applies
 /// it:
 ///
-/// - `Duplicate`/`Supersedes` merges the loser's earned reinforcement into
-///   the winner and tombstones the loser via the ordinary supersession
-///   mechanics, then re-points any insight citing the loser to the winner.
+/// - `Keep` merges the loser's earned reinforcement into the winner and
+///   tombstones the loser via the ordinary supersession mechanics, then
+///   re-points any insight citing the loser to the winner.
 /// - `Distinct` is recorded in `dedupe_seen` so the pair is never re-asked.
 /// - `Malformed` (or the judge call itself failing) does nothing — no
 ///   merge, no `dedupe_seen` entry — so the pair gets a fresh chance on a
@@ -1227,7 +1270,7 @@ fn run_dedupe_pass<L: ReflectLlm>(
             }
         };
         match reflect::parse_dedupe_verdict(&raw, id_a, id_b) {
-            reflect::DedupeVerdict::Duplicate { keep_id } | reflect::DedupeVerdict::Supersedes { winner_id: keep_id } => {
+            reflect::DedupeVerdict::Keep { keep_id } => {
                 let (winner_id, loser_id) = if keep_id == id_a { (id_a, id_b) } else { (id_b, id_a) };
                 if store::merge_and_supersede(conn, loser_id, winner_id, now)? {
                     store::repoint_insight_citations(conn, loser_id, winner_id)?;
@@ -1248,6 +1291,259 @@ fn run_dedupe_pass<L: ReflectLlm>(
         }
     }
     Ok((deduped, llm_failed))
+}
+
+/// The contradiction patrol (runs inside `mach kb reflect`, right after the
+/// nightly dedupe pass): finds ACTIVE memory pairs at
+/// `reflect::CONTRADICTION_MIN_SIM..reflect::CONTRADICTION_MAX_SIM` cosine —
+/// semantic siblings sitting just below the dedupe band, textually
+/// different enough that dedupe's own classifier never sees them as a pair
+/// — where at least one side was created since the last reflect run, asks
+/// one haiku call per pair (capped at `reflect::CONTRADICTION_MAX_PAIRS_PER_RUN`,
+/// newest-first) for a CONFLICT/BOTH_HOLD/UNCLEAR verdict, and applies it
+/// via `apply_contradiction_verdict`.
+///
+/// Returns `(contradictions_resolved, any_judge_call_failed)`. Generic over
+/// `ReflectLlm`, same as `run_dedupe_pass`, so it's exercised in tests
+/// against a fake that can fail on demand.
+fn run_contradiction_pass<L: ReflectLlm>(
+    conn: &Connection,
+    llm: &L,
+    new_ids: &HashSet<i64>,
+    now: &str,
+) -> Result<(usize, bool), KbError> {
+    if new_ids.is_empty() {
+        return Ok((0, false));
+    }
+    let pool = store::active_memories_for_dormancy(conn)?;
+    let items: Vec<(i64, Vec<f32>)> = pool.iter().filter_map(|m| m.embedding.clone().map(|e| (m.id, e))).collect();
+    let mut seen = store::dedupe_seen_pairs(conn)?;
+    seen.extend(store::contradiction_seen_pairs(conn)?);
+    let pairs = reflect::contradiction_candidate_pairs(
+        &items,
+        new_ids,
+        &seen,
+        reflect::CONTRADICTION_MIN_SIM,
+        reflect::CONTRADICTION_MAX_SIM,
+        reflect::CONTRADICTION_MAX_PAIRS_PER_RUN,
+    );
+
+    let mut resolved = 0usize;
+    let mut llm_failed = false;
+    for (id_a, id_b) in pairs {
+        let (mem_a, mem_b) = match (store::get(conn, id_a)?, store::get(conn, id_b)?) {
+            (Some(a), Some(b)) => (a, b),
+            _ => continue, // one side vanished between candidate generation and now
+        };
+        if mem_a.is_superseded() || mem_b.is_superseded() {
+            // Already resolved by an earlier pair examined this same run.
+            continue;
+        }
+        let prompt = reflect::build_contradiction_pass_prompt(
+            (mem_a.id, mem_a.content.as_str(), mem_a.created_at.as_str()),
+            (mem_b.id, mem_b.content.as_str(), mem_b.created_at.as_str()),
+        );
+        let raw = match llm.call("haiku", &prompt, TIMEOUT_HAIKU) {
+            Ok(out) => out,
+            Err(_) => {
+                // The judge call itself failed — never destructive, and
+                // deliberately NOT recorded in contradiction_seen either
+                // (this pair was never actually asked about): retry it
+                // next run.
+                llm_failed = true;
+                continue;
+            }
+        };
+        if apply_contradiction_verdict(
+            conn,
+            reflect::parse_contradiction_verdict(&raw),
+            id_a,
+            &mem_a.created_at,
+            id_b,
+            &mem_b.created_at,
+            now,
+        )? {
+            resolved += 1;
+        }
+    }
+    Ok((resolved, llm_failed))
+}
+
+/// Applies one contradiction verdict — shared by `run_contradiction_pass`
+/// and the strength-review sampler's own conflict routing (below), so both
+/// apply the exact same tombstone/flag/seen mechanics:
+///
+/// - `Conflict` resolves the winner via `reflect::newer_wins` as-is (later
+///   record wins — the model itself never names an id; see
+///   `ContradictionVerdict`'s own doc comment) and tombstones the loser via
+///   plain `store::supersede` (never `merge_and_supersede` — unlike a
+///   dedupe merge, the loser was once genuinely true, so its earned access
+///   stats stay exactly as they are, an honest history rather than folded
+///   into the winner) and flags (never repoints) any insight citing the
+///   loser — the insight may rest on the now-outdated fact, so it needs
+///   human review, not a silent citation swap.
+/// - `ConflictRetro` applies the exact same `supersede`/flag mechanics but
+///   with `newer_wins`'s output consumed swapped: the *later*-recorded
+///   memory is the retrospective one and loses, the *earlier*-recorded
+///   memory is the one that's actually current and wins. Recording time
+///   and event time aren't the same thing — see `ContradictionVerdict`'s
+///   own doc comment.
+/// - `BothHold` is recorded in `contradiction_seen` so the pair is never
+///   re-asked.
+/// - `Unclear` does nothing.
+///
+/// Returns whether a supersession was actually applied (for the caller's own
+/// resolved-count bookkeeping).
+#[allow(clippy::too_many_arguments)]
+fn apply_contradiction_verdict(
+    conn: &Connection,
+    verdict: reflect::ContradictionVerdict,
+    id_a: i64,
+    date_a: &str,
+    id_b: i64,
+    date_b: &str,
+    now: &str,
+) -> Result<bool, KbError> {
+    let apply_supersede = |winner_id: i64, loser_id: i64| -> Result<bool, KbError> {
+        if store::supersede(conn, loser_id, winner_id, now)? {
+            store::flag_insights_citing_memory(conn, loser_id, now)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    };
+    match verdict {
+        reflect::ContradictionVerdict::Conflict => {
+            let (winner_id, loser_id) = reflect::newer_wins((id_a, date_a), (id_b, date_b));
+            apply_supersede(winner_id, loser_id)
+        }
+        reflect::ContradictionVerdict::ConflictRetro => {
+            // newer_wins returns (later, earlier); retro swaps who wins.
+            let (later_id, earlier_id) = reflect::newer_wins((id_a, date_a), (id_b, date_b));
+            apply_supersede(earlier_id, later_id)
+        }
+        reflect::ContradictionVerdict::BothHold => {
+            store::mark_contradiction_seen(conn, id_a, id_b)?;
+            Ok(false)
+        }
+        reflect::ContradictionVerdict::Unclear => Ok(false),
+    }
+}
+
+/// The strength-review sampler (runs inside `mach kb reflect`, right after
+/// the contradiction patrol): extends the same re-verification idea from
+/// insights (step 4, above) to raw memories. Samples up to
+/// `REFLECT_STRENGTH_SAMPLE` ACTIVE memories at `importance >=
+/// STRENGTH_MIN_IMPORTANCE`, oldest `last_verified_at` first (mirrors
+/// `insights_due_for_verification`'s own ordering), and checks each against
+/// its own top-`STRENGTH_NEIGHBORS` semantic neighbors with one haiku call:
+///
+/// - `Stands` bumps `last_verified_at` — reviewed, still holds.
+/// - `Stale` halves `stability` (so it decays and gets recalled/reinforced
+///   less, without being tombstoned — actual supersession stays the
+///   contradiction patrol's job) and also bumps `last_verified_at`, so this
+///   memory doesn't monopolize every future run's sample.
+/// - `Conflict` routes the specific `(memory, neighbor)` pair through the
+///   exact same judge prompt/parse/apply path the contradiction patrol
+///   itself uses (skipping it if the pair is already in `dedupe_seen` or
+///   `contradiction_seen` — no need to ask twice). This sampler's own call
+///   already succeeded (it got a verdict), so `last_verified_at` is bumped
+///   regardless of how that follow-up call turns out; a failure in the
+///   follow-up call still marks the run degraded.
+/// - `Malformed` (or the sampler's own judge call failing) does nothing —
+///   the memory stays due and gets resampled on a later run.
+///
+/// Returns `(stands, stale, routed_to_contradiction, any_judge_call_failed)`.
+fn run_strength_review_pass<L: ReflectLlm>(conn: &Connection, llm: &L, now: &str) -> Result<(usize, usize, usize, bool), KbError> {
+    let candidates = store::memories_due_for_strength_review(conn, REFLECT_STRENGTH_SAMPLE, STRENGTH_MIN_IMPORTANCE)?;
+    let mut stands = 0usize;
+    let mut stale = 0usize;
+    let mut routed = 0usize;
+    let mut llm_failed = false;
+
+    for stale_mem in &candidates {
+        // Re-fetch rather than trust the up-front snapshot: an earlier
+        // iteration in this same loop may already have superseded this
+        // exact memory (as the loser of a routed conflict against a
+        // different sampled row).
+        let mem = match store::get(conn, stale_mem.id)? {
+            Some(m) if !m.is_superseded() => m,
+            _ => continue,
+        };
+        let emb = match &mem.embedding {
+            Some(e) if !e.is_empty() => e.clone(),
+            _ => continue,
+        };
+        let emb = emb.as_slice();
+        let neighbor_hits = store::top_similar_active(conn, emb, STRENGTH_NEIGHBORS + 1)?;
+        let neighbor_pairs: Vec<(i64, String)> = neighbor_hits
+            .into_iter()
+            .filter(|(m, _)| m.id != mem.id)
+            .take(STRENGTH_NEIGHBORS)
+            .map(|(m, _)| (m.id, m.content))
+            .collect();
+        if neighbor_pairs.is_empty() {
+            continue; // nothing to compare against yet
+        }
+
+        let prompt = reflect::build_strength_review_prompt(&mem.content, &mem.created_at, &neighbor_pairs);
+        let raw = match llm.call("haiku", &prompt, TIMEOUT_HAIKU) {
+            Ok(out) => out,
+            Err(_) => {
+                llm_failed = true;
+                continue;
+            }
+        };
+        let neighbor_ids: Vec<i64> = neighbor_pairs.iter().map(|(id, _)| *id).collect();
+        match reflect::parse_strength_verdict(&raw, &neighbor_ids) {
+            reflect::StrengthVerdict::Stands => {
+                store::mark_memory_verified(conn, mem.id, now)?;
+                stands += 1;
+            }
+            reflect::StrengthVerdict::Stale => {
+                store::halve_stability(conn, mem.id)?;
+                store::mark_memory_verified(conn, mem.id, now)?;
+                stale += 1;
+            }
+            reflect::StrengthVerdict::Conflict { with_id } => {
+                store::mark_memory_verified(conn, mem.id, now)?;
+                routed += 1;
+
+                let (id_a, id_b) = if mem.id < with_id { (mem.id, with_id) } else { (with_id, mem.id) };
+                let mut seen = store::dedupe_seen_pairs(conn)?;
+                seen.extend(store::contradiction_seen_pairs(conn)?);
+                if seen.contains(&(id_a, id_b)) {
+                    continue; // already ruled on by either judge — don't re-ask
+                }
+                let (neighbor_mem, this_mem) = match store::get(conn, with_id)? {
+                    Some(n) if !n.is_superseded() => (n, mem.clone()),
+                    _ => continue,
+                };
+                let prompt = reflect::build_contradiction_pass_prompt(
+                    (this_mem.id, this_mem.content.as_str(), this_mem.created_at.as_str()),
+                    (neighbor_mem.id, neighbor_mem.content.as_str(), neighbor_mem.created_at.as_str()),
+                );
+                match llm.call("haiku", &prompt, TIMEOUT_HAIKU) {
+                    Ok(craw) => {
+                        apply_contradiction_verdict(
+                            conn,
+                            reflect::parse_contradiction_verdict(&craw),
+                            this_mem.id,
+                            &this_mem.created_at,
+                            neighbor_mem.id,
+                            &neighbor_mem.created_at,
+                            now,
+                        )?;
+                    }
+                    Err(_) => {
+                        llm_failed = true;
+                    }
+                }
+            }
+            reflect::StrengthVerdict::Malformed => {}
+        }
+    }
+    Ok((stands, stale, routed, llm_failed))
 }
 
 fn cmd_insights(mut args: impl Iterator<Item = String>) -> io::Result<()> {
@@ -1715,7 +2011,7 @@ mod tests {
     }
 
     #[test]
-    fn run_dedupe_pass_duplicate_merges_tombstones_and_repoints_citations() {
+    fn run_dedupe_pass_keep_merges_tombstones_and_repoints_citations() {
         let conn = mem_conn();
         let (a, b) = insert_pair(&conn);
         // b's earned reinforcement must survive the merge into a.
@@ -1724,7 +2020,7 @@ mod tests {
         store::touch(&conn, &[b], &now).unwrap();
         let insight_id = store::insert_insight(&conn, "an insight citing the loser", 0.5, &[b.to_string()], None).unwrap();
 
-        let llm = OwnedReplyLlm { reply: format!("DUPLICATE {}", a) };
+        let llm = OwnedReplyLlm { reply: format!("KEEP {}", a) };
         let new_ids: HashSet<i64> = [a].into_iter().collect();
         let (deduped, failed) = run_dedupe_pass(&conn, &llm, &new_ids, &now).unwrap();
         assert_eq!(deduped, 1);
@@ -1740,5 +2036,267 @@ mod tests {
         assert_eq!(ins.source_ids, vec![a.to_string()], "citation of the tombstoned loser follows the merge to the winner");
 
         assert!(store::dedupe_seen_pairs(&conn).unwrap().is_empty(), "a merged pair needs no dedupe_seen record");
+    }
+
+    // --- run_contradiction_pass: band selection, offline safety, apply mechanics ---
+
+    /// Two memories at ~0.707 cosine (a 45-degree angle) — squarely inside
+    /// the contradiction band (0.60-0.85) and well below the dedupe band
+    /// (>= 0.85), unlike `insert_pair`'s identical-direction vectors.
+    fn insert_contradiction_pair(conn: &Connection) -> (i64, i64) {
+        let a = store::insert(conn, "TESTBOSS: Moses is the user's boss", None, None, true, Some(&[1.0f32, 0.0]), 5).unwrap();
+        let b = store::insert(
+            conn,
+            "TESTBOSS: the user's boss Ivar approved the RHI redesign",
+            None,
+            None,
+            true,
+            Some(&[1.0f32, 1.0]),
+            5,
+        )
+        .unwrap();
+        (a, b)
+    }
+
+    #[test]
+    fn run_contradiction_pass_skips_entirely_when_nothing_is_new() {
+        let conn = mem_conn();
+        let (a, _b) = insert_contradiction_pair(&conn);
+        let llm = FixedReflectLlm { reply: Ok("BOTH_HOLD") };
+        let (resolved, failed) = run_contradiction_pass(&conn, &llm, &HashSet::new(), &store::now_rfc3339()).unwrap();
+        assert_eq!(resolved, 0);
+        assert!(!failed);
+        let _ = a;
+    }
+
+    #[test]
+    fn run_contradiction_pass_failed_judge_call_is_never_recorded_as_seen() {
+        let conn = mem_conn();
+        let (a, b) = insert_contradiction_pair(&conn);
+        let llm = FixedReflectLlm { reply: Err("offline") };
+        let new_ids: HashSet<i64> = [a].into_iter().collect();
+        let (resolved, failed) = run_contradiction_pass(&conn, &llm, &new_ids, &store::now_rfc3339()).unwrap();
+        assert_eq!(resolved, 0, "never tombstones on a failed call");
+        assert!(failed, "caller must freeze the watermark");
+        assert!(store::contradiction_seen_pairs(&conn).unwrap().is_empty(), "a transport failure must not be recorded as seen");
+        assert!(!store::get(&conn, a).unwrap().unwrap().is_superseded());
+        assert!(!store::get(&conn, b).unwrap().unwrap().is_superseded());
+    }
+
+    #[test]
+    fn run_contradiction_pass_unclear_reply_is_never_recorded_as_seen() {
+        let conn = mem_conn();
+        let (a, b) = insert_contradiction_pair(&conn);
+        let llm = FixedReflectLlm { reply: Ok("UNCLEAR") };
+        let new_ids: HashSet<i64> = [a].into_iter().collect();
+        let (resolved, failed) = run_contradiction_pass(&conn, &llm, &new_ids, &store::now_rfc3339()).unwrap();
+        assert_eq!(resolved, 0);
+        assert!(!failed, "the call itself succeeded — only its verdict was UNCLEAR");
+        assert!(store::contradiction_seen_pairs(&conn).unwrap().is_empty(), "UNCLEAR -> retry next run, not silenced");
+        assert!(!store::get(&conn, a).unwrap().unwrap().is_superseded());
+        assert!(!store::get(&conn, b).unwrap().unwrap().is_superseded());
+    }
+
+    #[test]
+    fn run_contradiction_pass_both_hold_is_recorded_as_seen() {
+        let conn = mem_conn();
+        let (a, b) = insert_contradiction_pair(&conn);
+        let llm = FixedReflectLlm { reply: Ok("BOTH_HOLD") };
+        let new_ids: HashSet<i64> = [a].into_iter().collect();
+        let (resolved, failed) = run_contradiction_pass(&conn, &llm, &new_ids, &store::now_rfc3339()).unwrap();
+        assert_eq!(resolved, 0);
+        assert!(!failed);
+        let seen = store::contradiction_seen_pairs(&conn).unwrap();
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        assert_eq!(seen, [(lo, hi)].into_iter().collect());
+    }
+
+    #[test]
+    fn run_contradiction_pass_conflict_tombstones_the_older_without_absorbing_loser_stats() {
+        // Unlike a dedupe merge, a contradiction loser was once genuinely
+        // true — its earned access stats must survive untouched as history,
+        // not be folded into the winner (`merge_and_supersede`'s job, never
+        // called here). The verdict itself carries no id — `newer_wins`
+        // (keyed on `created_at`, not anything the model says) picks b
+        // (Ivar, inserted after a/Moses) as the winner.
+        let conn = mem_conn();
+        let (a, b) = insert_contradiction_pair(&conn); // a = Moses (old), b = Ivar (new)
+        let now = store::now_rfc3339();
+        store::touch(&conn, &[a], &now).unwrap();
+        store::touch(&conn, &[a], &now).unwrap();
+        let winner_stability_before = store::get(&conn, b).unwrap().unwrap().effective_stability();
+
+        let llm = FixedReflectLlm { reply: Ok("CONFLICT") };
+        let new_ids: HashSet<i64> = [b].into_iter().collect();
+        let (resolved, failed) = run_contradiction_pass(&conn, &llm, &new_ids, &now).unwrap();
+        assert_eq!(resolved, 1);
+        assert!(!failed);
+
+        let loser = store::get(&conn, a).unwrap().unwrap();
+        let winner = store::get(&conn, b).unwrap().unwrap();
+        assert!(loser.is_superseded());
+        assert_eq!(loser.superseded_by, Some(b));
+        assert_eq!(loser.access_count, 2, "the loser's earned reinforcement stays on the loser's own row, as history");
+        assert_eq!(
+            winner.effective_stability(),
+            winner_stability_before,
+            "the winner's own stability must be untouched — no merge happens here"
+        );
+        assert!(
+            store::contradiction_seen_pairs(&conn).unwrap().is_empty(),
+            "a resolved pair needs no contradiction_seen record"
+        );
+    }
+
+    #[test]
+    fn run_contradiction_pass_conflict_flags_but_never_repoints_citing_insights() {
+        let conn = mem_conn();
+        let (a, b) = insert_contradiction_pair(&conn); // a = Moses (loser), b = Ivar (winner)
+        let now = store::now_rfc3339();
+        let insight_id = store::insert_insight(&conn, "the user reports to Moses", 0.5, &[a.to_string()], None).unwrap();
+
+        let llm = FixedReflectLlm { reply: Ok("CONFLICT") };
+        let new_ids: HashSet<i64> = [b].into_iter().collect();
+        let (resolved, _failed) = run_contradiction_pass(&conn, &llm, &new_ids, &now).unwrap();
+        assert_eq!(resolved, 1);
+
+        let ins = store::get_insight(&conn, insight_id).unwrap().unwrap();
+        assert!(ins.is_flagged(), "an insight citing the now-superseded loser must be flagged for review");
+        assert_eq!(ins.source_ids, vec![a.to_string()], "the citation itself must NOT be repointed to the winner");
+    }
+
+    #[test]
+    fn run_contradiction_pass_conflict_retro_tombstones_the_newer_recorded_retrospective_note() {
+        // b is recorded after a, but CONFLICT_RETRO says it's b describing a
+        // PAST state retrospectively -- the swap from a plain Conflict must
+        // hold: a (older-recorded, still current) stays active, b
+        // (newer-recorded, retrospective) is the one tombstoned, even though
+        // it's the later row (newer_wins would pick b if this were a plain
+        // Conflict).
+        let conn = mem_conn();
+        let (a, b) = insert_contradiction_pair(&conn); // a = older-recorded, b = newer-recorded retrospective note
+        let now = store::now_rfc3339();
+        let insight_id =
+            store::insert_insight(&conn, "an insight citing the retrospective note", 0.5, &[b.to_string()], None).unwrap();
+
+        let llm = FixedReflectLlm { reply: Ok("CONFLICT_RETRO") };
+        let new_ids: HashSet<i64> = [b].into_iter().collect();
+        let (resolved, failed) = run_contradiction_pass(&conn, &llm, &new_ids, &now).unwrap();
+        assert_eq!(resolved, 1);
+        assert!(!failed);
+
+        let older = store::get(&conn, a).unwrap().unwrap();
+        let newer = store::get(&conn, b).unwrap().unwrap();
+        assert!(!older.is_superseded(), "the older-recorded, still-current fact must stay active");
+        assert!(newer.is_superseded(), "the newer-recorded retrospective note is the one tombstoned");
+        assert_eq!(newer.superseded_by, Some(a));
+
+        let ins = store::get_insight(&conn, insight_id).unwrap().unwrap();
+        assert!(ins.is_flagged(), "an insight citing the now-tombstoned retrospective note must be flagged");
+    }
+
+    // --- run_strength_review_pass: verdict application ---
+
+    #[test]
+    fn run_strength_review_pass_stands_bumps_last_verified_at() {
+        let conn = mem_conn();
+        let id = store::insert(&conn, "the user prefers dark mode", None, None, true, Some(&[1.0f32, 0.0]), 7).unwrap();
+        store::insert(&conn, "a related neighbor memory", None, None, true, Some(&[1.0f32, 0.1]), STRENGTH_MIN_IMPORTANCE - 1).unwrap();
+
+        let llm = FixedReflectLlm { reply: Ok("STANDS") };
+        let (stands, stale, routed, failed) = run_strength_review_pass(&conn, &llm, &store::now_rfc3339()).unwrap();
+        assert_eq!(stands, 1);
+        assert_eq!(stale, 0);
+        assert_eq!(routed, 0);
+        assert!(!failed);
+        assert!(store::get(&conn, id).unwrap().unwrap().last_verified_at.is_some());
+    }
+
+    #[test]
+    fn run_strength_review_pass_stale_halves_stability_and_bumps_verified() {
+        let conn = mem_conn();
+        let id = store::insert(&conn, "the user prefers dark mode", None, None, true, Some(&[1.0f32, 0.0]), 7).unwrap();
+        store::insert(&conn, "a related neighbor memory", None, None, true, Some(&[1.0f32, 0.1]), STRENGTH_MIN_IMPORTANCE - 1).unwrap();
+        let before = store::get(&conn, id).unwrap().unwrap().effective_stability();
+
+        let llm = FixedReflectLlm { reply: Ok("STALE") };
+        let (stands, stale, _routed, failed) = run_strength_review_pass(&conn, &llm, &store::now_rfc3339()).unwrap();
+        assert_eq!(stands, 0);
+        assert_eq!(stale, 1);
+        assert!(!failed);
+        let after = store::get(&conn, id).unwrap().unwrap();
+        assert!((after.effective_stability() - before / 2.0).abs() < 1e-9);
+        assert!(after.last_verified_at.is_some(), "a STALE check still counts as a review — must not monopolize future runs");
+        assert!(!after.is_superseded(), "STALE never tombstones — that stays the contradiction patrol's job");
+    }
+
+    #[test]
+    fn run_strength_review_pass_conflict_routes_through_the_contradiction_judge() {
+        let conn = mem_conn();
+        let id = store::insert(&conn, "TESTBOSS: Moses is the user's boss", None, None, true, Some(&[1.0f32, 0.0]), 7).unwrap();
+        let neighbor =
+            store::insert(&conn, "TESTBOSS: the user's boss Ivar approved the RHI redesign", None, None, true, Some(&[1.0f32, 0.1]), 7)
+                .unwrap();
+
+        // First call (the sampler's own STANDS/STALE/CONFLICT check) returns
+        // `CONFLICT <id>` naming the neighbor; the follow-up contradiction
+        // judge uses a different, id-free `CONFLICT`/`BOTH_HOLD`/`UNCLEAR`
+        // grammar (see `reflect::ContradictionVerdict`), so a routing double
+        // keyed on prompt content still gives each call the reply shape it
+        // actually expects.
+        struct RoutingLlm {
+            neighbor: i64,
+        }
+        impl ReflectLlm for RoutingLlm {
+            fn call(&self, _model: &str, prompt: &str, _timeout: std::time::Duration) -> Result<String, String> {
+                if prompt.contains("periodic strength check") {
+                    Ok(format!("CONFLICT {}", self.neighbor))
+                } else {
+                    Ok("CONFLICT".to_string())
+                }
+            }
+        }
+        let llm = RoutingLlm { neighbor };
+
+        let now = store::now_rfc3339();
+        let (stands, stale, routed, failed) = run_strength_review_pass(&conn, &llm, &now).unwrap();
+        assert_eq!(stands, 0);
+        assert_eq!(stale, 0);
+        assert_eq!(routed, 1);
+        assert!(!failed);
+
+        let sampled = store::get(&conn, id).unwrap().unwrap();
+        assert!(sampled.last_verified_at.is_some(), "the sampler's own successful call still counts as a review");
+        assert!(sampled.is_superseded(), "newer_wins picked the neighbor (inserted after it) as the winner");
+        assert_eq!(sampled.superseded_by, Some(neighbor));
+    }
+
+    #[test]
+    fn run_strength_review_pass_malformed_reply_changes_nothing() {
+        let conn = mem_conn();
+        let id = store::insert(&conn, "the user prefers dark mode", None, None, true, Some(&[1.0f32, 0.0]), 7).unwrap();
+        store::insert(&conn, "a related neighbor memory", None, None, true, Some(&[1.0f32, 0.1]), STRENGTH_MIN_IMPORTANCE - 1).unwrap();
+
+        let llm = FixedReflectLlm { reply: Ok("I'm not sure about this one.") };
+        let (stands, stale, routed, failed) = run_strength_review_pass(&conn, &llm, &store::now_rfc3339()).unwrap();
+        assert_eq!(stands, 0);
+        assert_eq!(stale, 0);
+        assert_eq!(routed, 0);
+        assert!(!failed, "the call itself succeeded — only its content was malformed");
+        assert!(store::get(&conn, id).unwrap().unwrap().last_verified_at.is_none(), "must stay due for a later run");
+    }
+
+    #[test]
+    fn run_strength_review_pass_skips_memories_below_the_importance_floor() {
+        let conn = mem_conn();
+        let id =
+            store::insert(&conn, "a low-importance memory", None, None, true, Some(&[1.0f32, 0.0]), STRENGTH_MIN_IMPORTANCE - 1)
+                .unwrap();
+        store::insert(&conn, "a related neighbor memory", None, None, true, Some(&[1.0f32, 0.1]), STRENGTH_MIN_IMPORTANCE - 1).unwrap();
+
+        let llm = FixedReflectLlm { reply: Ok("STANDS") };
+        let (stands, _stale, _routed, _failed) = run_strength_review_pass(&conn, &llm, &store::now_rfc3339()).unwrap();
+        assert_eq!(stands, 0, "importance below STRENGTH_MIN_IMPORTANCE must never be sampled");
+        assert!(store::get(&conn, id).unwrap().unwrap().last_verified_at.is_none());
     }
 }

@@ -75,6 +75,13 @@ pub struct Memory {
     // like a tombstoned row, but never deleted — `mach kb wake <id>` clears
     // it.
     pub dormant_at: Option<String>,
+    // Bumped by the strength-review sampler (part of `mach kb reflect`,
+    // alongside insight re-verification) when a sampled memory's evidence
+    // still holds or is merely aging (STANDS/STALE) — mirrors
+    // `Insight::last_verified_at`'s role for raw memories. NULL means never
+    // sampled yet, which sorts first in `memories_due_for_strength_review`'s
+    // `ORDER BY ... ASC`, same trick `insights_due_for_verification` uses.
+    pub last_verified_at: Option<String>,
 }
 
 impl Memory {
@@ -150,7 +157,7 @@ pub fn db_path() -> Result<PathBuf, KbError> {
 fn init_schema(conn: &Connection) -> Result<(), KbError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS memories (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             content TEXT NOT NULL,
             source TEXT,
             project TEXT,
@@ -165,10 +172,11 @@ fn init_schema(conn: &Connection) -> Result<(), KbError> {
             valid_from TEXT,
             invalidated_at TEXT,
             superseded_by INTEGER,
-            dormant_at TEXT
+            dormant_at TEXT,
+            last_verified_at TEXT
         );
         CREATE TABLE IF NOT EXISTS insights (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             text TEXT NOT NULL,
             created_at TEXT NOT NULL,
             confidence REAL NOT NULL DEFAULT 0.5,
@@ -185,6 +193,11 @@ fn init_schema(conn: &Connection) -> Result<(), KbError> {
             last_memory_id INTEGER
         );
         CREATE TABLE IF NOT EXISTS dedupe_seen (
+            id_a INTEGER NOT NULL,
+            id_b INTEGER NOT NULL,
+            PRIMARY KEY (id_a, id_b)
+        );
+        CREATE TABLE IF NOT EXISTS contradiction_seen (
             id_a INTEGER NOT NULL,
             id_b INTEGER NOT NULL,
             PRIMARY KEY (id_a, id_b)
@@ -300,6 +313,123 @@ fn migrate_v4_to_v5(conn: &Connection) -> Result<(), KbError> {
     Ok(())
 }
 
+/// `PRAGMA user_version`-gated, idempotent 5 -> 6 migration: adds
+/// `memories.last_verified_at` (for the strength-review sampler's own
+/// re-verification of raw memories — see `Memory::last_verified_at`) and the
+/// contradiction patrol's `contradiction_seen` table. `init_schema`'s
+/// `CREATE TABLE IF NOT EXISTS` already creates `contradiction_seen` and a
+/// fresh `memories` table with the column present, so the only real work
+/// here is backfilling a pre-existing `memories` table that predates the
+/// column — every existing row is, by definition, never-verified, which is
+/// exactly the column's implicit default (NULL) — and bumping the version.
+fn migrate_v5_to_v6(conn: &Connection) -> Result<(), KbError> {
+    let cols = existing_columns(conn)?;
+    if !cols.iter().any(|c| c == "last_verified_at") {
+        conn.execute("ALTER TABLE memories ADD COLUMN last_verified_at TEXT", [])?;
+    }
+    conn.execute("PRAGMA user_version = 6", [])?;
+    Ok(())
+}
+
+/// `PRAGMA user_version`-gated, idempotent 6 -> 7 migration: rebuilds
+/// `memories` and `insights` with `INTEGER PRIMARY KEY AUTOINCREMENT` in
+/// place of a plain `INTEGER PRIMARY KEY`.
+///
+/// A plain `INTEGER PRIMARY KEY` is just an alias for SQLite's own ROWID,
+/// which gets reused after a hard delete (`mach kb forget` /
+/// `insight-forget`) once the table's max-id row is the one removed: the
+/// next insert picks the smallest unused id, not `max(id) + 1`. Every
+/// watermark in the reflection subsystem is an "id > last seen id"
+/// comparison — `reflect_state.last_memory_id` against `memories`
+/// (`memories_since`), and a theme's own id against `insights` via
+/// `count_active_level1_created_after` — so a reused id lands *below* the
+/// watermark and is silently invisible to every reflection pass forever.
+/// `AUTOINCREMENT` fixes this: SQLite tracks the highest ROWID a table has
+/// EVER held in the `sqlite_sequence` table, so the next insert always
+/// exceeds it regardless of what has been deleted since.
+///
+/// SQLite has no `ALTER TABLE ... ADD AUTOINCREMENT`, so this is a full
+/// rebuild, done the standard SQLite way: a new table with the column
+/// declared correctly, copy every row across preserving its existing id,
+/// drop the old table, rename the new one into place — all inside one
+/// transaction so a database is never left caught between the two shapes.
+/// `sqlite_sequence` ends up seeded from the highest id actually copied
+/// (SQLite maintains that row itself as data is inserted, even when the id
+/// is explicit rather than auto-assigned), so it starts at least as high as
+/// any id either table has ever issued.
+///
+/// Also purges any `dedupe_seen`/`contradiction_seen` row citing a memory
+/// id no longer present in `memories`: before this migration, a forgotten
+/// (and, under the reused-rowid bug, possibly since-reissued) id could sit
+/// in one of those tables and cause a future pair built from the reissued
+/// id to be wrongly treated as "already judged" by the nightly dedupe or
+/// contradiction pass.
+fn migrate_v6_to_v7(conn: &Connection) -> Result<(), KbError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE memories_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            content TEXT NOT NULL,
+            source TEXT,
+            project TEXT,
+            created_at TEXT NOT NULL,
+            reviewed INTEGER NOT NULL DEFAULT 1,
+            embedding BLOB,
+            importance INTEGER NOT NULL DEFAULT 5,
+            stability REAL,
+            access_count INTEGER NOT NULL DEFAULT 0,
+            first_accessed_at TEXT,
+            last_accessed_at TEXT,
+            valid_from TEXT,
+            invalidated_at TEXT,
+            superseded_by INTEGER,
+            dormant_at TEXT,
+            last_verified_at TEXT
+        );
+        INSERT INTO memories_new
+            (id, content, source, project, created_at, reviewed, embedding, importance, stability,
+             access_count, first_accessed_at, last_accessed_at, valid_from, invalidated_at,
+             superseded_by, dormant_at, last_verified_at)
+        SELECT
+            id, content, source, project, created_at, reviewed, embedding, importance, stability,
+            access_count, first_accessed_at, last_accessed_at, valid_from, invalidated_at,
+            superseded_by, dormant_at, last_verified_at
+        FROM memories ORDER BY id;
+        DROP TABLE memories;
+        ALTER TABLE memories_new RENAME TO memories;
+
+        CREATE TABLE insights_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            confidence REAL NOT NULL DEFAULT 0.5,
+            source_ids TEXT NOT NULL,
+            embedding BLOB,
+            invalidated_at TEXT,
+            flagged_at TEXT,
+            last_verified_at TEXT,
+            level INTEGER NOT NULL DEFAULT 1
+        );
+        INSERT INTO insights_new
+            (id, text, created_at, confidence, source_ids, embedding, invalidated_at, flagged_at,
+             last_verified_at, level)
+        SELECT
+            id, text, created_at, confidence, source_ids, embedding, invalidated_at, flagged_at,
+            last_verified_at, level
+        FROM insights ORDER BY id;
+        DROP TABLE insights;
+        ALTER TABLE insights_new RENAME TO insights;
+
+        DELETE FROM dedupe_seen
+            WHERE id_a NOT IN (SELECT id FROM memories) OR id_b NOT IN (SELECT id FROM memories);
+        DELETE FROM contradiction_seen
+            WHERE id_a NOT IN (SELECT id FROM memories) OR id_b NOT IN (SELECT id FROM memories);",
+    )?;
+    tx.execute("PRAGMA user_version = 7", [])?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Runs every migration step whose version gate hasn't been cleared yet.
 /// Runs on every `open`, but the version gate makes every call after the
 /// first one a single cheap `PRAGMA` read.
@@ -319,6 +449,12 @@ fn migrate(conn: &Connection) -> Result<(), KbError> {
     }
     if version < 5 {
         migrate_v4_to_v5(conn)?;
+    }
+    if version < 6 {
+        migrate_v5_to_v6(conn)?;
+    }
+    if version < 7 {
+        migrate_v6_to_v7(conn)?;
     }
     Ok(())
 }
@@ -522,6 +658,7 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         invalidated_at: row.get("invalidated_at")?,
         superseded_by: row.get("superseded_by")?,
         dormant_at: row.get("dormant_at")?,
+        last_verified_at: row.get("last_verified_at")?,
         created_at,
     })
 }
@@ -635,8 +772,23 @@ pub fn get(conn: &Connection, id: i64) -> Result<Option<Memory>, KbError> {
 /// shouldn't destroy evidence the image ever existed. Orphaned image
 /// cleanup, if ever wanted, is a separate manual sweep, not a side effect
 /// of forgetting.
+///
+/// Also purges any `dedupe_seen`/`contradiction_seen` row citing `id` — a
+/// pair "already judged" against a memory that no longer exists must not
+/// silently suppress a fresh judgment if some future id (post-AUTOINCREMENT,
+/// this can no longer be `id` itself, but the cleanup is unconditional
+/// regardless) ever needs to be compared against the survivor again. Both
+/// deletes run in the same transaction as the memory delete so a crash
+/// mid-way never leaves a stale pair behind pointing at a row that's
+/// already gone.
 pub fn delete(conn: &Connection, id: i64) -> Result<bool, KbError> {
-    let n = conn.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+    let tx = conn.unchecked_transaction()?;
+    let n = tx.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+    if n > 0 {
+        tx.execute("DELETE FROM dedupe_seen WHERE id_a = ?1 OR id_b = ?1", params![id])?;
+        tx.execute("DELETE FROM contradiction_seen WHERE id_a = ?1 OR id_b = ?1", params![id])?;
+    }
+    tx.commit()?;
     Ok(n > 0)
 }
 
@@ -1551,6 +1703,106 @@ pub fn repoint_insight_citations(conn: &Connection, old_id: i64, new_id: i64) ->
     Ok(updated)
 }
 
+// --- contradiction patrol ---
+
+/// Records that a contradiction-patrol candidate pair was judged `BOTH_HOLD`
+/// — never asked about again on a future reflect run. Deliberately NOT
+/// called for an `UNCLEAR` verdict or a failed `claude` call: those get a
+/// fresh chance next run instead of being silenced forever (mirrors
+/// `mark_dedupe_seen`'s own contract exactly). A pair that instead resolves
+/// to `SUPERSEDES` never needs this either — the loser drops out of the
+/// active pool that candidate generation scans, so it can't resurface as a
+/// pair.
+pub fn mark_contradiction_seen(conn: &Connection, id_a: i64, id_b: i64) -> Result<(), KbError> {
+    let (a, b) = normalize_pair(id_a, id_b);
+    conn.execute("INSERT OR IGNORE INTO contradiction_seen (id_a, id_b) VALUES (?1, ?2)", params![a, b])?;
+    Ok(())
+}
+
+/// Every pair ever recorded by `mark_contradiction_seen`, as normalized
+/// `(min, max)` tuples — loaded once per reflect run so candidate
+/// generation (`reflect::contradiction_candidate_pairs`) can exclude them
+/// with a plain set lookup, same shape as `dedupe_seen_pairs`. The caller
+/// unions this with `dedupe_seen_pairs` before generating candidates: a pair
+/// either judge has already ruled on needs no second opinion from the other.
+pub fn contradiction_seen_pairs(conn: &Connection) -> Result<std::collections::HashSet<(i64, i64)>, KbError> {
+    let mut stmt = conn.prepare("SELECT id_a, id_b FROM contradiction_seen")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let mut out = std::collections::HashSet::new();
+    for r in rows {
+        out.insert(r?);
+    }
+    Ok(out)
+}
+
+/// Flags every active, not-already-flagged insight or theme whose
+/// `source_ids` cite `memory_id` as a raw memory — used when the
+/// contradiction patrol tombstones a memory rather than merely
+/// deduplicating it. Deliberately flags rather than re-points (unlike
+/// `repoint_insight_citations`, the dedupe pass's own provenance-preserving
+/// mechanism for a same-fact merge): an insight built on the now-superseded
+/// fact may itself rest on outdated evidence, so it needs a human to look at
+/// it, not a silent citation swap to the winner. Returns the number of
+/// insight rows actually flagged.
+pub fn flag_insights_citing_memory(conn: &Connection, memory_id: i64, now: &str) -> Result<usize, KbError> {
+    let needle = memory_id.to_string();
+    let mut stmt = conn.prepare("SELECT id, source_ids FROM insights WHERE invalidated_at IS NULL AND flagged_at IS NULL")?;
+    let rows: Vec<(i64, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    let mut flagged = 0usize;
+    for (id, json) in rows {
+        let ids: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
+        if ids.contains(&needle) && flag_insight(conn, id, now)? {
+            flagged += 1;
+        }
+    }
+    Ok(flagged)
+}
+
+// --- strength review sampler ---
+
+/// Up to `limit` ACTIVE memories (not tombstoned, not dormant) at
+/// `importance >= min_importance`, oldest `last_verified_at` first — SQLite
+/// sorts NULL first in `ASC` order, so never-sampled memories are naturally
+/// prioritized ahead of merely-stale ones, exactly mirroring
+/// `insights_due_for_verification`'s own ordering trick.
+pub fn memories_due_for_strength_review(conn: &Connection, limit: usize, min_importance: i64) -> Result<Vec<Memory>, KbError> {
+    let sql = format!(
+        "SELECT * FROM memories WHERE invalidated_at IS NULL AND dormant_at IS NULL AND importance >= ?1
+         ORDER BY last_verified_at ASC, id ASC LIMIT {}",
+        limit
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![min_importance], row_to_memory)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Bumps a memory's `last_verified_at` after the strength-review sampler
+/// finds its evidence still holds (or merely aging — see `halve_stability`)
+/// — the raw-memory counterpart of `mark_insight_verified`.
+pub fn mark_memory_verified(conn: &Connection, id: i64, now: &str) -> Result<bool, KbError> {
+    let n = conn.execute("UPDATE memories SET last_verified_at = ?1 WHERE id = ?2", params![now, id])?;
+    Ok(n > 0)
+}
+
+/// Halves a memory's effective `stability` (so it decays and gets recalled
+/// less over time) when the strength-review sampler judges it STALE —
+/// aging or weakening evidence, but not directly contradicted by anything
+/// shown, so it is never tombstoned here; actual supersession stays the
+/// contradiction patrol's job. `COALESCE` mirrors `touch`'s own fallback to
+/// `importance * 7.0` for a row whose `stability` somehow ended up NULL.
+pub fn halve_stability(conn: &Connection, id: i64) -> Result<bool, KbError> {
+    let n = conn.execute(
+        "UPDATE memories SET stability = COALESCE(stability, importance * 7.0) / 2.0
+         WHERE id = ?1 AND invalidated_at IS NULL",
+        params![id],
+    )?;
+    Ok(n > 0)
+}
+
 // --- export/import support (mach kb export / mach kb import) ---
 
 /// Every memory row, in every state (reviewed or not, tombstoned, dormant),
@@ -1604,8 +1856,8 @@ pub fn raw_upsert_memory(conn: &Connection, m: &Memory) -> Result<(), KbError> {
         "INSERT INTO memories
             (id, content, source, project, created_at, reviewed, embedding, importance, stability,
              access_count, first_accessed_at, last_accessed_at, valid_from, invalidated_at,
-             superseded_by, dormant_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+             superseded_by, dormant_at, last_verified_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
          ON CONFLICT(id) DO UPDATE SET
             content = excluded.content, source = excluded.source, project = excluded.project,
             created_at = excluded.created_at, reviewed = excluded.reviewed, embedding = excluded.embedding,
@@ -1613,7 +1865,7 @@ pub fn raw_upsert_memory(conn: &Connection, m: &Memory) -> Result<(), KbError> {
             access_count = excluded.access_count, first_accessed_at = excluded.first_accessed_at,
             last_accessed_at = excluded.last_accessed_at, valid_from = excluded.valid_from,
             invalidated_at = excluded.invalidated_at, superseded_by = excluded.superseded_by,
-            dormant_at = excluded.dormant_at",
+            dormant_at = excluded.dormant_at, last_verified_at = excluded.last_verified_at",
         params![
             m.id,
             m.content,
@@ -1631,6 +1883,7 @@ pub fn raw_upsert_memory(conn: &Connection, m: &Memory) -> Result<(), KbError> {
             m.invalidated_at,
             m.superseded_by,
             m.dormant_at,
+            m.last_verified_at,
         ],
     )?;
     Ok(())
@@ -1668,13 +1921,18 @@ pub fn raw_upsert_insight(conn: &Connection, i: &Insight) -> Result<(), KbError>
 }
 
 /// The "logical last-modified" instant for a memory row — the latest of
-/// `created_at`, `last_accessed_at`, `invalidated_at` and `dormant_at` —
-/// used by `mach kb import --merge`'s last-write-wins comparison. Every
-/// timestamp this store writes is a fixed-width RFC3339 string, so a plain
-/// lexicographic max is exact here, no parsing needed.
+/// `created_at`, `last_accessed_at`, `invalidated_at`, `dormant_at` and
+/// `last_verified_at` — used by `mach kb import --merge`'s last-write-wins
+/// comparison. Every timestamp this store writes is a fixed-width RFC3339
+/// string, so a plain lexicographic max is exact here, no parsing needed.
 pub fn memory_last_modified(m: &Memory) -> &str {
     let mut latest = m.created_at.as_str();
-    for candidate in [m.last_accessed_at.as_deref(), m.invalidated_at.as_deref(), m.dormant_at.as_deref()] {
+    for candidate in [
+        m.last_accessed_at.as_deref(),
+        m.invalidated_at.as_deref(),
+        m.dormant_at.as_deref(),
+        m.last_verified_at.as_deref(),
+    ] {
         if let Some(c) = candidate {
             if c > latest {
                 latest = c;
@@ -2110,10 +2368,11 @@ mod tests {
         // From v0, migrate() runs every step in one call: v0->v1 (the
         // memories column backfill this test is about), v1->v2 (reflection
         // tables), v2->v3 (the insights `level` column), v3->v4 (the
-        // memories `dormant_at` column), then v4->v5 (the `dedupe_seen`
-        // table), landing at the current version.
+        // memories `dormant_at` column), v4->v5 (the `dedupe_seen` table),
+        // v5->v6 (`last_verified_at` + `contradiction_seen`), then v6->v7
+        // (the AUTOINCREMENT rebuild), landing at the current version.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 7);
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1);
@@ -2262,9 +2521,10 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 5,
+            version, 7,
             "v1->v2 (reflection tables), v2->v3 (insights level column), v3->v4 (dormant_at), \
-             v4->v5 (dedupe_seen) all run"
+             v4->v5 (dedupe_seen), v5->v6 (last_verified_at + contradiction_seen), \
+             v6->v7 (AUTOINCREMENT rebuild) all run"
         );
 
         let rows = list(&conn, None, false).unwrap();
@@ -2286,7 +2546,7 @@ mod tests {
     fn fresh_database_lands_at_current_user_version() {
         let conn = mem_conn();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 7);
     }
 
     #[test]
@@ -2493,7 +2753,11 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 5, "v2->v3 (level column), v3->v4 (dormant_at), v4->v5 (dedupe_seen) all run");
+        assert_eq!(
+            version, 7,
+            "v2->v3 (level column), v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, \
+             v6->v7 (AUTOINCREMENT rebuild) all run"
+        );
 
         let rows = list_insights(&conn, false).unwrap();
         assert_eq!(rows.len(), 1);
@@ -2533,7 +2797,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 5, "v3->v4 (dormant_at), then v4->v5 (dedupe_seen) both run");
+        assert_eq!(version, 7, "v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild) all run");
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -2574,7 +2838,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 7, "v4->v5 (dedupe_seen), v5->v6, then v6->v7 (AUTOINCREMENT rebuild) all run");
 
         // The table exists and behaves — round-trips through the store
         // functions that use it.
@@ -2586,6 +2850,256 @@ mod tests {
         // idempotent on repeat
         migrate(&conn).unwrap();
         assert_eq!(list(&conn, None, false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migration_v5_to_v6_backfills_last_verified_at_and_creates_contradiction_seen() {
+        // Build a v5-era database by hand: every table up through
+        // `dedupe_seen`, but `memories` has no `last_verified_at` column and
+        // there's no `contradiction_seen` table yet, user_version = 5.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id INTEGER PRIMARY KEY, content TEXT NOT NULL, source TEXT, project TEXT,
+                created_at TEXT NOT NULL, reviewed INTEGER NOT NULL DEFAULT 1, embedding BLOB,
+                importance INTEGER NOT NULL DEFAULT 5, stability REAL, access_count INTEGER NOT NULL DEFAULT 0,
+                first_accessed_at TEXT, last_accessed_at TEXT, valid_from TEXT, invalidated_at TEXT,
+                superseded_by INTEGER, dormant_at TEXT
+            );
+            CREATE TABLE insights (
+                id INTEGER PRIMARY KEY, text TEXT NOT NULL, created_at TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.5, source_ids TEXT NOT NULL, embedding BLOB,
+                invalidated_at TEXT, flagged_at TEXT, last_verified_at TEXT, level INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE reflect_state (id INTEGER PRIMARY KEY CHECK (id = 1), last_run_at TEXT, last_memory_id INTEGER);
+            CREATE TABLE dedupe_seen (id_a INTEGER NOT NULL, id_b INTEGER NOT NULL, PRIMARY KEY (id_a, id_b));
+            INSERT INTO memories (content, created_at, valid_from, stability, importance)
+            VALUES ('a v5 memory', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 35.0, 7);
+            PRAGMA user_version = 5;",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 7, "v5->v6, then v6->v7 (AUTOINCREMENT rebuild) both run");
+
+        let rows = list(&conn, None, false).unwrap();
+        assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
+        assert!(rows[0].last_verified_at.is_none(), "pre-existing row must backfill to never-verified (NULL)");
+
+        // The new table exists and behaves — round-trips through the store
+        // functions that use it.
+        mark_contradiction_seen(&conn, 9, 4).unwrap();
+        assert_eq!(contradiction_seen_pairs(&conn).unwrap(), [(4, 9)].into_iter().collect());
+
+        // idempotent on repeat
+        migrate(&conn).unwrap();
+        assert_eq!(list(&conn, None, false).unwrap().len(), 1);
+    }
+
+    /// Builds a v6-era database by hand: every table exactly as
+    /// `migrate_v5_to_v6` leaves it (plain `INTEGER PRIMARY KEY` on both
+    /// `memories` and `insights`, no AUTOINCREMENT), user_version = 6. Used
+    /// by every v6->v7 test below so each one only has to state what it's
+    /// actually checking.
+    fn v6_era_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id INTEGER PRIMARY KEY, content TEXT NOT NULL, source TEXT, project TEXT,
+                created_at TEXT NOT NULL, reviewed INTEGER NOT NULL DEFAULT 1, embedding BLOB,
+                importance INTEGER NOT NULL DEFAULT 5, stability REAL, access_count INTEGER NOT NULL DEFAULT 0,
+                first_accessed_at TEXT, last_accessed_at TEXT, valid_from TEXT, invalidated_at TEXT,
+                superseded_by INTEGER, dormant_at TEXT, last_verified_at TEXT
+            );
+            CREATE TABLE insights (
+                id INTEGER PRIMARY KEY, text TEXT NOT NULL, created_at TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.5, source_ids TEXT NOT NULL, embedding BLOB,
+                invalidated_at TEXT, flagged_at TEXT, last_verified_at TEXT, level INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE reflect_state (id INTEGER PRIMARY KEY CHECK (id = 1), last_run_at TEXT, last_memory_id INTEGER);
+            CREATE TABLE dedupe_seen (id_a INTEGER NOT NULL, id_b INTEGER NOT NULL, PRIMARY KEY (id_a, id_b));
+            CREATE TABLE contradiction_seen (id_a INTEGER NOT NULL, id_b INTEGER NOT NULL, PRIMARY KEY (id_a, id_b));
+            PRAGMA user_version = 6;",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn migration_v6_to_v7_rebuilds_with_autoincrement_and_preserves_rows_and_data() {
+        let conn = v6_era_db();
+        conn.execute_batch(
+            "INSERT INTO memories (id, content, source, project, created_at, reviewed, importance, stability, valid_from)
+             VALUES (5, 'a v6 memory', 'src', 'proj', '2026-01-01T00:00:00Z', 1, 5, 35.0, '2026-01-01T00:00:00Z'),
+                    (133, 'gap-numbered v6 memory', NULL, NULL, '2026-02-01T00:00:00Z', 1, 5, 35.0, '2026-02-01T00:00:00Z');
+             INSERT INTO insights (id, text, created_at, confidence, source_ids)
+             VALUES (7, 'a v6 insight', '2026-01-01T00:00:00Z', 0.6, '[\"5\"]');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 7);
+
+        // Every row and its data survive the rebuild, ids included.
+        let rows = list(&conn, None, false).unwrap();
+        assert_eq!(rows.len(), 2);
+        let m5 = get(&conn, 5).unwrap().unwrap();
+        assert_eq!(m5.content, "a v6 memory");
+        assert_eq!(m5.source.as_deref(), Some("src"));
+        assert_eq!(m5.project.as_deref(), Some("proj"));
+        let m133 = get(&conn, 133).unwrap().unwrap();
+        assert_eq!(m133.content, "gap-numbered v6 memory");
+
+        let insights = list_insights(&conn, false).unwrap();
+        assert_eq!(insights.len(), 1);
+        assert_eq!(insights[0].id, 7);
+        assert_eq!(insights[0].text, "a v6 insight");
+
+        // The table really is AUTOINCREMENT now: sqlite_master's own DDL
+        // says so directly, for both tables.
+        let mem_sql: String = conn
+            .query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='memories'", [], |r| r.get(0))
+            .unwrap();
+        assert!(mem_sql.contains("AUTOINCREMENT"));
+        let ins_sql: String = conn
+            .query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='insights'", [], |r| r.get(0))
+            .unwrap();
+        assert!(ins_sql.contains("AUTOINCREMENT"));
+
+        // idempotent on repeat
+        migrate(&conn).unwrap();
+        assert_eq!(list(&conn, None, false).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn migration_v6_to_v7_purges_seen_pairs_citing_ids_no_longer_in_memories() {
+        // A dangling pair like this is exactly what the reused-rowid bug
+        // could produce pre-migration: a forgotten id sitting in
+        // dedupe_seen/contradiction_seen while some other still-live row
+        // now uses that same id. Nothing in `memories` may be trusted to
+        // still hold either historical id, so the pair must simply go.
+        let conn = v6_era_db();
+        conn.execute_batch(
+            "INSERT INTO memories (id, content, created_at, valid_from) VALUES (1, 'still here', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+             INSERT INTO dedupe_seen (id_a, id_b) VALUES (1, 99);
+             INSERT INTO contradiction_seen (id_a, id_b) VALUES (1, 99);",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert!(dedupe_seen_pairs(&conn).unwrap().is_empty(), "pair cites id 99, which no longer exists");
+        assert!(contradiction_seen_pairs(&conn).unwrap().is_empty(), "pair cites id 99, which no longer exists");
+    }
+
+    #[test]
+    fn migration_v6_to_v7_keeps_seen_pairs_whose_ids_both_still_exist() {
+        let conn = v6_era_db();
+        conn.execute_batch(
+            "INSERT INTO memories (id, content, created_at, valid_from) VALUES
+                (1, 'first', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                (2, 'second', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+             INSERT INTO dedupe_seen (id_a, id_b) VALUES (1, 2);
+             INSERT INTO contradiction_seen (id_a, id_b) VALUES (1, 2);",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(dedupe_seen_pairs(&conn).unwrap(), [(1, 2)].into_iter().collect());
+        assert_eq!(contradiction_seen_pairs(&conn).unwrap(), [(1, 2)].into_iter().collect());
+    }
+
+    #[test]
+    fn migration_v6_to_v7_then_deleting_the_highest_row_and_inserting_never_reuses_its_id() {
+        // The exact bug this whole migration exists to fix: pre-migration, a
+        // plain INTEGER PRIMARY KEY reissues a deleted max-id row's id to the
+        // very next insert. Post-migration this must be structurally
+        // impossible, not just improbable.
+        let conn = v6_era_db();
+        conn.execute_batch(
+            "INSERT INTO memories (id, content, created_at, valid_from) VALUES
+                (133, 'a', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                (134, 'b', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                (135, 'c', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                (136, 'd', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+
+        // Delete every row from the historical high-water mark down --
+        // mirrors the live bug report's own repro (rows 133-136 forgotten).
+        for id in [133, 134, 135, 136] {
+            assert!(delete(&conn, id).unwrap());
+        }
+        assert!(list(&conn, None, false).unwrap().is_empty());
+
+        let new_id = insert(&conn, "a fresh memory", None, None, true, None, 5).unwrap();
+        assert!(new_id > 136, "the new id ({}) must exceed every historical id, not reuse one", new_id);
+
+        // Same guarantee for insights: id 7 was the highest pre-migration
+        // insight id; deleting it must not free it up for reuse either.
+        let ins_conn = v6_era_db();
+        ins_conn
+            .execute(
+                "INSERT INTO insights (id, text, created_at, confidence, source_ids) VALUES (7, 'x', '2026-01-01T00:00:00Z', 0.5, '[]')",
+                [],
+            )
+            .unwrap();
+        migrate(&ins_conn).unwrap();
+        assert!(delete_insight(&ins_conn, 7).unwrap());
+        let new_insight_id = insert_insight(&ins_conn, "fresh insight", 0.5, &["1".into(), "2".into()], None).unwrap();
+        assert!(new_insight_id > 7, "the new insight id ({}) must exceed the deleted historical max", new_insight_id);
+    }
+
+    #[test]
+    fn migration_v6_to_v7_sqlite_sequence_starts_at_or_above_the_historical_max_id() {
+        let conn = v6_era_db();
+        conn.execute(
+            "INSERT INTO memories (id, content, created_at, valid_from) VALUES (250, 'x', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+
+        let seq: i64 = conn
+            .query_row("SELECT seq FROM sqlite_sequence WHERE name = 'memories'", [], |r| r.get(0))
+            .unwrap();
+        assert!(seq >= 250, "sqlite_sequence ({}) must be seeded from the highest id this table ever held", seq);
+    }
+
+    #[test]
+    fn delete_purges_dedupe_and_contradiction_seen_pairs_citing_the_forgotten_id() {
+        let conn = mem_conn();
+        let a = insert5(&conn, "memory a", None);
+        let b = insert5(&conn, "memory b", None);
+        let c = insert5(&conn, "memory c", None);
+        mark_dedupe_seen(&conn, a, b).unwrap();
+        mark_contradiction_seen(&conn, a, c).unwrap();
+        // A pair not touching `a` at all must survive untouched.
+        mark_dedupe_seen(&conn, b, c).unwrap();
+
+        assert!(delete(&conn, a).unwrap());
+
+        let (lo, hi) = if b < c { (b, c) } else { (c, b) };
+        assert_eq!(dedupe_seen_pairs(&conn).unwrap(), [(lo, hi)].into_iter().collect(), "the a-b pair must be purged, b-c must survive");
+        assert!(contradiction_seen_pairs(&conn).unwrap().is_empty(), "the a-c pair must be purged");
+    }
+
+    #[test]
+    fn delete_of_nonexistent_id_touches_no_seen_pairs() {
+        let conn = mem_conn();
+        let a = insert5(&conn, "memory a", None);
+        let b = insert5(&conn, "memory b", None);
+        mark_dedupe_seen(&conn, a, b).unwrap();
+
+        assert!(!delete(&conn, 999_999).unwrap());
+        assert_eq!(dedupe_seen_pairs(&conn).unwrap().len(), 1, "an unrelated delete must not purge anything");
     }
 
     #[test]
@@ -2902,6 +3416,7 @@ mod tests {
             invalidated_at: None,
             superseded_by: None,
             dormant_at: None,
+            last_verified_at: None,
         }
     }
 

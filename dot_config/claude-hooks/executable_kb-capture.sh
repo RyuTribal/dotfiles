@@ -50,7 +50,10 @@ fi
 command -v "$MACH_BIN" >/dev/null 2>&1 || exit 0
 command -v "$CLAUDE_BIN" >/dev/null 2>&1 || exit 0
 
-tail_content="$(tail -n "$TAIL_LINES" "$transcript_path" 2>/dev/null)"
+# Raw transcript JSONL embeds full tool outputs and can reach megabytes in a
+# few hundred lines, overflowing the digest model's context ("Prompt is too
+# long"). Reduce to dialogue text (capped) before digesting.
+tail_content="$(tail -n "$TAIL_LINES" "$transcript_path" 2>/dev/null | python3 "$(dirname "${BASH_SOURCE[0]}")/kb-transcript-filter.py" 2>/dev/null)"
 [ -z "$tail_content" ] && exit 0
 
 # The digest call can take tens of seconds; session teardown cancels hooks

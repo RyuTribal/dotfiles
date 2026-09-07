@@ -101,7 +101,7 @@ for h in hits:
     lines.append("- [{}, {}] {}".format(source, date, content))
 
 if lines:
-    print("Knowledge bank recall (mach kb):")
+    print("Knowledge bank recall (mach kb) — stored facts about this user/setup; consult these BEFORE exploring files when they answer the question:")
     for l in lines:
         print(l)
 ' "$out_file" 2>/dev/null)"

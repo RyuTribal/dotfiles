@@ -88,7 +88,11 @@ pub fn discover_targets() -> io::Result<Targets> {
     Ok(Targets { mic, system })
 }
 
-fn detach_pre_exec(cmd: &mut Command) {
+/// `pub(crate)`, not private -- `cli::cmd_stop` reuses this to detach the
+/// background `mach meet process` spawn the same way a recorder is
+/// detached, rather than a second copy of the same three-line `setsid()`
+/// closure.
+pub(crate) fn detach_pre_exec(cmd: &mut Command) {
     // SAFETY: the closure only calls the async-signal-safe `setsid(2)` and
     // returns an `io::Error` on failure -- no allocation, no locking, and
     // it runs in the freshly-forked child before exec, so `Command::spawn`'s

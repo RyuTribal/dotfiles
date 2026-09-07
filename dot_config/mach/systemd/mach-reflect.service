@@ -7,4 +7,17 @@ Description=mach kb reflect — periodic knowledge-bank reflection pass
 
 [Service]
 Type=oneshot
+# Catch-up path for `mach meet process`: normally it runs as a detached
+# background spawn from `mach meet stop` (see cli.rs's spawn_detached_process),
+# but a meeting recorded (and stopped) while offline can leave its
+# needs-processing/needs-summary marker sitting untouched if that spawn
+# never got a chance to finish the claude step -- this timer's own
+# opportunistic wakeup (OnUnitInactiveSec re-arm on a laptop that's merely
+# awake and online) is exactly the same "eventually, when connectivity
+# allows" cadence `mach meet process` itself needs, so it's the natural
+# home for the catch-up call. `-` means a failure here (or simply nothing
+# to do) never fails this unit or blocks the reflect pass that follows;
+# transcription (local, offline-safe) always proceeds regardless of
+# connectivity, only the summarize step defers -- see markers.rs.
+ExecStartPre=-%h/.local/bin/mach meet process
 ExecStart=%h/.local/bin/mach kb reflect

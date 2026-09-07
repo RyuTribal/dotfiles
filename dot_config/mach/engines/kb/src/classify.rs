@@ -127,7 +127,11 @@ fn extract_id(rest: &str) -> Option<i64> {
 /// `MACH_KB_DIGEST=1` recursion guard `kb-capture.sh` established, since
 /// every one of these calls is itself a non-interactive session whose own
 /// `SessionEnd` must not fire another digest/classifier/reflect call.
-pub(crate) fn run_claude(claude_bin: &str, model: &str, timeout: Duration, prompt: &str) -> Result<String, String> {
+/// Public (not `pub(crate)`) so `engines/meet`'s phase-B summarizer can
+/// reuse the exact same invocation — same flags, same recursion guard —
+/// for its own one-shot sonnet call rather than duplicating this function
+/// across crates.
+pub fn run_claude(claude_bin: &str, model: &str, timeout: Duration, prompt: &str) -> Result<String, String> {
     let mut child = Command::new(claude_bin)
         .arg("-p")
         .arg("--model")

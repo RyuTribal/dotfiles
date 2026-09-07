@@ -569,9 +569,12 @@ dependencies = [
 name = "meet-engine"
 version = "0.1.0"
 dependencies = [
+ "kb-engine",
  "libc",
+ "rusqlite",
  "serde",
  "serde_json",
+ "telegram-engine",
 ]
 
 [[package]]

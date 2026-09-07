@@ -8,10 +8,11 @@ use crate::active::{self, ActiveMeeting};
 use crate::capture;
 use crate::disk;
 use crate::meeting::{self, Meeting, Mode, Pids, TrackInfo};
+use crate::process::{self, ProcessNotifier};
 use crate::time;
 
 fn print_help() {
-    println!("mach meet -- meeting recorder (phase A: capture only)");
+    println!("mach meet -- meeting recorder (capture + processing)");
     println!();
     println!("usage: mach meet <subcommand> [args...]");
     println!();
@@ -19,9 +20,13 @@ fn print_help() {
     println!("  start [--solo] [--title \"...\"]  begin recording (refuses a second");
     println!("                                    concurrent meeting)");
     println!("  stop                              stop the active meeting, finalize its");
-    println!("                                    WAV files and meeting.json");
+    println!("                                    WAV files and meeting.json, and queue it");
+    println!("                                    for background processing");
     println!("  status                            whether a meeting is recording, elapsed");
     println!("                                    time, and whether track sizes are growing");
+    println!("  process [DIR]                     transcribe + summarize a meeting; with no");
+    println!("                                    DIR, every meeting marked needs-processing");
+    println!("                                    or needs-summary, oldest first");
 }
 
 pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
@@ -29,6 +34,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Some("start") => cmd_start(args),
         Some("stop") => cmd_stop(args),
         Some("status") => cmd_status(args),
+        Some("process") => cmd_process(args),
         Some("-h") | Some("--help") => {
             print_help();
             Ok(())
@@ -319,7 +325,38 @@ fn cmd_stop(mut args: impl Iterator<Item = String>) -> io::Result<()> {
             println!("  {}: {}", t.file, human_mb(t.bytes));
         }
     }
-    println!("  processing will be available after phase B");
+
+    match spawn_detached_process() {
+        Ok(()) => println!("  processing queued in the background (mach meet process)"),
+        Err(e) => eprintln!(
+            "mach meet stop: warning: could not spawn background processing ({}) -- run `mach meet process` \
+             manually, or wait for the next opportunistic `mach kb reflect` run",
+            e
+        ),
+    }
+    Ok(())
+}
+
+/// Spawns a detached `mach meet process` (no `DIR` -- it scans the whole
+/// queue) so `mach meet stop` returns instantly instead of blocking on
+/// whisper.cpp transcription and a sonnet call. Same detach pattern
+/// `capture::spawn_recorder` uses for the recorder subprocesses themselves
+/// (`setsid()` via `capture::detach_pre_exec`, so it survives the launching
+/// terminal closing); stdout/stderr are appended to a small log file next
+/// to the meetings root rather than nulled, since a process that can run
+/// for tens of minutes (whisper.cpp on a long meeting) is worth being able
+/// to inspect after the fact.
+fn spawn_detached_process() -> io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let root = meetings_root()?;
+    let log = fs::OpenOptions::new().create(true).append(true).open(root.join(".process.log"))?;
+    let log_err = log.try_clone()?;
+
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("meet").arg("process");
+    cmd.stdin(std::process::Stdio::null()).stdout(log).stderr(log_err);
+    capture::detach_pre_exec(&mut cmd);
+    cmd.spawn()?;
     Ok(())
 }
 
@@ -393,4 +430,44 @@ fn cmd_status(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         );
     }
     Ok(())
+}
+
+// ---------- process ----------
+
+fn cmd_process(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut dir_arg: Option<String> = None;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "-h" | "--help" => {
+                println!("usage: mach meet process [DIR]");
+                println!(
+                    "       DIR   a specific meeting directory (absolute, or a name under the meetings \
+                     root) to (re)process; if omitted, every meeting directory currently marked \
+                     needs-processing or needs-summary is processed, oldest first"
+                );
+                return Ok(());
+            }
+            other if dir_arg.is_none() => dir_arg = Some(other.to_string()),
+            other => {
+                eprintln!("mach meet process: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let root = meetings_root()?;
+    let notifier = ProcessNotifier;
+
+    match dir_arg {
+        Some(d) => {
+            let path = PathBuf::from(&d);
+            let dir = if path.is_dir() { path } else { root.join(&d) };
+            if !dir.is_dir() {
+                eprintln!("mach meet process: '{}' is not a directory", d);
+                std::process::exit(1);
+            }
+            process::process_dir(&dir, &notifier)
+        }
+        None => process::process_queue(&root, &notifier),
+    }
 }

@@ -10,6 +10,21 @@ serde_json = "1"
 # recorder into its own session (survives the launching terminal closing)
 # and signaling it at stop time. No other unsafe/FFI in this crate.
 libc = "0.2"
+# Phase B: fact storage (kb::store), embeddings (kb::embed), the claude
+# invocation this crate reuses (kb::classify::run_claude), and the
+# connectivity probe every offline-deferral check here shares with `mach kb
+# reflect` (kb::reflect::claude_reachable).
+kb = { package = "kb-engine", path = "../kb" }
+# whisper.cpp binary/model discovery (`voice::find_binary`/`ensure_model`)
+# and the `Converter` trait, reused rather than duplicated -- see
+# `transcribe`'s own doc comment for why the segment-level `Transcriber`
+# itself is a new (parallel) trait rather than that crate's single-string
+# one.
+telegram = { package = "telegram-engine", path = "../telegram" }
+# Same version/features kb-engine and telegram-engine already build with
+# (bundled sqlite3) -- needed directly here for the `rusqlite::Connection`
+# type in `process`'s and `summarize`'s signatures.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [lib]
 name = "meet"

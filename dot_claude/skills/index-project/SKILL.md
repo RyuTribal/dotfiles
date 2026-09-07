@@ -86,10 +86,35 @@ its contents. Same rule as everywhere in the kb.
 6. **Report**: fact count, one-line summary of what memory now covers, and
    anything deliberately left out.
 
-## Re-indexing
+## Re-indexing (updating the map)
 
 Re-run after a major refactor, or whenever recall about the project proves
 stale mid-session (wrong architecture claims, dead paths). Don't re-run on
 a schedule — the session-digest channel keeps incremental drift covered;
 this skill is for the map, and maps get redrawn when the territory
 changes, not weekly.
+
+An update is a diff, not a rewrite:
+
+1. Pull the current index:
+   `mach kb search "<project>" --json --limit 25` filtered to
+   `source: project-index:<project>` (plus a targeted search per area that
+   changed).
+2. Compare each existing fact against present reality.
+3. **Still true** → leave it alone (no re-add — a duplicate wastes a
+   dedupe-pass judgment).
+4. **Changed** → add the corrected fact WITHOUT `--no-classify`, so the
+   classifier supersedes the stale one (this is the one case where the
+   bulk-index flag rule inverts — you WANT the update semantics here).
+5. **Gone entirely** (component deleted, workflow removed) → supersession
+   has nothing new to attach to; state the removal as a fact ("As of
+   YYYY-MM-DD, <project> no longer has X; replaced by Y") — a removal is
+   knowledge too, and it invalidates the old claim through the
+   contradiction pass.
+6. **New territory** → index it like step 5 of the main procedure, with
+   `--no-classify`.
+
+Relationship edges need no separate handling: index facts are ordinary
+memories, so the reflect graph pass extracts/updates entities and edges
+from them organically on its next run — superseded facts stop feeding the
+graph, corrected ones feed corrected edges through edge contradiction.

@@ -7,6 +7,9 @@ edition = "2021"
 rusqlite = { version = "0.32", features = ["bundled"] }
 ureq = { version = "2", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
+# Content-addressed filenames for images attached to `mach note --image`
+# (see note::store_image) -- hex-encoded by hand to avoid a second crate.
+sha2 = "0.10"
 # float_roundtrip: without it, serde_json's float parser is a faster
 # algorithm that is not guaranteed correctly-rounded for every input — a
 # vanishingly rare 1-ULP miss that `mach kb export`/`import`'s full-fidelity

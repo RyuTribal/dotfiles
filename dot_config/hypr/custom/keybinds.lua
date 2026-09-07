@@ -22,3 +22,7 @@ hl.bind("CTRL+SUPER+SHIFT + BracketLeft", hl.dsp.exec_cmd("~/.config/hypr/custom
 hl.bind("CTRL+SUPER+SHIFT + C", hl.dsp.exec_cmd("kitty \"python3\""), { description = "open python" })
 
 hl.bind("SUPER + U", hl.dsp.exec_cmd("qs -c $qsConfig ipc call sweep toggle"), { description = "Disk usage inspector (sweep)" }) -- Disk usage inspector
+-- SUPER+SHIFT+N was already bound (Edit Nvim, hyprland/keybinds.lua) — used
+-- J instead (mnemonic: Jot a note). Real GlobalShortcut (quickshell:noteToggle),
+-- unlike sweep's direct ipc-call exec_cmd above.
+hl.bind("SUPER+SHIFT + J", hl.dsp.global("quickshell:noteToggle"), { description = "Jot a note" }) -- Jot a note

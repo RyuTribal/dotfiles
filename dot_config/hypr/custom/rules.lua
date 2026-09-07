@@ -10,3 +10,12 @@ hl.window_rule({
     float = true,
     center = true,
 })
+
+-- note capture panel (Quickshell FloatingWindow) — float + center it
+hl.window_rule({
+    match = {
+        title = "^(note)$",
+    },
+    float = true,
+    center = true,
+})

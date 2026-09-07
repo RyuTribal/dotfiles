@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Note
+GenericName=Jot a note
+Comment=Jot a note into memory
+Icon=accessories-text-editor
+Exec=qs -c ii ipc call note toggle
+Terminal=false
+Categories=Utility;
+Keywords=note;memory;tools;kb;

@@ -609,6 +609,14 @@ pub fn get(conn: &Connection, id: i64) -> Result<Option<Memory>, KbError> {
 
 /// Deletes a memory by id (hard delete — `mach kb forget` stays permanent,
 /// unlike supersession's tombstoning). Returns whether a row existed.
+/// Deletes one memory row (`mach kb forget <id>` and the dormancy-driven
+/// paths that call it). Row-only: a note's attached image under
+/// `~/.local/share/mach/kb-images/` (see `note::store_image`) is never
+/// touched here, by design — the file is content-addressed and may be
+/// referenced by other rows, and forgetting the fact that mentions an image
+/// shouldn't destroy evidence the image ever existed. Orphaned image
+/// cleanup, if ever wanted, is a separate manual sweep, not a side effect
+/// of forgetting.
 pub fn delete(conn: &Connection, id: i64) -> Result<bool, KbError> {
     let n = conn.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
     Ok(n > 0)

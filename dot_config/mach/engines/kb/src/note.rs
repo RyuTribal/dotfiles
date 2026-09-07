@@ -18,9 +18,30 @@
 //! "notes", title from its first few words), and a missing embedding
 //! (ollama down) stores the fact anyway, unembedded, with a warning that
 //! recall will only find it by keyword until it's re-embedded.
-use std::io::{self, IsTerminal, Read};
-use std::process::Command;
-use std::time::Duration;
+//!
+//! `--image PATH` attaches an image to the note: the file is copied into a
+//! permanent, content-addressed store (`store_image`) before anything else
+//! is attempted, then described with one vision-capable `claude -p` call
+//! (`describe_image`). That call deliberately does *not* go through the
+//! same `NoteLlm`/`run_claude` invocation the text classifier uses: it
+//! needs its Read tool to reach a path outside whatever directory `claude`
+//! happens to be launched from (permission prompts are disabled, so a
+//! denied Read is silent -- the model just narrates the denial in prose,
+//! a non-empty reply easily mistaken for a real description), so
+//! `describe_image` adds one extra `--add-dir` scoped to exactly the
+//! image's own directory. The user's typed text (if any) plus the image
+//! description are combined into one note string and run through the
+//! *same* classification pipeline below, so an image note gets a topic and
+//! title exactly like a text one. "Never lose the note" extends to the
+//! image: a failed or empty vision reply falls back to a fixed placeholder
+//! description rather than aborting, and the copied image file is never
+//! deleted by anything in this crate (see `store::delete`'s doc comment).
+use std::io::{self, IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use sha2::{Digest, Sha256};
 
 use crate::classify::run_claude;
 use crate::embed::{Embedder, OllamaEmbedder};
@@ -210,9 +231,13 @@ fn print_help() {
     println!();
     println!("usage: mach note \"<text>\" [-i N]");
     println!("       mach note [-i N]           reads stdin if piped, else opens $EDITOR");
+    println!("       mach note --image PATH [\"<text>\"] [-i N]");
+    println!("                                   attaches an image, described and filed");
+    println!("                                   alongside any text (text is optional)");
     println!("       note \"<text>\" [-i N]       same, via the `note` symlink");
     println!();
     println!("  -i, --importance N   1-10, default 6");
+    println!("  --image PATH         attach an image (copied to a permanent store)");
 }
 
 /// Opens `$EDITOR` (falling back to `vi`) on an empty temp file and returns
@@ -242,17 +267,154 @@ fn read_from_editor() -> io::Result<String> {
     Ok(content)
 }
 
+/// Directory under `~/.local/share/mach` where images attached to notes
+/// live permanently, addressed by content hash. Nothing in this crate ever
+/// deletes from here (see `store::delete`'s doc comment) — a note going
+/// dormant or being forgotten only ever touches the `memories` table.
+fn images_dir() -> io::Result<PathBuf> {
+    let home = std::env::var("HOME").map_err(|_| io::Error::other("HOME not set"))?;
+    let dir = PathBuf::from(home).join(".local/share/mach/kb-images");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Hex-encodes a byte slice by hand (lowercase, no separators) — avoids
+/// pulling in a whole crate just for this.
+fn to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
+/// Copies `src` into the permanent image store under a content-addressed
+/// name (first 16 hex chars of its sha256 digest, plus its original
+/// extension when it has one, else `.bin`) and returns the stored path.
+/// Content addressing means re-attaching the same bytes twice reuses one
+/// file rather than duplicating it. Copies, never moves — the source (e.g.
+/// a scratch clipboard-paste temp file) is left for its caller to clean up.
+pub fn store_image(src: &Path) -> io::Result<PathBuf> {
+    let bytes = std::fs::read(src)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let digest = hasher.finalize();
+    let hash16 = to_hex(&digest[..8]); // 8 bytes = 16 hex chars
+    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("bin");
+    let dest = images_dir()?.join(format!("{}.{}", hash16, ext));
+    if !dest.exists() {
+        std::fs::write(&dest, &bytes)?;
+    }
+    Ok(dest)
+}
+
+/// The fallback used whenever the vision call can't produce a description
+/// -- spawn error, timeout, non-zero exit, or an empty reply. The image is
+/// already safely copied by this point either way; this only affects the
+/// text of the filed fact.
+const UNDESCRIBED_IMAGE: &str = "image note (undescribed)";
+
+/// Vision needs more time than the plain-text classifier: reading and
+/// describing an image genuinely takes longer than parsing a few lines.
+const VISION_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Describes the image at `path` in one brief sentence with a
+/// vision-capable, non-interactive `claude -p --model haiku` call --
+/// mirroring `classify::run_claude`'s invocation flags (same disallowed
+/// tools, same `MACH_KB_DIGEST=1` recursion guard) but NOT going through
+/// that shared function, because this call needs one flag `run_claude`
+/// doesn't take: `--add-dir <path's parent>`. Without it, `claude`'s Read
+/// tool -- the only way a non-interactive session can look at an image
+/// file, there being no dedicated image-attachment flag as of this
+/// writing -- silently denies reading anything outside its own working
+/// directory (permission prompts are disabled), and the model narrates
+/// that denial in prose instead of describing the image: a non-empty
+/// reply the caller would otherwise mistake for a real description.
+/// `--add-dir` here is scoped to exactly the one directory this call needs
+/// to read from (the image's own), never a blanket grant.
+///
+/// Returns `None` on a spawn error, timeout, non-zero exit, or an empty
+/// reply, so the caller can fall back to `UNDESCRIBED_IMAGE` -- describing
+/// the image is never allowed to fail the note.
+fn describe_image(claude_bin: &str, path: &Path) -> Option<String> {
+    let prompt = format!(
+        "Use the Read tool to view the image at {} and describe it in one brief, plain sentence: \
+         what it shows, no preamble, no markdown formatting.",
+        path.display()
+    );
+
+    let mut cmd = Command::new(claude_bin);
+    cmd.arg("-p")
+        .arg("--model")
+        .arg("haiku")
+        .arg("--permission-prompts")
+        .arg("none")
+        .arg("--disallowedTools")
+        .arg("Bash Edit Write NotebookEdit WebFetch WebSearch Agent");
+    if let Some(dir) = path.parent() {
+        cmd.arg("--add-dir").arg(dir);
+    }
+    cmd.env("MACH_KB_DIGEST", "1").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        // Best-effort, same as `run_claude`: a write error here isn't
+        // fatal on its own -- the exit-status check below decides.
+        let _ = stdin.write_all(prompt.as_bytes());
+    }
+
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut out = String::new();
+                if let Some(mut stdout) = child.stdout.take() {
+                    let _ = stdout.read_to_string(&mut out);
+                }
+                if !status.success() {
+                    return None;
+                }
+                let t = out.trim();
+                return if t.is_empty() { None } else { Some(t.to_string()) };
+            }
+            Ok(None) => {
+                if start.elapsed() >= VISION_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Runs `mach note ...` (also reachable as `note ...` via the argv0
 /// dispatch in `mach`'s main). Content comes from a positional argument, or
-/// — bare `mach note` — from stdin if piped, else `$EDITOR`.
+/// — bare `mach note` — from stdin if piped, else `$EDITOR`. `--image PATH`
+/// attaches an image; text is then optional (an image alone is a complete
+/// note), and stdin is still consulted if piped, but `$EDITOR` never opens
+/// for an image note — that fallback exists for an interactive human typing
+/// at a terminal, not for a paste-driven capture flow.
 pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut content_arg: Option<String> = None;
     let mut importance: i64 = DEFAULT_IMPORTANCE;
+    let mut image_arg: Option<String> = None;
 
     while let Some(a) = args.next() {
         match a.as_str() {
             "-i" | "--importance" => {
                 importance = args.next().and_then(|v| v.parse::<i64>().ok()).unwrap_or(DEFAULT_IMPORTANCE).clamp(1, 10);
+            }
+            "--image" => {
+                image_arg = match args.next() {
+                    Some(p) => Some(p),
+                    None => {
+                        eprintln!("mach note: --image requires a path argument");
+                        std::process::exit(1);
+                    }
+                };
             }
             "-h" | "--help" => {
                 print_help();
@@ -269,8 +431,31 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         }
     }
 
+    // Copy the image first, before anything else is attempted: whatever
+    // happens next (vision call failure, classifier failure), the bytes
+    // are already durably saved.
+    let image_stored_path: Option<PathBuf> = match image_arg {
+        Some(ref img) => match store_image(Path::new(img)) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("mach note: warning: could not save image '{}': {} — filing text only", img, e);
+                None
+            }
+        },
+        None => None,
+    };
+
     let raw = match content_arg {
         Some(c) => c,
+        None if image_stored_path.is_some() => {
+            if !io::stdin().is_terminal() {
+                let mut buf = String::new();
+                io::stdin().read_to_string(&mut buf)?;
+                buf
+            } else {
+                String::new()
+            }
+        }
         None if !io::stdin().is_terminal() => {
             let mut buf = String::new();
             io::stdin().read_to_string(&mut buf)?;
@@ -279,7 +464,24 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         None => read_from_editor()?,
     };
 
-    let note = raw.trim().to_string();
+    let user_text = raw.trim().to_string();
+
+    let note = match &image_stored_path {
+        Some(stored) => {
+            let claude_bin = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
+            let description =
+                describe_image(&claude_bin, stored).unwrap_or_else(|| UNDESCRIBED_IMAGE.to_string());
+            let mut combined = String::new();
+            if !user_text.is_empty() {
+                combined.push_str(&user_text);
+                combined.push_str("\n\n");
+            }
+            combined.push_str(&format!("Image note: {}. Image stored at {}.", description, stored.display()));
+            combined
+        }
+        None => user_text,
+    };
+
     if note.is_empty() {
         eprintln!("mach note: nothing to save — empty note");
         std::process::exit(1);

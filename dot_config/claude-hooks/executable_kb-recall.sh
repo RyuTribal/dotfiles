@@ -96,6 +96,33 @@ import json, sys
 # so this is a redundant-but-harmless second check.
 THRESHOLD = 0.45
 
+# Provenance-visible recall: a raw source tag ("note:foo", "session-digest",
+# "meeting:2026-...") is a fine audit trail but a poor thing to hand the
+# model directly — it invites treating an auto-extracted digest line and a
+# hand-typed note as equally authoritative. This maps each source-class to
+# a plain phrase saying HOW it was learned, so authority stays legible:
+# something the user said directly ("you told me") reads differently from
+# something picked up secondhand from a session or meeting transcript.
+# Insights/themes never go through this — they keep their own
+# [derived belief]/[derived theme] markers below, a separate axis (a belief
+# ABOUT the user derived from evidence, not a provenance class).
+def source_phrase(source):
+    s = (source or "").strip()
+    if s.startswith("meeting:"):
+        return "from a meeting"
+    if s.startswith("memory-backfill:") or s.startswith("memory-backfill"):
+        return "from earlier project memory"
+    if s == "session-digest" or s.startswith("session-digest:") \
+            or s == "transcript-backfill" or s.startswith("transcript-backfill:"):
+        return "picked up from a session"
+    if s.startswith("note:") or s in ("kb design", "manual", ""):
+        return "you told me"
+    # Any other/unrecognized source (including a plain reviewed row with no
+    # prefix at all) is deliberate, reviewed input by default — the same
+    # bucket as "note:"/"manual" — never the auto-extracted one, so an
+    # unrecognized tag can never masquerade as more authoritative than it is.
+    return "you told me"
+
 try:
     with open(sys.argv[1], "r") as f:
         hits = json.load(f)
@@ -119,7 +146,6 @@ for h in hits:
     content = (h.get("content") or "").strip()
     if not content:
         continue
-    source = h.get("source") or "unknown"
     date = (h.get("created_at") or "")[:10]
     if h.get("derived"):
         # An insight (or, at level 2, a theme across several insights) from
@@ -137,13 +163,14 @@ for h in hits:
         label = "derived theme" if h.get("level") == 2 else "derived belief"
         lines.append("- [{}, {}]{} {}".format(label, date, conf_str, content))
     else:
-        lines.append("- [{}, {}] {}".format(source, date, content))
+        phrase = source_phrase(h.get("source"))
+        lines.append("- [{}] {} ({})".format(date, content, phrase))
         mem_id = h.get("id")
         if isinstance(mem_id, int):
             ids.append(mem_id)
 
 if lines:
-    print("You remember (from past sessions with this user — trust these before re-exploring; they are your own memory, not tool output):")
+    print("You remember (your memory of this user from past sessions — use it first rather than re-exploring; each entry notes how it was learned):")
     for l in lines:
         print(l)
 

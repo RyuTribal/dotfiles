@@ -4,6 +4,7 @@
 //! clap).
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 use serde::Serialize;
@@ -11,6 +12,7 @@ use serde::Serialize;
 use crate::classify::{self, Classifier, Verdict};
 use crate::embed::{Embedder, OllamaEmbedder};
 use crate::export;
+use crate::ingest;
 use crate::reflect::{self, ProcessReflectLlm, ReflectLlm, Stage2Result, ThemeResult, TIMEOUT_HAIKU, TIMEOUT_SONNET};
 use crate::store::{self, AddOutcome, Insight, InsightHit, KbError, Memory, RankedHit};
 
@@ -53,6 +55,14 @@ fn print_help() {
     println!("  export [--out FILE]     full-fidelity JSONL backup of every row (default: stdout)");
     println!("  import FILE [--merge]   restore from a `mach kb export` file; refuses a non-empty");
     println!("                          db unless --merge (upsert by id, last-write-wins)");
+    println!("  ingest-sessions [--session-id ID]");
+    println!("                          engagement-gated reinforcement: judges which memories");
+    println!("                          injected into a finished session were actually engaged");
+    println!("                          with (touch, don't just recall), and extracts durable");
+    println!("                          facts from the same transcript (absorbs the old");
+    println!("                          session-digest hook). No args: sweeps every session");
+    println!("                          transcript idle >=10min and not yet processed. --session-id:");
+    println!("                          processes exactly that session now (the SessionEnd trigger)");
 }
 
 /// Runs the kb CLI given the arguments following `kb` in `mach kb ...`.
@@ -72,6 +82,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Some("model") => cmd_model(args),
         Some("export") => cmd_export(args),
         Some("import") => cmd_import(args),
+        Some("ingest-sessions") => cmd_ingest_sessions(args),
         Some("-h") | Some("--help") => {
             print_help();
             Ok(())
@@ -1877,6 +1888,268 @@ fn cmd_import(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     }
 }
 
+// --- ingest-sessions: engagement-gated reinforcement ---
+
+/// A trivial session (nothing usable came out of transcript filtering, and
+/// nothing was ever injected into it) never needs a `claude` call at all —
+/// this is that raw JSONL-line floor below which even the fact-digest gate
+/// (`ingest::DIGEST_MIN_TRANSCRIPT_LINES`) wouldn't fire anyway, kept
+/// separate so the "nothing to do" short-circuit doesn't depend on the
+/// digest gate's own threshold changing later.
+const INGEST_TRIVIAL_LINE_FLOOR: usize = 1;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct IngestSummary {
+    scanned: usize,
+    processed: usize,
+    engaged: usize,
+    shown: usize,
+    facts_added: usize,
+    deferred_offline: usize,
+}
+
+/// Every `.jsonl` transcript under `~/.claude/projects/*/*.jsonl` —
+/// `projects_root` is that `projects` directory itself. Tolerant of a
+/// missing root (a fresh machine with no Claude Code sessions yet) and of
+/// individual unreadable entries, rather than erroring the whole sweep.
+fn list_transcript_files(projects_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(projects_root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(inner) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for f in inner.flatten() {
+            let p = f.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// Locates the one transcript file for `session_id`, regardless of its
+/// mtime — used by the `--session-id` fast-trigger path, which already
+/// knows this exact session just ended and must not wait for the
+/// opportunistic sweep's staleness gate.
+fn find_transcript_by_session(projects_root: &Path, session_id: &str) -> Option<PathBuf> {
+    list_transcript_files(projects_root).into_iter().find(|p| ingest::session_id_from_path(p).as_deref() == Some(session_id))
+}
+
+/// The engagement-gated reinforcement + fact-digest pass over one or more
+/// finished sessions. Generic over `Embedder`/`ReflectLlm`/
+/// `ingest::TranscriptFilter` so it's exercised in tests against fakes,
+/// without spawning a real `ollama`/`claude`/`python3` process — mirrors
+/// `run_dedupe_pass`'s own genericity. `only_session` selects the
+/// `--session-id` fast-trigger path (bypasses the staleness gate, still
+/// respects the processed-set and offline discipline below); `None` is the
+/// opportunistic sweep (every transcript idle >= `ingest::SWEEP_MIN_IDLE_SECS`
+/// and not yet processed).
+///
+/// Offline discipline: a session that needs a `claude` call this run (an
+/// engagement verdict, a fact digest, or both) is marked ingested ONLY if
+/// every such call it needed actually succeeded this run — a failure
+/// (offline, spawn error, timeout) leaves it entirely unprocessed, so it
+/// gets a fresh chance on a later run instead of silently losing its
+/// judgment. A session needing no `claude` call at all (no ids were ever
+/// injected into it, and its transcript is too trivial to digest) is always
+/// safe to mark processed immediately, regardless of connectivity.
+#[allow(clippy::too_many_arguments)]
+fn run_ingest_sessions<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>(
+    conn: &Connection,
+    embedder: &E,
+    llm: &L,
+    filter: &F,
+    projects_root: &Path,
+    recall_log_root: &Path,
+    only_session: Option<&str>,
+    now: &str,
+) -> Result<IngestSummary, KbError> {
+    let mut summary = IngestSummary::default();
+
+    let candidates: Vec<PathBuf> = match only_session {
+        Some(sid) => find_transcript_by_session(projects_root, sid).into_iter().collect(),
+        None => list_transcript_files(projects_root)
+            .into_iter()
+            .filter(|p| {
+                let age = std::fs::metadata(p)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|mtime| mtime.elapsed().ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                ingest::is_stale_enough(age)
+            })
+            .collect(),
+    };
+
+    for path in candidates {
+        summary.scanned += 1;
+        let Some(session_id) = ingest::session_id_from_path(&path) else {
+            continue;
+        };
+        if store::is_session_ingested(conn, &session_id)? {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue; // unreadable this run -- stays unprocessed, retried later
+        };
+
+        let recall_log_path = recall_log_root.join(format!("{}.jsonl", session_id));
+        let injected_ids: Vec<i64> =
+            std::fs::read_to_string(&recall_log_path).map(|c| ingest::parse_recall_log(&c)).unwrap_or_default();
+
+        let raw_line_count = raw.lines().count();
+        if raw_line_count < INGEST_TRIVIAL_LINE_FLOOR && injected_ids.is_empty() {
+            store::mark_session_ingested(conn, &session_id, now)?;
+            summary.processed += 1;
+            continue;
+        }
+
+        let dialogue = filter.filter(&raw);
+        let dialogue_text = match dialogue.as_deref() {
+            Some(d) if !d.trim().is_empty() => d,
+            _ => {
+                // No usable dialogue -- can't honestly judge engagement or
+                // extract anything; every injected id defaults to shown
+                // (fails closed, same as an unparseable verdict reply), and
+                // no `claude` call was needed, so this is always safe to
+                // mark processed.
+                summary.shown += injected_ids.len();
+                store::mark_session_ingested(conn, &session_id, now)?;
+                summary.processed += 1;
+                continue;
+            }
+        };
+
+        let mut needs_retry = false;
+
+        // --- engagement verdicts ---
+        if !injected_ids.is_empty() {
+            let mut memories: Vec<(i64, String)> = Vec::new();
+            for id in &injected_ids {
+                if let Some(m) = store::get(conn, *id)? {
+                    memories.push((*id, m.content));
+                }
+            }
+            if !memories.is_empty() {
+                let prompt = ingest::build_engagement_prompt(dialogue_text, &memories);
+                match llm.call("haiku", &prompt, ingest::TIMEOUT_INGEST) {
+                    Ok(out) => {
+                        let known_ids: Vec<i64> = memories.iter().map(|(id, _)| *id).collect();
+                        let verdicts = ingest::parse_engagement_verdicts(&out, &known_ids);
+                        let engaged_ids: Vec<i64> = verdicts
+                            .iter()
+                            .filter(|(_, v)| **v == ingest::EngagementVerdict::Engaged)
+                            .map(|(id, _)| *id)
+                            .collect();
+                        if !engaged_ids.is_empty() {
+                            store::touch(conn, &engaged_ids, now)?;
+                        }
+                        summary.engaged += engaged_ids.len();
+                        summary.shown += verdicts.len() - engaged_ids.len();
+                    }
+                    Err(_) => needs_retry = true,
+                }
+            }
+            // every injected id has since been forgotten -- nothing left to
+            // judge or touch, and no call was needed for it.
+        }
+
+        // --- fact digest (absorbed kb-capture.sh) ---
+        if !needs_retry && raw_line_count >= ingest::DIGEST_MIN_TRANSCRIPT_LINES {
+            let digest_prompt = ingest::build_digest_prompt(dialogue_text);
+            match llm.call("haiku", &digest_prompt, ingest::TIMEOUT_INGEST) {
+                Ok(out) => {
+                    for fact in ingest::parse_digest_facts(&out) {
+                        let embedding = embedder.embed(&fact).ok();
+                        if store::insert(conn, &fact, Some("session-digest"), None, false, embedding.as_deref(), 5)
+                            .is_ok()
+                        {
+                            summary.facts_added += 1;
+                        }
+                    }
+                }
+                Err(_) => needs_retry = true,
+            }
+        }
+
+        if needs_retry {
+            summary.deferred_offline += 1;
+            continue; // leave unprocessed -- retried on a later run
+        }
+
+        store::mark_session_ingested(conn, &session_id, now)?;
+        summary.processed += 1;
+    }
+
+    Ok(summary)
+}
+
+fn cmd_ingest_sessions(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut only_session: Option<String> = None;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--session-id" => only_session = args.next(),
+            "-h" | "--help" => {
+                println!("usage: mach kb ingest-sessions [--session-id ID]");
+                println!(
+                    "       engagement-gated reinforcement: for each finished session, judges \
+                     which memories injected into it (via kb-recall.sh's recall log) were \
+                     actually engaged with -- reinforcing only those -- and extracts durable \
+                     facts from the same transcript (absorbs the old kb-capture.sh digest)."
+                );
+                println!(
+                    "       no args: sweeps every transcript under ~/.claude/projects idle >= \
+                     10min and not yet processed (the crash-safe timer path)."
+                );
+                println!(
+                    "       --session-id ID: processes exactly that session now, regardless of \
+                     idle time (the SessionEnd fast trigger)."
+                );
+                return Ok(());
+            }
+            other => {
+                eprintln!("mach kb ingest-sessions: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => {
+            eprintln!("mach kb ingest-sessions: HOME is not set");
+            std::process::exit(1);
+        }
+    };
+    let projects_root = Path::new(&home).join(".claude/projects");
+    let recall_log_root = Path::new(&home).join(".local/share/mach/recall-log");
+
+    let conn = store::open().map_err(to_io)?;
+    let embedder = OllamaEmbedder::new();
+    let llm = ProcessReflectLlm::new();
+    let filter = ingest::ProcessTranscriptFilter::new();
+    let now = store::now_rfc3339();
+
+    let summary =
+        run_ingest_sessions(&conn, &embedder, &llm, &filter, &projects_root, &recall_log_root, only_session.as_deref(), &now)
+            .map_err(to_io)?;
+
+    println!(
+        "mach kb ingest-sessions: scanned={} processed={} engaged={} shown={} facts_added={} deferred_offline={}",
+        summary.scanned, summary.processed, summary.engaged, summary.shown, summary.facts_added, summary.deferred_offline
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2298,5 +2571,306 @@ mod tests {
         let (stands, _stale, _routed, _failed) = run_strength_review_pass(&conn, &llm, &store::now_rfc3339()).unwrap();
         assert_eq!(stands, 0, "importance below STRENGTH_MIN_IMPORTANCE must never be sampled");
         assert!(store::get(&conn, id).unwrap().unwrap().last_verified_at.is_none());
+    }
+
+    // --- ingest-sessions: engagement-gated reinforcement ---
+
+    struct FakeEmbedder;
+
+    impl Embedder for FakeEmbedder {
+        fn embed(&self, text: &str) -> Result<Vec<f32>, KbError> {
+            Ok(text.bytes().map(|b| b as f32).collect())
+        }
+    }
+
+    /// A `TranscriptFilter` test double returning a fixed dialogue string
+    /// (or `None`, simulating an unfiltered/empty transcript), never
+    /// spawning a real `python3` process.
+    struct FixedFilter {
+        dialogue: Option<&'static str>,
+    }
+
+    impl ingest::TranscriptFilter for FixedFilter {
+        fn filter(&self, _raw: &str) -> Option<String> {
+            self.dialogue.map(String::from)
+        }
+    }
+
+    /// A scratch directory under the system temp dir, unique per test run
+    /// (mirrors `note.rs`'s own `read_from_editor` test-adjacent pattern of
+    /// using `std::env::temp_dir()` directly rather than a `tempfile` crate
+    /// dependency this workspace doesn't otherwise need). Callers create
+    /// `<root>/projects/<proj>/<session>.jsonl` and `<root>/recall-log/...`
+    /// under this the same way the real `$HOME` layout does.
+    struct ScratchDir {
+        path: PathBuf,
+    }
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("mach-kb-ingest-test-{}-{}-{}", std::process::id(), tag, n));
+            std::fs::create_dir_all(&path).unwrap();
+            ScratchDir { path }
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Writes `<root>/projects/proj/<session_id>.jsonl` with `raw_lines`
+    /// raw lines of content, then backdates its mtime by `age_secs` (or
+    /// leaves it at "now" when `age_secs` is `None`, simulating a session
+    /// still being written to) — the opportunistic sweep's staleness gate
+    /// is mtime-driven, so tests need real file mtimes, not a fake clock.
+    fn write_transcript(root: &Path, session_id: &str, raw_lines: usize, age_secs: Option<u64>) -> PathBuf {
+        let dir = root.join("projects").join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.jsonl", session_id));
+        let content = (0..raw_lines).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        std::fs::write(&path, content).unwrap();
+        if let Some(age) = age_secs {
+            let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+            set_mtime(&path, mtime);
+        }
+        path
+    }
+
+    /// Sets a file's mtime directly via `utimensat`-equivalent — the
+    /// standard library has no portable setter, so this shells out to the
+    /// `touch` coreutil (present on every Linux/macOS test runner this
+    /// workspace targets) rather than adding a filetime crate dependency
+    /// for one test helper.
+    fn set_mtime(path: &Path, mtime: std::time::SystemTime) {
+        let secs = mtime.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let ts = format!("@{}", secs);
+        let status = std::process::Command::new("touch").arg("-d").arg(&ts).arg(path).status();
+        assert!(status.map(|s| s.success()).unwrap_or(false), "test setup: `touch -d {} {:?}` must succeed", ts, path);
+    }
+
+    fn write_recall_log(root: &Path, session_id: &str, lines: &[&str]) {
+        let dir = root.join("recall-log");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{}.jsonl", session_id)), lines.join("\n")).unwrap();
+    }
+
+    #[test]
+    fn run_ingest_sessions_stale_session_with_no_recall_log_just_gets_digested() {
+        let scratch = ScratchDir::new("digest-only");
+        let projects_root = scratch.path.join("projects");
+        let recall_log_root = scratch.path.join("recall-log");
+        write_transcript(&scratch.path, "sess-a", ingest::DIGEST_MIN_TRANSCRIPT_LINES + 10, Some(ingest::SWEEP_MIN_IDLE_SECS + 60));
+
+        let conn = mem_conn();
+        let embedder = FakeEmbedder;
+        let llm = FixedReflectLlm { reply: Ok("The user prefers dark mode.\nThe user works on project Zenith.") };
+        let filter = FixedFilter { dialogue: Some("USER: I use dark mode\nASSISTANT: noted") };
+
+        let summary =
+            run_ingest_sessions(&conn, &embedder, &llm, &filter, &projects_root, &recall_log_root, None, &store::now_rfc3339())
+                .unwrap();
+
+        assert_eq!(summary.scanned, 1);
+        assert_eq!(summary.processed, 1);
+        assert_eq!(summary.engaged, 0);
+        assert_eq!(summary.facts_added, 2);
+        assert!(store::is_session_ingested(&conn, "sess-a").unwrap());
+        let stored = store::unreviewed(&conn).unwrap();
+        assert_eq!(stored.len(), 2);
+        assert!(stored.iter().all(|m| m.source.as_deref() == Some("session-digest")));
+    }
+
+    #[test]
+    fn run_ingest_sessions_touches_only_the_engaged_id() {
+        let scratch = ScratchDir::new("engaged-vs-shown");
+        let projects_root = scratch.path.join("projects");
+        let recall_log_root = scratch.path.join("recall-log");
+        write_transcript(&scratch.path, "sess-b", 5, Some(ingest::SWEEP_MIN_IDLE_SECS + 60));
+        write_recall_log(
+            &scratch.path,
+            "sess-b",
+            &[r#"{"ts":"2026-01-01T00:00:00Z","ids":[1,2]}"#],
+        );
+
+        let conn = mem_conn();
+        let engaged_id = store::insert(&conn, "the user prefers dark mode", None, None, true, Some(&[1.0]), 5).unwrap();
+        let shown_id = store::insert(&conn, "the user once mentioned rust", None, None, true, Some(&[2.0]), 5).unwrap();
+        assert_eq!((engaged_id, shown_id), (1, 2), "test fixture assumes fresh in-memory ids starting at 1");
+
+        let embedder = FakeEmbedder;
+        let llm = FixedReflectLlm { reply: Ok("1 ENGAGED\n2 SHOWN") };
+        let filter = FixedFilter { dialogue: Some("USER: yeah I always use dark mode, thanks for remembering\nASSISTANT: got it") };
+
+        let summary =
+            run_ingest_sessions(&conn, &embedder, &llm, &filter, &projects_root, &recall_log_root, None, &store::now_rfc3339())
+                .unwrap();
+
+        assert_eq!(summary.engaged, 1);
+        assert_eq!(summary.shown, 1);
+        assert_eq!(summary.processed, 1);
+
+        let engaged = store::get(&conn, engaged_id).unwrap().unwrap();
+        assert_eq!(engaged.access_count, 1, "the engaged memory must be touched");
+        assert!(engaged.last_accessed_at.is_some());
+
+        let shown = store::get(&conn, shown_id).unwrap().unwrap();
+        assert_eq!(shown.access_count, 0, "the merely-shown memory must NOT be touched");
+        assert!(shown.last_accessed_at.is_none());
+
+        assert!(store::is_session_ingested(&conn, "sess-b").unwrap());
+    }
+
+    #[test]
+    fn run_ingest_sessions_malformed_verdict_reply_touches_nothing() {
+        let scratch = ScratchDir::new("malformed-verdict");
+        let projects_root = scratch.path.join("projects");
+        let recall_log_root = scratch.path.join("recall-log");
+        write_transcript(&scratch.path, "sess-c", 5, Some(ingest::SWEEP_MIN_IDLE_SECS + 60));
+        write_recall_log(&scratch.path, "sess-c", &[r#"{"ts":"2026-01-01T00:00:00Z","ids":[1]}"#]);
+
+        let conn = mem_conn();
+        let id = store::insert(&conn, "the user likes tea", None, None, true, Some(&[1.0]), 5).unwrap();
+
+        let embedder = FakeEmbedder;
+        // Reply omits the only known id entirely -- parse_engagement_verdicts
+        // must fail closed to all-SHOWN.
+        let llm = FixedReflectLlm { reply: Ok("I'm not sure about this one.") };
+        let filter = FixedFilter { dialogue: Some("USER: hello\nASSISTANT: hi") };
+
+        let summary =
+            run_ingest_sessions(&conn, &embedder, &llm, &filter, &projects_root, &recall_log_root, None, &store::now_rfc3339())
+                .unwrap();
+
+        assert_eq!(summary.engaged, 0);
+        assert_eq!(summary.shown, 1);
+        assert_eq!(store::get(&conn, id).unwrap().unwrap().access_count, 0, "never reinforce on doubt");
+        assert!(store::is_session_ingested(&conn, "sess-c").unwrap());
+    }
+
+    #[test]
+    fn run_ingest_sessions_failed_llm_call_leaves_session_unprocessed_for_retry() {
+        let scratch = ScratchDir::new("offline");
+        let projects_root = scratch.path.join("projects");
+        let recall_log_root = scratch.path.join("recall-log");
+        write_transcript(&scratch.path, "sess-d", 5, Some(ingest::SWEEP_MIN_IDLE_SECS + 60));
+        write_recall_log(&scratch.path, "sess-d", &[r#"{"ts":"2026-01-01T00:00:00Z","ids":[1]}"#]);
+
+        let conn = mem_conn();
+        let id = store::insert(&conn, "the user likes tea", None, None, true, Some(&[1.0]), 5).unwrap();
+
+        let embedder = FakeEmbedder;
+        let llm = FixedReflectLlm { reply: Err("offline") };
+        let filter = FixedFilter { dialogue: Some("USER: hello\nASSISTANT: hi") };
+
+        let summary =
+            run_ingest_sessions(&conn, &embedder, &llm, &filter, &projects_root, &recall_log_root, None, &store::now_rfc3339())
+                .unwrap();
+
+        assert_eq!(summary.deferred_offline, 1);
+        assert_eq!(summary.processed, 0);
+        assert!(!store::is_session_ingested(&conn, "sess-d").unwrap(), "must stay unprocessed so it's retried");
+        assert_eq!(store::get(&conn, id).unwrap().unwrap().access_count, 0);
+    }
+
+    #[test]
+    fn run_ingest_sessions_skips_sessions_still_too_fresh_to_be_stale() {
+        let scratch = ScratchDir::new("too-fresh");
+        let projects_root = scratch.path.join("projects");
+        let recall_log_root = scratch.path.join("recall-log");
+        // No age override -- mtime stays at "now", well under SWEEP_MIN_IDLE_SECS.
+        write_transcript(&scratch.path, "sess-e", 5, None);
+
+        let conn = mem_conn();
+        let embedder = FakeEmbedder;
+        let llm = FixedReflectLlm { reply: Ok("STANDS") };
+        let filter = FixedFilter { dialogue: Some("USER: hi\nASSISTANT: hello") };
+
+        let summary =
+            run_ingest_sessions(&conn, &embedder, &llm, &filter, &projects_root, &recall_log_root, None, &store::now_rfc3339())
+                .unwrap();
+
+        assert_eq!(summary.scanned, 0, "a fresh transcript must never enter the opportunistic sweep's candidate set");
+        assert!(!store::is_session_ingested(&conn, "sess-e").unwrap());
+    }
+
+    #[test]
+    fn run_ingest_sessions_session_id_bypasses_the_staleness_gate() {
+        let scratch = ScratchDir::new("session-id-bypass");
+        let projects_root = scratch.path.join("projects");
+        let recall_log_root = scratch.path.join("recall-log");
+        // Fresh mtime -- would never qualify for the bare sweep.
+        write_transcript(&scratch.path, "sess-f", 5, None);
+
+        let conn = mem_conn();
+        let embedder = FakeEmbedder;
+        let llm = FixedReflectLlm { reply: Ok("") };
+        let filter = FixedFilter { dialogue: Some("USER: hi\nASSISTANT: hello") };
+
+        let summary = run_ingest_sessions(
+            &conn,
+            &embedder,
+            &llm,
+            &filter,
+            &projects_root,
+            &recall_log_root,
+            Some("sess-f"),
+            &store::now_rfc3339(),
+        )
+        .unwrap();
+
+        assert_eq!(summary.scanned, 1, "the SessionEnd fast trigger must bypass the idle-time gate");
+        assert!(store::is_session_ingested(&conn, "sess-f").unwrap());
+    }
+
+    #[test]
+    fn run_ingest_sessions_processed_set_prevents_double_touch_on_rerun() {
+        let scratch = ScratchDir::new("idempotent");
+        let projects_root = scratch.path.join("projects");
+        let recall_log_root = scratch.path.join("recall-log");
+        write_transcript(&scratch.path, "sess-g", 5, Some(ingest::SWEEP_MIN_IDLE_SECS + 60));
+        write_recall_log(&scratch.path, "sess-g", &[r#"{"ts":"2026-01-01T00:00:00Z","ids":[1]}"#]);
+
+        let conn = mem_conn();
+        let id = store::insert(&conn, "the user prefers dark mode", None, None, true, Some(&[1.0]), 5).unwrap();
+
+        let embedder = FakeEmbedder;
+        let llm = FixedReflectLlm { reply: Ok("1 ENGAGED") };
+        let filter = FixedFilter { dialogue: Some("USER: yes I always use dark mode\nASSISTANT: got it") };
+
+        let now = store::now_rfc3339();
+        let first = run_ingest_sessions(&conn, &embedder, &llm, &filter, &projects_root, &recall_log_root, None, &now).unwrap();
+        assert_eq!(first.engaged, 1);
+        assert_eq!(store::get(&conn, id).unwrap().unwrap().access_count, 1);
+
+        // Re-run against the exact same transcript/recall-log with the same
+        // "ENGAGED" reply available -- the processed-set must skip it
+        // entirely rather than touching it a second time.
+        let second = run_ingest_sessions(&conn, &embedder, &llm, &filter, &projects_root, &recall_log_root, None, &now).unwrap();
+        assert_eq!(second.scanned, 1, "still enumerated as a candidate...");
+        assert_eq!(second.processed, 0, "...but skipped before doing any work");
+        assert_eq!(second.engaged, 0);
+        assert_eq!(store::get(&conn, id).unwrap().unwrap().access_count, 1, "must not be touched a second time");
+    }
+
+    #[test]
+    fn list_transcript_files_finds_nested_jsonl_and_ignores_other_files() {
+        let scratch = ScratchDir::new("listing");
+        let projects_root = scratch.path.join("projects");
+        write_transcript(&scratch.path, "sess-h", 3, None);
+        std::fs::write(projects_root.join("proj").join("notes.txt"), "not a transcript").unwrap();
+
+        let files = list_transcript_files(&projects_root);
+        assert_eq!(files.len(), 1);
+        assert_eq!(ingest::session_id_from_path(&files[0]).as_deref(), Some("sess-h"));
+    }
+
+    #[test]
+    fn list_transcript_files_on_missing_root_is_empty() {
+        let missing = std::env::temp_dir().join("mach-kb-ingest-test-definitely-missing-root");
+        assert_eq!(list_transcript_files(&missing), Vec::<PathBuf>::new());
     }
 }

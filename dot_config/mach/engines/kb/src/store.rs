@@ -201,6 +201,10 @@ fn init_schema(conn: &Connection) -> Result<(), KbError> {
             id_a INTEGER NOT NULL,
             id_b INTEGER NOT NULL,
             PRIMARY KEY (id_a, id_b)
+        );
+        CREATE TABLE IF NOT EXISTS ingested_sessions (
+            session_id TEXT PRIMARY KEY,
+            ingested_at TEXT NOT NULL
         );",
     )?;
     Ok(())
@@ -364,6 +368,17 @@ fn migrate_v5_to_v6(conn: &Connection) -> Result<(), KbError> {
 /// in one of those tables and cause a future pair built from the reissued
 /// id to be wrongly treated as "already judged" by the nightly dedupe or
 /// contradiction pass.
+/// `PRAGMA user_version`-gated, idempotent 7 -> 8 migration: the engagement-
+/// gated reinforcement pass's `ingested_sessions` table (`mach kb
+/// ingest-sessions`'s processed-set — see `is_session_ingested`/
+/// `mark_session_ingested`). `init_schema`'s `CREATE TABLE IF NOT EXISTS`
+/// already creates it on any database (fresh or pre-existing) before
+/// `migrate` ever runs, so the only work left here is bumping the version.
+fn migrate_v7_to_v8(conn: &Connection) -> Result<(), KbError> {
+    conn.execute("PRAGMA user_version = 8", [])?;
+    Ok(())
+}
+
 fn migrate_v6_to_v7(conn: &Connection) -> Result<(), KbError> {
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(
@@ -455,6 +470,9 @@ fn migrate(conn: &Connection) -> Result<(), KbError> {
     }
     if version < 7 {
         migrate_v6_to_v7(conn)?;
+    }
+    if version < 8 {
+        migrate_v7_to_v8(conn)?;
     }
     Ok(())
 }
@@ -1956,6 +1974,38 @@ pub fn insight_last_modified(i: &Insight) -> &str {
     latest
 }
 
+// --- engagement-gated reinforcement: `mach kb ingest-sessions` processed-set ---
+
+/// Whether `session_id` has already been fully judged by `mach kb
+/// ingest-sessions` — its engagement verdicts (if any) applied and its fact
+/// digest (if any) extracted. A session is only ever marked via
+/// `mark_session_ingested`, and only once every `claude` call it needed
+/// actually succeeded — see that function's own doc comment for why a
+/// degraded run must never land here.
+pub fn is_session_ingested(conn: &Connection, session_id: &str) -> Result<bool, KbError> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM ingested_sessions WHERE session_id = ?1",
+        params![session_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Records that `session_id` has been fully processed by `mach kb
+/// ingest-sessions` — never called on a run where any needed `claude` call
+/// failed (offline, spawn error, timeout), so a degraded pass stays fully
+/// retry-able next time rather than being silently marked done. `INSERT OR
+/// IGNORE` makes a second call for the same session (a `--session-id`
+/// fast-trigger racing the opportunistic sweep, say) a harmless no-op rather
+/// than an error.
+pub fn mark_session_ingested(conn: &Connection, session_id: &str, now: &str) -> Result<(), KbError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO ingested_sessions (session_id, ingested_at) VALUES (?1, ?2)",
+        params![session_id, now],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2369,10 +2419,11 @@ mod tests {
         // memories column backfill this test is about), v1->v2 (reflection
         // tables), v2->v3 (the insights `level` column), v3->v4 (the
         // memories `dormant_at` column), v4->v5 (the `dedupe_seen` table),
-        // v5->v6 (`last_verified_at` + `contradiction_seen`), then v6->v7
-        // (the AUTOINCREMENT rebuild), landing at the current version.
+        // v5->v6 (`last_verified_at` + `contradiction_seen`), v6->v7 (the
+        // AUTOINCREMENT rebuild), then v7->v8 (`ingested_sessions`),
+        // landing at the current version.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1);
@@ -2521,10 +2572,10 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 7,
+            version, 8,
             "v1->v2 (reflection tables), v2->v3 (insights level column), v3->v4 (dormant_at), \
              v4->v5 (dedupe_seen), v5->v6 (last_verified_at + contradiction_seen), \
-             v6->v7 (AUTOINCREMENT rebuild) all run"
+             v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions) all run"
         );
 
         let rows = list(&conn, None, false).unwrap();
@@ -2546,7 +2597,7 @@ mod tests {
     fn fresh_database_lands_at_current_user_version() {
         let conn = mem_conn();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
     #[test]
@@ -2754,9 +2805,9 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 7,
+            version, 8,
             "v2->v3 (level column), v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, \
-             v6->v7 (AUTOINCREMENT rebuild) all run"
+             v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions) all run"
         );
 
         let rows = list_insights(&conn, false).unwrap();
@@ -2797,7 +2848,11 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 7, "v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild) all run");
+        assert_eq!(
+            version, 8,
+            "v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild), \
+             v7->v8 (ingested_sessions) all run"
+        );
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -2838,7 +2893,11 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 7, "v4->v5 (dedupe_seen), v5->v6, then v6->v7 (AUTOINCREMENT rebuild) all run");
+        assert_eq!(
+            version, 8,
+            "v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 \
+             (ingested_sessions) all run"
+        );
 
         // The table exists and behaves — round-trips through the store
         // functions that use it.
@@ -2883,7 +2942,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 7, "v5->v6, then v6->v7 (AUTOINCREMENT rebuild) both run");
+        assert_eq!(version, 8, "v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) all run");
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -2943,7 +3002,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8, "v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) both run");
 
         // Every row and its data survive the rebuild, ids included.
         let rows = list(&conn, None, false).unwrap();
@@ -3071,6 +3130,62 @@ mod tests {
             .query_row("SELECT seq FROM sqlite_sequence WHERE name = 'memories'", [], |r| r.get(0))
             .unwrap();
         assert!(seq >= 250, "sqlite_sequence ({}) must be seeded from the highest id this table ever held", seq);
+    }
+
+    #[test]
+    fn migration_v7_to_v8_creates_ingested_sessions_table_and_keeps_rows() {
+        // Build a v7-era database by hand: current memories/insights shape,
+        // but no `ingested_sessions` table yet, user_version = 7.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, source TEXT, project TEXT,
+                created_at TEXT NOT NULL, reviewed INTEGER NOT NULL DEFAULT 1, embedding BLOB,
+                importance INTEGER NOT NULL DEFAULT 5, stability REAL, access_count INTEGER NOT NULL DEFAULT 0,
+                first_accessed_at TEXT, last_accessed_at TEXT, valid_from TEXT, invalidated_at TEXT,
+                superseded_by INTEGER, dormant_at TEXT, last_verified_at TEXT
+            );
+            CREATE TABLE insights (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, created_at TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.5, source_ids TEXT NOT NULL, embedding BLOB,
+                invalidated_at TEXT, flagged_at TEXT, last_verified_at TEXT, level INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE reflect_state (id INTEGER PRIMARY KEY CHECK (id = 1), last_run_at TEXT, last_memory_id INTEGER);
+            CREATE TABLE dedupe_seen (id_a INTEGER NOT NULL, id_b INTEGER NOT NULL, PRIMARY KEY (id_a, id_b));
+            CREATE TABLE contradiction_seen (id_a INTEGER NOT NULL, id_b INTEGER NOT NULL, PRIMARY KEY (id_a, id_b));
+            INSERT INTO memories (content, created_at, valid_from, stability)
+            VALUES ('a v7 memory', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 35.0);
+            PRAGMA user_version = 7;",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 8, "v7->v8 (ingested_sessions) runs");
+
+        assert_eq!(list(&conn, None, false).unwrap().len(), 1, "existing memory row must survive the migration");
+
+        // The table exists and behaves — round-trips through the store
+        // functions that use it.
+        assert!(!is_session_ingested(&conn, "abc-123").unwrap());
+        mark_session_ingested(&conn, "abc-123", &now_rfc3339()).unwrap();
+        assert!(is_session_ingested(&conn, "abc-123").unwrap());
+
+        // idempotent on repeat
+        migrate(&conn).unwrap();
+        assert_eq!(list(&conn, None, false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn mark_session_ingested_is_idempotent() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        mark_session_ingested(&conn, "sess-1", &now).unwrap();
+        mark_session_ingested(&conn, "sess-1", &now).unwrap(); // INSERT OR IGNORE — must not error
+        assert!(is_session_ingested(&conn, "sess-1").unwrap());
+        assert!(!is_session_ingested(&conn, "sess-2").unwrap(), "a different session id must be unaffected");
     }
 
     #[test]

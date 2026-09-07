@@ -1,86 +1,58 @@
 #!/usr/bin/env bash
 # kb-capture.sh — Claude Code SessionEnd hook.
 #
-# Distills up to 5 durable, cross-session-worthy facts about the USER out of
-# this session's transcript tail (preferences, projects, people,
-# commitments — not code details, not session mechanics) and stores each as
-# an unreviewed `mach kb` candidate for later curation via `mach kb review`.
+# Engagement-gated reinforcement: this hook no longer distills facts itself
+# (it used to spawn its own nested `claude -p --model haiku` digest call on
+# every session end). That work is now owned by `mach kb ingest-sessions`,
+# which reads the same transcript plus kb-recall.sh's per-session recall log
+# to BOTH judge which injected memories were actually engaged with (not
+# merely shown) AND extract the durable-facts digest this hook used to do
+# alone — see engines/kb/src/ingest.rs.
+#
+# This hook is now just the fast trigger: a clean SessionEnd gets its
+# session processed near-instantly (`--session-id` bypasses the
+# opportunistic sweep's idle-time gate, since this hook already knows the
+# session just ended). A crash or otherwise unclean exit — this hook never
+# firing at all — is caught instead by the mach-reflect timer's
+# opportunistic `ExecStartPre` sweep (no `--session-id`, mtime + processed-set
+# gated), so processing never depends on SessionEnd firing.
 #
 # Contract: this hook must NEVER block session teardown. No `set -e`, and
 # every path ends in `exit 0`.
 
-# Recursion guard: the `claude -p` digest call below is itself a
-# non-interactive session and fires its own SessionEnd. MACH_KB_DIGEST=1 is
-# set only when *we* invoke it, so a nested firing of this same hook exits
-# immediately instead of spawning another digest call forever.
-if [ "${MACH_KB_DIGEST:-}" = "1" ]; then
-    exit 0
-fi
-
 MACH_BIN="${MACH_BIN:-mach}"
-CLAUDE_BIN="${CLAUDE_BIN:-claude}"
-TAIL_LINES=400
-MIN_TRANSCRIPT_LINES=200
+
+command -v "$MACH_BIN" >/dev/null 2>&1 || exit 0
 
 input="$(cat)"
 
-transcript_path="$(printf '%s' "$input" | python3 -c '
+session_id="$(printf '%s' "$input" | python3 -c '
 import json, sys
 try:
     data = json.load(sys.stdin)
-    p = data.get("transcript_path", "")
-    print(p if isinstance(p, str) else "")
+    s = data.get("session_id", "")
+    print(s if isinstance(s, str) else "")
 except Exception:
     print("")
 ' 2>/dev/null)"
 
-if [ -z "$transcript_path" ] && command -v jq >/dev/null 2>&1; then
-    transcript_path="$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null)"
+if [ -z "$session_id" ] && command -v jq >/dev/null 2>&1; then
+    session_id="$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)"
 fi
 
-[ -z "$transcript_path" ] && exit 0
-[ -f "$transcript_path" ] || exit 0
-
-line_count="$(wc -l < "$transcript_path" 2>/dev/null)"
-[ -z "$line_count" ] && line_count=0
-if [ "$line_count" -lt "$MIN_TRANSCRIPT_LINES" ] 2>/dev/null; then
-    exit 0
-fi
-
-command -v "$MACH_BIN" >/dev/null 2>&1 || exit 0
-command -v "$CLAUDE_BIN" >/dev/null 2>&1 || exit 0
-
-# Raw transcript JSONL embeds full tool outputs and can reach megabytes in a
-# few hundred lines, overflowing the digest model's context ("Prompt is too
-# long"). Reduce to dialogue text (capped) before digesting.
-tail_content="$(tail -n "$TAIL_LINES" "$transcript_path" 2>/dev/null | python3 "$(dirname "${BASH_SOURCE[0]}")/kb-transcript-filter.py" 2>/dev/null)"
-[ -z "$tail_content" ] && exit 0
-
-# The digest call can take tens of seconds; session teardown cancels hooks
-# that block that long ("Hook cancelled"). Run the heavy part detached so
-# the hook itself returns instantly. The transcript file persists after the
-# session, so the detached work reads nothing volatile.
+# ingest-sessions can take a while (transcript filtering plus up to two
+# haiku calls) — session teardown cancels hooks that block that long, so
+# this runs detached, same pattern kb-capture.sh's own digest call used to
+# follow.
 (
-
-digest_prompt='You are extracting durable, cross-session-worthy facts about the USER from the tail of a Claude Code session transcript (JSONL below). Extract at most 5 facts: preferences, projects, people, or commitments that would still matter in a future, unrelated session. Do NOT extract code details, file contents, tool-call mechanics, or anything specific only to this one task. Never include secrets, credentials, tokens, or passwords. Output one fact per line, plain text, no numbering, no bullets, no preamble, no markdown. If nothing qualifies, output nothing at all — not even a note saying so.'
-
-facts="$(printf '%s\n\n---TRANSCRIPT TAIL---\n%s\n' "$digest_prompt" "$tail_content" \
-    | MACH_KB_DIGEST=1 timeout 60s "$CLAUDE_BIN" -p --model haiku \
-        --permission-prompts none \
-        --disallowedTools "Bash Edit Write NotebookEdit WebFetch WebSearch Agent" \
-        2>/dev/null)"
-
-[ -z "$facts" ] && exit 0
-
-printf '%s\n' "$facts" | while IFS= read -r line; do
-    line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-    [ -z "$line" ] && continue
-    # --no-classify: a digest can produce several facts per session, and
-    # each would otherwise trigger its own classifier subprocess call on a
-    # close match — n x LLM calls for facts that land unreviewed anyway.
-    # `mach kb review` is the curation point for these, not save-time.
-    printf '%s' "$line" | "$MACH_BIN" kb add - --source "session-digest" --unreviewed --no-classify >/dev/null 2>&1
-done
+    if [ -n "$session_id" ]; then
+        timeout 120s "$MACH_BIN" kb ingest-sessions --session-id "$session_id" >/dev/null 2>&1
+    else
+        # No session id available (shouldn't normally happen) — fall back
+        # to the bare opportunistic sweep so a crash-safety net still runs,
+        # even though this exact session won't qualify until it's stale.
+        timeout 120s "$MACH_BIN" kb ingest-sessions >/dev/null 2>&1
+    fi
 ) </dev/null >/dev/null 2>&1 &
 disown 2>/dev/null
 

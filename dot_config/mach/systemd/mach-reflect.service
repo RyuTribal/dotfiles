@@ -7,6 +7,18 @@ Description=mach kb reflect — periodic knowledge-bank reflection pass
 
 [Service]
 Type=oneshot
+# Crash-safety net for engagement-gated reinforcement: `mach kb
+# ingest-sessions` normally runs instantly per-session via kb-capture.sh's
+# SessionEnd `--session-id` fast trigger, but a crash or unclean exit means
+# that hook never fires at all. This bare (no --session-id) opportunistic
+# sweep is the guarantee — it scans every transcript idle >=10min and not
+# yet processed, so nothing is ever permanently missed. Runs before `mach
+# kb reflect` (not after) so any facts it just extracted are picked up by
+# the very same reflect run via `memories_since`, rather than waiting for
+# the next one. `-` means a failure here never fails this unit or blocks
+# the reflect pass that follows -- see ingest.rs's own offline discipline
+# for why a degraded run there is always safe to retry later.
+ExecStartPre=-%h/.local/bin/mach kb ingest-sessions
 # Catch-up path for `mach meet process`: normally it runs as a detached
 # background spawn from `mach meet stop` (see cli.rs's spawn_detached_process),
 # but a meeting recorded (and stopped) while offline can leave its

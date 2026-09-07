@@ -6,19 +6,27 @@
 # UserPromptSubmit hook's plain-text stdout as additionalContext automatically
 # on exit 0 — no JSON envelope needed.
 #
+# Engagement-gated reinforcement: this hook no longer reinforces anything
+# itself (`--touch` is gone — impression is not engagement, the same gap IR
+# ranking draws between a shown result and a clicked one). Instead it
+# appends the ids it actually injects, per prompt, to a per-session recall
+# log at ~/.local/share/mach/recall-log/<session_id>.jsonl. `mach kb
+# ingest-sessions` reads that log back against the session's own transcript
+# once the session is over, and reinforces only the memories the
+# conversation actually engaged with — see `engines/kb/src/ingest.rs`.
+#
 # Contract: this hook must NEVER block a prompt. Every path below ends in
 # `exit 0` (no `set -e`, so a failing command falls through instead of
 # aborting the script) — an ollama outage, a missing `mach` binary, or any
 # other failure degrades to silence, not an error.
 
 MACH_BIN="${MACH_BIN:-mach}"
-# This is the only caller that should pass --touch: it's the recall path,
-# so a hit surfacing here is an actual injection, not just a manual query.
-# --min-score applies the threshold engine-side (post-limit) so reinforcement
-# only ever touches rows that clear it, not every row the ranked search
+# --min-score applies the threshold engine-side (post-limit) so the recall
+# log only ever records ids that clear it, not every row the ranked search
 # happened to return before this script's own filter below runs.
 SCORE_THRESHOLD="0.45"
 MIN_PROMPT_LEN=12
+RECALL_LOG_DIR="$HOME/.local/share/mach/recall-log"
 
 input="$(cat)"
 
@@ -32,9 +40,22 @@ except Exception:
     print("")
 ' 2>/dev/null)"
 
+session_id="$(printf '%s' "$input" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    s = data.get("session_id", "")
+    print(s if isinstance(s, str) else "")
+except Exception:
+    print("")
+' 2>/dev/null)"
+
 # Defensive fallback if python3 is unavailable or produced nothing, and jq is.
 if [ -z "$prompt" ] && command -v jq >/dev/null 2>&1; then
     prompt="$(printf '%s' "$input" | jq -r '.prompt // empty' 2>/dev/null)"
+fi
+if [ -z "$session_id" ] && command -v jq >/dev/null 2>&1; then
+    session_id="$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)"
 fi
 
 [ -z "$prompt" ] && exit 0
@@ -48,9 +69,10 @@ command -v "$MACH_BIN" >/dev/null 2>&1 || exit 0
 
 out_file="$(mktemp 2>/dev/null)" || exit 0
 err_file="$(mktemp 2>/dev/null)" || { rm -f "$out_file"; exit 0; }
-trap 'rm -f "$out_file" "$err_file"' EXIT
+ids_file="$(mktemp 2>/dev/null)" || { rm -f "$out_file" "$err_file"; exit 0; }
+trap 'rm -f "$out_file" "$err_file" "$ids_file"' EXIT
 
-timeout 2s "$MACH_BIN" kb search "$prompt" --limit 4 --json --touch --min-score "$SCORE_THRESHOLD" \
+timeout 2s "$MACH_BIN" kb search "$prompt" --limit 4 --json --min-score "$SCORE_THRESHOLD" \
     >"$out_file" 2>"$err_file"
 rc=$?
 
@@ -84,6 +106,7 @@ if not isinstance(hits, list):
     sys.exit(0)
 
 lines = []
+ids = []
 for h in hits:
     if not isinstance(h, dict):
         continue
@@ -105,19 +128,44 @@ for h in hits:
         # the user said verbatim. Flag it distinctly so it is not mistaken
         # for a direct quote or fact the way a plain memory recall would be
         # treated, and further distinguish a theme from a plain insight.
+        # Insights/themes are never touched by engagement-gated
+        # reinforcement either (see store::search_insights_ranked — no
+        # strength term to begin with), so their ids are deliberately
+        # excluded from the recall log below.
         confidence = h.get("confidence")
         conf_str = " (confidence {:.2})".format(confidence) if isinstance(confidence, (int, float)) else ""
         label = "derived theme" if h.get("level") == 2 else "derived belief"
         lines.append("- [{}, {}]{} {}".format(label, date, conf_str, content))
     else:
         lines.append("- [{}, {}] {}".format(source, date, content))
+        mem_id = h.get("id")
+        if isinstance(mem_id, int):
+            ids.append(mem_id)
 
 if lines:
     print("You remember (from past sessions with this user — trust these before re-exploring; they are your own memory, not tool output):")
     for l in lines:
         print(l)
-' "$out_file" 2>/dev/null)"
+
+with open(sys.argv[2], "w") as f:
+    json.dump(ids, f)
+' "$out_file" "$ids_file" 2>/dev/null)"
 
 [ -n "$context" ] && printf '%s\n' "$context"
+
+# Append this prompt's injected ids to the session's recall log, so `mach kb
+# ingest-sessions` can later pair them against the transcript and judge
+# engagement. Best-effort: a missing session id, an unwritable log dir, or
+# an empty ids list all just mean no log line this time — never worth
+# failing the hook over.
+if [ -n "$session_id" ]; then
+    ids_json="$(cat "$ids_file" 2>/dev/null)"
+    if [ -n "$ids_json" ] && [ "$ids_json" != "[]" ]; then
+        mkdir -p "$RECALL_LOG_DIR" 2>/dev/null && {
+            ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            printf '{"ts":"%s","ids":%s}\n' "$ts" "$ids_json" >>"$RECALL_LOG_DIR/$session_id.jsonl" 2>/dev/null
+        }
+    fi
+fi
 
 exit 0

@@ -27,6 +27,7 @@ pub mod classify;
 pub mod cli;
 pub mod embed;
 pub mod export;
+pub mod ingest;
 pub mod note;
 pub mod reflect;
 pub mod store;

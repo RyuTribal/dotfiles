@@ -2,6 +2,7 @@
 //! kb — subcommand dispatch for `mach kb ...`, matching the hand-rolled
 //! arg-parsing style the sweep engine's `cli` module already uses (no
 //! clap).
+use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Read, Write};
 
 use rusqlite::Connection;
@@ -9,7 +10,8 @@ use serde::Serialize;
 
 use crate::classify::{self, Classifier, Verdict};
 use crate::embed::{Embedder, OllamaEmbedder};
-use crate::store::{self, AddOutcome, KbError, RankedHit};
+use crate::reflect::{self, ProcessReflectLlm, ReflectLlm, Stage2Result, TIMEOUT_HAIKU, TIMEOUT_SONNET};
+use crate::store::{self, AddOutcome, Insight, InsightHit, KbError, Memory, RankedHit};
 
 fn to_io(e: KbError) -> io::Error {
     io::Error::other(e.to_string())
@@ -36,6 +38,10 @@ fn print_help() {
     println!("  list [--limit N] [--superseded]");
     println!("                          most recent memories (--superseded: audit view)");
     println!("  forget <id>             permanently delete a memory");
+    println!("  reflect                 examine new memories, derive durable insights,");
+    println!("                          re-verify a sample of existing ones");
+    println!("  insights [--flagged]    list derived insights (confidence + source ids)");
+    println!("  insight-forget <id>     permanently delete an insight");
 }
 
 /// Runs the kb CLI given the arguments following `kb` in `mach kb ...`.
@@ -47,6 +53,9 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Some("review") => cmd_review(args),
         Some("list") => cmd_list(args),
         Some("forget") => cmd_forget(args),
+        Some("reflect") => cmd_reflect(args),
+        Some("insights") => cmd_insights(args),
+        Some("insight-forget") => cmd_insight_forget(args),
         Some("-h") | Some("--help") => {
             print_help();
             Ok(())
@@ -192,6 +201,13 @@ struct SearchHit {
     strength: f32,
     importance: i64,
     superseded: bool,
+    // Insight hits (from mach kb reflect) blended into recall: true marks a
+    // row that came from the insights table rather than memories. Present
+    // (and false) on memory hits too, so a consumer never has to treat its
+    // absence as meaningful.
+    derived: bool,
+    // Only meaningful when `derived` is true.
+    confidence: Option<f64>,
 }
 
 fn to_hit(h: RankedHit) -> SearchHit {
@@ -207,6 +223,27 @@ fn to_hit(h: RankedHit) -> SearchHit {
         strength: h.strength,
         importance: h.memory.importance,
         superseded: h.superseded,
+        derived: false,
+        confidence: None,
+    }
+}
+
+fn insight_to_hit(h: InsightHit) -> SearchHit {
+    let flagged = h.insight.is_flagged();
+    SearchHit {
+        id: h.insight.id,
+        content: h.insight.text,
+        source: Some("derived".to_string()),
+        project: None,
+        created_at: h.insight.created_at,
+        score: h.score,
+        sim: h.sim,
+        recency: h.recency,
+        strength: 0.0,
+        importance: 0,
+        superseded: flagged,
+        derived: true,
+        confidence: Some(h.insight.confidence),
     }
 }
 
@@ -256,52 +293,86 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let conn = store::open().map_err(to_io)?;
     let now = store::now_rfc3339();
     let embedder = OllamaEmbedder::new();
-    let hits: Vec<RankedHit> = match embedder.embed(&query) {
+    // Blend memory hits and insight hits into one ranked list: fetch up to
+    // `limit` unfiltered candidates from each side, merge, sort by score,
+    // truncate to `limit`, then apply `min_score` — this reduces to the
+    // original single-source behavior whenever there are no insights yet.
+    let mut hits: Vec<SearchHit> = match embedder.embed(&query) {
         Ok(q_emb) => {
-            store::search_ranked(&conn, &q_emb, limit, all, include_superseded, min_score, &now).map_err(to_io)?
+            let mem_hits =
+                store::search_ranked(&conn, &q_emb, limit, all, include_superseded, 0.0, &now).map_err(to_io)?;
+            if touch {
+                let ids: Vec<i64> = mem_hits.iter().map(|h| h.memory.id).collect();
+                store::touch(&conn, &ids, &now).map_err(to_io)?;
+            }
+            let insight_hits = store::search_insights_ranked(&conn, &q_emb, limit, &now).map_err(to_io)?;
+            let mut combined: Vec<SearchHit> =
+                mem_hits.into_iter().map(to_hit).chain(insight_hits.into_iter().map(insight_to_hit)).collect();
+            combined.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            combined.truncate(limit);
+            combined
         }
         Err(e) => {
             eprintln!(
                 "mach kb search: warning: {} — falling back to substring match",
                 e
             );
+            // No insight fallback here: substring match forces every hit to
+            // score 1.0 (not a meaningful ranking to begin with), and
+            // insights have no independent text-substring path worth adding
+            // for what's already a degraded mode.
             let subs = store::search_substring(&conn, &query, limit, all, include_superseded).map_err(to_io)?;
+            let ids: Vec<i64> = subs.iter().map(|(m, _)| m.id).collect();
+            if touch {
+                store::touch(&conn, &ids, &now).map_err(to_io)?;
+            }
             subs.into_iter()
                 .map(|(m, score)| {
                     let superseded = m.is_superseded();
-                    RankedHit { memory: m, score, sim: score, recency: 0.0, strength: 0.0, superseded }
+                    to_hit(RankedHit { memory: m, score, sim: score, recency: 0.0, strength: 0.0, superseded })
                 })
                 .collect()
         }
     };
 
-    if touch {
-        let ids: Vec<i64> = hits.iter().map(|h| h.memory.id).collect();
-        store::touch(&conn, &ids, &now).map_err(to_io)?;
+    if min_score > 0.0 {
+        hits.retain(|h| h.score >= min_score);
     }
 
     if json {
-        let out: Vec<SearchHit> = hits.into_iter().map(to_hit).collect();
-        println!("{}", serde_json::to_string(&out)?);
+        println!("{}", serde_json::to_string(&hits)?);
     } else if hits.is_empty() {
         println!("no matches");
     } else {
         let mut any_superseded = false;
         for h in &hits {
-            any_superseded |= h.superseded;
-            let flag = if h.memory.reviewed { ' ' } else { '*' };
+            any_superseded |= h.superseded && !h.derived;
+            let flag = if h.derived { 'D' } else { ' ' };
             let sup = if h.superseded { '!' } else { ' ' };
+            let label = if h.derived {
+                format!("#i{:<4}", h.id)
+            } else {
+                format!("#{:<5}", h.id)
+            };
+            let suffix = match h.confidence {
+                Some(c) => format!("  (confidence {:.2})", c),
+                None => String::new(),
+            };
             println!(
-                "{}{}{:>6.3}  #{:<5} {}",
+                "{}{}{:>6.3}  {} {}{}",
                 flag,
                 sup,
                 h.score,
-                h.memory.id,
-                truncate(&h.memory.content, 90)
+                label,
+                truncate(&h.content, 90),
+                suffix
             );
         }
+        if hits.iter().any(|h| h.derived) {
+            println!("\n(D = derived insight from `mach kb reflect` — see `mach kb insights`)");
+        }
         if any_superseded {
-            println!("\n(! = superseded — scored ×0.1, shown via --include-superseded)");
+            println!("(! = superseded — scored ×0.1, shown via --include-superseded)");
         }
     }
     Ok(())
@@ -506,6 +577,261 @@ fn cmd_forget(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Ok(())
     } else {
         eprintln!("mach kb forget: no memory with id {}", id);
+        std::process::exit(1);
+    }
+}
+
+// --- reflect: the periodic reflection pass ---
+
+const REFLECT_WORKING_SET_CAP: usize = 60;
+const REFLECT_NEIGHBORS_PER_MEMORY: usize = 3;
+const REFLECT_EVIDENCE_PER_QUESTION: usize = 8;
+const REFLECT_EXISTING_INSIGHTS_CONTEXT: usize = 3;
+const REFLECT_VERIFICATION_SAMPLE: usize = 5;
+const REFLECT_VERIFICATION_CANDIDATES: usize = 5;
+
+fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "-h" | "--help" => {
+                println!("usage: mach kb reflect");
+                return Ok(());
+            }
+            other => {
+                eprintln!("mach kb reflect: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let conn = store::open().map_err(to_io)?;
+    let now = store::now_rfc3339();
+    let state = store::get_reflect_state(&conn).map_err(to_io)?;
+    let last_id = state.last_memory_id.unwrap_or(0);
+
+    // Step 1: input selection.
+    let new_memories = store::memories_since(&conn, last_id).map_err(to_io)?;
+    if new_memories.is_empty() {
+        println!("mach kb reflect: nothing new");
+        return Ok(());
+    }
+
+    let embedder = OllamaEmbedder::new();
+    let llm = ProcessReflectLlm::new();
+
+    // Working set: the new memories, bridged with each one's top-3
+    // neighbors from the whole active store (reviewed and unreviewed
+    // alike) so a fresh fact can connect to an older pattern. Deduped by
+    // id via the BTreeMap; capped at 60, most-recent-first when over.
+    let mut working: BTreeMap<i64, Memory> = BTreeMap::new();
+    for m in &new_memories {
+        working.insert(m.id, m.clone());
+    }
+    for m in &new_memories {
+        if let Some(emb) = &m.embedding {
+            if let Ok(neighbors) = store::top_similar_active(&conn, emb, REFLECT_NEIGHBORS_PER_MEMORY) {
+                for (nm, _) in neighbors {
+                    working.entry(nm.id).or_insert(nm);
+                }
+            }
+        }
+    }
+    let mut working_vec: Vec<Memory> = working.into_values().collect();
+    if working_vec.len() > REFLECT_WORKING_SET_CAP {
+        working_vec.sort_by(|a, b| b.id.cmp(&a.id));
+        working_vec.truncate(REFLECT_WORKING_SET_CAP);
+    }
+    working_vec.sort_by_key(|m| m.id);
+    let examined = working_vec.len();
+
+    // Step 2 (stage 1): salient questions, one haiku call over the whole
+    // working set.
+    let question_lines: Vec<(i64, String)> = working_vec.iter().map(|m| (m.id, m.content.clone())).collect();
+    let q_prompt = reflect::build_questions_prompt(&question_lines);
+    let questions: Vec<String> = match llm.call("haiku", &q_prompt, TIMEOUT_HAIKU) {
+        Ok(out) => reflect::parse_questions(&out),
+        Err(_) => Vec::new(),
+    };
+
+    // Step 3 (stage 2): one durable insight per question, sonnet — only
+    // when the evidence actually supports it.
+    let mut insights_added = 0usize;
+    for question in &questions {
+        let q_emb = match embedder.embed(question) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let evidence = match store::top_similar_active(&conn, &q_emb, REFLECT_EVIDENCE_PER_QUESTION) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if evidence.len() < 2 {
+            // Can never clear the 2-citation floor regardless of what the
+            // model says — skip the sonnet call entirely.
+            continue;
+        }
+        let existing_near =
+            store::top_similar_insights(&conn, &q_emb, REFLECT_EXISTING_INSIGHTS_CONTEXT).unwrap_or_default();
+
+        let evidence_pairs: Vec<(i64, String)> = evidence.iter().map(|(m, _)| (m.id, m.content.clone())).collect();
+        let existing_pairs: Vec<(i64, String)> =
+            existing_near.iter().map(|(ins, _)| (ins.id, ins.text.clone())).collect();
+        let prompt = reflect::build_insight_prompt(question, &evidence_pairs, &existing_pairs);
+
+        let raw = match llm.call("sonnet", &prompt, TIMEOUT_SONNET) {
+            Ok(out) => out,
+            Err(_) => continue,
+        };
+
+        if let Stage2Result::Insight { text, memory_ids } = reflect::parse_stage2(&raw) {
+            // Defensive cross-check: citations must be real evidence rows
+            // we actually showed the model, not hallucinated ids — a
+            // fabricated id must not let a claim slip past the floor.
+            let evidence_ids: std::collections::HashSet<i64> = evidence.iter().map(|(m, _)| m.id).collect();
+            let mut valid_ids: Vec<i64> = memory_ids.into_iter().filter(|id| evidence_ids.contains(id)).collect();
+            valid_ids.sort_unstable();
+            valid_ids.dedup();
+            if valid_ids.len() < 2 {
+                continue;
+            }
+            let confidence = reflect::compute_confidence(valid_ids.len());
+            let source_ids: Vec<String> = valid_ids.iter().map(|id| id.to_string()).collect();
+            let text_embedding = embedder.embed(&text).ok();
+            if store::insert_insight(&conn, &text, confidence, &source_ids, text_embedding.as_deref()).is_ok() {
+                insights_added += 1;
+            }
+        }
+    }
+
+    // Step 4: re-verification, same run — up to 5 oldest insights by
+    // last_verified_at (never-verified first). Never deletes, only flags.
+    let mut flagged = 0usize;
+    let mut verified = 0usize;
+    let stale = store::insights_due_for_verification(&conn, REFLECT_VERIFICATION_SAMPLE).map_err(to_io)?;
+    for insight in &stale {
+        let mut broken_citation = false;
+        for sid in &insight.source_ids {
+            if sid.starts_with('i') || sid.starts_with('I') {
+                continue; // insight references aren't re-checked here
+            }
+            let still_active = match sid.parse::<i64>() {
+                Ok(mid) => matches!(store::get(&conn, mid), Ok(Some(m)) if m.invalidated_at.is_none()),
+                Err(_) => false,
+            };
+            if !still_active {
+                broken_citation = true;
+                break;
+            }
+        }
+
+        if broken_citation {
+            store::flag_insight(&conn, insight.id, &now).map_err(to_io)?;
+            flagged += 1;
+            continue;
+        }
+
+        let contradicted = match embedder.embed(&insight.text) {
+            Ok(emb) => match store::top_similar_active(&conn, &emb, REFLECT_VERIFICATION_CANDIDATES) {
+                Ok(candidates) if !candidates.is_empty() => {
+                    let pairs: Vec<(i64, String)> =
+                        candidates.iter().map(|(m, _)| (m.id, m.content.clone())).collect();
+                    let prompt = reflect::build_contradiction_prompt(&insight.text, &pairs);
+                    match llm.call("haiku", &prompt, TIMEOUT_HAIKU) {
+                        Ok(out) => reflect::parse_contradiction(&out).is_some(),
+                        Err(_) => false,
+                    }
+                }
+                _ => false,
+            },
+            Err(_) => false,
+        };
+
+        if contradicted {
+            store::flag_insight(&conn, insight.id, &now).map_err(to_io)?;
+            flagged += 1;
+        } else {
+            store::mark_insight_verified(&conn, insight.id, &now).map_err(to_io)?;
+            verified += 1;
+        }
+    }
+
+    // Step 5: advance the watermark to the newest memory id actually
+    // examined this run (not the bridged neighbors, which may be older).
+    let new_watermark = new_memories.iter().map(|m| m.id).max();
+    store::update_reflect_state(&conn, &now, new_watermark).map_err(to_io)?;
+
+    println!(
+        "mach kb reflect: examined={} questions={} insights_added={} flagged={} verified={}",
+        examined,
+        questions.len(),
+        insights_added,
+        flagged,
+        verified
+    );
+    Ok(())
+}
+
+fn cmd_insights(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut flagged_only = false;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--flagged" => flagged_only = true,
+            "-h" | "--help" => {
+                println!("usage: mach kb insights [--flagged]");
+                return Ok(());
+            }
+            other => {
+                eprintln!("mach kb insights: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+    let conn = store::open().map_err(to_io)?;
+    let rows: Vec<Insight> = store::list_insights(&conn, flagged_only).map_err(to_io)?;
+    if rows.is_empty() {
+        println!("{}", if flagged_only { "no flagged insights" } else { "no insights yet — run `mach kb reflect`" });
+        return Ok(());
+    }
+    for ins in &rows {
+        let flag = if ins.is_flagged() { '!' } else { ' ' };
+        println!(
+            "{}i{:<5} {}  (confidence {:.2}, sources: {})",
+            flag,
+            ins.id,
+            truncate(&ins.text, 80),
+            ins.confidence,
+            ins.source_ids.join(", "),
+        );
+    }
+    println!(
+        "\n(! = flagged by re-verification — evidence no longer supports it; \
+         `mach kb insight-forget <id>` removes one)"
+    );
+    Ok(())
+}
+
+fn cmd_insight_forget(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let id_str = match args.next() {
+        Some(s) => s,
+        None => {
+            eprintln!("mach kb insight-forget: missing <id> argument");
+            std::process::exit(1);
+        }
+    };
+    let id: i64 = match id_str.parse() {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("mach kb insight-forget: '{}' is not a valid id", id_str);
+            std::process::exit(1);
+        }
+    };
+    let conn = store::open().map_err(to_io)?;
+    let existed = store::delete_insight(&conn, id).map_err(to_io)?;
+    if existed {
+        println!("forgot insight #{}", id);
+        Ok(())
+    } else {
+        eprintln!("mach kb insight-forget: no insight with id {}", id);
         std::process::exit(1);
     }
 }

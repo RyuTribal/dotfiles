@@ -70,6 +70,35 @@ check_ollama() {
 }
 check_ollama
 
+# mach kb reflect (phase 3) runs on a schedule via a systemd user timer
+# rather than a hand-rolled loop inside machd — a timer survives logouts,
+# gets Persistent=true catch-up, and needs no daemon process of its own.
+# This is a soft install: a non-systemd environment (no `systemctl`, or a
+# user session systemd doesn't manage) must not fail the whole install —
+# `mach kb reflect` still works fine run by hand or from cron in that case.
+install_reflect_timer() {
+  local unit_dir="$HOME/.config/systemd/user"
+  install -Dm644 "$HERE/systemd/mach-reflect.service" "$unit_dir/mach-reflect.service"
+  install -Dm644 "$HERE/systemd/mach-reflect.timer"   "$unit_dir/mach-reflect.timer"
+  echo "installed: $unit_dir/mach-reflect.{service,timer}"
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "NOTE: systemctl not found — units installed but not enabled. Run 'mach kb reflect' via cron or by hand instead."
+    return
+  fi
+  if ! systemctl --user list-units >/dev/null 2>&1; then
+    echo "NOTE: no systemd --user session available here — units installed but not enabled."
+    return
+  fi
+  systemctl --user daemon-reload
+  if systemctl --user enable --now mach-reflect.timer >/dev/null 2>&1; then
+    echo "enabled: mach-reflect.timer (daily 04:00, +10min after boot, +/-15min jitter)"
+  else
+    echo "WARNING: 'systemctl --user enable --now mach-reflect.timer' failed — enable it by hand once mach is on PATH."
+  fi
+}
+install_reflect_timer
+
 echo
 echo "Done. Reload quickshell if running, then press SUPER+U."
 echo "Or test now:  qs -c ii ipc call sweep toggle"

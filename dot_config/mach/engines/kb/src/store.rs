@@ -78,6 +78,43 @@ impl Memory {
     }
 }
 
+/// A reflection-engine insight: a durable, higher-level belief about the
+/// user derived from `>= 2` independent memories, produced by `mach kb
+/// reflect`. `source_ids` holds the citations backing it, as strings —
+/// a plain memory id ("12") or an insight reference ("i7") for an insight
+/// it explicitly builds on; only raw memory ids count toward the
+/// evidence floor (see `reflect::parse_stage2`).
+#[derive(Debug, Clone)]
+pub struct Insight {
+    pub id: i64,
+    pub text: String,
+    pub created_at: String,
+    pub confidence: f64,
+    pub source_ids: Vec<String>,
+    pub embedding: Option<Vec<f32>>,
+    pub invalidated_at: Option<String>,
+    pub flagged_at: Option<String>,
+    pub last_verified_at: Option<String>,
+}
+
+impl Insight {
+    pub fn is_active(&self) -> bool {
+        self.invalidated_at.is_none()
+    }
+
+    pub fn is_flagged(&self) -> bool {
+        self.flagged_at.is_some()
+    }
+}
+
+/// The single-row `reflect_state` watermark: how far `mach kb reflect` has
+/// gotten through the memories table, and when it last ran.
+#[derive(Debug, Clone, Default)]
+pub struct ReflectState {
+    pub last_run_at: Option<String>,
+    pub last_memory_id: Option<i64>,
+}
+
 /// `~/.local/share/mach/kb.db`, the default store location.
 pub fn db_path() -> Result<PathBuf, KbError> {
     let home = env::var("HOME").map_err(|_| KbError::Other("HOME is not set".into()))?;
@@ -102,6 +139,22 @@ fn init_schema(conn: &Connection) -> Result<(), KbError> {
             valid_from TEXT,
             invalidated_at TEXT,
             superseded_by INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS insights (
+            id INTEGER PRIMARY KEY,
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            confidence REAL NOT NULL DEFAULT 0.5,
+            source_ids TEXT NOT NULL,
+            embedding BLOB,
+            invalidated_at TEXT,
+            flagged_at TEXT,
+            last_verified_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS reflect_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            last_run_at TEXT,
+            last_memory_id INTEGER
         );",
     )?;
     Ok(())
@@ -132,13 +185,8 @@ fn existing_columns(conn: &Connection) -> Result<Vec<String>, KbError> {
 /// reinforcement/supersession columns to a pre-existing `memories` table
 /// (a no-op ALTER-wise on a table `init_schema` just created fresh, since
 /// those columns are already there) and backfills `valid_from` and
-/// `stability` on existing rows. Runs on every `open`, but the version gate
-/// makes every call after the first one a single cheap `PRAGMA` read.
-fn migrate(conn: &Connection) -> Result<(), KbError> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version >= 1 {
-        return Ok(());
-    }
+/// `stability` on existing rows.
+fn migrate_v0_to_v1(conn: &Connection) -> Result<(), KbError> {
     let cols = existing_columns(conn)?;
     for (name, decl) in NEW_COLUMNS {
         if !cols.iter().any(|c| c == name) {
@@ -150,6 +198,34 @@ fn migrate(conn: &Connection) -> Result<(), KbError> {
          UPDATE memories SET stability = importance * 7.0 WHERE stability IS NULL;",
     )?;
     conn.execute("PRAGMA user_version = 1", [])?;
+    Ok(())
+}
+
+/// `PRAGMA user_version`-gated, idempotent 1 -> 2 migration: the reflection
+/// subsystem's tables. `init_schema`'s `CREATE TABLE IF NOT EXISTS` already
+/// creates `insights`/`reflect_state` on any database (fresh or pre-existing)
+/// before `migrate` ever runs, so the only work left here is seeding the
+/// `reflect_state` singleton row and bumping the version.
+fn migrate_v1_to_v2(conn: &Connection) -> Result<(), KbError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO reflect_state (id, last_run_at, last_memory_id) VALUES (1, NULL, NULL)",
+        [],
+    )?;
+    conn.execute("PRAGMA user_version = 2", [])?;
+    Ok(())
+}
+
+/// Runs every migration step whose version gate hasn't been cleared yet.
+/// Runs on every `open`, but the version gate makes every call after the
+/// first one a single cheap `PRAGMA` read.
+fn migrate(conn: &Connection) -> Result<(), KbError> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version < 1 {
+        migrate_v0_to_v1(conn)?;
+    }
+    if version < 2 {
+        migrate_v1_to_v2(conn)?;
+    }
     Ok(())
 }
 
@@ -677,6 +753,244 @@ pub fn apply_verdict(
     }
 }
 
+// --- reflection subsystem: insights + reflect_state ---
+
+fn row_to_insight(row: &rusqlite::Row) -> rusqlite::Result<Insight> {
+    let blob: Option<Vec<u8>> = row.get("embedding")?;
+    let source_ids_json: String = row.get("source_ids")?;
+    let source_ids: Vec<String> = serde_json::from_str(&source_ids_json).unwrap_or_default();
+    Ok(Insight {
+        id: row.get("id")?,
+        text: row.get("text")?,
+        created_at: row.get("created_at")?,
+        confidence: row.get("confidence")?,
+        source_ids,
+        embedding: blob.map(|b| decode_embedding(&b)),
+        invalidated_at: row.get("invalidated_at")?,
+        flagged_at: row.get("flagged_at")?,
+        last_verified_at: row.get("last_verified_at")?,
+    })
+}
+
+/// Inserts a new insight (current time as `created_at`) and returns its id.
+pub fn insert_insight(
+    conn: &Connection,
+    text: &str,
+    confidence: f64,
+    source_ids: &[String],
+    embedding: Option<&[f32]>,
+) -> Result<i64, KbError> {
+    let created_at = now_rfc3339();
+    let source_ids_json =
+        serde_json::to_string(source_ids).map_err(|e| KbError::Other(format!("encoding source_ids: {}", e)))?;
+    let blob = embedding.map(encode_embedding);
+    conn.execute(
+        "INSERT INTO insights (text, created_at, confidence, source_ids, embedding)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![text, created_at, confidence, source_ids_json, blob],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn get_insight(conn: &Connection, id: i64) -> Result<Option<Insight>, KbError> {
+    let mut stmt = conn.prepare("SELECT * FROM insights WHERE id = ?1")?;
+    Ok(stmt.query_row(params![id], row_to_insight).optional()?)
+}
+
+/// Active (non-invalidated) insights, newest first, optionally filtered to
+/// only those currently flagged by re-verification — `mach kb insights
+/// [--flagged]`.
+pub fn list_insights(conn: &Connection, flagged_only: bool) -> Result<Vec<Insight>, KbError> {
+    let sql = if flagged_only {
+        "SELECT * FROM insights WHERE invalidated_at IS NULL AND flagged_at IS NOT NULL ORDER BY id DESC"
+    } else {
+        "SELECT * FROM insights WHERE invalidated_at IS NULL ORDER BY id DESC"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], row_to_insight)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// All non-invalidated insights, unordered filter aside — the pool
+/// `search_insights_ranked`/`top_similar_insights` rank over.
+fn active_insights(conn: &Connection) -> Result<Vec<Insight>, KbError> {
+    let mut stmt = conn.prepare("SELECT * FROM insights WHERE invalidated_at IS NULL")?;
+    let rows = stmt.query_map([], row_to_insight)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Hard delete — `mach kb insight-forget <id>`. Returns whether a row
+/// existed.
+pub fn delete_insight(conn: &Connection, id: i64) -> Result<bool, KbError> {
+    let n = conn.execute("DELETE FROM insights WHERE id = ?1", params![id])?;
+    Ok(n > 0)
+}
+
+/// Marks an insight flagged by re-verification (evidence no longer
+/// supports it). Never cleared automatically — `mach kb insight-forget` is
+/// the only way a flagged insight goes away.
+pub fn flag_insight(conn: &Connection, id: i64, now: &str) -> Result<bool, KbError> {
+    let n = conn.execute("UPDATE insights SET flagged_at = ?1 WHERE id = ?2", params![now, id])?;
+    Ok(n > 0)
+}
+
+/// Bumps `last_verified_at` after a re-verification pass finds an insight's
+/// evidence still holds.
+pub fn mark_insight_verified(conn: &Connection, id: i64, now: &str) -> Result<bool, KbError> {
+    let n = conn.execute("UPDATE insights SET last_verified_at = ?1 WHERE id = ?2", params![now, id])?;
+    Ok(n > 0)
+}
+
+/// Up to `limit` active insights due for re-verification, oldest
+/// `last_verified_at` first — SQLite sorts NULL first in `ASC` order, so
+/// never-verified insights are naturally prioritized ahead of merely-stale
+/// ones without a separate `CASE` clause.
+pub fn insights_due_for_verification(conn: &Connection, limit: usize) -> Result<Vec<Insight>, KbError> {
+    let sql = format!(
+        "SELECT * FROM insights WHERE invalidated_at IS NULL
+         ORDER BY last_verified_at ASC, id ASC LIMIT {}",
+        limit
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], row_to_insight)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// One ranked insight search hit, paralleling `RankedHit` — no `strength`
+/// component: insights aren't reinforced by `--touch` (their currency comes
+/// from re-verification instead), so that term of the blend is fixed at 0.
+pub struct InsightHit {
+    pub insight: Insight,
+    pub score: f32,
+    pub sim: f32,
+    pub recency: f32,
+}
+
+/// Stand-in "stability" for insight recency decay. Insights have no
+/// `access_count`/`stability` growth path (excluded from reinforcement by
+/// design), so there's nothing to derive a per-row value from; this fixed
+/// constant plays the same role `Memory::effective_stability` plays for
+/// memories.
+const INSIGHT_RECENCY_STABILITY_DAYS: f64 = 60.0;
+
+fn compute_insight_recency(insight: &Insight, now: i64) -> f32 {
+    let last = insight.last_verified_at.as_deref().unwrap_or(&insight.created_at);
+    let last_secs = parse_rfc3339(last).unwrap_or(now);
+    let days = days_between(now, last_secs);
+    (-days / INSIGHT_RECENCY_STABILITY_DAYS).exp() as f32
+}
+
+/// Ranked top-N search over active insights, for blending into `mach kb
+/// search`: `score = 0.70*sim + 0.20*recency` (the 0.10 strength term of
+/// the memory blend is simply omitted, i.e. fixed at 0).
+pub fn search_insights_ranked(
+    conn: &Connection,
+    query_embedding: &[f32],
+    limit: usize,
+    now: &str,
+) -> Result<Vec<InsightHit>, KbError> {
+    let now_secs = parse_rfc3339(now).unwrap_or(0);
+    let mut scored: Vec<InsightHit> = active_insights(conn)?
+        .into_iter()
+        .filter_map(|insight| {
+            let sim = match &insight.embedding {
+                Some(e) if !e.is_empty() => cosine(query_embedding, e).clamp(0.0, 1.0),
+                _ => return None,
+            };
+            let recency = compute_insight_recency(&insight, now_secs);
+            let score = 0.70 * sim + 0.20 * recency;
+            Some(InsightHit { insight, score, sim, recency })
+        })
+        .collect();
+    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit);
+    Ok(scored)
+}
+
+/// Plain cosine top-N over active insights (no recency blend) — used by
+/// reflection's stage 2 to show the model existing insights it might be
+/// duplicating, not for ranked recall.
+pub fn top_similar_insights(conn: &Connection, query_embedding: &[f32], limit: usize) -> Result<Vec<(Insight, f32)>, KbError> {
+    let mut scored: Vec<(Insight, f32)> = active_insights(conn)?
+        .into_iter()
+        .filter_map(|insight| {
+            let score = match &insight.embedding {
+                Some(e) if !e.is_empty() => cosine(query_embedding, e).clamp(0.0, 1.0),
+                _ => return None,
+            };
+            Some((insight, score))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit);
+    Ok(scored)
+}
+
+/// k-NN top-`limit` over the ACTIVE memory store (reviewed and unreviewed
+/// alike, just not tombstoned) — unlike `top_similar` (reviewed-only, used
+/// by `mach kb add`'s save-time dedup check), reflection deliberately
+/// bridges into not-yet-reviewed digest candidates too.
+pub fn top_similar_active(conn: &Connection, query_embedding: &[f32], limit: usize) -> Result<Vec<(Memory, f32)>, KbError> {
+    let mut scored: Vec<(Memory, f32)> = candidates(conn, true, false)?
+        .into_iter()
+        .filter_map(|m| {
+            let score = match &m.embedding {
+                Some(e) if !e.is_empty() => cosine(query_embedding, e).clamp(0.0, 1.0),
+                _ => return None,
+            };
+            Some((m, score))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit);
+    Ok(scored)
+}
+
+/// Active memories with `id > last_id`, ascending — `mach kb reflect`'s
+/// input-selection step (both reviewed and unreviewed candidates count).
+pub fn memories_since(conn: &Connection, last_id: i64) -> Result<Vec<Memory>, KbError> {
+    let mut stmt = conn.prepare("SELECT * FROM memories WHERE id > ?1 AND invalidated_at IS NULL ORDER BY id ASC")?;
+    let rows = stmt.query_map(params![last_id], row_to_memory)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+pub fn get_reflect_state(conn: &Connection) -> Result<ReflectState, KbError> {
+    let row = conn
+        .query_row("SELECT last_run_at, last_memory_id FROM reflect_state WHERE id = 1", [], |r| {
+            Ok(ReflectState { last_run_at: r.get(0)?, last_memory_id: r.get(1)? })
+        })
+        .optional()?;
+    Ok(row.unwrap_or_default())
+}
+
+/// Upserts the `reflect_state` singleton row (id=1 is created by the v1->v2
+/// migration, but `ON CONFLICT` makes this correct even against a database
+/// that somehow never got that row).
+pub fn update_reflect_state(conn: &Connection, last_run_at: &str, last_memory_id: Option<i64>) -> Result<(), KbError> {
+    conn.execute(
+        "INSERT INTO reflect_state (id, last_run_at, last_memory_id) VALUES (1, ?1, ?2)
+         ON CONFLICT(id) DO UPDATE SET last_run_at = excluded.last_run_at, last_memory_id = excluded.last_memory_id",
+        params![last_run_at, last_memory_id],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1063,10 +1377,21 @@ mod tests {
         .unwrap();
 
         assert_eq!(existing_columns(&conn).unwrap().len(), 7);
+        // init_schema (CREATE TABLE IF NOT EXISTS) always runs before
+        // migrate in the real open_with_path flow — it's what creates the
+        // insights/reflect_state tables the v1->v2 step below now expects
+        // to already exist. It's a no-op on the memories table itself
+        // (already present with the old 7 columns; IF NOT EXISTS never
+        // alters an existing table), so the migration below still has real
+        // ALTER work to do.
+        init_schema(&conn).unwrap();
         migrate(&conn).unwrap();
 
+        // From v0, migrate() runs both steps in one call: v0->v1 (the
+        // memories column backfill this test is about) then v1->v2
+        // (reflection tables), landing at the current version.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1);
@@ -1085,12 +1410,8 @@ mod tests {
         assert_eq!(rows_again.len(), 1);
     }
 
-    #[test]
-    fn fresh_database_lands_at_user_version_1() {
-        let conn = mem_conn();
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 1);
-    }
+    // (fresh-database version-landing is covered by
+    // fresh_database_lands_at_user_version_2 in the reflection tests below)
 
     // --- supersession apply_verdict ---
 
@@ -1177,5 +1498,225 @@ mod tests {
             AddOutcome::Added { id } => assert!(get(&conn, id).unwrap().is_some()),
             _ => panic!("expected a plain Added fallback"),
         }
+    }
+
+    // --- reflection subsystem ---
+
+    #[test]
+    fn migration_v1_to_v2_creates_reflection_tables_and_preserves_rows() {
+        // Build a v1-era database by hand: memories table with every v1
+        // column but no insights/reflect_state tables, user_version = 1.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id INTEGER PRIMARY KEY,
+                content TEXT NOT NULL,
+                source TEXT,
+                project TEXT,
+                created_at TEXT NOT NULL,
+                reviewed INTEGER NOT NULL DEFAULT 1,
+                embedding BLOB,
+                importance INTEGER NOT NULL DEFAULT 5,
+                stability REAL,
+                access_count INTEGER NOT NULL DEFAULT 0,
+                first_accessed_at TEXT,
+                last_accessed_at TEXT,
+                valid_from TEXT,
+                invalidated_at TEXT,
+                superseded_by INTEGER
+            );
+            INSERT INTO memories (content, created_at, valid_from, stability)
+            VALUES ('a v1 memory', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 35.0);
+            PRAGMA user_version = 1;",
+        )
+        .unwrap();
+
+        // init_schema (CREATE TABLE IF NOT EXISTS) + migrate is exactly what
+        // open_with_path does; drive it the same way here since we built the
+        // v1 db by hand instead of through open_with_path.
+        init_schema(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 2);
+
+        let rows = list(&conn, None, false).unwrap();
+        assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
+        assert_eq!(rows[0].content, "a v1 memory");
+
+        let state = get_reflect_state(&conn).unwrap();
+        assert!(state.last_run_at.is_none());
+        assert!(state.last_memory_id.is_none());
+
+        assert!(list_insights(&conn, false).unwrap().is_empty());
+
+        // idempotent on repeat, like the v0->v1 migration
+        migrate(&conn).unwrap();
+        assert_eq!(list(&conn, None, false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fresh_database_lands_at_user_version_2() {
+        let conn = mem_conn();
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 2);
+    }
+
+    #[test]
+    fn insight_insert_get_roundtrip() {
+        let conn = mem_conn();
+        let emb = fake_embed("insight text");
+        let ids = vec!["1".to_string(), "2".to_string()];
+        let id = insert_insight(&conn, "the user prefers X", 0.6, &ids, Some(&emb)).unwrap();
+        let ins = get_insight(&conn, id).unwrap().expect("row exists");
+        assert_eq!(ins.text, "the user prefers X");
+        assert_eq!(ins.confidence, 0.6);
+        assert_eq!(ins.source_ids, ids);
+        assert_eq!(ins.embedding.clone().unwrap(), emb);
+        assert!(ins.invalidated_at.is_none());
+        assert!(ins.flagged_at.is_none());
+        assert!(ins.last_verified_at.is_none());
+        assert!(ins.is_active());
+        assert!(!ins.is_flagged());
+    }
+
+    #[test]
+    fn list_insights_flagged_only_filters_correctly() {
+        let conn = mem_conn();
+        let a = insert_insight(&conn, "insight a", 0.5, &["1".into(), "2".into()], None).unwrap();
+        let _b = insert_insight(&conn, "insight b", 0.5, &["3".into(), "4".into()], None).unwrap();
+        flag_insight(&conn, a, &now_rfc3339()).unwrap();
+
+        let all = list_insights(&conn, false).unwrap();
+        assert_eq!(all.len(), 2);
+        let flagged = list_insights(&conn, true).unwrap();
+        assert_eq!(flagged.len(), 1);
+        assert_eq!(flagged[0].id, a);
+    }
+
+    #[test]
+    fn delete_insight_removes_row() {
+        let conn = mem_conn();
+        let id = insert_insight(&conn, "gone soon", 0.5, &["1".into(), "2".into()], None).unwrap();
+        assert!(delete_insight(&conn, id).unwrap());
+        assert!(get_insight(&conn, id).unwrap().is_none());
+        assert!(!delete_insight(&conn, id).unwrap());
+    }
+
+    #[test]
+    fn insights_due_for_verification_prioritizes_never_verified_then_oldest() {
+        let conn = mem_conn();
+        let a = insert_insight(&conn, "a", 0.5, &["1".into(), "2".into()], None).unwrap();
+        let b = insert_insight(&conn, "b", 0.5, &["1".into(), "2".into()], None).unwrap();
+        let c = insert_insight(&conn, "c", 0.5, &["1".into(), "2".into()], None).unwrap();
+        // b gets verified (no longer "never verified"); a and c stay NULL
+        mark_insight_verified(&conn, b, &now_rfc3339()).unwrap();
+
+        let due = insights_due_for_verification(&conn, 5).unwrap();
+        let ids: Vec<i64> = due.iter().map(|i| i.id).collect();
+        // never-verified (a, c) must both sort ahead of the verified one (b)
+        let pos_a = ids.iter().position(|&x| x == a).unwrap();
+        let pos_b = ids.iter().position(|&x| x == b).unwrap();
+        let pos_c = ids.iter().position(|&x| x == c).unwrap();
+        assert!(pos_a < pos_b);
+        assert!(pos_c < pos_b);
+    }
+
+    #[test]
+    fn reflect_state_defaults_to_empty_then_watermark_advances() {
+        let conn = mem_conn();
+        let initial = get_reflect_state(&conn).unwrap();
+        assert!(initial.last_run_at.is_none());
+        assert!(initial.last_memory_id.is_none());
+
+        update_reflect_state(&conn, "2026-01-01T00:00:00Z", Some(5)).unwrap();
+        let mid = get_reflect_state(&conn).unwrap();
+        assert_eq!(mid.last_run_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(mid.last_memory_id, Some(5));
+
+        update_reflect_state(&conn, "2026-01-02T00:00:00Z", Some(11)).unwrap();
+        let advanced = get_reflect_state(&conn).unwrap();
+        assert_eq!(advanced.last_run_at.as_deref(), Some("2026-01-02T00:00:00Z"));
+        assert_eq!(advanced.last_memory_id, Some(11), "watermark must advance, not reset");
+    }
+
+    #[test]
+    fn memories_since_returns_only_newer_active_rows_ascending() {
+        let conn = mem_conn();
+        let a = insert5(&conn, "one", None);
+        let b = insert5(&conn, "two", None);
+        let c = insert5(&conn, "three", None);
+        let d_id = insert5(&conn, "four (will be tombstoned)", None);
+        supersede(&conn, d_id, c, &now_rfc3339()).unwrap();
+
+        let since_a = memories_since(&conn, a).unwrap();
+        let ids: Vec<i64> = since_a.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![b, c], "tombstoned row must be excluded, order ascending");
+    }
+
+    #[test]
+    fn top_similar_active_includes_unreviewed_unlike_top_similar() {
+        let conn = mem_conn();
+        let emb = fake_embed("shared reflection topic");
+        insert5(&conn, "reviewed shared reflection topic", Some(&emb));
+        insert(&conn, "unreviewed shared reflection topic", None, None, false, Some(&emb), 5).unwrap();
+
+        let reviewed_only = top_similar(&conn, &emb, 10).unwrap();
+        assert_eq!(reviewed_only.len(), 1);
+
+        let active_all = top_similar_active(&conn, &emb, 10).unwrap();
+        assert_eq!(active_all.len(), 2, "top_similar_active must bridge into unreviewed rows too");
+    }
+
+    #[test]
+    fn search_insights_ranked_favors_high_similarity() {
+        let conn = mem_conn();
+        insert_insight(
+            &conn, "the user prefers dark mode", 0.5, &["1".into(), "2".into()],
+            Some(&fake_embed("the user prefers dark mode")),
+        )
+        .unwrap();
+        insert_insight(
+            &conn, "the user likes hiking", 0.5, &["3".into(), "4".into()],
+            Some(&fake_embed("the user likes hiking")),
+        )
+        .unwrap();
+
+        let now = now_rfc3339();
+        let query = fake_embed("does the user prefer dark mode");
+        let hits = search_insights_ranked(&conn, &query, 5, &now).unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].insight.text, "the user prefers dark mode");
+    }
+
+    #[test]
+    fn search_insights_ranked_excludes_invalidated() {
+        let conn = mem_conn();
+        let emb = fake_embed("temporary belief");
+        let id = insert_insight(&conn, "temporary belief", 0.5, &["1".into(), "2".into()], Some(&emb)).unwrap();
+        conn.execute("UPDATE insights SET invalidated_at = ?1 WHERE id = ?2", params![now_rfc3339(), id])
+            .unwrap();
+
+        let now = now_rfc3339();
+        let hits = search_insights_ranked(&conn, &emb, 5, &now).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn touch_only_ever_targets_memories_table_insights_unaffected() {
+        // Insights have no access_count/stability columns at all, so a
+        // `--touch` call is structurally incapable of reinforcing them —
+        // this pins that invariant: touching a memory id must never change
+        // an insight, even one that happens to share the same integer id
+        // (the two tables have independent id sequences).
+        let conn = mem_conn();
+        let mem_id = insert5(&conn, "touchable memory", None);
+        let insight = insert_insight(&conn, "untouchable insight", 0.5, &["1".into(), "2".into()], None).unwrap();
+        let now = now_rfc3339();
+        touch(&conn, &[mem_id, insight], &now).unwrap();
+
+        let ins = get_insight(&conn, insight).unwrap().unwrap();
+        assert!(ins.last_verified_at.is_none());
+        assert!(ins.flagged_at.is_none());
     }
 }

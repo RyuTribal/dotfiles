@@ -26,6 +26,7 @@
 pub mod classify;
 pub mod cli;
 pub mod embed;
+pub mod reflect;
 pub mod store;
 
 pub use store::{KbError, Memory};

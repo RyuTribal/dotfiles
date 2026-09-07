@@ -98,7 +98,16 @@ for h in hits:
         continue
     source = h.get("source") or "unknown"
     date = (h.get("created_at") or "")[:10]
-    lines.append("- [{}, {}] {}".format(source, date, content))
+    if h.get("derived"):
+        # An insight from `mach kb reflect`, not a raw stored memory — a
+        # belief derived from >= 2 memories, not something the user said
+        # verbatim. Flag it distinctly so it is not mistaken for a direct
+        # quote or fact the way a plain memory recall would be treated.
+        confidence = h.get("confidence")
+        conf_str = " (confidence {:.2})".format(confidence) if isinstance(confidence, (int, float)) else ""
+        lines.append("- [derived belief, {}]{} {}".format(date, conf_str, content))
+    else:
+        lines.append("- [{}, {}] {}".format(source, date, content))
 
 if lines:
     print("Knowledge bank recall (mach kb) — stored facts about this user/setup; consult these BEFORE exploring files when they answer the question:")

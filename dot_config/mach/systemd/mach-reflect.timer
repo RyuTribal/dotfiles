@@ -1,0 +1,11 @@
+[Unit]
+Description=Run mach kb reflect periodically
+
+[Timer]
+OnBootSec=10min
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+RandomizedDelaySec=15min
+
+[Install]
+WantedBy=timers.target

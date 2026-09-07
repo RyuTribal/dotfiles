@@ -1,0 +1,10 @@
+[Unit]
+Description=mach kb reflect — periodic knowledge-bank reflection pass
+# Best-effort: a missing ollama/claude binary or an offline network must
+# degrade to a quiet no-op inside `mach kb reflect` itself, not a failed
+# unit — this is intentionally not wired to any other target's dependency
+# chain.
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/mach kb reflect

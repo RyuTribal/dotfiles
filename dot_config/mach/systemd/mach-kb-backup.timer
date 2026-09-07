@@ -1,0 +1,11 @@
+[Unit]
+Description=Run mach kb export (backup) periodically
+
+[Timer]
+OnBootSec=15min
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target

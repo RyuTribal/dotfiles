@@ -1,0 +1,9 @@
+[Unit]
+Description=mach kb export — nightly knowledge-bank backup (JSONL, pruned to last 14)
+# Best-effort like mach-reflect.service: a missing kb db, a full disk, or a
+# transient failure must degrade to a failed-but-harmless oneshot run, never
+# block other units.
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/mach-kb-backup

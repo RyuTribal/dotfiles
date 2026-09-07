@@ -435,15 +435,17 @@ pub const META_TRIGGER_MIN_LEVEL1: i64 = 6;
 /// before another meta pass is worth running (see `should_run_meta_pass`).
 pub const META_TRIGGER_GROWTH: i64 = 3;
 
-/// Greedy clustering of active level-1 insights by embedding similarity:
-/// `items` must be pre-sorted oldest-first (ascending id). The seed of
-/// each cluster is the oldest not-yet-assigned insight; every other
-/// not-yet-assigned insight with cosine similarity `>= META_CLUSTER_MIN_SIM`
-/// to that seed joins its cluster. A cluster smaller than
-/// `META_MIN_CLUSTER_SIZE` is dropped (its seed stays unthemed for a later
-/// pass, once more insights accumulate around it). Returns each surviving
-/// cluster as a `Vec<i64>` of insight ids.
-pub fn cluster_insights_by_similarity(items: &[(i64, Vec<f32>)]) -> Vec<Vec<i64>> {
+/// Greedy clustering by embedding similarity, parameterized by threshold
+/// and minimum cluster size: `items` must be pre-sorted oldest-first
+/// (ascending id). The seed of each cluster is the oldest not-yet-assigned
+/// item; every other not-yet-assigned item with cosine similarity `>=
+/// min_sim` to that seed joins its cluster. A cluster smaller than
+/// `min_size` is dropped (its seed stays unclustered for a later pass, once
+/// more items accumulate around it). Returns each surviving cluster as a
+/// `Vec<i64>` of ids. Shared by meta-reflection's theme clustering
+/// (`cluster_insights_by_similarity`) and the dormancy pass's consolidation
+/// clustering, each with its own threshold/floor.
+pub fn cluster_by_similarity(items: &[(i64, Vec<f32>)], min_sim: f32, min_size: usize) -> Vec<Vec<i64>> {
     let mut used = vec![false; items.len()];
     let mut clusters = Vec::new();
     for seed_idx in 0..items.len() {
@@ -456,19 +458,67 @@ pub fn cluster_insights_by_similarity(items: &[(i64, Vec<f32>)]) -> Vec<Vec<i64>
             if used[j] {
                 continue;
             }
-            if cosine(&items[seed_idx].1, &items[j].1) >= META_CLUSTER_MIN_SIM {
+            if cosine(&items[seed_idx].1, &items[j].1) >= min_sim {
                 cluster.push(j);
                 used[j] = true;
             }
         }
-        if cluster.len() >= META_MIN_CLUSTER_SIZE {
+        if cluster.len() >= min_size {
             clusters.push(cluster.iter().map(|&i| items[i].0).collect());
         }
-        // else: a singleton stays unthemed — its `used` flag is still set
-        // so it isn't re-tested as a neighbor of a later seed, but it also
-        // never appears in any cluster this pass produces.
+        // else: a singleton (or under-floor group) stays out of any
+        // cluster — its `used` flag is still set so it isn't re-tested as
+        // a neighbor of a later seed, but it also never appears in any
+        // cluster this pass produces.
     }
     clusters
+}
+
+/// Meta-reflection's own clustering call: the fixed `META_CLUSTER_MIN_SIM`
+/// / `META_MIN_CLUSTER_SIZE` thresholds, over active level-1 insights.
+pub fn cluster_insights_by_similarity(items: &[(i64, Vec<f32>)]) -> Vec<Vec<i64>> {
+    cluster_by_similarity(items, META_CLUSTER_MIN_SIM, META_MIN_CLUSTER_SIZE)
+}
+
+/// Minimum cosine similarity for two newly-dormant memories to land in the
+/// same consolidation cluster (the dormancy pass in `mach kb reflect`).
+pub const DORMANCY_CONSOLIDATION_MIN_SIM: f32 = 0.55;
+/// A consolidation cluster smaller than this is left alone — each row stays
+/// its own dormant memory rather than becoming a trivial one-row "summary".
+pub const DORMANCY_CONSOLIDATION_MIN_CLUSTER: usize = 3;
+
+/// Builds the per-cluster consolidation prompt: a cluster of related,
+/// newly-dormant, low-importance memories, asked to be folded into one
+/// compact durable fact (or declined outright).
+pub fn build_consolidation_prompt(memories: &[(i64, String)]) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "These related, low-importance memories from a personal knowledge bank are about to go \
+         dormant (archived, no longer surfaced in search):\n\n",
+    );
+    for (id, content) in memories {
+        s.push_str(&format!("[{}] {}\n", id, content));
+    }
+    s.push_str(
+        "\nSummarize these into ONE compact fact that preserves anything durable still worth \
+         keeping. Output the fact alone and nothing else, or output exactly NONE if nothing here \
+         is worth preserving.\n",
+    );
+    s
+}
+
+/// Parses a consolidation reply: `None` for an explicit `NONE` (whole-output
+/// match, tolerating surrounding whitespace) or empty output; otherwise the
+/// trimmed fact text. Unlike the other stage parsers here there's no
+/// citation marker to scan for — the model is asked for prose alone — so
+/// this simply trims rather than hunting line by line.
+pub fn parse_consolidation(output: &str) -> Option<String> {
+    let text = output.trim().trim_matches('`').trim();
+    if text.is_empty() || text.eq_ignore_ascii_case("none") {
+        None
+    } else {
+        Some(text.to_string())
+    }
 }
 
 /// Whether `mach kb reflect`'s meta-reflection (theme) pass should run this
@@ -880,6 +930,49 @@ mod tests {
     #[test]
     fn cluster_insights_by_similarity_empty_input_yields_no_clusters() {
         assert!(cluster_insights_by_similarity(&[]).is_empty());
+    }
+
+    // --- dormancy consolidation: clustering threshold/floor, prompt, parser ---
+
+    #[test]
+    fn cluster_by_similarity_respects_its_own_threshold_and_floor() {
+        // Same shape as the meta-reflection clustering tests, but proving
+        // the generic function actually honors whatever threshold/floor
+        // it's called with rather than the hardcoded META_* constants.
+        let items = vec![(1, unit_vec(4, 0)), (2, unit_vec(4, 0)), (3, unit_vec(4, 0))];
+        // Floor of 3 is met exactly.
+        assert_eq!(cluster_by_similarity(&items, 0.55, 3), vec![vec![1, 2, 3]]);
+        // Raise the floor to 4 — the same three items now fall short.
+        assert!(cluster_by_similarity(&items, 0.55, 4).is_empty());
+    }
+
+    #[test]
+    fn cluster_by_similarity_orthogonal_items_never_join_a_cluster() {
+        let items = vec![(1, unit_vec(4, 0)), (2, unit_vec(4, 0)), (3, unit_vec(4, 1))];
+        let clusters = cluster_by_similarity(&items, 0.55, 3);
+        assert!(clusters.is_empty(), "only 2 of the 3 share a direction — under the floor of 3");
+    }
+
+    #[test]
+    fn build_consolidation_prompt_includes_ids_and_content() {
+        let p = build_consolidation_prompt(&[(1, "likes tea".to_string()), (2, "likes coffee".to_string())]);
+        assert!(p.contains("[1] likes tea"));
+        assert!(p.contains("[2] likes coffee"));
+        assert!(p.contains("NONE"));
+    }
+
+    #[test]
+    fn parse_consolidation_returns_trimmed_fact() {
+        assert_eq!(parse_consolidation("  The user has tried several beverages.  \n"), Some("The user has tried several beverages.".to_string()));
+        assert_eq!(parse_consolidation("`a backtick-wrapped fact`"), Some("a backtick-wrapped fact".to_string()));
+    }
+
+    #[test]
+    fn parse_consolidation_none_and_empty_both_decline() {
+        assert_eq!(parse_consolidation("NONE"), None);
+        assert_eq!(parse_consolidation("  none  \n"), None);
+        assert_eq!(parse_consolidation(""), None);
+        assert_eq!(parse_consolidation("   \n  "), None);
     }
 
     // --- meta-reflection: trigger conditions ---

@@ -44,7 +44,13 @@ impl From<std::io::Error> for KbError {
     }
 }
 
-#[derive(Debug, Clone)]
+impl From<serde_json::Error> for KbError {
+    fn from(e: serde_json::Error) -> Self {
+        KbError::Other(format!("json error: {}", e))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Memory {
     pub id: i64,
     pub content: String,
@@ -64,6 +70,11 @@ pub struct Memory {
     pub valid_from: String,
     pub invalidated_at: Option<String>,
     pub superseded_by: Option<i64>,
+    // Set by the nightly `mach kb reflect` dormancy pass (never by a user
+    // action directly). Excluded from search/recall/reflection working sets
+    // like a tombstoned row, but never deleted — `mach kb wake <id>` clears
+    // it.
+    pub dormant_at: Option<String>,
 }
 
 impl Memory {
@@ -76,6 +87,10 @@ impl Memory {
     pub fn is_superseded(&self) -> bool {
         self.invalidated_at.is_some()
     }
+
+    pub fn is_dormant(&self) -> bool {
+        self.dormant_at.is_some()
+    }
 }
 
 /// A reflection-engine insight: a durable, higher-level belief derived
@@ -86,7 +101,7 @@ impl Memory {
 /// insight reference ("i7") for an insight it explicitly builds on; only
 /// raw memory ids count toward the evidence floor (see
 /// `reflect::parse_stage2`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Insight {
     pub id: i64,
     pub text: String,
@@ -149,7 +164,8 @@ fn init_schema(conn: &Connection) -> Result<(), KbError> {
             last_accessed_at TEXT,
             valid_from TEXT,
             invalidated_at TEXT,
-            superseded_by INTEGER
+            superseded_by INTEGER,
+            dormant_at TEXT
         );
         CREATE TABLE IF NOT EXISTS insights (
             id INTEGER PRIMARY KEY,
@@ -253,6 +269,22 @@ fn migrate_v2_to_v3(conn: &Connection) -> Result<(), KbError> {
     Ok(())
 }
 
+/// `PRAGMA user_version`-gated, idempotent 3 -> 4 migration: adds the
+/// dormancy column to `memories` for the nightly `mach kb reflect`
+/// forgetting pass. `init_schema`'s `CREATE TABLE IF NOT EXISTS` already
+/// creates a fresh `memories` table with this column present, so the only
+/// real work here is backfilling a pre-existing table that predates it —
+/// every existing row is, by definition, active (not dormant), which is
+/// exactly the column's implicit default (NULL).
+fn migrate_v3_to_v4(conn: &Connection) -> Result<(), KbError> {
+    let cols = existing_columns(conn)?;
+    if !cols.iter().any(|c| c == "dormant_at") {
+        conn.execute("ALTER TABLE memories ADD COLUMN dormant_at TEXT", [])?;
+    }
+    conn.execute("PRAGMA user_version = 4", [])?;
+    Ok(())
+}
+
 /// Runs every migration step whose version gate hasn't been cleared yet.
 /// Runs on every `open`, but the version gate makes every call after the
 /// first one a single cheap `PRAGMA` read.
@@ -266,6 +298,9 @@ fn migrate(conn: &Connection) -> Result<(), KbError> {
     }
     if version < 3 {
         migrate_v2_to_v3(conn)?;
+    }
+    if version < 4 {
+        migrate_v3_to_v4(conn)?;
     }
     Ok(())
 }
@@ -468,6 +503,7 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         valid_from: valid_from.unwrap_or_else(|| created_at.clone()),
         invalidated_at: row.get("invalidated_at")?,
         superseded_by: row.get("superseded_by")?,
+        dormant_at: row.get("dormant_at")?,
         created_at,
     })
 }
@@ -498,16 +534,36 @@ pub fn insert(
 /// Most recent memories first, optionally capped to `limit` rows.
 /// Tombstoned (superseded) rows are excluded unless `superseded_only` is
 /// set, in which case *only* tombstoned rows are returned — the audit view
-/// (`mach kb list --superseded`).
+/// (`mach kb list --superseded`). Dormant rows are excluded from the default
+/// view the same way tombstoned ones are — see `list_dormant` for their own
+/// audit view (`mach kb list --dormant`), a separate axis from this flag.
 pub fn list(conn: &Connection, limit: Option<usize>, superseded_only: bool) -> Result<Vec<Memory>, KbError> {
     let where_clause = if superseded_only {
         "WHERE invalidated_at IS NOT NULL"
     } else {
-        "WHERE invalidated_at IS NULL"
+        "WHERE invalidated_at IS NULL AND dormant_at IS NULL"
     };
     let sql = match limit {
         Some(n) => format!("SELECT * FROM memories {} ORDER BY id DESC LIMIT {}", where_clause, n),
         None => format!("SELECT * FROM memories {} ORDER BY id DESC", where_clause),
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], row_to_memory)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Dormant memories only, most recent first, optionally capped — the audit
+/// view `mach kb list --dormant`. A separate function (rather than a third
+/// state of `list`'s `superseded_only` flag) since dormancy and supersession
+/// are independent axes: a row can in principle be both.
+pub fn list_dormant(conn: &Connection, limit: Option<usize>) -> Result<Vec<Memory>, KbError> {
+    let sql = match limit {
+        Some(n) => format!("SELECT * FROM memories WHERE dormant_at IS NOT NULL ORDER BY id DESC LIMIT {}", n),
+        None => "SELECT * FROM memories WHERE dormant_at IS NOT NULL ORDER BY id DESC".to_string(),
     };
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], row_to_memory)?;
@@ -613,10 +669,121 @@ pub fn touch(conn: &Connection, ids: &[i64], now: &str) -> Result<(), KbError> {
     Ok(())
 }
 
+/// Marks an active memory dormant (the nightly `mach kb reflect` dormancy
+/// pass) — never a delete, and never touches anything else about the row.
+/// No-op (returns `false`) if the row doesn't exist or is already dormant.
+pub fn set_dormant(conn: &Connection, id: i64, now: &str) -> Result<bool, KbError> {
+    let n = conn.execute(
+        "UPDATE memories SET dormant_at = ?1 WHERE id = ?2 AND dormant_at IS NULL",
+        params![now, id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Wakes a dormant memory (`mach kb wake <id>`): clears `dormant_at` and
+/// resets `last_accessed_at` to `now` so it doesn't immediately qualify to
+/// go dormant again on the very next reflect pass. No-op (returns `false`)
+/// if the row doesn't exist or isn't currently dormant.
+pub fn wake(conn: &Connection, id: i64, now: &str) -> Result<bool, KbError> {
+    let n = conn.execute(
+        "UPDATE memories SET dormant_at = NULL, last_accessed_at = ?1 WHERE id = ?2 AND dormant_at IS NOT NULL",
+        params![now, id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Nightly dormancy thresholds for `mach kb reflect`'s forgetting pass.
+pub const DORMANCY_MIN_AGE_DAYS: f64 = 90.0;
+pub const DORMANCY_MIN_UNTOUCHED_STALE_DAYS: f64 = 60.0;
+pub const DORMANCY_MAX_IMPORTANCE: i64 = 5;
+pub const DORMANCY_UNREVIEWED_MAX_AGE_DAYS: f64 = 30.0;
+
+/// Whether an active memory qualifies to go dormant on tonight's `mach kb
+/// reflect` pass. Two independent rules, either one sufficient:
+///
+/// 1. It is an unreviewed row (`reviewed = false`) older than
+///    `DORMANCY_UNREVIEWED_MAX_AGE_DAYS` — the never-curated digest queue
+///    goes dormant regardless of anything else (touch count, importance,
+///    citations); and
+/// 2. ALL of: created more than `DORMANCY_MIN_AGE_DAYS` ago; never touched
+///    (`access_count == 0`) or not touched in over
+///    `DORMANCY_MIN_UNTOUCHED_STALE_DAYS` days; `importance <=
+///    DORMANCY_MAX_IMPORTANCE`; and not cited by any active insight or
+///    theme (`cited`, computed by the caller against `cited_memory_ids`).
+///
+/// A tombstoned or already-dormant row never qualifies (the caller's own
+/// candidate pool — `active_memories_for_dormancy` — already excludes both,
+/// this is just a defensive second guard for a direct call).
+pub fn memory_qualifies_for_dormancy(m: &Memory, cited: bool, now: &str) -> bool {
+    if m.is_dormant() || m.is_superseded() {
+        return false;
+    }
+    let now_secs = parse_rfc3339(now).unwrap_or(0);
+    let created_secs = parse_rfc3339(&m.created_at).unwrap_or(now_secs);
+    let age_days = days_between(now_secs, created_secs);
+
+    if !m.reviewed && age_days > DORMANCY_UNREVIEWED_MAX_AGE_DAYS {
+        return true;
+    }
+
+    if age_days <= DORMANCY_MIN_AGE_DAYS {
+        return false;
+    }
+    let stale_or_untouched = match &m.last_accessed_at {
+        None => true,
+        Some(last) => {
+            m.access_count == 0 || {
+                let last_secs = parse_rfc3339(last).unwrap_or(now_secs);
+                days_between(now_secs, last_secs) > DORMANCY_MIN_UNTOUCHED_STALE_DAYS
+            }
+        }
+    };
+    if !stale_or_untouched {
+        return false;
+    }
+    if m.importance > DORMANCY_MAX_IMPORTANCE {
+        return false;
+    }
+    if cited {
+        return false;
+    }
+    true
+}
+
+/// Every non-tombstoned, non-dormant memory (reviewed and unreviewed alike)
+/// — the pool the nightly dormancy pass in `mach kb reflect` evaluates each
+/// run against `memory_qualifies_for_dormancy`.
+pub fn active_memories_for_dormancy(conn: &Connection) -> Result<Vec<Memory>, KbError> {
+    candidates(conn, true, false)
+}
+
+/// Every raw memory id cited (in `source_ids`) by any active insight or
+/// theme — the dormancy pass's "not cited" criterion. Plain numeric tokens
+/// only; an `i<id>` insight-reference token simply fails to parse as an
+/// `i64` and is skipped, exactly as intended (a theme's own citation of an
+/// insight is not a memory citation).
+pub fn cited_memory_ids(conn: &Connection) -> Result<std::collections::HashSet<i64>, KbError> {
+    let mut stmt = conn.prepare("SELECT source_ids FROM insights WHERE invalidated_at IS NULL")?;
+    let rows: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<_, _>>()?;
+    let mut set = std::collections::HashSet::new();
+    for json in rows {
+        let ids: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
+        for s in ids {
+            if let Ok(id) = s.parse::<i64>() {
+                set.insert(id);
+            }
+        }
+    }
+    Ok(set)
+}
+
 /// Candidate rows for a search: reviewed-only unless `include_all`, and
-/// active-only (not tombstoned) unless `include_superseded`.
+/// active-only (not tombstoned) unless `include_superseded`. Dormant rows
+/// are excluded unconditionally — like a tombstoned row, a dormant one
+/// never belongs in a search/recall/reflection working set; `mach kb list
+/// --dormant` (not this function) is how they're ever surfaced again.
 fn candidates(conn: &Connection, include_all: bool, include_superseded: bool) -> Result<Vec<Memory>, KbError> {
-    let mut clauses = Vec::new();
+    let mut clauses = vec!["dormant_at IS NULL"];
     if !include_all {
         clauses.push("reviewed = 1");
     }
@@ -1029,8 +1196,12 @@ pub fn top_similar_active(conn: &Connection, query_embedding: &[f32], limit: usi
 
 /// Active memories with `id > last_id`, ascending — `mach kb reflect`'s
 /// input-selection step (both reviewed and unreviewed candidates count).
+/// Dormant rows are excluded, same as everywhere else in a reflection
+/// working set.
 pub fn memories_since(conn: &Connection, last_id: i64) -> Result<Vec<Memory>, KbError> {
-    let mut stmt = conn.prepare("SELECT * FROM memories WHERE id > ?1 AND invalidated_at IS NULL ORDER BY id ASC")?;
+    let mut stmt = conn.prepare(
+        "SELECT * FROM memories WHERE id > ?1 AND invalidated_at IS NULL AND dormant_at IS NULL ORDER BY id ASC",
+    )?;
     let rows = stmt.query_map(params![last_id], row_to_memory)?;
     let mut out = Vec::new();
     for r in rows {
@@ -1233,6 +1404,153 @@ pub fn reinforce_insight(conn: &Connection, id: i64, new_memory_ids: &[i64], now
         params![source_ids_json, confidence, now, id],
     )?;
     Ok(n > 0)
+}
+
+// --- export/import support (mach kb export / mach kb import) ---
+
+/// Every memory row, in every state (reviewed or not, tombstoned, dormant),
+/// ascending by id — full-fidelity input for `mach kb export`.
+pub fn all_memories(conn: &Connection) -> Result<Vec<Memory>, KbError> {
+    let mut stmt = conn.prepare("SELECT * FROM memories ORDER BY id ASC")?;
+    let rows = stmt.query_map([], row_to_memory)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Every insight/theme row, in every state, ascending by id — the insights
+/// counterpart of `all_memories` for `mach kb export`.
+pub fn all_insights(conn: &Connection) -> Result<Vec<Insight>, KbError> {
+    let mut stmt = conn.prepare("SELECT * FROM insights ORDER BY id ASC")?;
+    let rows = stmt.query_map([], row_to_insight)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Whether the store has no memories and no insights at all — `mach kb
+/// import`'s refuse-without-`--merge` guard. The `reflect_state` singleton
+/// row (always present after the v1->v2 migration) is deliberately not part
+/// of this check: a database with only that watermark row is, for every
+/// practical purpose, still an empty one.
+pub fn is_db_empty(conn: &Connection) -> Result<bool, KbError> {
+    let mem_count: i64 = conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))?;
+    if mem_count > 0 {
+        return Ok(false);
+    }
+    let ins_count: i64 = conn.query_row("SELECT COUNT(*) FROM insights", [], |r| r.get(0))?;
+    Ok(ins_count == 0)
+}
+
+/// Inserts or fully overwrites a memory row at its own explicit id — used
+/// only by `mach kb import`, which is reconstructing rows from another
+/// machine's export rather than minting new ones (ordinary `insert` always
+/// lets SQLite pick the id). An `ON CONFLICT` upsert rather than a
+/// look-up-then-branch: the caller (`export::import_from_reader`) has
+/// already decided whether overwriting is correct (identical/older rows are
+/// filtered out before this is ever called).
+pub fn raw_upsert_memory(conn: &Connection, m: &Memory) -> Result<(), KbError> {
+    let blob = m.embedding.as_deref().map(encode_embedding);
+    conn.execute(
+        "INSERT INTO memories
+            (id, content, source, project, created_at, reviewed, embedding, importance, stability,
+             access_count, first_accessed_at, last_accessed_at, valid_from, invalidated_at,
+             superseded_by, dormant_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+         ON CONFLICT(id) DO UPDATE SET
+            content = excluded.content, source = excluded.source, project = excluded.project,
+            created_at = excluded.created_at, reviewed = excluded.reviewed, embedding = excluded.embedding,
+            importance = excluded.importance, stability = excluded.stability,
+            access_count = excluded.access_count, first_accessed_at = excluded.first_accessed_at,
+            last_accessed_at = excluded.last_accessed_at, valid_from = excluded.valid_from,
+            invalidated_at = excluded.invalidated_at, superseded_by = excluded.superseded_by,
+            dormant_at = excluded.dormant_at",
+        params![
+            m.id,
+            m.content,
+            m.source,
+            m.project,
+            m.created_at,
+            m.reviewed as i64,
+            blob,
+            m.importance,
+            m.stability,
+            m.access_count,
+            m.first_accessed_at,
+            m.last_accessed_at,
+            m.valid_from,
+            m.invalidated_at,
+            m.superseded_by,
+            m.dormant_at,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Insights counterpart of `raw_upsert_memory` — same explicit-id
+/// upsert-at-the-caller's-discretion contract, for `mach kb import`.
+pub fn raw_upsert_insight(conn: &Connection, i: &Insight) -> Result<(), KbError> {
+    let blob = i.embedding.as_deref().map(encode_embedding);
+    let source_ids_json =
+        serde_json::to_string(&i.source_ids).map_err(|e| KbError::Other(format!("encoding source_ids: {}", e)))?;
+    conn.execute(
+        "INSERT INTO insights (id, text, created_at, confidence, source_ids, embedding, invalidated_at,
+             flagged_at, last_verified_at, level)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+         ON CONFLICT(id) DO UPDATE SET
+            text = excluded.text, created_at = excluded.created_at, confidence = excluded.confidence,
+            source_ids = excluded.source_ids, embedding = excluded.embedding,
+            invalidated_at = excluded.invalidated_at, flagged_at = excluded.flagged_at,
+            last_verified_at = excluded.last_verified_at, level = excluded.level",
+        params![
+            i.id,
+            i.text,
+            i.created_at,
+            i.confidence,
+            source_ids_json,
+            blob,
+            i.invalidated_at,
+            i.flagged_at,
+            i.last_verified_at,
+            i.level,
+        ],
+    )?;
+    Ok(())
+}
+
+/// The "logical last-modified" instant for a memory row — the latest of
+/// `created_at`, `last_accessed_at`, `invalidated_at` and `dormant_at` —
+/// used by `mach kb import --merge`'s last-write-wins comparison. Every
+/// timestamp this store writes is a fixed-width RFC3339 string, so a plain
+/// lexicographic max is exact here, no parsing needed.
+pub fn memory_last_modified(m: &Memory) -> &str {
+    let mut latest = m.created_at.as_str();
+    for candidate in [m.last_accessed_at.as_deref(), m.invalidated_at.as_deref(), m.dormant_at.as_deref()] {
+        if let Some(c) = candidate {
+            if c > latest {
+                latest = c;
+            }
+        }
+    }
+    latest
+}
+
+/// Insights counterpart of `memory_last_modified` — latest of `created_at`,
+/// `last_verified_at`, `flagged_at`, `invalidated_at`.
+pub fn insight_last_modified(i: &Insight) -> &str {
+    let mut latest = i.created_at.as_str();
+    for candidate in [i.last_verified_at.as_deref(), i.flagged_at.as_deref(), i.invalidated_at.as_deref()] {
+        if let Some(c) = candidate {
+            if c > latest {
+                latest = c;
+            }
+        }
+    }
+    latest
 }
 
 #[cfg(test)]
@@ -1633,10 +1951,10 @@ mod tests {
 
         // From v0, migrate() runs every step in one call: v0->v1 (the
         // memories column backfill this test is about), v1->v2 (reflection
-        // tables), then v2->v3 (the insights `level` column), landing at
-        // the current version.
+        // tables), v2->v3 (the insights `level` column), then v3->v4 (the
+        // memories `dormant_at` column), landing at the current version.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1);
@@ -1648,6 +1966,7 @@ mod tests {
         assert_eq!(m.valid_from, "2026-01-01T00:00:00Z");
         assert_eq!(m.access_count, 0);
         assert!(m.invalidated_at.is_none());
+        assert!(m.dormant_at.is_none());
 
         // idempotent: running it again (as every `open` does) is a no-op
         migrate(&conn).unwrap();
@@ -1656,7 +1975,7 @@ mod tests {
     }
 
     // (fresh-database version-landing is covered by
-    // fresh_database_lands_at_user_version_3 in the reflection tests below)
+    // fresh_database_lands_at_user_version_4 in the reflection tests below)
 
     // --- supersession apply_verdict ---
 
@@ -1783,7 +2102,10 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 3, "v1->v2 (reflection tables) then v2->v3 (insights level column) both run");
+        assert_eq!(
+            version, 4,
+            "v1->v2 (reflection tables), v2->v3 (insights level column), v3->v4 (dormant_at) all run"
+        );
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -1801,10 +2123,10 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_lands_at_user_version_3() {
+    fn fresh_database_lands_at_user_version_4() {
         let conn = mem_conn();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
     }
 
     #[test]
@@ -2011,7 +2333,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4, "v2->v3 (level column) then v3->v4 (dormant_at) both run");
 
         let rows = list_insights(&conn, false).unwrap();
         assert_eq!(rows.len(), 1);
@@ -2020,6 +2342,47 @@ mod tests {
         // idempotent on repeat
         migrate(&conn).unwrap();
         assert_eq!(list_insights(&conn, false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migration_v3_to_v4_backfills_dormant_at_column_and_keeps_rows_active() {
+        // Build a v3-era database by hand: memories table without the
+        // `dormant_at` column, user_version = 3.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id INTEGER PRIMARY KEY, content TEXT NOT NULL, source TEXT, project TEXT,
+                created_at TEXT NOT NULL, reviewed INTEGER NOT NULL DEFAULT 1, embedding BLOB,
+                importance INTEGER NOT NULL DEFAULT 5, stability REAL, access_count INTEGER NOT NULL DEFAULT 0,
+                first_accessed_at TEXT, last_accessed_at TEXT, valid_from TEXT, invalidated_at TEXT,
+                superseded_by INTEGER
+            );
+            CREATE TABLE insights (
+                id INTEGER PRIMARY KEY, text TEXT NOT NULL, created_at TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.5, source_ids TEXT NOT NULL, embedding BLOB,
+                invalidated_at TEXT, flagged_at TEXT, last_verified_at TEXT, level INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE reflect_state (id INTEGER PRIMARY KEY CHECK (id = 1), last_run_at TEXT, last_memory_id INTEGER);
+            INSERT INTO memories (content, created_at, valid_from, stability)
+            VALUES ('a v3 memory', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 35.0);
+            PRAGMA user_version = 3;",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 4);
+
+        let rows = list(&conn, None, false).unwrap();
+        assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
+        assert!(rows[0].dormant_at.is_none(), "pre-existing row must backfill to active (not dormant)");
+        assert!(!rows[0].is_dormant());
+
+        // idempotent on repeat
+        migrate(&conn).unwrap();
+        assert_eq!(list(&conn, None, false).unwrap().len(), 1);
     }
 
     #[test]
@@ -2187,5 +2550,351 @@ mod tests {
     fn reinforce_insight_missing_id_returns_false() {
         let conn = mem_conn();
         assert!(!reinforce_insight(&conn, 999, &[1, 2], &now_rfc3339()).unwrap());
+    }
+
+    // --- dormancy (forgetting) ---
+
+    /// Builds a `Memory` fixture with fields the dormancy criteria actually
+    /// read set directly (bypassing `insert`, which can't backdate
+    /// `created_at`/`last_accessed_at`) — everything else at harmless
+    /// defaults. Not persisted to any connection; `memory_qualifies_for_dormancy`
+    /// is pure over its `Memory` argument.
+    fn dormancy_fixture(
+        age_days: f64,
+        access_count: i64,
+        last_accessed_days_ago: Option<f64>,
+        importance: i64,
+        reviewed: bool,
+    ) -> Memory {
+        let now = now_secs() as i64;
+        let created_at = now_rfc3339_from_secs((now as f64 - age_days * 86400.0) as u64);
+        let last_accessed_at = last_accessed_days_ago
+            .map(|d| now_rfc3339_from_secs((now as f64 - d * 86400.0) as u64));
+        Memory {
+            id: 1,
+            content: "fixture".to_string(),
+            source: None,
+            project: None,
+            created_at: created_at.clone(),
+            reviewed,
+            embedding: None,
+            importance,
+            stability: None,
+            access_count,
+            first_accessed_at: last_accessed_at.clone(),
+            last_accessed_at,
+            valid_from: created_at,
+            invalidated_at: None,
+            superseded_by: None,
+            dormant_at: None,
+        }
+    }
+
+    #[test]
+    fn dormancy_qualifies_when_all_four_ordinary_criteria_hold() {
+        // 100 days old, never touched, importance 5 (<=5), uncited.
+        let m = dormancy_fixture(100.0, 0, None, 5, true);
+        assert!(memory_qualifies_for_dormancy(&m, false, &now_rfc3339()));
+    }
+
+    #[test]
+    fn dormancy_qualifies_when_touched_but_stale() {
+        // 100 days old, touched once but 70 days ago (> 60-day staleness).
+        let m = dormancy_fixture(100.0, 3, Some(70.0), 5, true);
+        assert!(memory_qualifies_for_dormancy(&m, false, &now_rfc3339()));
+    }
+
+    #[test]
+    fn dormancy_rejects_when_too_young() {
+        // Only 80 days old — under the 90-day floor — regardless of everything else.
+        let m = dormancy_fixture(80.0, 0, None, 5, true);
+        assert!(!memory_qualifies_for_dormancy(&m, false, &now_rfc3339()));
+    }
+
+    #[test]
+    fn dormancy_rejects_when_recently_touched() {
+        // Old enough, but touched only 10 days ago (well under the 60-day floor).
+        let m = dormancy_fixture(100.0, 5, Some(10.0), 5, true);
+        assert!(!memory_qualifies_for_dormancy(&m, false, &now_rfc3339()));
+    }
+
+    #[test]
+    fn dormancy_rejects_when_importance_too_high() {
+        let m = dormancy_fixture(100.0, 0, None, 8, true);
+        assert!(!memory_qualifies_for_dormancy(&m, false, &now_rfc3339()));
+    }
+
+    #[test]
+    fn dormancy_rejects_when_cited_by_an_active_insight() {
+        let m = dormancy_fixture(100.0, 0, None, 5, true);
+        assert!(!memory_qualifies_for_dormancy(&m, true, &now_rfc3339()));
+    }
+
+    #[test]
+    fn dormancy_importance_boundary_at_five_is_inclusive() {
+        let at_floor = dormancy_fixture(100.0, 0, None, 5, true);
+        assert!(memory_qualifies_for_dormancy(&at_floor, false, &now_rfc3339()), "importance == 5 must qualify");
+        let above_floor = dormancy_fixture(100.0, 0, None, 6, true);
+        assert!(!memory_qualifies_for_dormancy(&above_floor, false, &now_rfc3339()), "importance == 6 must not");
+    }
+
+    #[test]
+    fn dormancy_unreviewed_row_older_than_30_days_qualifies_regardless_of_everything_else() {
+        // 35 days old (well under the 90-day floor), touched recently,
+        // importance 10, cited — every ordinary criterion says "no" — but
+        // it's unreviewed, so the absolute rule overrides all of them.
+        let m = dormancy_fixture(35.0, 5, Some(1.0), 10, false);
+        assert!(memory_qualifies_for_dormancy(&m, true, &now_rfc3339()), "unreviewed + >30 days must always qualify");
+    }
+
+    #[test]
+    fn dormancy_unreviewed_row_at_or_under_30_days_does_not_qualify_via_the_absolute_rule() {
+        let m = dormancy_fixture(30.0, 0, None, 10, false);
+        // Fails the absolute rule (not yet strictly over 30 days) AND the
+        // ordinary rule (well under the 90-day floor, importance too high).
+        assert!(!memory_qualifies_for_dormancy(&m, false, &now_rfc3339()));
+    }
+
+    #[test]
+    fn dormancy_reviewed_old_low_importance_uncited_row_under_30_days_old_still_needs_the_90_day_floor() {
+        // Reviewed, so the unreviewed absolute rule never applies; must
+        // fall through to the ordinary >=90-day check and fail it.
+        let m = dormancy_fixture(20.0, 0, None, 3, true);
+        assert!(!memory_qualifies_for_dormancy(&m, false, &now_rfc3339()));
+    }
+
+    #[test]
+    fn dormancy_already_dormant_or_superseded_never_requalifies() {
+        let mut dormant = dormancy_fixture(100.0, 0, None, 5, true);
+        dormant.dormant_at = Some(now_rfc3339());
+        assert!(!memory_qualifies_for_dormancy(&dormant, false, &now_rfc3339()));
+
+        let mut superseded = dormancy_fixture(100.0, 0, None, 5, true);
+        superseded.invalidated_at = Some(now_rfc3339());
+        assert!(!memory_qualifies_for_dormancy(&superseded, false, &now_rfc3339()));
+    }
+
+    #[test]
+    fn set_dormant_marks_row_and_is_a_noop_the_second_time() {
+        let conn = mem_conn();
+        let id = insert5(&conn, "will sleep", None);
+        let now = now_rfc3339();
+        assert!(set_dormant(&conn, id, &now).unwrap());
+        let m = get(&conn, id).unwrap().unwrap();
+        assert!(m.is_dormant());
+        assert_eq!(m.dormant_at.as_deref(), Some(now.as_str()));
+
+        // already dormant — a second call is a no-op, not a re-stamp
+        assert!(!set_dormant(&conn, id, &now_rfc3339()).unwrap());
+    }
+
+    #[test]
+    fn set_dormant_missing_id_returns_false() {
+        let conn = mem_conn();
+        assert!(!set_dormant(&conn, 999, &now_rfc3339()).unwrap());
+    }
+
+    #[test]
+    fn wake_clears_dormant_at_and_resets_last_accessed() {
+        let conn = mem_conn();
+        let id = insert5(&conn, "will wake", None);
+        set_dormant(&conn, id, &now_rfc3339()).unwrap();
+
+        let wake_time = now_rfc3339();
+        assert!(wake(&conn, id, &wake_time).unwrap());
+        let m = get(&conn, id).unwrap().unwrap();
+        assert!(!m.is_dormant());
+        assert_eq!(m.last_accessed_at.as_deref(), Some(wake_time.as_str()), "must reset so it doesn't instantly re-sleep");
+    }
+
+    #[test]
+    fn wake_on_a_non_dormant_or_missing_row_is_a_noop() {
+        let conn = mem_conn();
+        let id = insert5(&conn, "never slept", None);
+        assert!(!wake(&conn, id, &now_rfc3339()).unwrap(), "row is active, not dormant");
+        assert!(!wake(&conn, 999, &now_rfc3339()).unwrap(), "row doesn't exist");
+    }
+
+    #[test]
+    fn list_default_excludes_dormant_list_dormant_shows_only_them() {
+        let conn = mem_conn();
+        let awake_id = insert5(&conn, "awake", None);
+        let sleeping_id = insert5(&conn, "sleeping", None);
+        set_dormant(&conn, sleeping_id, &now_rfc3339()).unwrap();
+
+        let default_view = list(&conn, None, false).unwrap();
+        assert!(default_view.iter().any(|m| m.id == awake_id));
+        assert!(default_view.iter().all(|m| m.id != sleeping_id), "dormant row must be excluded by default");
+
+        let dormant_view = list_dormant(&conn, None).unwrap();
+        assert_eq!(dormant_view.len(), 1);
+        assert_eq!(dormant_view[0].id, sleeping_id);
+    }
+
+    #[test]
+    fn dormant_rows_are_excluded_from_search_recall_and_reflection_working_sets() {
+        let conn = mem_conn();
+        let emb = fake_embed("shared dormancy topic");
+        let awake_id = insert5(&conn, "awake shared dormancy topic", Some(&emb));
+        let sleeping_id = insert(&conn, "sleeping shared dormancy topic", None, None, false, Some(&emb), 5).unwrap();
+        set_dormant(&conn, sleeping_id, &now_rfc3339()).unwrap();
+
+        let now = now_rfc3339();
+        let ranked = search_ranked(&conn, &emb, 10, true, false, 0.0, &now).unwrap();
+        assert!(ranked.iter().all(|h| h.memory.id != sleeping_id), "search_ranked must exclude dormant rows even with --all");
+        assert!(ranked.iter().any(|h| h.memory.id == awake_id));
+
+        let top = top_similar_active(&conn, &emb, 10).unwrap();
+        assert!(top.iter().all(|(m, _)| m.id != sleeping_id), "top_similar_active must exclude dormant rows");
+
+        let since = memories_since(&conn, 0).unwrap();
+        assert!(since.iter().all(|m| m.id != sleeping_id), "memories_since must exclude dormant rows");
+    }
+
+    #[test]
+    fn cited_memory_ids_collects_raw_ids_from_active_insights_and_themes_only() {
+        let conn = mem_conn();
+        let cited_by_insight = insert5(&conn, "cited by a plain insight", None);
+        let cited_by_theme = insert5(&conn, "cited by a theme", None);
+        let uncited = insert5(&conn, "cited by nothing", None);
+        let only_by_invalidated = insert5(&conn, "cited only by an invalidated insight", None);
+
+        insert_insight(&conn, "insight", 0.5, &[cited_by_insight.to_string()], None).unwrap();
+        insert_theme(&conn, "theme", 0.5, &["i1".into(), cited_by_theme.to_string()], None).unwrap();
+        let invalidated_ins =
+            insert_insight(&conn, "gone", 0.5, &[only_by_invalidated.to_string()], None).unwrap();
+        conn.execute(
+            "UPDATE insights SET invalidated_at = ?1 WHERE id = ?2",
+            params![now_rfc3339(), invalidated_ins],
+        )
+        .unwrap();
+
+        let cited = cited_memory_ids(&conn).unwrap();
+        assert!(cited.contains(&cited_by_insight));
+        assert!(cited.contains(&cited_by_theme));
+        assert!(!cited.contains(&uncited));
+        assert!(!cited.contains(&only_by_invalidated), "citation from an invalidated insight doesn't count");
+    }
+
+    #[test]
+    fn active_memories_for_dormancy_excludes_dormant_and_superseded_but_includes_unreviewed() {
+        let conn = mem_conn();
+        let active_reviewed = insert5(&conn, "active reviewed", None);
+        let active_unreviewed = insert(&conn, "active unreviewed", None, None, false, None, 5).unwrap();
+        let dormant_id = insert5(&conn, "dormant", None);
+        set_dormant(&conn, dormant_id, &now_rfc3339()).unwrap();
+        let old_id = insert5(&conn, "superseded", None);
+        let new_id = insert5(&conn, "superseding", None);
+        supersede(&conn, old_id, new_id, &now_rfc3339()).unwrap();
+
+        let pool = active_memories_for_dormancy(&conn).unwrap();
+        let ids: std::collections::HashSet<i64> = pool.iter().map(|m| m.id).collect();
+        assert!(ids.contains(&active_reviewed));
+        assert!(ids.contains(&active_unreviewed), "unreviewed rows must be in the dormancy pool too");
+        assert!(!ids.contains(&dormant_id));
+        assert!(!ids.contains(&old_id), "the superseded row itself must be excluded");
+    }
+
+    // --- export/import support helpers ---
+
+    #[test]
+    fn memory_last_modified_picks_the_latest_of_created_last_accessed_invalidated_dormant() {
+        let mut m = dormancy_fixture(100.0, 0, None, 5, true);
+        let created = m.created_at.clone();
+        assert_eq!(memory_last_modified(&m), created, "no other timestamp set — created_at wins");
+
+        m.last_accessed_at = Some("2027-01-01T00:00:00Z".to_string());
+        assert_eq!(memory_last_modified(&m), "2027-01-01T00:00:00Z");
+
+        m.invalidated_at = Some("2028-01-01T00:00:00Z".to_string());
+        assert_eq!(memory_last_modified(&m), "2028-01-01T00:00:00Z", "a later invalidated_at must win over last_accessed_at");
+
+        m.dormant_at = Some("2026-06-01T00:00:00Z".to_string());
+        assert_eq!(memory_last_modified(&m), "2028-01-01T00:00:00Z", "an earlier dormant_at must not override the later invalidated_at");
+    }
+
+    #[test]
+    fn insight_last_modified_picks_the_latest_of_created_verified_flagged_invalidated() {
+        let conn = mem_conn();
+        let id = insert_insight(&conn, "x", 0.5, &["1".into(), "2".into()], None).unwrap();
+        let ins = get_insight(&conn, id).unwrap().unwrap();
+        let created = ins.created_at.clone();
+        assert_eq!(insight_last_modified(&ins), created);
+
+        let mut later = ins.clone();
+        later.flagged_at = Some("2099-01-01T00:00:00Z".to_string());
+        assert_eq!(insight_last_modified(&later), "2099-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn is_db_empty_true_only_when_both_tables_have_no_rows() {
+        let conn = mem_conn();
+        assert!(is_db_empty(&conn).unwrap());
+        insert5(&conn, "something", None);
+        assert!(!is_db_empty(&conn).unwrap());
+    }
+
+    #[test]
+    fn all_memories_and_all_insights_include_every_state() {
+        let conn = mem_conn();
+        let old_id = insert5(&conn, "old", None);
+        let new_id = insert5(&conn, "new", None);
+        supersede(&conn, old_id, new_id, &now_rfc3339()).unwrap();
+        let dormant_id = insert5(&conn, "dormant", None);
+        set_dormant(&conn, dormant_id, &now_rfc3339()).unwrap();
+        let unreviewed_id = insert(&conn, "unreviewed", None, None, false, None, 5).unwrap();
+
+        let all = all_memories(&conn).unwrap();
+        let ids: std::collections::HashSet<i64> = all.iter().map(|m| m.id).collect();
+        assert!(ids.contains(&old_id));
+        assert!(ids.contains(&new_id));
+        assert!(ids.contains(&dormant_id));
+        assert!(ids.contains(&unreviewed_id));
+        assert_eq!(all.len(), 4);
+
+        let ins_id = insert_insight(&conn, "an insight", 0.5, &["1".into(), "2".into()], None).unwrap();
+        flag_insight(&conn, ins_id, &now_rfc3339()).unwrap();
+        let all_ins = all_insights(&conn).unwrap();
+        assert_eq!(all_ins.len(), 1);
+        assert!(all_ins[0].is_flagged());
+    }
+
+    #[test]
+    fn raw_upsert_memory_inserts_at_explicit_id_then_overwrites_in_place() {
+        let conn = mem_conn();
+        let mut m = dormancy_fixture(0.0, 0, None, 5, true);
+        m.id = 42;
+        m.content = "explicit id row".to_string();
+        raw_upsert_memory(&conn, &m).unwrap();
+        assert_eq!(get(&conn, 42).unwrap().unwrap().content, "explicit id row");
+
+        m.content = "overwritten".to_string();
+        raw_upsert_memory(&conn, &m).unwrap();
+        assert_eq!(get(&conn, 42).unwrap().unwrap().content, "overwritten");
+        assert_eq!(list(&conn, None, false).unwrap().len(), 1, "must overwrite in place, not duplicate");
+    }
+
+    #[test]
+    fn raw_upsert_insight_inserts_at_explicit_id_then_overwrites_in_place() {
+        let conn = mem_conn();
+        let i = Insight {
+            id: 7,
+            text: "explicit id insight".to_string(),
+            created_at: now_rfc3339(),
+            confidence: 0.5,
+            source_ids: vec!["1".into(), "2".into()],
+            embedding: None,
+            invalidated_at: None,
+            flagged_at: None,
+            last_verified_at: None,
+            level: 1,
+        };
+        raw_upsert_insight(&conn, &i).unwrap();
+        assert_eq!(get_insight(&conn, 7).unwrap().unwrap().text, "explicit id insight");
+
+        let mut updated = i.clone();
+        updated.text = "overwritten insight".to_string();
+        raw_upsert_insight(&conn, &updated).unwrap();
+        assert_eq!(get_insight(&conn, 7).unwrap().unwrap().text, "overwritten insight");
     }
 }

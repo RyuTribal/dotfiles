@@ -16,7 +16,8 @@ install_bins() {
   install -Dm755 "$HERE/target/release/machd"  "$BIN_DIR/machd"
   install -Dm755 "$HERE/target/release/sweep"  "$BIN_DIR/sweep"
   install -Dm755 "$HERE/target/release/sweepd" "$BIN_DIR/sweepd"
-  echo "installed: $BIN_DIR/{mach,machd,sweep,sweepd}"
+  install -Dm755 "$HERE/scripts/kb-backup.sh"  "$BIN_DIR/mach-kb-backup"
+  echo "installed: $BIN_DIR/{mach,machd,sweep,sweepd,mach-kb-backup}"
 }
 
 build() {
@@ -96,6 +97,32 @@ install_reflect_timer() {
   fi
 }
 install_reflect_timer
+
+# mach kb export (phase 4 backup) — same soft-install treatment as the
+# reflect timer: a non-systemd environment must not fail the whole install,
+# `mach-kb-backup` still works run by hand or from cron in that case.
+install_kb_backup_timer() {
+  local unit_dir="$HOME/.config/systemd/user"
+  install -Dm644 "$HERE/systemd/mach-kb-backup.service" "$unit_dir/mach-kb-backup.service"
+  install -Dm644 "$HERE/systemd/mach-kb-backup.timer"   "$unit_dir/mach-kb-backup.timer"
+  echo "installed: $unit_dir/mach-kb-backup.{service,timer}"
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "NOTE: systemctl not found — units installed but not enabled. Run 'mach-kb-backup' via cron or by hand instead."
+    return
+  fi
+  if ! systemctl --user list-units >/dev/null 2>&1; then
+    echo "NOTE: no systemd --user session available here — units installed but not enabled."
+    return
+  fi
+  systemctl --user daemon-reload
+  if systemctl --user enable --now mach-kb-backup.timer >/dev/null 2>&1; then
+    echo "enabled: mach-kb-backup.timer (daily 03:00, +15min after boot, +/-30min jitter)"
+  else
+    echo "WARNING: 'systemctl --user enable --now mach-kb-backup.timer' failed — enable it by hand once mach is on PATH."
+  fi
+}
+install_kb_backup_timer
 
 echo
 echo "Done. Reload quickshell if running, then press SUPER+U."

@@ -10,6 +10,7 @@ use serde::Serialize;
 
 use crate::classify::{self, Classifier, Verdict};
 use crate::embed::{Embedder, OllamaEmbedder};
+use crate::export;
 use crate::reflect::{self, ProcessReflectLlm, ReflectLlm, Stage2Result, ThemeResult, TIMEOUT_HAIKU, TIMEOUT_SONNET};
 use crate::store::{self, AddOutcome, Insight, InsightHit, KbError, Memory, RankedHit};
 
@@ -35,18 +36,23 @@ fn print_help() {
     println!("  supersede <old_id> <new_id>");
     println!("                          tombstone <old_id> in favor of <new_id>");
     println!("  review                  interactive review of unreviewed candidates");
-    println!("  list [--limit N] [--superseded]");
-    println!("                          most recent memories (--superseded: audit view)");
+    println!("  list [--limit N] [--superseded] [--dormant]");
+    println!("                          most recent memories (--superseded/--dormant: audit views)");
     println!("  forget <id>             permanently delete a memory");
+    println!("  wake <id>               clear a memory's dormant status (mach kb list --dormant)");
     println!("  reflect [--meta]        examine new memories, derive/reinforce durable");
-    println!("                          insights, re-verify a sample of existing ones,");
-    println!("                          and (when triggered, or forced via --meta) find");
-    println!("                          themes across insights");
+    println!("                          insights, re-verify a sample of existing ones, put");
+    println!("                          stale low-importance memories to sleep (consolidating");
+    println!("                          related ones), and (when triggered, or forced via");
+    println!("                          --meta) find themes across insights");
     println!("  insights [--flagged]    list derived insights and themes (confidence + source ids)");
     println!("  insight-forget <id>     permanently delete an insight or theme");
     println!("  tree                    render the theme -> insight -> memory hierarchy");
     println!("  model [--json]          compact mental-model view (active themes/insights only,");
     println!("                          no source ids or memory leaves) for context injection");
+    println!("  export [--out FILE]     full-fidelity JSONL backup of every row (default: stdout)");
+    println!("  import FILE [--merge]   restore from a `mach kb export` file; refuses a non-empty");
+    println!("                          db unless --merge (upsert by id, last-write-wins)");
 }
 
 /// Runs the kb CLI given the arguments following `kb` in `mach kb ...`.
@@ -58,11 +64,14 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Some("review") => cmd_review(args),
         Some("list") => cmd_list(args),
         Some("forget") => cmd_forget(args),
+        Some("wake") => cmd_wake(args),
         Some("reflect") => cmd_reflect(args),
         Some("insights") => cmd_insights(args),
         Some("insight-forget") => cmd_insight_forget(args),
         Some("tree") => cmd_tree(args),
         Some("model") => cmd_model(args),
+        Some("export") => cmd_export(args),
+        Some("import") => cmd_import(args),
         Some("-h") | Some("--help") => {
             print_help();
             Ok(())
@@ -528,12 +537,14 @@ fn cmd_review(_args: impl Iterator<Item = String>) -> io::Result<()> {
 fn cmd_list(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut limit: usize = 20;
     let mut superseded_only = false;
+    let mut dormant_only = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--limit" => limit = args.next().and_then(|v| v.parse().ok()).unwrap_or(20),
             "--superseded" => superseded_only = true,
+            "--dormant" => dormant_only = true,
             "-h" | "--help" => {
-                println!("usage: mach kb list [--limit N] [--superseded]");
+                println!("usage: mach kb list [--limit N] [--superseded] [--dormant]");
                 return Ok(());
             }
             other => {
@@ -543,21 +554,33 @@ fn cmd_list(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         }
     }
     let conn: Connection = store::open().map_err(to_io)?;
-    let rows = store::list(&conn, Some(limit), superseded_only).map_err(to_io)?;
+    let rows = if dormant_only {
+        store::list_dormant(&conn, Some(limit)).map_err(to_io)?
+    } else {
+        store::list(&conn, Some(limit), superseded_only).map_err(to_io)?
+    };
     if rows.is_empty() {
         println!(
             "{}",
-            if superseded_only { "no superseded memories" } else { "no memories stored yet" }
+            if dormant_only {
+                "no dormant memories"
+            } else if superseded_only {
+                "no superseded memories"
+            } else {
+                "no memories stored yet"
+            }
         );
         return Ok(());
     }
     for m in &rows {
         let flag = if m.reviewed { ' ' } else { '*' };
         let sup = if m.is_superseded() { '!' } else { ' ' };
+        let dor = if m.is_dormant() { 'z' } else { ' ' };
         println!(
-            "{}{}{:>5}  {}  {:<10} {:<12}  {}",
+            "{}{}{}{:>5}  {}  {:<10} {:<12}  {}",
             flag,
             sup,
+            dor,
             m.id,
             m.created_at,
             m.source.as_deref().unwrap_or("-"),
@@ -565,7 +588,10 @@ fn cmd_list(mut args: impl Iterator<Item = String>) -> io::Result<()> {
             truncate(&m.content, 70)
         );
     }
-    println!("\n(* = awaiting review — run `mach kb review`; ! = superseded — run `mach kb list --superseded`)");
+    println!(
+        "\n(* = awaiting review — run `mach kb review`; ! = superseded — run `mach kb list --superseded`; \
+         z = dormant — run `mach kb list --dormant`, wake with `mach kb wake <id>`)"
+    );
     Ok(())
 }
 
@@ -591,6 +617,32 @@ fn cmd_forget(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Ok(())
     } else {
         eprintln!("mach kb forget: no memory with id {}", id);
+        std::process::exit(1);
+    }
+}
+
+fn cmd_wake(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let id_str = match args.next() {
+        Some(s) => s,
+        None => {
+            eprintln!("mach kb wake: missing <id> argument");
+            std::process::exit(1);
+        }
+    };
+    let id: i64 = match id_str.parse() {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("mach kb wake: '{}' is not a valid id", id_str);
+            std::process::exit(1);
+        }
+    };
+    let conn = store::open().map_err(to_io)?;
+    let now = store::now_rfc3339();
+    if store::wake(&conn, id, &now).map_err(to_io)? {
+        println!("woke memory #{}", id);
+        Ok(())
+    } else {
+        eprintln!("mach kb wake: no dormant memory with id {}", id);
         std::process::exit(1);
     }
 }
@@ -842,6 +894,14 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         }
     }
 
+    // Step 4.5: dormancy — put stale, low-importance, uncited memories (and
+    // any never-curated digest row past its own 30-day floor) to sleep,
+    // then consolidate this run's freshly-dormant rows into new durable
+    // facts where a cluster of them shares something worth keeping. Runs
+    // every invocation regardless of has_new/force_meta — it's a nightly
+    // sweep over the whole active store, not gated on new material.
+    let (dormant, consolidated) = run_dormancy_pass(&conn, &embedder, &llm, &now).map_err(to_io)?;
+
     // Step 5: meta-reflection (theme) pass — only when triggered, or
     // forced via --meta for manual runs.
     let level1_active = store::count_active_insights_level(&conn, 1).map_err(to_io)?;
@@ -867,10 +927,79 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
 
     println!(
         "mach kb reflect: examined={} questions={} insights_added={} reinforced={} \
-         themes_added={} flagged={} verified={}",
-        examined, questions_count, insights_added, reinforced, themes_added, flagged, verified
+         themes_added={} flagged={} verified={} dormant={} consolidated={}",
+        examined, questions_count, insights_added, reinforced, themes_added, flagged, verified, dormant, consolidated
     );
     Ok(())
+}
+
+/// The dormancy (forgetting) pass: evaluates every active memory against
+/// `store::memory_qualifies_for_dormancy` and puts qualifying rows to
+/// sleep, then clusters this run's freshly-dormant rows by embedding
+/// similarity (`>= DORMANCY_CONSOLIDATION_MIN_SIM`, floor
+/// `DORMANCY_CONSOLIDATION_MIN_CLUSTER`) and asks one haiku call per
+/// cluster for a single consolidated fact, stored as a new active memory
+/// (source `consolidation:<id>,<id>,...`). Returns `(dormant_count,
+/// consolidated_count)`. Never deletes anything — dormancy is a status
+/// flag, and a consolidation summary is an addition, not a replacement.
+fn run_dormancy_pass(
+    conn: &Connection,
+    embedder: &OllamaEmbedder,
+    llm: &ProcessReflectLlm,
+    now: &str,
+) -> Result<(usize, usize), KbError> {
+    let cited = store::cited_memory_ids(conn)?;
+    let pool = store::active_memories_for_dormancy(conn)?;
+    let mut newly_dormant: Vec<i64> = Vec::new();
+    for m in &pool {
+        if store::memory_qualifies_for_dormancy(m, cited.contains(&m.id), now) && store::set_dormant(conn, m.id, now)? {
+            newly_dormant.push(m.id);
+        }
+    }
+    let dormant_count = newly_dormant.len();
+
+    // Consolidation: only over this run's freshly-dormant rows, and never
+    // over a row that is itself a past consolidation summary (guardrail —
+    // a consolidated fact never gets folded into a later one).
+    let mut consolidated = 0usize;
+    if !newly_dormant.is_empty() {
+        let mut rows: Vec<Memory> = Vec::new();
+        for id in &newly_dormant {
+            if let Some(m) = store::get(conn, *id)? {
+                rows.push(m);
+            }
+        }
+        let eligible: Vec<&Memory> =
+            rows.iter().filter(|m| !m.source.as_deref().unwrap_or("").starts_with("consolidation")).collect();
+        let items: Vec<(i64, Vec<f32>)> =
+            eligible.iter().filter_map(|m| m.embedding.clone().map(|e| (m.id, e))).collect();
+        let clusters = reflect::cluster_by_similarity(
+            &items,
+            reflect::DORMANCY_CONSOLIDATION_MIN_SIM,
+            reflect::DORMANCY_CONSOLIDATION_MIN_CLUSTER,
+        );
+        let by_id: BTreeMap<i64, &Memory> = eligible.iter().map(|m| (m.id, *m)).collect();
+
+        for cluster in clusters {
+            let cluster_rows: Vec<&Memory> = cluster.iter().filter_map(|id| by_id.get(id).copied()).collect();
+            let pairs: Vec<(i64, String)> = cluster_rows.iter().map(|m| (m.id, m.content.clone())).collect();
+            let prompt = reflect::build_consolidation_prompt(&pairs);
+            let raw = match llm.call("haiku", &prompt, TIMEOUT_HAIKU) {
+                Ok(out) => out,
+                Err(_) => continue,
+            };
+            if let Some(fact) = reflect::parse_consolidation(&raw) {
+                let cluster_ids: Vec<String> = cluster_rows.iter().map(|m| m.id.to_string()).collect();
+                let source = format!("consolidation:{}", cluster_ids.join(","));
+                let embedding = embedder.embed(&fact).ok();
+                if store::insert(conn, &fact, Some(&source), None, true, embedding.as_deref(), 4).is_ok() {
+                    consolidated += 1;
+                }
+            }
+        }
+    }
+
+    Ok((dormant_count, consolidated))
 }
 
 /// The meta-reflection (theme) pass: clusters active, not-yet-themed
@@ -1182,6 +1311,106 @@ fn cmd_model(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+// --- export / import: full-fidelity JSONL backup ---
+
+fn cmd_export(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut out_path: Option<String> = None;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--out" => out_path = args.next(),
+            "-h" | "--help" => {
+                println!("usage: mach kb export [--out FILE]");
+                println!(
+                    "       full-fidelity JSONL: every memories row (any state), then every \
+                     insights row, then reflect_state — one JSON object per line, a header \
+                     line first. Default: written to stdout (status goes to stderr, so stdout \
+                     stays clean for piping/redirecting)."
+                );
+                return Ok(());
+            }
+            other => {
+                eprintln!("mach kb export: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let conn = store::open().map_err(to_io)?;
+    match out_path {
+        Some(path) => {
+            let mut f = std::fs::File::create(&path)?;
+            let counts = export::export_to_writer(&conn, &mut f).map_err(to_io)?;
+            eprintln!("exported {} memories, {} insights -> {}", counts.memories, counts.insights, path);
+        }
+        None => {
+            let stdout = io::stdout();
+            let mut lock = stdout.lock();
+            let counts = export::export_to_writer(&conn, &mut lock).map_err(to_io)?;
+            eprintln!("exported {} memories, {} insights", counts.memories, counts.insights);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_import(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut file: Option<String> = None;
+    let mut merge = false;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--merge" => merge = true,
+            "-h" | "--help" => {
+                println!("usage: mach kb import FILE [--merge]");
+                println!(
+                    "       restores a `mach kb export` JSONL file. Without --merge, refuses \
+                     outright if the database already has any memories or insights. With \
+                     --merge, upserts each row by id: last-write-wins against the existing row \
+                     of the same id, identical rows are skipped, embeddings are imported as-is."
+                );
+                return Ok(());
+            }
+            other => {
+                if file.is_none() {
+                    file = Some(other.to_string());
+                } else {
+                    eprintln!("mach kb import: unexpected argument '{}'", other);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    let file = match file {
+        Some(f) => f,
+        None => {
+            eprintln!("mach kb import: missing FILE argument");
+            std::process::exit(1);
+        }
+    };
+
+    let conn = store::open().map_err(to_io)?;
+    let f = std::fs::File::open(&file)?;
+    let reader = io::BufReader::new(f);
+    match export::import_from_reader(&conn, reader, merge) {
+        Ok(counts) => {
+            println!(
+                "imported: memories +{} ~{} ={} | insights +{} ~{} ={} | reflect_state {}",
+                counts.memories_inserted,
+                counts.memories_updated,
+                counts.memories_skipped,
+                counts.insights_inserted,
+                counts.insights_updated,
+                counts.insights_skipped,
+                if counts.reflect_state_updated { "updated" } else { "unchanged" }
+            );
+            println!("(+ inserted, ~ updated, = skipped/unchanged)");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("mach kb import: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 #[cfg(test)]

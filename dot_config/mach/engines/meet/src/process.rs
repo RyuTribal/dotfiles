@@ -96,15 +96,9 @@ fn render_summary_md(title: &str, started_at: &str, parsed: &ParsedSummary) -> S
     s.push_str(&format!("# {} ({})\n\n", title, started_at));
     s.push_str("## Summary\n");
     s.push_str(parsed.summary.trim());
-    s.push_str("\n\n## Names\n");
-    if parsed.names.is_empty() {
-        s.push_str("No names inferred from the transcript.\n");
-    } else {
-        for n in &parsed.names {
-            s.push_str(&format!("- {} = {} (inferred)\n", n.label, n.name));
-        }
-    }
-    s.push_str("\n## Facts filed\n");
+    // The NAMES mapping is deliberately not rendered: it exists for fact
+    // attribution and transcript context, not as reader-facing content.
+    s.push_str("\n\n## Facts filed\n");
     if parsed.facts.is_empty() {
         s.push_str("No durable facts extracted.\n");
     } else {
@@ -494,7 +488,7 @@ mod tests {
 
         let summary = fs::read_to_string(dir.join("summary.md")).unwrap();
         assert!(summary.contains("Agreed to ship Friday."));
-        assert!(summary.contains("No names inferred"));
+        assert!(!summary.contains("Names"));
 
         let filed = store::unreviewed(&conn).unwrap();
         assert_eq!(filed.len(), 1);

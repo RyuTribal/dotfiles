@@ -17,7 +17,12 @@ install_bins() {
   install -Dm755 "$HERE/target/release/sweep"  "$BIN_DIR/sweep"
   install -Dm755 "$HERE/target/release/sweepd" "$BIN_DIR/sweepd"
   install -Dm755 "$HERE/scripts/kb-backup.sh"  "$BIN_DIR/mach-kb-backup"
-  echo "installed: $BIN_DIR/{mach,machd,sweep,sweepd,mach-kb-backup}"
+  # `note` is a plain symlink to `mach` — busybox-style argv0 dispatch (see
+  # mach/src/main.rs's `invoked_as_note`) makes `note "text"` equivalent to
+  # `mach note "text"`. Relative target so it keeps working if BIN_DIR moves.
+  mkdir -p "$BIN_DIR"
+  ln -sf mach "$BIN_DIR/note"
+  echo "installed: $BIN_DIR/{mach,machd,sweep,sweepd,mach-kb-backup,note}"
 }
 
 build() {

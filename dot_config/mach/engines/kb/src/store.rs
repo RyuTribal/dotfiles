@@ -586,6 +586,22 @@ pub fn unreviewed(conn: &Connection) -> Result<Vec<Memory>, KbError> {
     Ok(out)
 }
 
+/// Distinct, non-empty `project` values across every memory (any state,
+/// reviewed or not) — topic anchoring for `mach note`'s classifier prompt,
+/// so a repeat topic reuses its existing name rather than drifting into a
+/// near-duplicate kebab-case variant.
+pub fn distinct_projects(conn: &Connection) -> Result<Vec<String>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT project FROM memories WHERE project IS NOT NULL AND TRIM(project) != '' ORDER BY project",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
 pub fn get(conn: &Connection, id: i64) -> Result<Option<Memory>, KbError> {
     let mut stmt = conn.prepare("SELECT * FROM memories WHERE id = ?1")?;
     Ok(stmt.query_row(params![id], row_to_memory).optional()?)
@@ -1649,6 +1665,19 @@ mod tests {
         assert_eq!(m.access_count, 0);
         assert!(m.invalidated_at.is_none());
         assert!(m.superseded_by.is_none());
+    }
+
+    #[test]
+    fn distinct_projects_dedupes_orders_and_skips_empty_and_null() {
+        let conn = mem_conn();
+        insert(&conn, "a", None, Some("helios-rendering"), true, None, 5).unwrap();
+        insert(&conn, "b", None, Some("helios-rendering"), true, None, 5).unwrap();
+        insert(&conn, "c", None, Some("dotfiles"), true, None, 5).unwrap();
+        insert(&conn, "d", None, None, true, None, 5).unwrap();
+        insert(&conn, "e", None, Some("  "), true, None, 5).unwrap();
+        insert(&conn, "f", None, Some(""), true, None, 5).unwrap();
+        let projects = distinct_projects(&conn).unwrap();
+        assert_eq!(projects, vec!["dotfiles".to_string(), "helios-rendering".to_string()]);
     }
 
     #[test]

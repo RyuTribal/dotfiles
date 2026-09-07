@@ -3,6 +3,8 @@ import qs.services
 import qs.modules.common
 import qs.modules.common.widgets
 import qs.modules.sidebarRight.quickToggles
+import qs.modules.sidebarRight.wifiNetworks
+import qs.modules.sidebarRight.bluetoothDevices
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
@@ -16,21 +18,15 @@ Item {
     property int sidebarWidth: Appearance.sizes.sidebarWidth
     property int sidebarPadding: 12
     property string settingsQmlPath: Quickshell.shellPath("settings.qml")
+    property bool showWifiDialog: false
+    property bool showBluetoothDialog: false
     Connections {
         target: GlobalStates
         function onSidebarRightOpenChanged() {
             if (!GlobalStates.sidebarRightOpen) {
-                centerWidgetGroup.closeDrillIn();
+                root.showWifiDialog = false;
+                root.showBluetoothDialog = false;
             }
-        }
-    }
-    Connections {
-        target: centerWidgetGroup
-        function onActiveDrillInChanged() {
-            // Stop discovering whenever we're not looking at the Bluetooth
-            // drill-in, mirroring the old dialog's dismiss behaviour.
-            if (centerWidgetGroup.activeDrillIn !== "bluetooth" && Bluetooth.defaultAdapter)
-                Bluetooth.defaultAdapter.discovering = false;
         }
     }
 
@@ -129,7 +125,7 @@ Item {
                     altAction: () => {
                         Network.enableWifi();
                         Network.rescanWifi();
-                        centerWidgetGroup.openDrillIn("wifi");
+                        root.showWifiDialog = true;
                     }
                 }
                 BluetoothToggle {
@@ -138,7 +134,7 @@ Item {
                             Bluetooth.defaultAdapter.enabled = true;
                             Bluetooth.defaultAdapter.discovering = true;
                         }
-                        centerWidgetGroup.openDrillIn("bluetooth");
+                        root.showBluetoothDialog = true;
                     }
                 }
                 NightLight {}
@@ -178,7 +174,7 @@ Item {
                     QuickToggleButton {
                         toggled: false
                         buttonIcon: "chevron_right"
-                        onClicked: centerWidgetGroup.openDrillIn("mixer")
+                        onClicked: centerWidgetGroup.selectedTab = 1
                         StyledToolTip {
                             content: Translation.tr("Volume mixer")
                         }
@@ -210,6 +206,62 @@ Item {
                 Layout.alignment: Qt.AlignHCenter
                 Layout.fillHeight: true
                 Layout.fillWidth: true
+            }
+        }
+    }
+
+    onShowWifiDialogChanged: if (showWifiDialog)
+        wifiDialogLoader.active = true
+    Loader {
+        id: wifiDialogLoader
+        anchors.fill: parent
+
+        active: root.showWifiDialog || item.visible
+        onActiveChanged: {
+            if (active) {
+                item.show = true;
+                item.forceActiveFocus();
+            }
+        }
+
+        sourceComponent: WifiDialog {
+            onDismiss: {
+                show = false;
+                root.showWifiDialog = false;
+            }
+            onVisibleChanged: {
+                if (!visible && !root.showWifiDialog)
+                    wifiDialogLoader.active = false;
+            }
+        }
+    }
+
+    onShowBluetoothDialogChanged: {
+        if (showBluetoothDialog)
+            bluetoothDialogLoader.active = true;
+        else if (Bluetooth.defaultAdapter)
+            Bluetooth.defaultAdapter.discovering = false;
+    }
+    Loader {
+        id: bluetoothDialogLoader
+        anchors.fill: parent
+
+        active: root.showBluetoothDialog || item.visible
+        onActiveChanged: {
+            if (active) {
+                item.show = true;
+                item.forceActiveFocus();
+            }
+        }
+
+        sourceComponent: BluetoothDialog {
+            onDismiss: {
+                show = false;
+                root.showBluetoothDialog = false;
+            }
+            onVisibleChanged: {
+                if (!visible && !root.showBluetoothDialog)
+                    bluetoothDialogLoader.active = false;
             }
         }
     }

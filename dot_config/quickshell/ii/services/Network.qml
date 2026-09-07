@@ -201,6 +201,19 @@ Singleton {
         }
     }
 
+    // nmcli monitor (subscriber, below) only emits on connection/state events,
+    // not on ambient RSSI drift, so the strength shown on the bar/toggle icon
+    // would otherwise go stale between those events. Poll it lightly instead.
+    Timer {
+        interval: 5000
+        running: root.wifiEnabled
+        repeat: true
+        onTriggered: {
+            if (!updateNetworkStrength.running)
+                updateNetworkStrength.running = true;
+        }
+    }
+
     Process {
         id: wifiStatusProcess
         command: ["nmcli", "radio", "wifi"]

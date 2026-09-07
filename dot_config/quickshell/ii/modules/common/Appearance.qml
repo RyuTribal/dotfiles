@@ -331,6 +331,9 @@ Singleton {
         property real barHeight: Config.options.bar.cornerStyle === 1 ? 
             (baseBarHeight + root.sizes.hyprlandGapsOut * 2) : baseBarHeight
         property real barCenterSideModuleWidth: Config.options?.bar.verbose ? 480 : 140
+        // The clock pill needs less room than the stats+media pill; keeping it
+        // narrower returns space to the right bar section (tray, weather).
+        property real barCenterSideModuleWidthClock: Config.options?.bar.verbose ? 400 : 140
         property real barCenterSideModuleWidthShortened: 360
         property real barCenterSideModuleWidthHellaShortened: 230
         property real barShortenScreenWidthThreshold: 1200 // Shorten if screen width is at most this value

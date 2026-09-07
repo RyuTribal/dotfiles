@@ -162,7 +162,7 @@ Item { // Bar content region
             id: rightCenterGroup
             implicitWidth: rightCenterGroupContent.implicitWidth
             implicitHeight: rightCenterGroupContent.implicitHeight
-            Layout.preferredWidth: root.centerSideModuleWidth
+            Layout.preferredWidth: (root.useShortenedForm == 0) ? Appearance.sizes.barCenterSideModuleWidthClock : root.centerSideModuleWidth
 
             // Clicking the clock jumps straight to the top menu's Calendar
             // tab (batch 2), closing the menu again on a second click rather
@@ -185,10 +185,18 @@ Item { // Bar content region
                 id: rightCenterGroupContent
                 anchors.fill: parent
 
+                // GridLayout has no built-in "center my content" option, so the
+                // clock/buttons/battery group is centered by flanking it with
+                // two equal fillWidth spacers instead of giving the clock
+                // fillWidth itself (which used to stretch it across the whole
+                // 480px pill instead of keeping it at its natural size).
+                Item {
+                    Layout.fillWidth: true
+                }
+
                 ClockWidget {
                     showDate: (Config.options.bar.verbose && root.useShortenedForm < 2)
                     Layout.alignment: Qt.AlignVCenter
-                    Layout.fillWidth: true
                 }
 
                 UtilButtons {
@@ -200,12 +208,28 @@ Item { // Bar content region
                     visible: (root.useShortenedForm < 2 && UPower.displayDevice.isLaptopBattery)
                     Layout.alignment: Qt.AlignVCenter
                 }
+
+                Item {
+                    Layout.fillWidth: true
+                }
             }
         }
     }
 
     FocusedScrollMouseArea { // Right side | scroll to change volume
         id: barRightSideMouseArea
+
+        // This area is anchored on both edges (left: middleSection.right,
+        // right: parent.right), so its actual width is whatever's left over
+        // after the two fixed-width 480px center pills, not its own
+        // implicitWidth. When that leftover space is narrower than
+        // rightSectionRowLayout's natural content width (sidebar button,
+        // indicators, systray, weather), the row overflows — and because
+        // layoutDirection is RightToLeft, the overflow pushes the leftmost
+        // item (weather) out past this area's own left edge, over the
+        // battery pill in rightCenterGroup. clip keeps that overflow
+        // contained instead of letting it paint over adjacent content.
+        clip: true
 
         anchors {
             top: parent.top

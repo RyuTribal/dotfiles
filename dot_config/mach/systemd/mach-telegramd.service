@@ -1,12 +1,13 @@
 [Unit]
-Description=mach-telegramd — Telegram note bridge daemon
-# Config-gated: a missing/unconfigured telegram.toml means the unit doesn't
-# even start (rather than starting and immediately clean-exiting, which
-# Restart=on-failure would otherwise never retry anyway since a clean exit
-# isn't a failure -- ConditionPathExists just avoids the pointless attempt
-# and shows up as "condition failed", not "failed", in systemctl status).
-# See mach/telegram.toml.example and install.sh's onboarding block.
-ConditionPathExists=%h/.local/share/mach/telegram.toml
+Description=machd — mach daemon (telegram, kb socket)
+# No ConditionPathExists here anymore: machd now also hosts the kb socket
+# subsystem (serves $XDG_RUNTIME_DIR/mach-kb.sock for Claude Code's
+# kb-recall.sh hook), which needs no config at all and must come up
+# regardless of whether Telegram has ever been configured. The telegram
+# subsystem itself now no-ops cleanly (one log line, stays up) when
+# ~/.local/share/mach/telegram.toml is missing or still holds placeholder
+# values -- see machd/src/main.rs's run_telegram_subsystem and
+# mach/telegram.toml.example / install.sh's onboarding block.
 After=network-online.target
 Wants=network-online.target
 

@@ -220,33 +220,38 @@ fn cmd_add(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     Ok(())
 }
 
+// `pub` (fields included): shared with `socket::run` (the kb socket
+// daemon serving `$XDG_RUNTIME_DIR/mach-kb.sock`) via `search_hits` below,
+// so its response is byte-identical in shape to `mach kb search --json`'s
+// stdout, and `kb-recall.sh`'s downstream JSON renderer needs no branching
+// on which path served a given prompt.
 #[derive(Serialize)]
-struct SearchHit {
-    id: i64,
-    content: String,
-    source: Option<String>,
-    project: Option<String>,
-    created_at: String,
-    score: f32,
-    sim: f32,
-    recency: f32,
-    strength: f32,
-    importance: i64,
-    superseded: bool,
+pub struct SearchHit {
+    pub id: i64,
+    pub content: String,
+    pub source: Option<String>,
+    pub project: Option<String>,
+    pub created_at: String,
+    pub score: f32,
+    pub sim: f32,
+    pub recency: f32,
+    pub strength: f32,
+    pub importance: i64,
+    pub superseded: bool,
     // Insight hits (from mach kb reflect) blended into recall: true marks a
     // row that came from the insights table rather than memories. Present
     // (and false) on memory hits too, so a consumer never has to treat its
     // absence as meaningful.
-    derived: bool,
+    pub derived: bool,
     // Only meaningful when `derived` is true.
-    confidence: Option<f64>,
+    pub confidence: Option<f64>,
     // Only meaningful when `derived` is true: 1 = a plain insight, 2 = a
     // level-2 theme. `None` on plain memory hits — lets `kb-recall.sh`
     // distinguish "[derived belief]" from "[derived theme]".
-    level: Option<i64>,
+    pub level: Option<i64>,
 }
 
-fn to_hit(h: RankedHit) -> SearchHit {
+pub(crate) fn to_hit(h: RankedHit) -> SearchHit {
     SearchHit {
         id: h.memory.id,
         content: h.memory.content,
@@ -265,7 +270,7 @@ fn to_hit(h: RankedHit) -> SearchHit {
     }
 }
 
-fn insight_to_hit(h: InsightHit) -> SearchHit {
+pub(crate) fn insight_to_hit(h: InsightHit) -> SearchHit {
     let flagged = h.insight.is_flagged();
     SearchHit {
         id: h.insight.id,
@@ -283,6 +288,46 @@ fn insight_to_hit(h: InsightHit) -> SearchHit {
         confidence: Some(h.insight.confidence),
         level: Some(h.insight.level),
     }
+}
+
+/// Ranked top-N search + insight blend, embedding `query` itself — the same
+/// merge `cmd_search` performs for `mach kb search --json` (mem hits and
+/// insight hits fetched independently, combined, sorted by score, truncated
+/// to `limit`, then `min_score`-filtered). Extracted as its own `pub`
+/// function so the kb socket daemon (`socket::run`, serving
+/// `$XDG_RUNTIME_DIR/mach-kb.sock` for `kb-recall.sh`'s fast path) can
+/// produce the exact same `SearchHit` shape without going through a
+/// subprocess.
+///
+/// Unlike `cmd_search`, there is no substring-fallback branch here: an
+/// embed failure (ollama unreachable) is returned as a `KbError` rather
+/// than degraded into a noisy substring match — the socket daemon treats
+/// any error here as "bounce the caller back to the cold subprocess path",
+/// which already has its own (separately noisy-guarded) fallback. `--touch`
+/// reinforcement is also out of scope here — `kb-recall.sh` never sets it
+/// (engagement-gated reinforcement now happens later, via `mach kb
+/// ingest-sessions`), so neither call site needs it.
+pub fn search_hits<E: Embedder>(
+    conn: &Connection,
+    embedder: &E,
+    query: &str,
+    limit: usize,
+    reviewed_only: bool,
+    include_superseded: bool,
+    min_score: f32,
+    now: &str,
+) -> Result<Vec<SearchHit>, KbError> {
+    let q_emb = embedder.embed(query)?;
+    let mem_hits = store::search_ranked(conn, &q_emb, limit, reviewed_only, include_superseded, 0.0, now)?;
+    let insight_hits = store::search_insights_ranked(conn, &q_emb, limit, now)?;
+    let mut combined: Vec<SearchHit> =
+        mem_hits.into_iter().map(to_hit).chain(insight_hits.into_iter().map(insight_to_hit)).collect();
+    combined.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    combined.truncate(limit);
+    if min_score > 0.0 {
+        combined.retain(|h| h.score >= min_score);
+    }
+    Ok(combined)
 }
 
 fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {

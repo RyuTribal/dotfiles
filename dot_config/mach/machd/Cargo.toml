@@ -5,6 +5,10 @@ edition = "2021"
 
 [dependencies]
 telegram = { package = "telegram-engine", path = "../engines/telegram" }
+# The kb subsystem (engines/kb/src/socket.rs) -- already a transitive dep
+# via `telegram`, but named directly here since machd's main.rs now spawns
+# it itself rather than only reaching it through the telegram crate.
+kb = { package = "kb-engine", path = "../engines/kb" }
 # Already resolved transitively in this workspace's Cargo.lock (ratatui's
 # crossterm backend pulls it in for terminal resize handling), so adding it
 # here as a direct dependency for SIGTERM/SIGINT handling costs nothing new

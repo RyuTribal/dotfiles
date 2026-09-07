@@ -1,13 +1,22 @@
 //! machd — machine daemon host process.
 //!
-//! Hosts registered subsystems; the telegram note bridge is the first (and
-//! so far only) one. A subsystem is just "a config type to load, and a `run`
-//! function that blocks until told to shut down" -- there's no formal
-//! registry trait yet because there's exactly one subsystem to register.
-//! When a second one shows up (e.g. sweepd, per the phase-1 doc comment
-//! this file used to carry), that's the point to extract a real
-//! `Subsystem` trait and a `Vec<Box<dyn Subsystem>>` this `main` iterates,
-//! each on its own thread, joined on the same shutdown flag below.
+//! Hosts two registered subsystems, each on its own thread, joined on the
+//! same shutdown flag below:
+//!   - kb    (engines/kb/src/socket.rs) — always runs. Serves
+//!           `$XDG_RUNTIME_DIR/mach-kb.sock` for Claude Code's
+//!           `kb-recall.sh` hook's fast path (a warm db connection + a warm
+//!           ollama HTTP agent, instead of that hook cold-starting a `mach
+//!           kb search` subprocess every prompt). Needs no config -- the kb
+//!           store always exists.
+//!   - telegram (engines/telegram) — the note bridge. No-ops cleanly (one
+//!           log line, immediate return -- see `run_telegram_subsystem`)
+//!           when `~/.local/share/mach/telegram.toml` is missing or still
+//!           holds placeholder values; this must never take the kb
+//!           subsystem down with it.
+//!
+//! There's no formal `Subsystem` trait/registry yet -- two subsystems are
+//! still few enough to just spawn by hand in `main`. If a third one shows
+//! up, that's the point to extract one.
 //!
 //! Always runs in the foreground: there is no double-fork/daemonize step
 //! anywhere in this process, matching what systemd's `Type=simple` unit
@@ -17,18 +26,19 @@
 //! about behavior, only signals human intent at the command line.
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::thread;
 
 fn print_help() {
     println!("machd — machine daemon host process");
     println!();
     println!("usage: machd [--foreground]");
     println!();
-    println!("Hosts registered subsystems (currently: the telegram note bridge).");
-    println!("Reads its config from ~/.local/share/mach/telegram.toml; exits");
-    println!("cleanly with a one-line log if that file is missing or still holds");
-    println!("placeholder values (the mach-telegramd.service unit's");
-    println!("ConditionPathExists keeps systemd from even starting it in that");
-    println!("case -- see install.sh's onboarding instructions).");
+    println!("Hosts two subsystems, each on its own thread:");
+    println!("  kb        always runs -- serves $XDG_RUNTIME_DIR/mach-kb.sock for Claude");
+    println!("            Code's kb-recall.sh hook (op \"search\" only). No config needed.");
+    println!("  telegram  the note bridge. No-ops cleanly (one log line, stays up) if");
+    println!("            ~/.local/share/mach/telegram.toml is missing or still holds");
+    println!("            placeholder values -- see install.sh's onboarding instructions.");
     println!();
     println!("  --foreground   run attached to the terminal (the documented way");
     println!("                 to run this by hand for debugging -- machd never");
@@ -52,6 +62,45 @@ fn install_signal_handlers(shutdown: &Arc<AtomicBool>) {
     }
 }
 
+/// Runs the telegram subsystem in this thread until `shutdown` is set.
+/// No-ops cleanly -- one log line, immediate return, `Ok(())` -- when the
+/// config file is missing or still holds placeholder values: this must
+/// never take the whole daemon down, since the kb subsystem doesn't depend
+/// on Telegram being configured at all (this is exactly what used to be
+/// `machd`'s own top-level `ConditionPathExists`-backed exit, moved down
+/// into just this one subsystem). Returns `Err` only for a genuinely
+/// unexpected setup failure surfaced by `telegram::run` itself (e.g. an
+/// unwritable state path or a broken kb store) -- see that function's own
+/// doc comment.
+fn run_telegram_subsystem(shutdown: &AtomicBool) -> Result<(), String> {
+    let cfg = match telegram::config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("machd: telegram subsystem: {} -- staying disabled (kb subsystem is unaffected)", e);
+            return Ok(());
+        }
+    };
+    eprintln!("machd: starting telegram subsystem");
+    telegram::run(cfg, shutdown)
+}
+
+/// Logs a subsystem thread's outcome and folds it into the process exit
+/// code: a thread panic or an `Err` return both count as failure (`1`), a
+/// clean `Ok(())` (whether from a full run or an immediate no-op) doesn't.
+fn report(name: &str, result: thread::Result<Result<(), String>>) -> i32 {
+    match result {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) => {
+            eprintln!("machd: {} subsystem exited with an error: {}", name, e);
+            1
+        }
+        Err(_) => {
+            eprintln!("machd: {} subsystem thread panicked", name);
+            1
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
@@ -62,31 +111,22 @@ fn main() {
     // comment for why it doesn't otherwise change behavior.
     let _foreground = args.iter().any(|a| a == "--foreground");
 
-    let cfg = match telegram::config::load() {
-        Ok(c) => c,
-        Err(e) => {
-            // Clean exit, one-line log -- never a crash-loop over a missing
-            // or placeholder config. Under the shipped systemd unit this
-            // path is normally unreachable (ConditionPathExists keeps the
-            // unit from even starting); it's the fallback for a bare
-            // `machd`/`machd --foreground` run by hand before the config
-            // exists.
-            eprintln!("machd: {}", e);
-            std::process::exit(0);
-        }
-    };
-
     let shutdown = Arc::new(AtomicBool::new(false));
     install_signal_handlers(&shutdown);
 
-    eprintln!("machd: starting telegram subsystem");
-    match telegram::run(cfg, &shutdown) {
-        Ok(()) => {
-            eprintln!("machd: telegram subsystem shut down cleanly");
-        }
-        Err(e) => {
-            eprintln!("machd: telegram subsystem exited with an error: {}", e);
-            std::process::exit(1);
-        }
-    }
+    let kb_shutdown = Arc::clone(&shutdown);
+    let kb_thread = thread::spawn(move || kb::socket::run(&kb_shutdown));
+
+    let tg_shutdown = Arc::clone(&shutdown);
+    let tg_thread = thread::spawn(move || run_telegram_subsystem(&tg_shutdown));
+
+    // Both threads block in their own loop until `shutdown` flips (SIGTERM/
+    // SIGINT) -- joining here is just waiting for that, same as the old
+    // single-subsystem version blocked directly inside `telegram::run`.
+    let kb_result = kb_thread.join();
+    let tg_result = tg_thread.join();
+
+    let kb_code = report("kb", kb_result);
+    let tg_code = report("telegram", tg_result);
+    std::process::exit(kb_code.max(tg_code));
 }

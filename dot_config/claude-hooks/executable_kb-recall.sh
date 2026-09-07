@@ -65,27 +65,72 @@ case "$prompt" in
     /*) exit 0 ;;
 esac
 
-command -v "$MACH_BIN" >/dev/null 2>&1 || exit 0
-
 out_file="$(mktemp 2>/dev/null)" || exit 0
 err_file="$(mktemp 2>/dev/null)" || { rm -f "$out_file"; exit 0; }
 ids_file="$(mktemp 2>/dev/null)" || { rm -f "$out_file" "$err_file"; exit 0; }
 trap 'rm -f "$out_file" "$err_file" "$ids_file"' EXIT
 
-timeout 2s "$MACH_BIN" kb search "$prompt" --limit 4 --json --min-score "$SCORE_THRESHOLD" \
-    >"$out_file" 2>"$err_file"
-rc=$?
+# Fast path: machd's kb socket subsystem (engines/kb/src/socket.rs) keeps a
+# warm db connection + a warm ollama HTTP agent alive, so a search over it
+# skips this hook's usual cold `mach kb search` subprocess entirely. Tried
+# first, with a short client-side timeout; ANY failure here (daemon not
+# running, socket missing, timeout, malformed/error response) just falls
+# through to the subprocess path below unchanged -- graceful degradation,
+# same contract as every other failure mode in this script.
+via_socket=0
+kb_sock="${XDG_RUNTIME_DIR:-}/mach-kb.sock"
+if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -S "$kb_sock" ] && command -v python3 >/dev/null 2>&1; then
+    if python3 -c '
+import json, socket, sys
 
-# Nonzero exit (including a timeout kill) means recall didn't complete
-# cleanly — stay silent.
-[ "$rc" -ne 0 ] && exit 0
+sock_path, query, limit, min_score, out_path = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4]), sys.argv[5]
+req = json.dumps({"op": "search", "query": query, "limit": limit, "min_score": min_score}) + "\n"
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(0.5)
+    s.connect(sock_path)
+    s.sendall(req.encode())
+    buf = b""
+    while b"\n" not in buf:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    s.close()
+    line = buf.split(b"\n", 1)[0]
+    data = json.loads(line)
+    # Only a JSON array is a successful hit list (matches "mach kb search
+    # --json" exactly) -- an {"error": ...} object, or anything else, means
+    # fall back to the subprocess path instead of serving a degraded result.
+    if not isinstance(data, list):
+        sys.exit(1)
+    with open(out_path, "w") as f:
+        f.write(line.decode())
+except Exception:
+    sys.exit(1)
+' "$kb_sock" "$prompt" 4 "$SCORE_THRESHOLD" "$out_file" 2>/dev/null; then
+        via_socket=1
+    fi
+fi
 
-# `mach kb search` degrades to a substring fallback (every hit forced to
-# score 1.0) when it can't reach ollama for embeddings — that fallback is
-# noisy/unreliable for automatic injection, so treat the warning it prints
-# on stderr the same as an outage: silence, not a flood of loose matches.
-if grep -qi 'cannot reach ollama\|falling back to substring match' "$err_file" 2>/dev/null; then
-    exit 0
+if [ "$via_socket" -ne 1 ]; then
+    command -v "$MACH_BIN" >/dev/null 2>&1 || exit 0
+
+    timeout 2s "$MACH_BIN" kb search "$prompt" --limit 4 --json --min-score "$SCORE_THRESHOLD" \
+        >"$out_file" 2>"$err_file"
+    rc=$?
+
+    # Nonzero exit (including a timeout kill) means recall didn't complete
+    # cleanly — stay silent.
+    [ "$rc" -ne 0 ] && exit 0
+
+    # `mach kb search` degrades to a substring fallback (every hit forced to
+    # score 1.0) when it can't reach ollama for embeddings — that fallback is
+    # noisy/unreliable for automatic injection, so treat the warning it prints
+    # on stderr the same as an outage: silence, not a flood of loose matches.
+    if grep -qi 'cannot reach ollama\|falling back to substring match' "$err_file" 2>/dev/null; then
+        exit 0
+    fi
 fi
 
 context="$(python3 -c '

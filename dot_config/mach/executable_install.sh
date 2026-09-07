@@ -163,12 +163,14 @@ check_whisper() {
 }
 check_whisper
 
-# mach-telegramd (Telegram note bridge) — same soft-install treatment as the
-# other systemd units: a non-systemd environment must not fail the whole
-# install. Unlike the reflect/backup timers this is a persistent long-poll
-# daemon (Type=simple), not a periodic oneshot, so there is exactly one unit,
-# no timer. Its own ConditionPathExists means enabling it before a real
-# telegram.toml exists is safe and expected — it simply won't start yet.
+# mach-telegramd (machd: telegram bridge + kb socket) — same soft-install
+# treatment as the other systemd units: a non-systemd environment must not
+# fail the whole install. Unlike the reflect/backup timers this is a
+# persistent daemon (Type=simple), not a periodic oneshot, so there is
+# exactly one unit, no timer. It always starts (no ConditionPathExists) --
+# the kb socket subsystem needs no config, and the telegram subsystem
+# no-ops cleanly on its own when a real telegram.toml doesn't exist yet, so
+# enabling this before one exists is safe and expected either way.
 install_telegramd_unit() {
   local unit_dir="$HOME/.config/systemd/user"
   install -Dm644 "$HERE/systemd/mach-telegramd.service" "$unit_dir/mach-telegramd.service"
@@ -184,7 +186,9 @@ install_telegramd_unit() {
   fi
   systemctl --user daemon-reload
   if systemctl --user enable --now mach-telegramd.service >/dev/null 2>&1; then
-    echo "enabled: mach-telegramd.service (starts once ~/.local/share/mach/telegram.toml exists — see below if it doesn't yet)"
+    echo "enabled: mach-telegramd.service (machd — always serves the kb socket subsystem;"
+    echo "         the telegram bridge itself stays disabled until ~/.local/share/mach/telegram.toml"
+    echo "         exists — see below if it doesn't yet)"
   else
     echo "WARNING: 'systemctl --user enable --now mach-telegramd.service' failed — enable it by hand once mach is on PATH."
   fi

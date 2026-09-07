@@ -30,6 +30,7 @@ pub mod export;
 pub mod ingest;
 pub mod note;
 pub mod reflect;
+pub mod socket;
 pub mod store;
 
 pub use store::{KbError, Memory};

@@ -561,6 +561,7 @@ dependencies = [
 name = "machd"
 version = "0.1.0"
 dependencies = [
+ "kb-engine",
  "signal-hook",
  "telegram-engine",
 ]

@@ -20,6 +20,16 @@ pub trait Embedder {
 pub struct OllamaEmbedder {
     base_url: String,
     model: String,
+    // One `ureq::Agent` per `OllamaEmbedder`, reused across every `embed`
+    // call it makes (rather than the bare `ureq::post` top-level fn, which
+    // goes through ureq's own implicit default agent). Explicit here so a
+    // long-lived process holding one `OllamaEmbedder` -- the kb socket
+    // subsystem (`socket::run`), the telegram bridge -- keeps its
+    // connection to ollama warm (pooled, kept-alive) across calls instead
+    // of re-resolving/re-connecting each time. A short-lived `mach kb`
+    // CLI invocation makes at most one call, so this costs nothing extra
+    // there.
+    agent: ureq::Agent,
 }
 
 impl OllamaEmbedder {
@@ -29,6 +39,7 @@ impl OllamaEmbedder {
         OllamaEmbedder {
             base_url: std::env::var("MACH_KB_OLLAMA_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string()),
             model: std::env::var("MACH_KB_OLLAMA_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string()),
+            agent: ureq::AgentBuilder::new().build(),
         }
     }
 }
@@ -47,7 +58,9 @@ struct EmbedResponse {
 impl Embedder for OllamaEmbedder {
     fn embed(&self, text: &str) -> Result<Vec<f32>, KbError> {
         let url = format!("{}/api/embed", self.base_url);
-        let resp = ureq::post(&url)
+        let resp = self
+            .agent
+            .post(&url)
             .timeout(Duration::from_secs(30))
             .send_json(serde_json::json!({ "model": self.model, "input": text }))
             .map_err(|e| {

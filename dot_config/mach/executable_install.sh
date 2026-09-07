@@ -28,12 +28,10 @@ build() {
   (cd "$HERE" && cargo build --release)
 }
 
-# Build when no binaries exist yet (fresh machine: chezmoi does not ship
-# target/), or when the prebuilt ones do not run on this system.
-if [ ! -x "$HERE/target/release/sweep" ] || [ ! -x "$HERE/target/release/sweepd" ] \
-   || [ ! -x "$HERE/target/release/mach" ] || [ ! -x "$HERE/target/release/machd" ]; then
-  build
-fi
+# Always build: cargo is incremental, so an up-to-date tree is a fast no-op,
+# and a changed tree never silently reinstalls stale binaries (which the old
+# exists-and-runs check allowed).
+build
 install_bins
 
 if ! "$BIN_DIR/sweep" --help >/dev/null 2>&1; then

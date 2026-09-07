@@ -16,6 +16,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use kb::note::Worth;
+
 use crate::api::Message;
 
 /// The one allowlist check. `sender_id` is `None` for a message with no
@@ -101,9 +103,19 @@ impl DropCounter {
 /// memory either way, this is just what the user sees back.
 pub const VOICE_TRANSCRIBE_FAILURE_REPLY: &str = "couldn't transcribe — saved raw audio reference";
 
-pub fn format_note_confirmation(topic: &str, title: &str, fact_count: usize) -> String {
+/// Builds the confirmation reply for a filed note. `worth` (the classifier's
+/// triage verdict — see `kb::note::Worth`) is `Durable` in the ordinary case
+/// and leaves the reply exactly as before; `Dubious`/`Noise` append a plain
+/// statement that the note was demoted to the review queue instead, so the
+/// user isn't left thinking it landed as a regular reviewed memory.
+pub fn format_note_confirmation(topic: &str, title: &str, fact_count: usize, worth: Worth) -> String {
     let noun = if fact_count == 1 { "memory" } else { "memories" };
-    format!("filed {} {} under \"{}\" — refer to it as: \"{}\"", fact_count, noun, topic, title)
+    let base = format!("filed {} {} under \"{}\" — refer to it as: \"{}\"", fact_count, noun, topic, title);
+    match worth {
+        Worth::Durable => base,
+        Worth::Dubious => format!("{} — filed to review queue (looked dubious) — `mach kb review` to promote", base),
+        Worth::Noise => format!("{} — filed to review queue (looked like noise) — `mach kb review` to promote", base),
+    }
 }
 
 pub fn format_note_failure(reason: &str) -> String {
@@ -262,12 +274,28 @@ mod tests {
     #[test]
     fn note_confirmation_singular_vs_plural() {
         assert_eq!(
-            format_note_confirmation("helios-rendering", "Helios RHI descriptor design", 1),
+            format_note_confirmation("helios-rendering", "Helios RHI descriptor design", 1, Worth::Durable),
             "filed 1 memory under \"helios-rendering\" — refer to it as: \"Helios RHI descriptor design\""
         );
         assert_eq!(
-            format_note_confirmation("dotfiles", "chezmoi migration notes", 3),
+            format_note_confirmation("dotfiles", "chezmoi migration notes", 3, Worth::Durable),
             "filed 3 memories under \"dotfiles\" — refer to it as: \"chezmoi migration notes\""
+        );
+    }
+
+    #[test]
+    fn note_confirmation_states_review_queue_demotion_plainly_when_dubious() {
+        assert_eq!(
+            format_note_confirmation("notes", "a vague fragment", 1, Worth::Dubious),
+            "filed 1 memory under \"notes\" — refer to it as: \"a vague fragment\" — filed to review queue (looked dubious) — `mach kb review` to promote"
+        );
+    }
+
+    #[test]
+    fn note_confirmation_states_review_queue_demotion_plainly_when_noise() {
+        assert_eq!(
+            format_note_confirmation("notes", "asdf test", 1, Worth::Noise),
+            "filed 1 memory under \"notes\" — refer to it as: \"asdf test\" — filed to review queue (looked like noise) — `mach kb review` to promote"
         );
     }
 

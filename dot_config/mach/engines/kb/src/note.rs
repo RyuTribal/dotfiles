@@ -145,6 +145,14 @@ pub enum NoteOutcome {
     /// falls back to keyword search until it is re-embedded. Distinct from
     /// `FallbackRaw`: the note text itself was never at risk here.
     MissingEmbedding { reason: String },
+    /// Stored and classified normally, but the `WORTH` verdict was `noise`
+    /// — filed unreviewed at importance 2 rather than lost. Surfaced (only
+    /// under `--quiet`, and only when this was the sole degradation — see
+    /// `run`'s priority ordering) so rapid-fire jotting stays silent for
+    /// real notes but the user still learns when something was junk-binned.
+    /// `dubious` gets no notification at all in `--quiet` mode: the review
+    /// queue already catches it, and it isn't worth an interruption.
+    WorthNoise,
 }
 
 /// Takes the first `n` words of `s`, or "untitled note" if there are none
@@ -176,6 +184,9 @@ pub fn build_notification(outcome: &NoteOutcome, note: &str) -> Option<(Urgency,
         NoteOutcome::MissingEmbedding { reason } => {
             Some((Urgency::Normal, format!("Note saved unembedded ({})", reason)))
         }
+        NoteOutcome::WorthNoise => {
+            Some((Urgency::Normal, format!("Note saved to review queue (looked like noise): {}", first_words(note, 6))))
+        }
     }
 }
 
@@ -193,13 +204,47 @@ pub fn maybe_notify(notifier: &dyn Notifier, quiet: bool, outcome: &NoteOutcome,
     }
 }
 
+/// The classifier's judgment of whether a note is worth surfacing as a
+/// reviewed memory or filing quietly to the review queue instead — one
+/// verdict per whole note (mirrors `TOPIC`/`TITLE`, not per-fact). Judged
+/// as: `Durable` would matter in a future, unrelated session (real
+/// preferences, project facts, people, commitments); `Dubious` might
+/// matter, unclear (vague fragments, context-free references); `Noise` is
+/// test strings, gibberish, greetings, or obviously transient ("remind me
+/// in 5 min" style) ephemera. See `file_note`'s mapping of each to
+/// `reviewed`/importance, and this type's `Copy` derive means reading
+/// `classification.worth` multiple times (mapping it, then reporting it on
+/// `FiledNote`) never fights the moves of `topic`/`title`/`facts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Worth {
+    Durable,
+    Dubious,
+    Noise,
+}
+
+/// Parses one `WORTH:` line's value (already stripped of the prefix),
+/// case-insensitively. `None` for anything else — including empty or
+/// garbled text — so the caller's fail-open default (`Durable`) applies
+/// exactly like a missing line: a broken classifier must not demote a real
+/// note.
+fn parse_worth(s: &str) -> Option<Worth> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "durable" => Some(Worth::Durable),
+        "dubious" => Some(Worth::Dubious),
+        "noise" => Some(Worth::Noise),
+        _ => None,
+    }
+}
+
 /// The result of classifying one note: one topic for the whole note, a
-/// short referable title, and 1-N self-contained durable facts.
+/// short referable title, 1-N self-contained durable facts, and a `worth`
+/// triage verdict for the whole note.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Classification {
     pub topic: String,
     pub title: String,
     pub facts: Vec<String>,
+    pub worth: Worth,
 }
 
 /// Builds the classification prompt: the note, the existing topics to
@@ -220,6 +265,14 @@ pub fn build_prompt(note: &str, existing_topics: &[String], today: &str) -> Stri
          produce a short, referable title (3-6 words) the user could use to recall this note in \
          a later session.\n\n",
     );
+    s.push_str(
+        "Also judge, once for the whole note (not per fact), how likely it is to matter in a \
+         future, unrelated session: WORTH durable means real preferences, project facts, \
+         people, or commitments that would still matter later; WORTH dubious means a vague \
+         fragment or context-free reference whose future relevance is unclear; WORTH noise \
+         means a test string, gibberish, a greeting, or an obviously transient one-off (\"remind \
+         me in 5 min\" style ephemera).\n\n",
+    );
     if existing_topics.is_empty() {
         s.push_str("Existing topics: (none yet)\n\n");
     } else {
@@ -234,6 +287,7 @@ pub fn build_prompt(note: &str, existing_topics: &[String], today: &str) -> Stri
          one), no numbering, no other text:\n\
          TOPIC: <topic>\n\
          TITLE: <title>\n\
+         WORTH: durable|dubious|noise\n\
          FACT: <fact one>\n\
          FACT: <fact two>\n",
     );
@@ -266,6 +320,7 @@ pub fn parse_classification(output: &str, note: &str) -> Classification {
 pub fn parse_classification_verbose(output: &str, note: &str) -> (Classification, bool) {
     let mut topic: Option<String> = None;
     let mut title: Option<String> = None;
+    let mut worth: Option<Worth> = None;
     let mut facts: Vec<String> = Vec::new();
 
     for raw_line in output.lines() {
@@ -291,6 +346,17 @@ pub fn parse_classification_verbose(output: &str, note: &str) -> (Classification
             }
             continue;
         }
+        if let Some(rest) = strip_prefix_ci(line, "WORTH:") {
+            // Same "first well-formed value wins" rule as TOPIC/TITLE; an
+            // unrecognized value (garbled or missing entirely) leaves
+            // `worth` at `None`, which the match below fails open to
+            // `Durable` on -- a broken classifier must not demote a real
+            // note.
+            if worth.is_none() {
+                worth = parse_worth(rest);
+            }
+            continue;
+        }
         if let Some(rest) = strip_prefix_ci(line, "FACT:") {
             let fact = rest.trim();
             if !fact.is_empty() {
@@ -301,16 +367,20 @@ pub fn parse_classification_verbose(output: &str, note: &str) -> (Classification
     }
 
     match (topic, title) {
-        (Some(topic), Some(title)) if !facts.is_empty() => (Classification { topic, title, facts }, false),
+        (Some(topic), Some(title)) if !facts.is_empty() => {
+            (Classification { topic, title, facts, worth: worth.unwrap_or(Worth::Durable) }, false)
+        }
         _ => (fallback_classification(note), true),
     }
 }
 
 /// The "never lose the note" fallback: stores the raw note verbatim as one
-/// fact, topic "notes", title built from its first few words.
+/// fact, topic "notes", title built from its first few words, worth
+/// `Durable` -- a classifier reply too malformed to parse at all must not
+/// also demote the note out of the reviewed set; fail open on both fronts.
 fn fallback_classification(note: &str) -> Classification {
     let trimmed = note.trim();
-    Classification { topic: "notes".to_string(), title: first_words(trimmed, 6), facts: vec![trimmed.to_string()] }
+    Classification { topic: "notes".to_string(), title: first_words(trimmed, 6), facts: vec![trimmed.to_string()], worth: Worth::Durable }
 }
 
 /// Kebab-cases arbitrary text for use in a `source` value (`note:<slug>`):
@@ -558,6 +628,11 @@ pub struct FiledNote {
     pub fallback_reason: Option<String>,
     pub any_missing_embedding: bool,
     pub embed_reason: Option<String>,
+    /// The `WORTH` verdict this note was filed under -- see `file_note`'s
+    /// mapping to `reviewed`/importance. Callers (this module's own `run`,
+    /// and the telegram bridge) use it to decide whether to mention the
+    /// review-queue demotion back to the user.
+    pub worth: Worth,
 }
 
 /// Classifies `note` (via `llm`), embeds each resulting fact (via
@@ -575,6 +650,13 @@ pub struct FiledNote {
 /// embedder can do short of that degrades to `used_fallback` /
 /// `any_missing_embedding` instead, same as `run`'s inline version always
 /// guaranteed.
+///
+/// The classification's `worth` verdict maps to `reviewed`/importance as
+/// follows: `Durable` (the unchanged, pre-existing behavior) stores
+/// reviewed at the caller-supplied `importance` (the `-i` flag, default
+/// `DEFAULT_IMPORTANCE`); `Dubious` stores unreviewed at importance 4;
+/// `Noise` stores unreviewed at importance 2. Every path still stores —
+/// this triages for `mach kb review`, it never refuses or drops a note.
 pub fn file_note(
     conn: &Connection,
     llm: &dyn NoteLlm,
@@ -601,6 +683,17 @@ pub fn file_note(
     let slug = slugify(&classification.title);
     let source = format!("note:{}", slug);
 
+    // WORTH -> reviewed/importance mapping (see this function's doc
+    // comment). `Durable` is exactly the old, unconditional behavior
+    // (reviewed, caller's `importance`) -- `Dubious`/`Noise` route to the
+    // unreviewed review queue instead, at a fixed importance that reflects
+    // how little the classifier trusted them, never the caller's flag.
+    let (reviewed, effective_importance) = match classification.worth {
+        Worth::Durable => (true, importance),
+        Worth::Dubious => (false, 4),
+        Worth::Noise => (false, 2),
+    };
+
     let mut any_missing_embedding = false;
     let mut embed_err: Option<String> = None;
     for fact in &classification.facts {
@@ -624,10 +717,13 @@ pub fn file_note(
             None => fact.clone(),
         };
         // Direct store call, not `mach kb add`'s subprocess/classifier
-        // path: a note is fresh, deliberate input (reviewed, not
-        // unreviewed) and the save-time supersession classifier is
-        // deliberately skipped — that's `mach kb reflect`'s job later.
-        store::insert(conn, &content, Some(&source), Some(&classification.topic), true, embedding.as_deref(), importance)?;
+        // path: a note is fresh, deliberate input and the save-time
+        // supersession classifier is deliberately skipped — that's `mach
+        // kb reflect`'s job later. `reviewed`/`effective_importance` come
+        // from the WORTH mapping above -- durable notes keep the old
+        // "reviewed at the caller's importance" behavior; dubious/noise
+        // ones go to the unreviewed review queue instead.
+        store::insert(conn, &content, Some(&source), Some(&classification.topic), reviewed, embedding.as_deref(), effective_importance)?;
     }
 
     Ok(FiledNote {
@@ -646,6 +742,7 @@ pub fn file_note(
         } else {
             None
         },
+        worth: classification.worth,
     })
 }
 
@@ -823,13 +920,19 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     // Exactly one of these fires (or none, on a clean success): a raw-
     // storage fallback is the more significant degradation, so it takes
     // priority over a same-note missing-embedding notice if somehow both
-    // happened at once.
+    // happened at once; a WORTH-noise notice is the least urgent of the
+    // three (informational, not a degradation of the note itself) so it
+    // only fires when neither of the other two already did. WORTH-dubious
+    // never notifies at all, even here — the review queue catches it,
+    // silently.
     if filed.used_fallback {
         let reason = filed.fallback_reason.clone().unwrap_or_else(|| "classifier reply was empty or malformed".to_string());
         maybe_notify(&notifier, quiet, &NoteOutcome::FallbackRaw { reason }, &note);
     } else if filed.any_missing_embedding {
         let reason = filed.embed_reason.clone().unwrap_or_else(|| "could not reach ollama for embeddings".to_string());
         maybe_notify(&notifier, quiet, &NoteOutcome::MissingEmbedding { reason }, &note);
+    } else if filed.worth == Worth::Noise {
+        maybe_notify(&notifier, quiet, &NoteOutcome::WorthNoise, &note);
     }
 
     // Success = silence under --quiet: none of the stdout below runs, and
@@ -842,8 +945,17 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
             );
         }
 
+        // A demoted note is still filed in full below (topic, title, every
+        // fact) -- this suffix is purely informational, telling an
+        // interactive user it landed in the unreviewed review queue
+        // instead of the reviewed set.
+        let worth_suffix = match filed.worth {
+            Worth::Dubious => " (review queue — looked dubious)",
+            Worth::Noise => " (review queue — looked like noise)",
+            Worth::Durable => "",
+        };
         let n = filed.facts.len();
-        println!("filed {} {} under \"{}\"", n, if n == 1 { "memory" } else { "memories" }, filed.topic);
+        println!("filed {} {} under \"{}\"{}", n, if n == 1 { "memory" } else { "memories" }, filed.topic, worth_suffix);
         println!("  refer to it as: \"{}\"", filed.title);
         for fact in &filed.facts {
             // Mirrors exactly what got stored (see `file_note`'s insert
@@ -977,6 +1089,61 @@ mod tests {
         }
     }
 
+    // ---------- WORTH parsing ----------
+
+    #[test]
+    fn parses_worth_durable() {
+        let out = "TOPIC: t\nTITLE: a title\nWORTH: durable\nFACT: only fact\n";
+        let c = parse_classification(out, "irrelevant");
+        assert_eq!(c.worth, Worth::Durable);
+    }
+
+    #[test]
+    fn parses_worth_dubious() {
+        let out = "TOPIC: t\nTITLE: a title\nWORTH: dubious\nFACT: only fact\n";
+        let c = parse_classification(out, "irrelevant");
+        assert_eq!(c.worth, Worth::Dubious);
+    }
+
+    #[test]
+    fn parses_worth_noise() {
+        let out = "TOPIC: t\nTITLE: a title\nWORTH: noise\nFACT: only fact\n";
+        let c = parse_classification(out, "irrelevant");
+        assert_eq!(c.worth, Worth::Noise);
+    }
+
+    #[test]
+    fn parses_worth_case_insensitively_and_tolerates_surrounding_whitespace() {
+        let out = "TOPIC: t\nTITLE: a title\nworth:   Dubious  \nFACT: only fact\n";
+        let c = parse_classification(out, "irrelevant");
+        assert_eq!(c.worth, Worth::Dubious);
+    }
+
+    #[test]
+    fn missing_worth_line_fails_open_to_durable() {
+        let out = "TOPIC: t\nTITLE: a title\nFACT: only fact\n";
+        let c = parse_classification(out, "irrelevant");
+        assert_eq!(c.worth, Worth::Durable);
+    }
+
+    #[test]
+    fn garbled_worth_value_fails_open_to_durable() {
+        let out = "TOPIC: t\nTITLE: a title\nWORTH: maybe??\nFACT: only fact\n";
+        let c = parse_classification(out, "irrelevant");
+        assert_eq!(c.worth, Worth::Durable);
+    }
+
+    #[test]
+    fn a_fully_malformed_reply_still_falls_open_to_durable_worth() {
+        // The overall-malformed-reply fallback (topic/title/facts missing
+        // entirely) must not ALSO demote the note out of the reviewed set
+        // -- fail open on every front at once.
+        for bad in ["", "I couldn't parse this.", "TOPIC: only-a-topic\n"] {
+            let c = parse_classification(bad, "raw note text");
+            assert_eq!(c.worth, Worth::Durable, "expected durable fail-open for {:?}", bad);
+        }
+    }
+
     // ---------- first_words ----------
 
     #[test]
@@ -1020,6 +1187,13 @@ mod tests {
         let (urgency, summary) = build_notification(&outcome, "irrelevant").unwrap();
         assert_eq!(urgency, Urgency::Normal);
         assert_eq!(summary, "Note saved unembedded (cannot reach ollama at http://127.0.0.1:1)");
+    }
+
+    #[test]
+    fn worth_noise_builds_normal_review_queue_notification() {
+        let (urgency, summary) = build_notification(&NoteOutcome::WorthNoise, "asdf test qwerty gibberish here").unwrap();
+        assert_eq!(urgency, Urgency::Normal);
+        assert_eq!(summary, "Note saved to review queue (looked like noise): asdf test qwerty gibberish here");
     }
 
     // ---------- maybe_notify: quiet gating, mock notifier ----------
@@ -1089,6 +1263,19 @@ mod tests {
         let calls = quiet.calls.borrow();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0], (Urgency::Normal, "Note saved unembedded (ollama down)".to_string()));
+    }
+
+    #[test]
+    fn maybe_notify_fires_on_worth_noise_only_when_quiet() {
+        let loud = FakeNotifier::default();
+        maybe_notify(&loud, false, &NoteOutcome::WorthNoise, "asdf test qwerty");
+        assert!(loud.calls.borrow().is_empty(), "interactive/non-quiet use must never notify");
+
+        let quiet = FakeNotifier::default();
+        maybe_notify(&quiet, true, &NoteOutcome::WorthNoise, "asdf test qwerty");
+        let calls = quiet.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], (Urgency::Normal, "Note saved to review queue (looked like noise): asdf test qwerty".to_string()));
     }
 
     // ---------- file_note: the reusable programmatic pipeline ----------
@@ -1176,6 +1363,82 @@ mod tests {
         assert!(stored[0].embedding.is_none());
     }
 
+    // ---------- file_note: WORTH -> reviewed/importance mapping ----------
+
+    #[test]
+    fn worth_durable_stores_reviewed_at_the_callers_importance() {
+        let conn = scratch_conn();
+        let llm = FakeNoteLlm { reply: "TOPIC: t\nTITLE: a title\nWORTH: durable\nFACT: the fact\n".to_string() };
+        let filed = file_note(&conn, &llm, &FakeEmbedder, "a note", None, 8).unwrap();
+
+        assert_eq!(filed.worth, Worth::Durable);
+        let stored = store::list(&conn, None, false).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].reviewed);
+        assert_eq!(stored[0].importance, 8);
+    }
+
+    #[test]
+    fn worth_dubious_stores_unreviewed_at_importance_four_regardless_of_the_callers_importance() {
+        let conn = scratch_conn();
+        let llm = FakeNoteLlm { reply: "TOPIC: t\nTITLE: a title\nWORTH: dubious\nFACT: the fact\n".to_string() };
+        // Pass a caller importance far from 4, to prove the fixed mapping
+        // wins rather than the flag.
+        let filed = file_note(&conn, &llm, &FakeEmbedder, "a note", None, 9).unwrap();
+
+        assert_eq!(filed.worth, Worth::Dubious);
+        let stored = store::list(&conn, None, false).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(!stored[0].reviewed);
+        assert_eq!(stored[0].importance, 4);
+    }
+
+    #[test]
+    fn worth_noise_stores_unreviewed_at_importance_two_regardless_of_the_callers_importance() {
+        let conn = scratch_conn();
+        let llm = FakeNoteLlm { reply: "TOPIC: t\nTITLE: a title\nWORTH: noise\nFACT: the fact\n".to_string() };
+        let filed = file_note(&conn, &llm, &FakeEmbedder, "a note", None, 9).unwrap();
+
+        assert_eq!(filed.worth, Worth::Noise);
+        let stored = store::list(&conn, None, false).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(!stored[0].reviewed);
+        assert_eq!(stored[0].importance, 2);
+    }
+
+    #[test]
+    fn missing_worth_line_files_exactly_like_pre_worth_behavior() {
+        // No WORTH line at all -- the fail-open default (Durable) must
+        // reproduce the exact old unconditional "reviewed, caller's
+        // importance" behavior, unchanged.
+        let conn = scratch_conn();
+        let llm = FakeNoteLlm { reply: "TOPIC: t\nTITLE: a title\nFACT: the fact\n".to_string() };
+        let filed = file_note(&conn, &llm, &FakeEmbedder, "a note", None, 7).unwrap();
+
+        assert_eq!(filed.worth, Worth::Durable);
+        let stored = store::list(&conn, None, false).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].reviewed);
+        assert_eq!(stored[0].importance, 7);
+    }
+
+    #[test]
+    fn a_malformed_reply_falls_back_raw_but_still_reviewed_at_the_callers_importance() {
+        // used_fallback (raw storage) is a distinct degradation path from
+        // WORTH, but both must fail open the same way: a broken classifier
+        // never demotes a real note out of the reviewed set.
+        let conn = scratch_conn();
+        let llm = FakeNoteLlm { reply: "not a valid reply".to_string() };
+        let filed = file_note(&conn, &llm, &FakeEmbedder, "remember to buy milk", None, 6).unwrap();
+
+        assert!(filed.used_fallback);
+        assert_eq!(filed.worth, Worth::Durable);
+        let stored = store::list(&conn, None, false).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].reviewed);
+        assert_eq!(stored[0].importance, 6);
+    }
+
     #[test]
     fn file_note_with_image_combines_caption_and_description_and_files_through_file_note() {
         let conn = scratch_conn();
@@ -1198,5 +1461,31 @@ mod tests {
         let stored = store::list(&conn, None, false).unwrap();
         assert_eq!(stored.len(), 1);
         assert!(stored[0].content.contains("/tmp/photo.jpg"));
+    }
+
+    #[test]
+    fn file_note_with_image_applies_the_worth_verdict_to_the_extracted_content_the_same_way() {
+        // The classifier only ever sees the combined caption+description
+        // text (image notes don't get their own separate WORTH path) --
+        // this confirms the verdict still reaches `reviewed`/importance
+        // exactly like a plain text note's does.
+        let conn = scratch_conn();
+        let llm = FakeNoteLlm { reply: "TOPIC: t\nTITLE: a title\nWORTH: noise\nFACT: the fact\n".to_string() };
+        let filed = file_note_with_image(
+            &conn,
+            &llm,
+            &FakeEmbedder,
+            "/nonexistent/definitely-not-claude-xyz",
+            Path::new("/tmp/photo.jpg"),
+            "my new desk setup",
+            6,
+        )
+        .unwrap();
+
+        assert_eq!(filed.worth, Worth::Noise);
+        let stored = store::list(&conn, None, false).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(!stored[0].reviewed);
+        assert_eq!(stored[0].importance, 2);
     }
 }

@@ -96,7 +96,7 @@ impl<'a> Pipeline<'a> {
 
     fn file_text_note(&self, text: &str) -> String {
         match note::file_note(self.conn, self.llm, self.embedder, text, None, note::DEFAULT_IMPORTANCE) {
-            Ok(filed) => bot::format_note_confirmation(&filed.topic, &filed.title, filed.facts.len()),
+            Ok(filed) => bot::format_note_confirmation(&filed.topic, &filed.title, filed.facts.len(), filed.worth),
             Err(e) => bot::format_note_failure(&e.to_string()),
         }
     }
@@ -184,7 +184,7 @@ impl<'a> Pipeline<'a> {
         let _ = std::fs::remove_file(&temp);
 
         match note::file_note_with_image(self.conn, self.llm, self.embedder, &self.claude_bin, &stored, caption, note::DEFAULT_IMPORTANCE) {
-            Ok(filed) => bot::format_note_confirmation(&filed.topic, &filed.title, filed.facts.len()),
+            Ok(filed) => bot::format_note_confirmation(&filed.topic, &filed.title, filed.facts.len(), filed.worth),
             Err(e) => bot::format_note_failure(&e.to_string()),
         }
     }
@@ -334,6 +334,44 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0], (999, "filed 1 memory under \"helios\" — refer to it as: \"a title\"".to_string()));
         assert_eq!(store::all_memories(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn text_message_the_classifier_judges_as_noise_files_unreviewed_and_replies_with_the_review_queue_notice() {
+        let api = FakeApi::default();
+        let conn = scratch_conn();
+        let llm = FakeLlm { reply: "TOPIC: notes\nTITLE: a title\nWORTH: noise\nFACT: fact one\n".to_string() };
+        let counter = DropCounter::default();
+        let pipeline = Pipeline {
+            api: &api,
+            allowed_user_id: 42,
+            drop_counter: &counter,
+            conn: &conn,
+            llm: &llm,
+            embedder: &FakeEmbedder,
+            transcriber: None,
+            converter: &FakeConverter,
+            claude_bin: "claude".to_string(),
+            started_at: Instant::now(),
+        };
+        let mut msg = msg_from(Some(42));
+        msg.text = Some("asdf test qwerty".to_string());
+        pipeline.handle_update(&Update { update_id: 11, message: Some(msg) });
+
+        let sent = api.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0],
+            (
+                999,
+                "filed 1 memory under \"notes\" — refer to it as: \"a title\" — filed to review queue (looked like noise) — `mach kb review` to promote"
+                    .to_string()
+            )
+        );
+        let stored = store::all_memories(&conn).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(!stored[0].reviewed);
+        assert_eq!(stored[0].importance, 2);
     }
 
     #[test]

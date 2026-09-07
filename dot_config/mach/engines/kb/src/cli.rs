@@ -2065,6 +2065,7 @@ struct IngestSummary {
     shown: usize,
     facts_added: usize,
     deferred_offline: usize,
+    pruned_recall_logs: usize,
 }
 
 /// Every `.jsonl` transcript under `~/.claude/projects/*/*.jsonl` —
@@ -2092,6 +2093,48 @@ fn list_transcript_files(projects_root: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// Deletes every recall-log file (`<session_id>.jsonl` under
+/// `recall_log_root`) whose session has already been fully ingested
+/// (`store::is_session_ingested`) and which has sat untouched for at least
+/// `ingest::RECALL_LOG_PRUNE_MIN_AGE_SECS` — these otherwise accumulate
+/// forever, one per session, with nothing else ever cleaning them up.
+/// Tolerant of a missing `recall_log_root` (nothing to prune yet, same
+/// posture as `list_transcript_files`) and of any single file's metadata
+/// read, DB lookup, or delete failing — that one file is left alone and
+/// retried on a later run rather than aborting the rest of the sweep. A
+/// file whose session was never ingested is never touched, no matter how
+/// old it is — pruning only ever removes logs whose data already did its
+/// job.
+fn prune_recall_logs(conn: &Connection, recall_log_root: &Path) -> usize {
+    let mut pruned = 0usize;
+    let Ok(entries) = std::fs::read_dir(recall_log_root) else {
+        return pruned;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(session_id) = ingest::session_id_from_path(&path) else {
+            continue;
+        };
+        let ingested = match store::is_session_ingested(conn, &session_id) {
+            Ok(v) => v,
+            Err(_) => continue, // DB hiccup this run -- leave the file, retried next time
+        };
+        let age_secs = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| mtime.elapsed().ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0); // unknown age -- never prune on uncertainty
+        if ingest::should_prune_recall_log(ingested, age_secs) && std::fs::remove_file(&path).is_ok() {
+            pruned += 1;
+        }
+    }
+    pruned
 }
 
 /// Locates the one transcript file for `session_id`, regardless of its
@@ -2249,6 +2292,8 @@ fn run_ingest_sessions<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>(
         summary.processed += 1;
     }
 
+    summary.pruned_recall_logs = prune_recall_logs(conn, recall_log_root);
+
     Ok(summary)
 }
 
@@ -2303,8 +2348,14 @@ fn cmd_ingest_sessions(mut args: impl Iterator<Item = String>) -> io::Result<()>
             .map_err(to_io)?;
 
     println!(
-        "mach kb ingest-sessions: scanned={} processed={} engaged={} shown={} facts_added={} deferred_offline={}",
-        summary.scanned, summary.processed, summary.engaged, summary.shown, summary.facts_added, summary.deferred_offline
+        "mach kb ingest-sessions: scanned={} processed={} engaged={} shown={} facts_added={} deferred_offline={} pruned_recall_logs={}",
+        summary.scanned,
+        summary.processed,
+        summary.engaged,
+        summary.shown,
+        summary.facts_added,
+        summary.deferred_offline,
+        summary.pruned_recall_logs
     );
     Ok(())
 }
@@ -3142,6 +3193,95 @@ mod tests {
         assert_eq!(second.processed, 0, "...but skipped before doing any work");
         assert_eq!(second.engaged, 0);
         assert_eq!(store::get(&conn, id).unwrap().unwrap().access_count, 1, "must not be touched a second time");
+    }
+
+    // --- recall-log pruning ---
+
+    /// Writes `<root>/recall-log/<session_id>.jsonl` and backdates its mtime
+    /// by `age_secs` (or leaves it at "now" when `None`) -- mirrors
+    /// `write_transcript`'s own mtime-backdating helper, since pruning's
+    /// age gate is real-file-mtime-driven too.
+    fn write_aged_recall_log(root: &Path, session_id: &str, age_secs: Option<u64>) -> PathBuf {
+        write_recall_log(root, session_id, &[r#"{"ts":"2026-01-01T00:00:00Z","ids":[1]}"#]);
+        let path = root.join("recall-log").join(format!("{}.jsonl", session_id));
+        if let Some(age) = age_secs {
+            let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+            set_mtime(&path, mtime);
+        }
+        path
+    }
+
+    #[test]
+    fn prune_recall_logs_deletes_an_ingested_old_enough_log() {
+        let scratch = ScratchDir::new("prune-ok");
+        let conn = mem_conn();
+        store::mark_session_ingested(&conn, "sess-old", &store::now_rfc3339()).unwrap();
+        let path = write_aged_recall_log(&scratch.path, "sess-old", Some(ingest::RECALL_LOG_PRUNE_MIN_AGE_SECS + 60));
+
+        let pruned = prune_recall_logs(&conn, &scratch.path.join("recall-log"));
+
+        assert_eq!(pruned, 1);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn prune_recall_logs_never_touches_an_un_ingested_session_regardless_of_age() {
+        let scratch = ScratchDir::new("prune-not-ingested");
+        let conn = mem_conn();
+        // Deliberately never marked ingested.
+        let path = write_aged_recall_log(&scratch.path, "sess-never-ingested", Some(ingest::RECALL_LOG_PRUNE_MIN_AGE_SECS * 10));
+
+        let pruned = prune_recall_logs(&conn, &scratch.path.join("recall-log"));
+
+        assert_eq!(pruned, 0, "an un-ingested session's recall log must never be pruned, no matter its age");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn prune_recall_logs_keeps_an_ingested_but_too_fresh_log() {
+        let scratch = ScratchDir::new("prune-too-fresh");
+        let conn = mem_conn();
+        store::mark_session_ingested(&conn, "sess-fresh", &store::now_rfc3339()).unwrap();
+        let path = write_aged_recall_log(&scratch.path, "sess-fresh", Some(ingest::RECALL_LOG_PRUNE_MIN_AGE_SECS - 60));
+
+        let pruned = prune_recall_logs(&conn, &scratch.path.join("recall-log"));
+
+        assert_eq!(pruned, 0, "younger than the 14-day floor must be kept regardless of ingested status");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn prune_recall_logs_missing_root_is_a_silent_no_op() {
+        let scratch = ScratchDir::new("prune-missing-root");
+        let conn = mem_conn();
+        let pruned = prune_recall_logs(&conn, &scratch.path.join("recall-log")); // never created
+        assert_eq!(pruned, 0);
+    }
+
+    #[test]
+    fn run_ingest_sessions_prunes_recall_logs_of_already_ingested_sessions_at_the_end_of_the_run() {
+        let scratch = ScratchDir::new("prune-end-of-run");
+        let projects_root = scratch.path.join("projects");
+        let recall_log_root = scratch.path.join("recall-log");
+        let conn = mem_conn();
+
+        // A session ingested in some earlier run, whose recall log has
+        // long since aged out -- pruning must catch this even though
+        // nothing about it is scanned as a candidate this run (no fresh
+        // transcript, already in `ingested_sessions`).
+        store::mark_session_ingested(&conn, "sess-stale-ingested", &store::now_rfc3339()).unwrap();
+        let old_log = write_aged_recall_log(&scratch.path, "sess-stale-ingested", Some(ingest::RECALL_LOG_PRUNE_MIN_AGE_SECS + 1));
+
+        let embedder = FakeEmbedder;
+        let llm = FixedReflectLlm { reply: Ok("") };
+        let filter = FixedFilter { dialogue: None };
+
+        let summary =
+            run_ingest_sessions(&conn, &embedder, &llm, &filter, &projects_root, &recall_log_root, None, &store::now_rfc3339())
+                .unwrap();
+
+        assert_eq!(summary.pruned_recall_logs, 1);
+        assert!(!old_log.exists());
     }
 
     #[test]

@@ -78,6 +78,23 @@ pub fn parse_recall_log(content: &str) -> Vec<i64> {
     seen.into_iter().collect()
 }
 
+/// A recall-log file is only ever pruned once its session has been fully
+/// ingested AND it has sat untouched for at least this long -- long enough
+/// that nothing plausible still needs it (a delayed opportunistic sweep, a
+/// `--session-id` re-run racing the same window), but nowhere near
+/// "forever," which is what these files otherwise accumulate for.
+pub const RECALL_LOG_PRUNE_MIN_AGE_SECS: u64 = 14 * 24 * 60 * 60;
+
+/// Pure prune decision -- no filesystem, no DB. A recall-log file is safe
+/// to delete only when BOTH hold: its session has already been fully
+/// consumed into `ingested_sessions` (its data has done its job), and it's
+/// old enough that nothing still plausibly needs it. An un-ingested
+/// session's recall log is never pruned, regardless of age -- age alone is
+/// never sufficient, only ever a necessary condition once ingested.
+pub fn should_prune_recall_log(session_ingested: bool, age_secs: u64) -> bool {
+    session_ingested && age_secs >= RECALL_LOG_PRUNE_MIN_AGE_SECS
+}
+
 // --- session <-> transcript pairing ---
 
 /// A session's transcript file is named `<session_id>.jsonl` (verified
@@ -321,6 +338,26 @@ mod tests {
         assert!(!is_stale_enough(SWEEP_MIN_IDLE_SECS - 1));
         assert!(is_stale_enough(SWEEP_MIN_IDLE_SECS));
         assert!(is_stale_enough(SWEEP_MIN_IDLE_SECS + 1));
+    }
+
+    // --- recall-log pruning ---
+
+    #[test]
+    fn should_prune_recall_log_never_prunes_an_un_ingested_session_regardless_of_age() {
+        assert!(!should_prune_recall_log(false, 0));
+        assert!(!should_prune_recall_log(false, RECALL_LOG_PRUNE_MIN_AGE_SECS));
+        assert!(!should_prune_recall_log(false, RECALL_LOG_PRUNE_MIN_AGE_SECS * 100));
+    }
+
+    #[test]
+    fn should_prune_recall_log_ingested_but_younger_than_the_threshold_is_kept() {
+        assert!(!should_prune_recall_log(true, RECALL_LOG_PRUNE_MIN_AGE_SECS - 1));
+    }
+
+    #[test]
+    fn should_prune_recall_log_ingested_and_old_enough_is_pruned() {
+        assert!(should_prune_recall_log(true, RECALL_LOG_PRUNE_MIN_AGE_SECS));
+        assert!(should_prune_recall_log(true, RECALL_LOG_PRUNE_MIN_AGE_SECS + 1));
     }
 
     // --- engagement verdicts ---

@@ -78,12 +78,14 @@ impl Memory {
     }
 }
 
-/// A reflection-engine insight: a durable, higher-level belief about the
-/// user derived from `>= 2` independent memories, produced by `mach kb
-/// reflect`. `source_ids` holds the citations backing it, as strings —
-/// a plain memory id ("12") or an insight reference ("i7") for an insight
-/// it explicitly builds on; only raw memory ids count toward the
-/// evidence floor (see `reflect::parse_stage2`).
+/// A reflection-engine insight: a durable, higher-level belief derived
+/// from `>= 2` independent memories, produced by `mach kb reflect` —
+/// about the user, a project or system, an engineering practice, or a
+/// recurring pattern, not the user alone. `source_ids` holds the
+/// citations backing it, as strings — a plain memory id ("12") or an
+/// insight reference ("i7") for an insight it explicitly builds on; only
+/// raw memory ids count toward the evidence floor (see
+/// `reflect::parse_stage2`).
 #[derive(Debug, Clone)]
 pub struct Insight {
     pub id: i64,

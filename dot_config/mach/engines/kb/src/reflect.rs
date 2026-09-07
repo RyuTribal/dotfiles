@@ -1,10 +1,12 @@
 
 //! `mach kb reflect` — the reflection subsystem: a periodic pass that reads
 //! recently-added memories, asks a small model what higher-level questions
-//! they might answer about the user, then asks a stronger model to state a
-//! durable insight for each question when at least two independent memories
-//! back it up. A separate re-verification pass samples existing insights and
-//! flags (never deletes) ones whose evidence no longer holds.
+//! they might answer — about the user, a project or system, an engineering
+//! practice or lesson, or a recurring pattern across work, not the user
+//! alone — then asks a stronger model to state a durable insight for each
+//! question when at least two independent memories back it up. A separate
+//! re-verification pass samples existing insights and flags (never deletes)
+//! ones whose evidence no longer holds.
 //!
 //! Behind the `ReflectLlm` trait so the pure parsing/prompt-building logic
 //! here is unit-testable without spawning a real `claude` process — mirrors
@@ -57,20 +59,23 @@ impl ReflectLlm for ProcessReflectLlm {
 // --- stage 1: salient questions ---
 
 /// Builds the stage-1 prompt: the working set as `id: content` lines,
-/// asking for 2-3 higher-level questions these statements could answer
-/// about the user.
+/// asking for 2-3 higher-level questions these statements could answer —
+/// about the user, a project or system, an engineering practice, or a
+/// recurring pattern, not the user alone.
 pub fn build_questions_prompt(working_set: &[(i64, String)]) -> String {
     let mut s = String::new();
     s.push_str(
         "You are analyzing a personal knowledge bank to find deeper patterns. \
-         Here are recent statements about the user (id: content):\n\n",
+         Here are recent statements from a personal knowledge bank (id: content):\n\n",
     );
     for (id, content) in working_set {
         s.push_str(&format!("{}: {}\n", id, content));
     }
     s.push_str(
-        "\nWhat are the 2-3 most salient higher-level questions about the USER these \
-         statements could answer? One per line, nothing else.\n",
+        "\nWhat are the 2-3 most salient higher-level questions these statements \
+         could answer -- about the user's preferences, their projects and systems, \
+         engineering practices and lessons, or recurring patterns across work? \
+         One per line, nothing else.\n",
     );
     s
 }
@@ -108,7 +113,7 @@ fn strip_list_marker(line: &str) -> &str {
 /// output-format instructions.
 pub fn build_insight_prompt(question: &str, evidence: &[(i64, String)], existing_insights: &[(i64, String)]) -> String {
     let mut s = String::new();
-    s.push_str("Evidence (memories about the user):\n");
+    s.push_str("Evidence (knowledge-bank memories):\n");
     for (id, content) in evidence {
         s.push_str(&format!("[{}] {}\n", id, content));
     }
@@ -120,8 +125,9 @@ pub fn build_insight_prompt(question: &str, evidence: &[(i64, String)], existing
     }
     s.push_str(&format!(
         "\nQuestion: {}\n\n\
-         State ONE durable insight about the user ONLY IF at least 2 independent evidence \
-         rows support it. Format exactly: `<insight text> (because of: <id>, <id>[, ...])`. \
+         State ONE durable higher-level insight the evidence supports -- it may be \
+         about the user, a project, a technical practice, or a recurring pattern -- \
+         ONLY IF at least 2 independent evidence rows support it. Format exactly: `<insight text> (because of: <id>, <id>[, ...])`. \
          If evidence is insufficient or the insight would duplicate an existing [i*] insight, \
          output exactly NONE.\n",
         question
@@ -217,7 +223,7 @@ fn find_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
 /// over the insight text, not necessarily its original citations).
 pub fn build_contradiction_prompt(claim: &str, candidates: &[(i64, String)]) -> String {
     let mut s = String::new();
-    s.push_str("Claim about the user:\n");
+    s.push_str("Claim under review:\n");
     s.push_str(claim);
     s.push_str("\n\nCandidate memories:\n");
     for (id, content) in candidates {

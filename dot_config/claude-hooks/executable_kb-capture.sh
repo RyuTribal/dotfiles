@@ -53,6 +53,12 @@ command -v "$CLAUDE_BIN" >/dev/null 2>&1 || exit 0
 tail_content="$(tail -n "$TAIL_LINES" "$transcript_path" 2>/dev/null)"
 [ -z "$tail_content" ] && exit 0
 
+# The digest call can take tens of seconds; session teardown cancels hooks
+# that block that long ("Hook cancelled"). Run the heavy part detached so
+# the hook itself returns instantly. The transcript file persists after the
+# session, so the detached work reads nothing volatile.
+(
+
 digest_prompt='You are extracting durable, cross-session-worthy facts about the USER from the tail of a Claude Code session transcript (JSONL below). Extract at most 5 facts: preferences, projects, people, or commitments that would still matter in a future, unrelated session. Do NOT extract code details, file contents, tool-call mechanics, or anything specific only to this one task. Never include secrets, credentials, tokens, or passwords. Output one fact per line, plain text, no numbering, no bullets, no preamble, no markdown. If nothing qualifies, output nothing at all — not even a note saying so.'
 
 facts="$(printf '%s\n\n---TRANSCRIPT TAIL---\n%s\n' "$digest_prompt" "$tail_content" \
@@ -72,5 +78,7 @@ printf '%s\n' "$facts" | while IFS= read -r line; do
     # `mach kb review` is the curation point for these, not save-time.
     printf '%s' "$line" | "$MACH_BIN" kb add - --source "session-digest" --unreviewed --no-classify >/dev/null 2>&1
 done
+) </dev/null >/dev/null 2>&1 &
+disown 2>/dev/null
 
 exit 0

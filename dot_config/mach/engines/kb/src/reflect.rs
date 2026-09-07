@@ -937,6 +937,147 @@ pub fn build_contradiction_pass_prompt(a: (i64, &str, &str), b: (i64, &str, &str
     s
 }
 
+// --- curation pass: organic promotion of the unreviewed queue ---
+//
+// Memory is organic: `search_ranked` already surfaces unreviewed rows by
+// default (at a small confidence penalty — see
+// `store::UNREVIEWED_SEARCH_PENALTY`), so `mach kb review` is no longer a
+// gate anything has to pass through to be useful. This pass is what closes
+// the loop — it judges the auto-captured queue itself, on the same footing
+// `mach kb review`'s human "keep" already uses (`reviewed = 1`), so the
+// penalty goes away as evidence accumulates, not on a fixed clock. `mach kb
+// review` remains available as an optional, immediate override (it can
+// still keep/edit/delete a row directly) — this pass is what makes it
+// optional rather than required.
+//
+// Runs in `mach kb reflect` after the contradiction patrol and before the
+// dormancy pass (see `cmd_reflect`'s step-ordering comments in `cli.rs`):
+// a row this pass just DEMOTEd can never be swept into dormancy in the very
+// same run regardless of ordering, because dormancy's own age floor
+// (`store::DORMANCY_MIN_AGE_DAYS`, 90 days) is well above this pass's
+// 3-day settling period — a row young enough to still be a curation
+// candidate is never old enough to qualify for dormancy yet.
+
+/// Settling period before an unreviewed row is judged: gives session
+/// engagement (touch, via `mach kb ingest-sessions`) a chance to accumulate
+/// before a model has to guess from static content alone. A row younger
+/// than this is simply left for a later run.
+pub const CURATION_MIN_AGE_DAYS: f64 = 3.0;
+/// At most this many candidate rows are judged per `mach kb reflect` run —
+/// same bounded-cost rationale as `DEDUPE_MAX_PAIRS_PER_RUN`.
+pub const CURATION_MAX_PER_RUN: usize = 12;
+/// An unreviewed row touched at least this many times (by engagement-gated
+/// session reinforcement — see `store::touch`/`ingest.rs`) auto-promotes
+/// with no LLM call at all: having actually been used twice is stronger
+/// evidence than a model's guess from content alone.
+pub const CURATION_ENGAGEMENT_FAST_PATH: i64 = 2;
+/// Importance a DEMOTEd row is pinned to (well under
+/// `store::DORMANCY_MAX_IMPORTANCE`, so ordinary dormancy criteria still
+/// pick it up in due course). Never deletes — organic decay finishes the
+/// job later.
+pub const CURATION_DEMOTE_IMPORTANCE: i64 = 2;
+
+/// Outcome of parsing the curation judge's reply for one candidate row.
+/// Unlike the dedupe/contradiction verdicts, there is no `Malformed`
+/// variant here: an empty reply, an unrecognized line, or a judge call that
+/// failed outright are all treated identically to `Leave` by the caller
+/// (`run_curation_pass` in `cli.rs`) — nothing is recorded either way, so
+/// the row simply re-enters the candidate pool on a later run rather than
+/// being silenced. That's a deliberate difference from dedupe/contradiction:
+/// those record a genuine `Distinct`/`BOTH_HOLD` verdict as "seen" so the
+/// same pair is never re-asked, but a curation candidate has no paired
+/// judge to avoid re-asking — leaving it exactly as it is IS the correct
+/// outcome for "can't tell yet," so there's nothing to distinguish a
+/// deliberate `LEAVE` from a malformed reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CurationVerdict {
+    /// Durable, coherent with what's already known, plausibly useful weeks
+    /// or months from now — promote it (`reviewed = 1`; the search penalty
+    /// goes away).
+    Promote,
+    /// Can't yet tell — leave it exactly as it is; it re-enters the pool on
+    /// a later run once more evidence (age, engagement) has accumulated.
+    Leave,
+    /// Transient, noise, or incoherent junk — demote it
+    /// (`CURATION_DEMOTE_IMPORTANCE` + halved stability). Never deleted;
+    /// organic decay (dormancy) finishes the job.
+    Demote,
+}
+
+/// Parses the curation judge's reply. Scans line by line (tolerating
+/// leading chatter, like the other reflect-pass parsers) for the first
+/// recognized token; anything else — empty output, an unrecognized line —
+/// defaults to `Leave`, which is exactly the right behavior for "can't
+/// tell" (see `CurationVerdict`'s own doc comment for why there's no
+/// separate `Malformed` case here).
+pub fn parse_curation_verdict(output: &str) -> CurationVerdict {
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let upper = line.to_uppercase();
+        if upper.starts_with("PROMOTE") {
+            return CurationVerdict::Promote;
+        }
+        if upper.starts_with("LEAVE") {
+            return CurationVerdict::Leave;
+        }
+        if upper.starts_with("DEMOTE") {
+            return CurationVerdict::Demote;
+        }
+    }
+    CurationVerdict::Leave
+}
+
+/// Builds the curation pass's one-haiku-call prompt: the candidate's fact,
+/// source class, age, engagement evidence (`access_count` — a session
+/// having actually touched it is stronger signal than any of the rest), and
+/// its top-3 semantic neighbors (a coherence check against what the store
+/// already believes) — asks for a single PROMOTE/LEAVE/DEMOTE verdict.
+/// `neighbors` are `(id, content)`.
+pub fn build_curation_prompt(
+    content: &str,
+    source: Option<&str>,
+    age_days: f64,
+    access_count: i64,
+    neighbors: &[(i64, String)],
+) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "You are curating a personal knowledge bank's auto-captured candidate queue. Decide \
+         whether the fact below is worth keeping as a durable memory.\n\n",
+    );
+    s.push_str(&format!(
+        "Candidate (source: {}, age: {:.0} days):\n{}\n\n",
+        source.unwrap_or("unknown"),
+        age_days,
+        content
+    ));
+    let engagement = if access_count > 0 {
+        format!("sessions have engaged this {} time(s)", access_count)
+    } else {
+        "never engaged".to_string()
+    };
+    s.push_str(&format!("Engagement evidence: {}\n\n", engagement));
+    if neighbors.is_empty() {
+        s.push_str("No closely related memories exist yet.\n\n");
+    } else {
+        s.push_str("Closely related existing memories (for coherence -- does this fit what's already known?):\n");
+        for (id, text) in neighbors {
+            s.push_str(&format!("#{}: {}\n", id, text));
+        }
+        s.push('\n');
+    }
+    s.push_str(
+        "Reply with exactly one line and no other text: PROMOTE, LEAVE, or DEMOTE.\n\
+         PROMOTE -- durable, coherent with what's known, plausibly useful weeks or months from now.\n\
+         LEAVE -- can't yet tell; it will be re-judged on a later run once more evidence accumulates.\n\
+         DEMOTE -- transient, noise, or incoherent junk; it is never deleted, just weakened.\n",
+    );
+    s
+}
+
 // --- strength review sampler ---
 
 /// Outcome of parsing the strength-review judge's reply for one sampled
@@ -1609,6 +1750,54 @@ mod tests {
         assert!(p.contains("Memory #2 (source: unknown):\nlikes tea a lot"));
         assert!(p.contains("KEEP"));
         assert!(p.contains("DISTINCT"));
+    }
+
+    // --- curation pass: verdict parsing ---
+
+    #[test]
+    fn parse_curation_verdict_accepts_all_three_tokens_case_insensitively() {
+        assert_eq!(parse_curation_verdict("PROMOTE"), CurationVerdict::Promote);
+        assert_eq!(parse_curation_verdict("  promote  \n"), CurationVerdict::Promote);
+        assert_eq!(parse_curation_verdict("LEAVE"), CurationVerdict::Leave);
+        assert_eq!(parse_curation_verdict("leave"), CurationVerdict::Leave);
+        assert_eq!(parse_curation_verdict("DEMOTE"), CurationVerdict::Demote);
+        assert_eq!(parse_curation_verdict("demote"), CurationVerdict::Demote);
+    }
+
+    #[test]
+    fn parse_curation_verdict_scans_past_leading_chatter() {
+        let out = "Sure, here's my answer:\nPROMOTE";
+        assert_eq!(parse_curation_verdict(out), CurationVerdict::Promote);
+    }
+
+    #[test]
+    fn parse_curation_verdict_defaults_to_leave_on_malformed_or_empty_output() {
+        // Deliberately Leave, not a separate Malformed case — see
+        // CurationVerdict's own doc comment for why.
+        assert_eq!(parse_curation_verdict(""), CurationVerdict::Leave);
+        assert_eq!(parse_curation_verdict("I'm not sure about this one."), CurationVerdict::Leave);
+        assert_eq!(parse_curation_verdict("PROMOTION"), CurationVerdict::Leave, "must not fuzzy-match a similar word");
+    }
+
+    #[test]
+    fn build_curation_prompt_includes_content_engagement_and_neighbors() {
+        let neighbors = vec![(7i64, "the user drinks tea".to_string())];
+        let p = build_curation_prompt("candidate fact", Some("session-digest"), 5.0, 0, &neighbors);
+        assert!(p.contains("candidate fact"));
+        assert!(p.contains("source: session-digest"));
+        assert!(p.contains("age: 5 days"));
+        assert!(p.contains("never engaged"));
+        assert!(p.contains("#7: the user drinks tea"));
+        assert!(p.contains("PROMOTE"));
+        assert!(p.contains("LEAVE"));
+        assert!(p.contains("DEMOTE"));
+    }
+
+    #[test]
+    fn build_curation_prompt_reports_engagement_count_when_touched() {
+        let p = build_curation_prompt("candidate fact", None, 4.0, 3, &[]);
+        assert!(p.contains("engaged this 3 time(s)"));
+        assert!(p.contains("No closely related memories exist yet."));
     }
 
     #[test]

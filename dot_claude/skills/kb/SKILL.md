@@ -102,13 +102,27 @@ mach kb add "<fact>" --source "<context>" --project "<project>" --importance 6
 mach kb search "<query>" --json
 ```
 
-Add `--limit N` to control result count and `--all` to include unreviewed
-candidates. Read `score` in the JSON output — treat anything below ~0.45
-as noise. `score` is a blend of similarity, recency, and how reinforced the
-memory is (the JSON also breaks these out individually as `sim`, `recency`,
-`strength`). Don't pass `--touch` here — that reinforces a memory as if it
-were actually recalled and injected as context, and belongs only to the
-automated recall hook, not a manual search you run yourself.
+Add `--limit N` to control result count. Search is organic by default: an
+unreviewed row (auto-captured, not yet curated) surfaces right alongside
+everything else, just at a small confidence penalty, so you never have to
+think about review state while searching — pass `--reviewed-only` on the
+rare occasion you want to exclude the unreviewed queue entirely. Read
+`score` in the JSON output — treat anything below ~0.45 as noise. `score`
+is a blend of similarity, recency, and how reinforced the memory is (the
+JSON also breaks these out individually as `sim`, `recency`, `strength`).
+Don't pass `--touch` here — that reinforces a memory as if it were actually
+recalled and injected as context, and belongs only to the automated recall
+hook, not a manual search you run yourself.
+
+## Review is optional, not a gate
+
+`mach kb reflect`'s curation pass already works through the unreviewed
+queue on its own — judging each row's durability, coherence with what's
+already known, and engagement (a row actually touched by a session
+promotes automatically, no model call needed) — so a fact doesn't sit
+invisible until a human looks at it. `mach kb review` still exists as an
+immediate, optional human override over the same queue (keep/edit/delete a
+row right now, or promote it early), never as something recall depends on.
 
 ## What qualifies as worth saving
 

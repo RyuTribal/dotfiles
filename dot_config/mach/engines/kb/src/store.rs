@@ -570,14 +570,17 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146097 + doe - 719468
 }
 
-fn now_secs() -> u64 {
+// `pub(crate)` (not just `fn`) so cli.rs's own tests can backdate a row's
+// `created_at` the same way store.rs's own tests do (e.g. the curation-pass
+// settling-period tests) without duplicating this civil-date math.
+pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
 }
 
-fn now_rfc3339_from_secs(secs: u64) -> String {
+pub(crate) fn now_rfc3339_from_secs(secs: u64) -> String {
     let days = secs / 86400;
     let tod = secs % 86400;
     let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
@@ -749,6 +752,9 @@ pub fn list_dormant(conn: &Connection, limit: Option<usize>) -> Result<Vec<Memor
 
 /// All `reviewed = 0` rows (auto-extracted candidates awaiting `mach kb
 /// review`), oldest first so review works through them in insertion order.
+/// `mach kb reflect`'s curation pass (`curation_candidates`, below) is the
+/// organic path that clears this queue on its own; `mach kb review` remains
+/// available as an optional, immediate human override over the same rows.
 pub fn unreviewed(conn: &Connection) -> Result<Vec<Memory>, KbError> {
     let mut stmt = conn.prepare("SELECT * FROM memories WHERE reviewed = 0 ORDER BY id ASC")?;
     let rows = stmt.query_map([], row_to_memory)?;
@@ -756,6 +762,42 @@ pub fn unreviewed(conn: &Connection) -> Result<Vec<Memory>, KbError> {
     for r in rows {
         out.push(r?);
     }
+    Ok(out)
+}
+
+/// Age in whole (fractional) days of `created_at`, relative to `now` — both
+/// RFC3339 strings in this store's own format. Exposed for `mach kb
+/// reflect`'s curation pass, which shows a candidate's age to the judge;
+/// mirrors the age math `memory_qualifies_for_dormancy` already does
+/// internally.
+pub fn age_days(created_at: &str, now: &str) -> f64 {
+    let now_secs = parse_rfc3339(now).unwrap_or(0);
+    let created_secs = parse_rfc3339(created_at).unwrap_or(now_secs);
+    days_between(now_secs, created_secs)
+}
+
+/// Curation-pass candidates for `mach kb reflect`: ACTIVE (not dormant, not
+/// superseded) unreviewed rows at least `min_age_days` old — a settling
+/// period so engagement evidence (session judgments touching a row) has a
+/// chance to accumulate before a model has to judge on content alone — and
+/// oldest-first among those, capped at `cap` per run so a large backlog
+/// drains in a stable order across runs rather than being reshuffled. A row
+/// still inside its settling period is simply left for a later run, same as
+/// `dedupe_candidate_pairs`/`contradiction_candidate_pairs`'s own caps.
+pub fn curation_candidates(conn: &Connection, now: &str, min_age_days: f64, cap: usize) -> Result<Vec<Memory>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM memories WHERE reviewed = 0 AND dormant_at IS NULL AND invalidated_at IS NULL \
+         ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map([], row_to_memory)?;
+    let mut out = Vec::new();
+    for r in rows {
+        let m = r?;
+        if age_days(&m.created_at, now) >= min_age_days {
+            out.push(m);
+        }
+    }
+    out.truncate(cap);
     Ok(out)
 }
 
@@ -815,6 +857,16 @@ pub fn set_reviewed(conn: &Connection, id: i64, reviewed: bool) -> Result<bool, 
         "UPDATE memories SET reviewed = ?1 WHERE id = ?2",
         params![reviewed as i64, id],
     )?;
+    Ok(n > 0)
+}
+
+/// Sets a memory's `importance` directly (1-10, though this never enforces
+/// the range itself — callers own that). Used by `mach kb reflect`'s
+/// curation pass to pin a DEMOTEd row's importance down to
+/// `reflect::CURATION_DEMOTE_IMPORTANCE`; unlike `forget`, never deletes —
+/// organic decay (dormancy) finishes the job later.
+pub fn set_importance(conn: &Connection, id: i64, importance: i64) -> Result<bool, KbError> {
+    let n = conn.execute("UPDATE memories SET importance = ?1 WHERE id = ?2", params![importance, id])?;
     Ok(n > 0)
 }
 
@@ -908,20 +960,22 @@ pub fn wake(conn: &Connection, id: i64, now: &str) -> Result<bool, KbError> {
 pub const DORMANCY_MIN_AGE_DAYS: f64 = 90.0;
 pub const DORMANCY_MIN_UNTOUCHED_STALE_DAYS: f64 = 60.0;
 pub const DORMANCY_MAX_IMPORTANCE: i64 = 5;
-pub const DORMANCY_UNREVIEWED_MAX_AGE_DAYS: f64 = 30.0;
 
 /// Whether an active memory qualifies to go dormant on tonight's `mach kb
-/// reflect` pass. Two independent rules, either one sufficient:
+/// reflect` pass. ALL of: created more than `DORMANCY_MIN_AGE_DAYS` ago;
+/// never touched (`access_count == 0`) or not touched in over
+/// `DORMANCY_MIN_UNTOUCHED_STALE_DAYS` days; `importance <=
+/// DORMANCY_MAX_IMPORTANCE`; and not cited by any active insight or theme
+/// (`cited`, computed by the caller against `cited_memory_ids`).
 ///
-/// 1. It is an unreviewed row (`reviewed = false`) older than
-///    `DORMANCY_UNREVIEWED_MAX_AGE_DAYS` — the never-curated digest queue
-///    goes dormant regardless of anything else (touch count, importance,
-///    citations); and
-/// 2. ALL of: created more than `DORMANCY_MIN_AGE_DAYS` ago; never touched
-///    (`access_count == 0`) or not touched in over
-///    `DORMANCY_MIN_UNTOUCHED_STALE_DAYS` days; `importance <=
-///    DORMANCY_MAX_IMPORTANCE`; and not cited by any active insight or
-///    theme (`cited`, computed by the caller against `cited_memory_ids`).
+/// Reviewed and unreviewed rows follow this exact same criteria — memory is
+/// organic, so an auto-captured row earns its way to dormancy (or doesn't)
+/// on the same age/engagement/importance/citation terms as anything else,
+/// never on an absolute "never curated" clock. (An earlier version of this
+/// rule forced any unreviewed row past 30 days into dormancy regardless of
+/// everything else; that absolute rule is gone — `mach kb reflect`'s
+/// curation pass now judges the unreviewed queue on its merits instead, the
+/// same way this function judges everyone else.)
 ///
 /// A tombstoned or already-dormant row never qualifies (the caller's own
 /// candidate pool — `active_memories_for_dormancy` — already excludes both,
@@ -933,10 +987,6 @@ pub fn memory_qualifies_for_dormancy(m: &Memory, cited: bool, now: &str) -> bool
     let now_secs = parse_rfc3339(now).unwrap_or(0);
     let created_secs = parse_rfc3339(&m.created_at).unwrap_or(now_secs);
     let age_days = days_between(now_secs, created_secs);
-
-    if !m.reviewed && age_days > DORMANCY_UNREVIEWED_MAX_AGE_DAYS {
-        return true;
-    }
 
     if age_days <= DORMANCY_MIN_AGE_DAYS {
         return false;
@@ -1027,10 +1077,29 @@ pub struct RankedHit {
     pub superseded: bool,
 }
 
-/// Ranked top-N search: `final = 0.70*sim + 0.20*recency + 0.10*strength`.
-/// Tombstoned rows are excluded unless `include_superseded`, in which case
-/// they're included but scored at 10% of the blend (still marked
-/// `superseded` in the result so callers can label them).
+/// Confidence penalty applied to an unreviewed (`reviewed = 0`) row's score
+/// in both search paths below. Memory is organic: an auto-captured fact
+/// that nobody has looked at yet is still real evidence and belongs in
+/// recall by default, not gated behind `mach kb review` — but it earns
+/// slightly less confidence than something a human (or a deliberate `mach
+/// kb add`) has actually vouched for. `mach kb reflect`'s curation pass is
+/// what removes this penalty over time (by setting `reviewed = 1`); `mach
+/// kb review` remains available as an optional, immediate human override of
+/// the same thing.
+pub const UNREVIEWED_SEARCH_PENALTY: f32 = 0.85;
+
+/// Ranked top-N search: `final = 0.70*sim + 0.20*recency + 0.10*strength`,
+/// then `× UNREVIEWED_SEARCH_PENALTY` for any unreviewed row. Tombstoned
+/// rows are excluded unless `include_superseded`, in which case they're
+/// included but scored at 10% of the blend (still marked `superseded` in
+/// the result so callers can label them); the two discounts stack (a
+/// superseded *and* unreviewed row is rarer still, and scored accordingly).
+///
+/// Unreviewed rows are included by default (`reviewed_only = false`) — the
+/// organic default: auto-captured, un-curated facts still surface in
+/// recall, just with the above confidence penalty. Pass `reviewed_only =
+/// true` (`mach kb search --reviewed-only`) for the old exclusive
+/// behavior.
 ///
 /// Applies `limit` first, then `min_score` — "post-limit, post-threshold"
 /// — so `--touch` (which reinforces exactly the rows this function
@@ -1041,13 +1110,13 @@ pub fn search_ranked(
     conn: &Connection,
     query_embedding: &[f32],
     limit: usize,
-    include_all: bool,
+    reviewed_only: bool,
     include_superseded: bool,
     min_score: f32,
     now: &str,
 ) -> Result<Vec<RankedHit>, KbError> {
     let now_secs = parse_rfc3339(now).unwrap_or(0);
-    let mut scored: Vec<RankedHit> = candidates(conn, include_all, include_superseded)?
+    let mut scored: Vec<RankedHit> = candidates(conn, !reviewed_only, include_superseded)?
         .into_iter()
         .filter_map(|m| {
             let sim = match &m.embedding {
@@ -1060,6 +1129,9 @@ pub fn search_ranked(
             let mut score = 0.70 * sim + 0.20 * recency + 0.10 * strength;
             if superseded {
                 score *= 0.1;
+            }
+            if !m.reviewed {
+                score *= UNREVIEWED_SEARCH_PENALTY;
             }
             Some(RankedHit { memory: m, score, sim, recency, strength, superseded })
         })
@@ -1074,22 +1146,28 @@ pub fn search_ranked(
 
 /// Fallback search when embedding the query failed (e.g. ollama is down):
 /// a plain case-insensitive substring match over content, newest first.
-/// Every non-superseded hit gets score 1.0 (not a meaningful ranking);
-/// a superseded hit included via `include_superseded` gets 0.1, mirroring
-/// `search_ranked`'s treatment.
+/// Every non-superseded, reviewed hit gets score 1.0 (not a meaningful
+/// ranking); a superseded hit included via `include_superseded` gets 0.1,
+/// and an unreviewed hit gets `× UNREVIEWED_SEARCH_PENALTY` (the two
+/// discounts stack), mirroring `search_ranked`'s treatment. `reviewed_only`
+/// has the same organic-default meaning as `search_ranked`'s: `false`
+/// (default) includes unreviewed rows, `true` excludes them.
 pub fn search_substring(
     conn: &Connection,
     query: &str,
     limit: usize,
-    include_all: bool,
+    reviewed_only: bool,
     include_superseded: bool,
 ) -> Result<Vec<(Memory, f32)>, KbError> {
     let needle = query.to_lowercase();
-    let mut hits: Vec<(Memory, f32)> = candidates(conn, include_all, include_superseded)?
+    let mut hits: Vec<(Memory, f32)> = candidates(conn, !reviewed_only, include_superseded)?
         .into_iter()
         .filter(|m| m.content.to_lowercase().contains(&needle))
         .map(|m| {
-            let score = if m.is_superseded() { 0.1 } else { 1.0 };
+            let mut score = if m.is_superseded() { 0.1 } else { 1.0 };
+            if !m.reviewed {
+                score *= UNREVIEWED_SEARCH_PENALTY;
+            }
             (m, score)
         })
         .collect();
@@ -2172,6 +2250,71 @@ mod tests {
     }
 
     #[test]
+    fn set_importance_updates_the_row_and_is_a_noop_on_a_missing_one() {
+        let conn = mem_conn();
+        let id = insert5(&conn, "will be demoted", None);
+        assert!(set_importance(&conn, id, 2).unwrap());
+        assert_eq!(get(&conn, id).unwrap().unwrap().importance, 2);
+        assert!(!set_importance(&conn, 999, 2).unwrap());
+    }
+
+    #[test]
+    fn age_days_computes_whole_fractional_days_and_floors_at_zero_on_clock_skew() {
+        let now = now_rfc3339();
+        assert_eq!(age_days(&now, &now), 0.0);
+        let five_days_ago = now_rfc3339_from_secs(now_secs() - 5 * 86400);
+        assert!((age_days(&five_days_ago, &now) - 5.0).abs() < 0.01);
+        let future = now_rfc3339_from_secs(now_secs() + 86400);
+        assert_eq!(age_days(&future, &now), 0.0, "created_at after now must floor at 0, not go negative");
+    }
+
+    #[test]
+    fn curation_candidates_only_active_unreviewed_rows_past_the_settling_period() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let old_ts = now_rfc3339_from_secs(now_secs() - 10 * 86400);
+
+        let old_unreviewed = insert(&conn, "old unreviewed", None, None, false, None, 5).unwrap();
+        conn.execute("UPDATE memories SET created_at = ?1 WHERE id = ?2", params![old_ts, old_unreviewed]).unwrap();
+
+        let young_unreviewed = insert(&conn, "young unreviewed", None, None, false, None, 5).unwrap();
+
+        let old_reviewed = insert(&conn, "old reviewed", None, None, true, None, 5).unwrap();
+        conn.execute("UPDATE memories SET created_at = ?1 WHERE id = ?2", params![old_ts, old_reviewed]).unwrap();
+
+        let old_dormant = insert(&conn, "old dormant unreviewed", None, None, false, None, 5).unwrap();
+        conn.execute("UPDATE memories SET created_at = ?1 WHERE id = ?2", params![old_ts, old_dormant]).unwrap();
+        set_dormant(&conn, old_dormant, &now).unwrap();
+
+        let candidates = curation_candidates(&conn, &now, 3.0, 12).unwrap();
+        let ids: std::collections::HashSet<i64> = candidates.iter().map(|m| m.id).collect();
+        assert!(ids.contains(&old_unreviewed));
+        assert!(!ids.contains(&young_unreviewed), "must respect the settling period");
+        assert!(!ids.contains(&old_reviewed), "reviewed rows are never curation candidates");
+        assert!(!ids.contains(&old_dormant), "dormant rows are excluded");
+    }
+
+    #[test]
+    fn curation_candidates_oldest_first_and_capped() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let mut ids = Vec::new();
+        for i in 0..5u64 {
+            let content = format!("candidate {}", i);
+            let id = insert(&conn, &content, None, None, false, None, 5).unwrap();
+            let ts = now_rfc3339_from_secs(now_secs() - (10 + i) * 86400);
+            conn.execute("UPDATE memories SET created_at = ?1 WHERE id = ?2", params![ts, id]).unwrap();
+            ids.push(id);
+        }
+        // ids[4] was backdated 14 days, ids[0] only 10 -- oldest-first means
+        // ids[4] then ids[3].
+        let capped = curation_candidates(&conn, &now, 3.0, 2).unwrap();
+        assert_eq!(capped.len(), 2, "cap must be respected");
+        assert_eq!(capped[0].id, ids[4], "oldest first");
+        assert_eq!(capped[1].id, ids[3]);
+    }
+
+    #[test]
     fn update_content_with_new_embedding() {
         let conn = mem_conn();
         let id = insert(&conn, "old", None, None, true, Some(&fake_embed("old")), 5).unwrap();
@@ -2268,7 +2411,7 @@ mod tests {
     }
 
     #[test]
-    fn ranking_excludes_unreviewed_by_default_but_all_includes_them() {
+    fn ranking_includes_unreviewed_by_default_with_penalty_but_reviewed_only_excludes_them() {
         let conn = mem_conn();
         let emb = fake_embed("shared topic");
         insert5(&conn, "reviewed memory shared topic", Some(&emb));
@@ -2276,11 +2419,21 @@ mod tests {
 
         let now = now_rfc3339();
         let default_results = search_ranked(&conn, &emb, 10, false, false, 0.0, &now).unwrap();
-        assert_eq!(default_results.len(), 1);
-        assert_eq!(default_results[0].memory.content, "reviewed memory shared topic");
+        assert_eq!(default_results.len(), 2, "default search must be organic — unreviewed rows surface too");
+        assert_eq!(default_results[0].memory.content, "reviewed memory shared topic", "same sim/recency/strength, so the unpenalized reviewed row wins");
+        assert_eq!(default_results[1].memory.content, "unreviewed memory shared topic");
+        let expected_penalized = default_results[0].score * UNREVIEWED_SEARCH_PENALTY;
+        assert!(
+            (default_results[1].score - expected_penalized).abs() < 1e-4,
+            "unreviewed score {} must equal reviewed score {} x {}",
+            default_results[1].score,
+            default_results[0].score,
+            UNREVIEWED_SEARCH_PENALTY
+        );
 
-        let all_results = search_ranked(&conn, &emb, 10, true, false, 0.0, &now).unwrap();
-        assert_eq!(all_results.len(), 2);
+        let reviewed_only_results = search_ranked(&conn, &emb, 10, true, false, 0.0, &now).unwrap();
+        assert_eq!(reviewed_only_results.len(), 1, "--reviewed-only must still exclude unreviewed rows");
+        assert_eq!(reviewed_only_results[0].memory.content, "reviewed memory shared topic");
     }
 
     #[test]
@@ -3584,28 +3737,34 @@ mod tests {
     }
 
     #[test]
-    fn dormancy_unreviewed_row_older_than_30_days_qualifies_regardless_of_everything_else() {
-        // 35 days old (well under the 90-day floor), touched recently,
-        // importance 10, cited — every ordinary criterion says "no" — but
-        // it's unreviewed, so the absolute rule overrides all of them.
+    fn dormancy_unreviewed_row_young_and_engaged_does_not_qualify_merely_for_being_unreviewed() {
+        // Only 35 days old (well under the 90-day floor), touched recently,
+        // importance 10, cited — every ordinary criterion says "no", and
+        // there is no longer an absolute unreviewed-age rule to override
+        // them: an unreviewed row gets no special treatment here at all.
         let m = dormancy_fixture(35.0, 5, Some(1.0), 10, false);
-        assert!(memory_qualifies_for_dormancy(&m, true, &now_rfc3339()), "unreviewed + >30 days must always qualify");
+        assert!(!memory_qualifies_for_dormancy(&m, true, &now_rfc3339()), "unreviewed alone must never force dormancy");
     }
 
     #[test]
-    fn dormancy_unreviewed_row_at_or_under_30_days_does_not_qualify_via_the_absolute_rule() {
-        let m = dormancy_fixture(30.0, 0, None, 10, false);
-        // Fails the absolute rule (not yet strictly over 30 days) AND the
-        // ordinary rule (well under the 90-day floor, importance too high).
-        assert!(!memory_qualifies_for_dormancy(&m, false, &now_rfc3339()));
+    fn dormancy_unreviewed_row_meeting_the_ordinary_criteria_qualifies_same_as_a_reviewed_one() {
+        // Old, never touched, low importance, uncited — the ordinary rule's
+        // full set — reviewed status must be irrelevant to the outcome.
+        let unreviewed = dormancy_fixture(100.0, 0, None, 5, false);
+        let reviewed = dormancy_fixture(100.0, 0, None, 5, true);
+        let now = now_rfc3339();
+        assert!(memory_qualifies_for_dormancy(&unreviewed, false, &now), "unreviewed must qualify on the same ordinary terms as reviewed");
+        assert!(memory_qualifies_for_dormancy(&reviewed, false, &now));
     }
 
     #[test]
-    fn dormancy_reviewed_old_low_importance_uncited_row_under_30_days_old_still_needs_the_90_day_floor() {
-        // Reviewed, so the unreviewed absolute rule never applies; must
-        // fall through to the ordinary >=90-day check and fail it.
-        let m = dormancy_fixture(20.0, 0, None, 3, true);
-        assert!(!memory_qualifies_for_dormancy(&m, false, &now_rfc3339()));
+    fn dormancy_old_low_importance_uncited_row_under_90_days_old_still_needs_the_90_day_floor() {
+        // Reviewed or not, must fall through to the ordinary >=90-day check
+        // and fail it — no shortcut for either.
+        let reviewed = dormancy_fixture(20.0, 0, None, 3, true);
+        let unreviewed = dormancy_fixture(20.0, 0, None, 3, false);
+        assert!(!memory_qualifies_for_dormancy(&reviewed, false, &now_rfc3339()));
+        assert!(!memory_qualifies_for_dormancy(&unreviewed, false, &now_rfc3339()));
     }
 
     #[test]
@@ -3685,8 +3844,11 @@ mod tests {
         set_dormant(&conn, sleeping_id, &now_rfc3339()).unwrap();
 
         let now = now_rfc3339();
-        let ranked = search_ranked(&conn, &emb, 10, true, false, 0.0, &now).unwrap();
-        assert!(ranked.iter().all(|h| h.memory.id != sleeping_id), "search_ranked must exclude dormant rows even with --all");
+        // reviewed_only = false — organic default, unreviewed rows included
+        // too — proves dormant exclusion holds even then, not just under
+        // the stricter --reviewed-only path.
+        let ranked = search_ranked(&conn, &emb, 10, false, false, 0.0, &now).unwrap();
+        assert!(ranked.iter().all(|h| h.memory.id != sleeping_id), "search_ranked must exclude dormant rows even when unreviewed rows are included");
         assert!(ranked.iter().any(|h| h.memory.id == awake_id));
 
         let top = top_similar_active(&conn, &emb, 10).unwrap();

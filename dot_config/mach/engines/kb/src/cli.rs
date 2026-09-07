@@ -31,19 +31,24 @@ fn print_help() {
     println!("                          embed + store a memory (content \"-\" reads stdin);");
     println!("                          N is 1-10, default 5. A close (>0.75 sim) existing");
     println!("                          memory triggers a classifier verdict unless --no-classify.");
-    println!("  search \"<query>\" [--limit N] [--json] [--all] [--touch]");
+    println!("  search \"<query>\" [--limit N] [--json] [--reviewed-only] [--touch]");
     println!("      [--include-superseded] [--min-score F]");
     println!("                          ranked top-N search (sim/recency/strength blend);");
+    println!("                          unreviewed rows are included by default at a small");
+    println!("                          confidence penalty — --reviewed-only excludes them;");
     println!("                          --touch reinforces the rows actually returned");
     println!("  supersede <old_id> <new_id>");
     println!("                          tombstone <old_id> in favor of <new_id>");
-    println!("  review                  interactive review of unreviewed candidates");
+    println!("  review                  interactive review of unreviewed candidates — optional");
+    println!("                          human override; `mach kb reflect`'s curation pass");
+    println!("                          already promotes/demotes this queue on its own");
     println!("  list [--limit N] [--superseded] [--dormant]");
     println!("                          most recent memories (--superseded/--dormant: audit views)");
     println!("  forget <id>             permanently delete a memory");
     println!("  wake <id>               clear a memory's dormant status (mach kb list --dormant)");
     println!("  reflect [--meta]        examine new memories, derive/reinforce durable");
-    println!("                          insights, re-verify a sample of existing ones, put");
+    println!("                          insights, re-verify a sample of existing ones, curate");
+    println!("                          the unreviewed queue (promote/leave/demote), put");
     println!("                          stale low-importance memories to sleep (consolidating");
     println!("                          related ones), and (when triggered, or forced via");
     println!("                          --meta) find themes across insights");
@@ -284,7 +289,7 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut query: Option<String> = None;
     let mut limit: usize = 10;
     let mut json = false;
-    let mut all = false;
+    let mut reviewed_only = false;
     let mut include_superseded = false;
     let mut touch = false;
     let mut min_score: f32 = 0.0;
@@ -293,13 +298,13 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         match a.as_str() {
             "--limit" => limit = args.next().and_then(|v| v.parse().ok()).unwrap_or(10),
             "--json" => json = true,
-            "--all" => all = true,
+            "--reviewed-only" => reviewed_only = true,
             "--include-superseded" => include_superseded = true,
             "--touch" => touch = true,
             "--min-score" => min_score = args.next().and_then(|v| v.parse().ok()).unwrap_or(0.0),
             "-h" | "--help" => {
                 println!(
-                    "usage: mach kb search \"<query>\" [--limit N] [--json] [--all] [--touch] \
+                    "usage: mach kb search \"<query>\" [--limit N] [--json] [--reviewed-only] [--touch] \
                      [--include-superseded] [--min-score F]"
                 );
                 return Ok(());
@@ -333,7 +338,7 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut hits: Vec<SearchHit> = match embedder.embed(&query) {
         Ok(q_emb) => {
             let mem_hits =
-                store::search_ranked(&conn, &q_emb, limit, all, include_superseded, 0.0, &now).map_err(to_io)?;
+                store::search_ranked(&conn, &q_emb, limit, reviewed_only, include_superseded, 0.0, &now).map_err(to_io)?;
             if touch {
                 let ids: Vec<i64> = mem_hits.iter().map(|h| h.memory.id).collect();
                 store::touch(&conn, &ids, &now).map_err(to_io)?;
@@ -354,7 +359,7 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
             // score 1.0 (not a meaningful ranking to begin with), and
             // insights have no independent text-substring path worth adding
             // for what's already a degraded mode.
-            let subs = store::search_substring(&conn, &query, limit, all, include_superseded).map_err(to_io)?;
+            let subs = store::search_substring(&conn, &query, limit, reviewed_only, include_superseded).map_err(to_io)?;
             let ids: Vec<i64> = subs.iter().map(|(m, _)| m.id).collect();
             if touch {
                 store::touch(&conn, &ids, &now).map_err(to_io)?;
@@ -988,6 +993,22 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let (contradictions, contradiction_llm_failed) = run_contradiction_pass(&conn, &llm, &new_ids, &now).map_err(to_io)?;
     llm_failed = llm_failed || contradiction_llm_failed;
 
+    // Step 4.57: curation — the organic promotion path for the unreviewed
+    // queue (`mach kb add --unreviewed`/digests): judges ACTIVE unreviewed
+    // rows past their 3-day settling period (reflect::CURATION_MIN_AGE_DAYS),
+    // oldest-first, capped at reflect::CURATION_MAX_PER_RUN. `mach kb review`
+    // remains an optional, immediate human override over the same rows —
+    // this pass is what makes it optional rather than a required gate. Runs
+    // every invocation regardless of has_new (like dormancy, below — it's a
+    // sweep over the whole unreviewed queue, not gated on new material).
+    // Deliberately before dormancy: not because same-run burial is otherwise
+    // possible (a row just DEMOTEd here is at most a few days old, and
+    // dormancy's own floor is store::DORMANCY_MIN_AGE_DAYS = 90 days, so it
+    // can never qualify in the same run regardless of ordering) but to keep
+    // this pass grouped with the other judge-driven sweeps above it.
+    let (curated, promoted, demoted, curation_llm_failed) = run_curation_pass(&conn, &llm, &now).map_err(to_io)?;
+    llm_failed = llm_failed || curation_llm_failed;
+
     // Step 4.6: strength review — extends re-verification (step 4, above)
     // from insights to raw memories themselves: samples up to
     // REFLECT_STRENGTH_SAMPLE oldest-verified ACTIVE memories at importance
@@ -999,10 +1020,13 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         run_strength_review_pass(&conn, &llm, &now).map_err(to_io)?;
     llm_failed = llm_failed || strength_llm_failed;
 
-    // Step 4.65: dormancy — put stale, low-importance, uncited memories (and
-    // any never-curated digest row past its own 30-day floor) to sleep,
-    // then consolidate this run's freshly-dormant rows into new durable
-    // facts where a cluster of them shares something worth keeping. Runs
+    // Step 4.65: dormancy — put stale, low-importance, uncited memories to
+    // sleep (reviewed and unreviewed alike, on the exact same criteria —
+    // see store::memory_qualifies_for_dormancy's own doc comment; there is
+    // no separate absolute clock for an unreviewed row anymore, the
+    // curation pass above is what handles that queue now), then consolidate
+    // this run's freshly-dormant rows into new durable facts where a
+    // cluster of them shares something worth keeping. Runs
     // every invocation regardless of has_new/force_meta — it's a nightly
     // sweep over the whole active store, not gated on new material. Runs
     // last among these sweeps so a memory the contradiction patrol just
@@ -1042,8 +1066,8 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
 
     println!(
         "mach kb reflect: examined={} questions={} insights_added={} reinforced={} \
-         themes_added={} flagged={} verified={} dormant={} consolidated={} deduped={} \
-         contradictions={} mem_verified={} mem_stale={} mem_routed={}{}",
+         themes_added={} flagged={} verified={} curated={} promoted={} demoted={} dormant={} \
+         consolidated={} deduped={} contradictions={} mem_verified={} mem_stale={} mem_routed={}{}",
         examined,
         questions_count,
         insights_added,
@@ -1051,6 +1075,9 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         themes_added,
         flagged,
         verified,
+        curated,
+        promoted,
+        demoted,
         dormant,
         consolidated,
         deduped,
@@ -1439,6 +1466,93 @@ fn apply_contradiction_verdict(
         }
         reflect::ContradictionVerdict::Unclear => Ok(false),
     }
+}
+
+/// The curation pass (runs inside `mach kb reflect`, right after the
+/// contradiction patrol): judges the unreviewed queue itself so `mach kb
+/// review` becomes optional curation rather than a required gate — see
+/// `reflect`'s own "curation pass" section doc comment for the full
+/// rationale. Candidates: `store::curation_candidates` (ACTIVE unreviewed
+/// rows past `reflect::CURATION_MIN_AGE_DAYS`, oldest-first, capped at
+/// `reflect::CURATION_MAX_PER_RUN`).
+///
+/// A row touched at least `reflect::CURATION_ENGAGEMENT_FAST_PATH` times
+/// auto-promotes with no LLM call. Otherwise one haiku call per row, built
+/// from the row's content/source/age/engagement plus its top-3 semantic
+/// neighbors (via `store::top_similar_active`, self excluded) for a
+/// coherence check:
+///
+/// - `Promote` sets `reviewed = 1` (`store::set_reviewed`) — this IS the
+///   review; the search penalty for an unreviewed row goes away.
+/// - `Leave` records nothing at all — the row simply re-enters the pool on
+///   a later run once more evidence has accumulated. Never marked "seen":
+///   unlike a dedupe/contradiction pair, there is no paired judge here to
+///   avoid re-asking.
+/// - `Demote` pins `importance` to `reflect::CURATION_DEMOTE_IMPORTANCE`
+///   (`store::set_importance`) and halves `stability`
+///   (`store::halve_stability`) — never deletes; ordinary dormancy criteria
+///   (`store::DORMANCY_MIN_AGE_DAYS` = 90 days) finish the job later, so a
+///   row demoted this run can never be swept as dormant in this same run
+///   regardless of pass ordering.
+/// - A failed judge call is treated exactly like `Leave` (nothing
+///   recorded) but does set the caller's `llm_failed` flag so the
+///   watermark doesn't advance on a degraded run.
+///
+/// Returns `(examined, promoted, demoted, any_judge_call_failed)`. Generic
+/// over `ReflectLlm`, same as `run_dedupe_pass`/`run_contradiction_pass`,
+/// so it's exercised in tests against a fake that can fail on demand.
+fn run_curation_pass<L: ReflectLlm>(conn: &Connection, llm: &L, now: &str) -> Result<(usize, usize, usize, bool), KbError> {
+    let candidates =
+        store::curation_candidates(conn, now, reflect::CURATION_MIN_AGE_DAYS, reflect::CURATION_MAX_PER_RUN)?;
+    let examined = candidates.len();
+    let mut promoted = 0usize;
+    let mut demoted = 0usize;
+    let mut llm_failed = false;
+
+    for m in candidates {
+        if m.access_count >= reflect::CURATION_ENGAGEMENT_FAST_PATH {
+            store::set_reviewed(conn, m.id, true)?;
+            promoted += 1;
+            continue;
+        }
+
+        let neighbors: Vec<(i64, String)> = match &m.embedding {
+            Some(emb) => store::top_similar_active(conn, emb, 4)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(nm, _)| nm.id != m.id)
+                .take(3)
+                .map(|(nm, _)| (nm.id, nm.content))
+                .collect(),
+            None => Vec::new(),
+        };
+        let age = store::age_days(&m.created_at, now);
+        let prompt = reflect::build_curation_prompt(&m.content, m.source.as_deref(), age, m.access_count, &neighbors);
+
+        let raw = match llm.call("haiku", &prompt, TIMEOUT_HAIKU) {
+            Ok(out) => out,
+            Err(_) => {
+                // The judge call itself failed — Leave semantics (nothing
+                // recorded, retried next run) but the caller must still
+                // freeze the watermark.
+                llm_failed = true;
+                continue;
+            }
+        };
+        match reflect::parse_curation_verdict(&raw) {
+            reflect::CurationVerdict::Promote => {
+                store::set_reviewed(conn, m.id, true)?;
+                promoted += 1;
+            }
+            reflect::CurationVerdict::Demote => {
+                store::set_importance(conn, m.id, reflect::CURATION_DEMOTE_IMPORTANCE)?;
+                store::halve_stability(conn, m.id)?;
+                demoted += 1;
+            }
+            reflect::CurationVerdict::Leave => {}
+        }
+    }
+    Ok((examined, promoted, demoted, llm_failed))
 }
 
 /// The strength-review sampler (runs inside `mach kb reflect`, right after
@@ -2184,6 +2298,7 @@ mod tests {
 
     // --- run_dedupe_pass: offline safety + apply mechanics ---
 
+    use rusqlite::params;
     use std::path::Path;
 
     fn mem_conn() -> Connection {
@@ -2466,6 +2581,134 @@ mod tests {
 
         let ins = store::get_insight(&conn, insight_id).unwrap().unwrap();
         assert!(ins.is_flagged(), "an insight citing the now-tombstoned retrospective note must be flagged");
+    }
+
+    // --- run_curation_pass: candidate selection, apply mechanics, offline safety ---
+
+    /// Inserts an unreviewed row and backdates it past the curation pass's
+    /// settling period so it actually shows up as a candidate.
+    fn insert_settled_unreviewed(conn: &Connection, content: &str, importance: i64) -> i64 {
+        let id = store::insert(conn, content, Some("session-digest"), None, false, None, importance).unwrap();
+        let old_ts = store::now_rfc3339_from_secs(store::now_secs() - 10 * 86400);
+        conn.execute("UPDATE memories SET created_at = ?1 WHERE id = ?2", params![old_ts, id]).unwrap();
+        id
+    }
+
+    #[test]
+    fn run_curation_pass_ignores_a_row_still_inside_its_settling_period() {
+        let conn = mem_conn();
+        // Not backdated -- created "now", well inside the 3-day floor.
+        let id = store::insert(&conn, "too fresh to judge", None, None, false, None, 5).unwrap();
+        let llm = FixedReflectLlm { reply: Ok("PROMOTE") };
+        let (examined, promoted, demoted, failed) = run_curation_pass(&conn, &llm, &store::now_rfc3339()).unwrap();
+        assert_eq!((examined, promoted, demoted), (0, 0, 0));
+        assert!(!failed);
+        assert!(!store::get(&conn, id).unwrap().unwrap().reviewed);
+    }
+
+    #[test]
+    fn run_curation_pass_engagement_fast_path_promotes_without_any_llm_call() {
+        let conn = mem_conn();
+        let id = insert_settled_unreviewed(&conn, "used twice already", 5);
+        let now = store::now_rfc3339();
+        store::touch(&conn, &[id], &now).unwrap();
+        store::touch(&conn, &[id], &now).unwrap();
+        assert_eq!(store::get(&conn, id).unwrap().unwrap().access_count, 2);
+
+        // A call here would itself be a test failure via llm_failed, since
+        // the fast path must never invoke the judge at all.
+        let llm = FixedReflectLlm { reply: Err("must never be called") };
+        let (examined, promoted, demoted, failed) = run_curation_pass(&conn, &llm, &now).unwrap();
+        assert_eq!((examined, promoted, demoted), (1, 1, 0));
+        assert!(!failed, "the engagement fast path must never touch the LLM");
+        assert!(store::get(&conn, id).unwrap().unwrap().reviewed);
+    }
+
+    #[test]
+    fn run_curation_pass_promote_verdict_sets_reviewed() {
+        let conn = mem_conn();
+        let id = insert_settled_unreviewed(&conn, "durable fact", 5);
+        let llm = FixedReflectLlm { reply: Ok("PROMOTE") };
+        let (examined, promoted, demoted, failed) = run_curation_pass(&conn, &llm, &store::now_rfc3339()).unwrap();
+        assert_eq!((examined, promoted, demoted), (1, 1, 0));
+        assert!(!failed);
+        assert!(store::get(&conn, id).unwrap().unwrap().reviewed);
+    }
+
+    #[test]
+    fn run_curation_pass_demote_verdict_pins_importance_and_halves_stability_never_deletes() {
+        let conn = mem_conn();
+        let id = insert_settled_unreviewed(&conn, "transient noise", 5); // stability starts at 5*7=35.0
+        let llm = FixedReflectLlm { reply: Ok("DEMOTE") };
+        let (examined, promoted, demoted, failed) = run_curation_pass(&conn, &llm, &store::now_rfc3339()).unwrap();
+        assert_eq!((examined, promoted, demoted), (1, 0, 1));
+        assert!(!failed);
+        let m = store::get(&conn, id).unwrap().unwrap();
+        assert_eq!(m.importance, reflect::CURATION_DEMOTE_IMPORTANCE);
+        assert_eq!(m.stability, Some(17.5), "stability must be halved, not reset");
+        assert!(!m.reviewed, "a DEMOTE must never itself count as review");
+    }
+
+    #[test]
+    fn run_curation_pass_leave_verdict_and_failed_call_both_change_nothing_and_are_not_recorded() {
+        let conn = mem_conn();
+        let leave_id = insert_settled_unreviewed(&conn, "can't tell yet", 5);
+        let fail_id = insert_settled_unreviewed(&conn, "offline this run", 5);
+
+        let leave_llm = FixedReflectLlm { reply: Ok("LEAVE") };
+        let (examined, promoted, demoted, failed) =
+            run_curation_pass(&conn, &leave_llm, &store::now_rfc3339()).unwrap();
+        assert_eq!((examined, promoted, demoted), (2, 0, 0));
+        assert!(!failed, "a genuine LEAVE reply is not itself a failure");
+
+        let m = store::get(&conn, leave_id).unwrap().unwrap();
+        assert!(!m.reviewed && m.importance == 5, "LEAVE must change nothing");
+        let _ = fail_id;
+
+        let fail_llm = FixedReflectLlm { reply: Err("offline") };
+        let (examined2, promoted2, demoted2, failed2) =
+            run_curation_pass(&conn, &fail_llm, &store::now_rfc3339()).unwrap();
+        assert_eq!((examined2, promoted2, demoted2), (2, 0, 0));
+        assert!(failed2, "a failed judge call must freeze the watermark");
+
+        // Both rows must still be candidates on a later run -- nothing was
+        // recorded as "seen" for either the LEAVE or the failed call.
+        let still_pending = store::curation_candidates(&conn, &store::now_rfc3339(), reflect::CURATION_MIN_AGE_DAYS, 12).unwrap();
+        let ids: std::collections::HashSet<i64> = still_pending.iter().map(|m| m.id).collect();
+        assert!(ids.contains(&leave_id));
+        assert!(ids.contains(&fail_id));
+    }
+
+    #[test]
+    fn run_curation_pass_respects_the_per_run_cap() {
+        let conn = mem_conn();
+        for i in 0..(reflect::CURATION_MAX_PER_RUN + 3) {
+            insert_settled_unreviewed(&conn, &format!("candidate {}", i), 5);
+        }
+        let llm = FixedReflectLlm { reply: Ok("LEAVE") };
+        let (examined, _promoted, _demoted, _failed) = run_curation_pass(&conn, &llm, &store::now_rfc3339()).unwrap();
+        assert_eq!(examined, reflect::CURATION_MAX_PER_RUN);
+    }
+
+    #[test]
+    fn a_row_demoted_this_run_can_never_be_swept_dormant_in_the_same_run() {
+        // Direct proof of the pass-ordering invariant: curation's own
+        // settling floor (3 days) is far below dormancy's own age floor
+        // (store::DORMANCY_MIN_AGE_DAYS, 90 days), so a row young enough to
+        // still be a curation candidate can never simultaneously qualify
+        // for dormancy, regardless of which pass runs first this run.
+        let conn = mem_conn();
+        let id = insert_settled_unreviewed(&conn, "freshly demoted", 5);
+        let now = store::now_rfc3339();
+        let llm = FixedReflectLlm { reply: Ok("DEMOTE") };
+        let (_examined, _promoted, demoted, _failed) = run_curation_pass(&conn, &llm, &now).unwrap();
+        assert_eq!(demoted, 1);
+
+        let m = store::get(&conn, id).unwrap().unwrap();
+        assert!(
+            !store::memory_qualifies_for_dormancy(&m, false, &now),
+            "a ~10-day-old row must never qualify for dormancy regardless of its freshly-lowered importance"
+        );
     }
 
     // --- run_strength_review_pass: verdict application ---

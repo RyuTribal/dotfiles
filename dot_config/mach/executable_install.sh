@@ -216,7 +216,7 @@ telegram_config_onboarding() {
   echo "    it must never live under ~/.config where chezmoi can pick it up):"
   echo
   echo "      mkdir -p ~/.local/share/mach"
-  echo "      cp $HERE/mach/telegram.toml.example $cfg"
+  echo "      cp $HERE/telegram.toml.example $cfg"
   echo "      \$EDITOR $cfg"
   echo
   echo " Then start the bridge:  systemctl --user restart mach-telegramd.service"

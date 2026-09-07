@@ -1,6 +1,6 @@
 //! Telegram bridge config: `~/.local/share/mach/telegram.toml`, deliberately
 //! OUTSIDE the chezmoi-managed tree (`~/.config`) because it holds a secret
-//! bot token. `mach/telegram.toml.example` (shipped in the repo) is the
+//! bot token. `telegram.toml.example` (shipped in the repo) is the
 //! placeholder template; `install.sh`'s onboarding block tells the user how
 //! to create the real file at runtime.
 //!

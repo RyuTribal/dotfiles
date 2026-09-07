@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["engines/sweep", "engines/kb", "engines/telegram", "machd", "mach"]
+members = ["engines/sweep", "engines/kb", "engines/telegram", "engines/meet", "machd", "mach"]
 
 [profile.release]
 lto = true

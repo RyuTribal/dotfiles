@@ -1,0 +1,16 @@
+[package]
+name = "meet-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Only used for setsid()/kill() in capture.rs -- detaching a spawned
+# recorder into its own session (survives the launching terminal closing)
+# and signaling it at stop time. No other unsafe/FFI in this crate.
+libc = "0.2"
+
+[lib]
+name = "meet"
+path = "src/lib.rs"

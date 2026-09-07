@@ -16,6 +16,7 @@ fn print_help() {
     println!("  kb [args...]      personal vectorized knowledge bank (mach kb --help)");
     println!("  note [args...]    jot a quick note (mach note --help) — also reachable as");
     println!("                    the `note` command, a symlink to this binary");
+    println!("  meet [args...]    meeting recorder, capture only (mach meet --help)");
 }
 
 /// Busybox-style dispatch: true when this binary was invoked via a symlink
@@ -40,6 +41,7 @@ fn main() -> std::io::Result<()> {
         Some("sweep") => sweep::cli::run(args),
         Some("kb") => kb::cli::run(args),
         Some("note") => kb::note::run(args),
+        Some("meet") => meet::cli::run(args),
         Some("-h") | Some("--help") => {
             print_help();
             Ok(())

@@ -553,6 +553,7 @@ name = "mach"
 version = "0.1.0"
 dependencies = [
  "kb-engine",
+ "meet-engine",
  "sweep-engine",
 ]
 
@@ -562,6 +563,15 @@ version = "0.1.0"
 dependencies = [
  "signal-hook",
  "telegram-engine",
+]
+
+[[package]]
+name = "meet-engine"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

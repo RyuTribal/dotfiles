@@ -422,10 +422,49 @@ fn active_relations_for_recall(conn: &Connection, entity_id: i64) -> Vec<store::
         .collect()
 }
 
-fn entity_connections_for_query(conn: &Connection, q_emb: &[f32]) -> Vec<ConnectionHit> {
-    let entity = match store::find_entity_by_similarity(conn, q_emb, SEARCH_ENTITY_CONNECTION_SIM_THRESHOLD) {
-        Ok(Some((e, _sim))) => e,
-        _ => return Vec::new(),
+/// An entity literally named in the query always matches, regardless of
+/// embedding similarity: whole-sentence embeddings vs a short entity name
+/// are threshold-fragile ("tell me about Moses and what he wants" cleared
+/// 0.75 while "what does moses want in umoja" did not, live). Name match is
+/// case-insensitive on word boundaries; the longest matching name wins
+/// (most specific). Embedding similarity remains the fallback for prompts
+/// that only paraphrase an entity.
+fn entity_named_in_query(conn: &Connection, query: &str) -> Option<store::Entity> {
+    let q = query.to_lowercase();
+    let q_bytes = q.as_bytes();
+    let mut best: Option<store::Entity> = None;
+    for e in store::all_entities(conn).unwrap_or_default() {
+        let name = e.name.to_lowercase();
+        if name.len() < 3 || name == "user" {
+            continue; // too short to be a reliable mention; "user" matches everything
+        }
+        let mut start = 0usize;
+        let mut found = false;
+        while let Some(pos) = q[start..].find(&name) {
+            let abs = start + pos;
+            let end = abs + name.len();
+            let left_ok = abs == 0 || !q_bytes[abs - 1].is_ascii_alphanumeric();
+            let right_ok = end == q.len() || !q_bytes[end].is_ascii_alphanumeric();
+            if left_ok && right_ok {
+                found = true;
+                break;
+            }
+            start = abs + 1;
+        }
+        if found && best.as_ref().map_or(true, |b| name.len() > b.name.len()) {
+            best = Some(e);
+        }
+    }
+    best
+}
+
+fn entity_connections_for_query(conn: &Connection, query: &str, q_emb: &[f32]) -> Vec<ConnectionHit> {
+    let entity = match entity_named_in_query(conn, query) {
+        Some(e) => e,
+        None => match store::find_entity_by_similarity(conn, q_emb, SEARCH_ENTITY_CONNECTION_SIM_THRESHOLD) {
+            Ok(Some((e, _sim))) => e,
+            _ => return Vec::new(),
+        },
     };
     let hop1_edges = active_relations_for_recall(conn, entity.id);
     let mut out: Vec<ConnectionHit> = Vec::new();
@@ -534,7 +573,7 @@ pub fn search_hits<E: Embedder>(
     if min_score > 0.0 {
         combined.retain(|h| h.score >= min_score);
     }
-    let connections = entity_connections_for_query(conn, &q_emb);
+    let connections = entity_connections_for_query(conn, query, &q_emb);
     Ok(SearchResponse { hits: combined, connections })
 }
 
@@ -5199,19 +5238,19 @@ mod tests {
         let edge = store::insert_relation(&conn, moses, "boss-of", user, Some(evidence_mem), Some(0.9), &now).unwrap();
 
         // Still active/live: the connection surfaces.
-        let before = entity_connections_for_query(&conn, &q);
+        let before = entity_connections_for_query(&conn, "unrelated query text", &q);
         assert_eq!(before.len(), 1);
 
         // Evidence naps -- must be excluded from recall connections, but the
         // edge itself must remain untouched (never invalidated).
         store::set_dormant(&conn, evidence_mem, &now).unwrap();
-        let during_nap = entity_connections_for_query(&conn, &q);
+        let during_nap = entity_connections_for_query(&conn, "unrelated query text", &q);
         assert!(during_nap.is_empty(), "a dormant-evidence edge must not surface in recall connections");
         assert!(store::get_relation(&conn, edge).unwrap().unwrap().is_active(), "must never be tombstoned for napping");
 
         // Evidence wakes -- the connection surfaces again, same edge row.
         store::wake(&conn, evidence_mem, &now).unwrap();
-        let after_wake = entity_connections_for_query(&conn, &q);
+        let after_wake = entity_connections_for_query(&conn, "unrelated query text", &q);
         assert_eq!(after_wake.len(), 1);
         assert_eq!(after_wake[0].src_name, "Moses");
     }

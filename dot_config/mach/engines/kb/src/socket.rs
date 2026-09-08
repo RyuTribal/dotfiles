@@ -17,13 +17,19 @@
 //! one request per line in, one JSON response per line out.
 //!
 //!   Request:  {"op":"search","query":"...","limit":4,"min_score":0.45}
-//!   Response: on success, the same JSON array `mach kb search --json`
-//!             prints (see `cli::search_hits`/`cli::SearchHit`); on any
-//!             failure (malformed request, unknown op, missing/empty
-//!             query, an embed or db error), `{"error":"..."}` — the
-//!             response is never a bare connection close or a crash, and a
-//!             caller can always tell the two shapes apart (`Array` vs
-//!             `Object`) without needing an "ok" envelope field.
+//!   Response: on success, the same JSON object `mach kb search --json`
+//!             prints (see `cli::search_hits`/`cli::SearchResponse`) --
+//!             `{"hits":[...], "connections":[...]}`, where `hits` is the
+//!             ranked memory/insight blend (`cli::SearchHit`) and
+//!             `connections` is up to 3 association-graph edges for an
+//!             entity the query itself named closely enough (see
+//!             `cli::entity_connections_for_query`), or `[]` when none
+//!             matched; on any failure (malformed request, unknown op,
+//!             missing/empty query, an embed or db error), `{"error":"..."}`
+//!             instead — the response is never a bare connection close or a
+//!             crash, and a caller can always tell the two shapes apart (a
+//!             `hits` key vs. an `error` key) without needing a separate
+//!             "ok" envelope field.
 //!
 //! Concurrency: a single-threaded accept loop, one request handled at a
 //! time — recall is rare and cheap enough in practice (one hook invocation
@@ -100,8 +106,8 @@ fn run_one_search(
     min_score: f32,
 ) -> Result<Value, KbError> {
     let now = store::now_rfc3339();
-    let hits = search_hits(conn, embedder, query, limit, false, false, min_score, &now)?;
-    Ok(serde_json::to_value(&hits)?)
+    let resp = search_hits(conn, embedder, query, limit, false, false, min_score, &now)?;
+    Ok(serde_json::to_value(&resp)?)
 }
 
 /// Handles the "search" op, with one reopen-and-retry on failure — per the
@@ -336,19 +342,22 @@ mod tests {
         store::insert(&conn, "hello world", Some("note:test"), None, true, Some(&emb), 5).unwrap();
 
         let now = store::now_rfc3339();
-        let hits = search_hits(&conn, &fake, "hello world", 4, false, false, 0.0, &now).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].content, "hello world");
-        assert!(hits[0].score > 0.0);
-        assert!(!hits[0].derived);
+        let resp = search_hits(&conn, &fake, "hello world", 4, false, false, 0.0, &now).unwrap();
+        assert_eq!(resp.hits.len(), 1);
+        assert_eq!(resp.hits[0].content, "hello world");
+        assert!(resp.hits[0].score > 0.0);
+        assert!(!resp.hits[0].derived);
+        assert!(resp.connections.is_empty(), "no entities exist yet, so no connections to surface");
 
         // Same call through the socket's own request handler (real
         // OllamaEmbedder swapped for nothing here -- this exercises
         // run_one_search's plumbing directly against the fake to keep the
-        // test hermetic) produces the identical serialized shape.
-        let serialized = serde_json::to_value(&hits).unwrap();
-        assert!(serialized.is_array());
-        assert_eq!(serialized[0]["content"], json!("hello world"));
+        // test hermetic) produces the identical serialized shape: an object
+        // with "hits" and "connections" keys, not a bare array.
+        let serialized = serde_json::to_value(&resp).unwrap();
+        assert!(serialized.is_object());
+        assert_eq!(serialized["hits"][0]["content"], json!("hello world"));
+        assert_eq!(serialized["connections"], json!([]));
     }
 
     #[test]

@@ -142,6 +142,8 @@ struct MemoryRow {
     dormant_at: Option<String>,
     #[serde(default)]
     last_verified_at: Option<String>,
+    #[serde(default)]
+    graph_extracted_at: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -186,6 +188,7 @@ fn memory_to_row(m: &Memory) -> MemoryRow {
         superseded_by: m.superseded_by,
         dormant_at: m.dormant_at.clone(),
         last_verified_at: m.last_verified_at.clone(),
+        graph_extracted_at: m.graph_extracted_at.clone(),
     }
 }
 
@@ -215,6 +218,7 @@ fn row_to_memory(row: MemoryRow) -> Result<Memory, KbError> {
         superseded_by: row.superseded_by,
         dormant_at: row.dormant_at,
         last_verified_at: row.last_verified_at,
+        graph_extracted_at: row.graph_extracted_at,
     })
 }
 
@@ -570,6 +574,7 @@ mod tests {
             superseded_by: None,
             dormant_at: None,
             last_verified_at: None,
+            graph_extracted_at: None,
         };
         let mut buf: Vec<u8> = Vec::new();
         writeln!(

@@ -13,7 +13,7 @@
 //! `classify::Classifier`. `ProcessReflectLlm` is the real implementation,
 //! reusing `classify::run_claude` (same invocation flags, same
 //! `MACH_KB_DIGEST=1` recursion guard).
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::classify::run_claude;
@@ -1155,6 +1155,483 @@ pub fn build_strength_review_prompt(claim: &str, claim_date: &str, neighbors: &[
     s
 }
 
+
+// --- graph extraction: entities/relations from truth-maintained memories ---
+
+/// Reuse threshold for entity resolution during graph extraction: an
+/// embedding match at or above this cosine similarity to an existing
+/// entity's name embedding reuses that entity rather than minting a
+/// near-duplicate ("Claude" vs "claude" is already caught by the
+/// case-insensitive exact-name index; this is for near-spellings/typos that
+/// exact match misses). Deliberately a high floor -- entity names are
+/// short, so even a fairly high similarity can still be two genuinely
+/// different short names; only a very close match is treated as "the same
+/// thing".
+pub const ENTITY_RESOLUTION_SIM_THRESHOLD: f32 = 0.85;
+
+/// At most this many not-yet-extracted memories are offered to the
+/// graph-extraction judge per `mach kb reflect` run -- same bounded-cost
+/// rationale as `CURATION_MAX_PER_RUN`. A large backlog (this feature's own
+/// one-time backfill over every pre-existing memory, say) simply drains
+/// across several runs in stable (oldest-first) order rather than being
+/// reshuffled.
+pub const GRAPH_EXTRACTION_MAX_PER_RUN: usize = 40;
+
+/// At most this many triples are accepted from one extraction reply, even
+/// if the model returns more -- keeps a single reply gone wrong from
+/// flooding the graph.
+pub const GRAPH_EXTRACTION_MAX_TRIPLES: usize = 4;
+
+/// Default confidence for a triple whose own confidence field the model
+/// left out or wrote unparseably -- not zero (a triple the model bothered
+/// to extract is presumably not its least confident guess) but below a
+/// clean, deliberate 1.0.
+pub const GRAPH_EXTRACTION_DEFAULT_CONFIDENCE: f64 = 0.6;
+
+/// Confidence penalty applied to an edge extracted from a memory that was
+/// still unreviewed at extraction time -- mirrors
+/// `store::UNREVIEWED_SEARCH_PENALTY`'s "organic, not gated" rationale for
+/// raw memories: an edge from an unreviewed fact is still real evidence,
+/// just less vouched-for yet.
+pub const GRAPH_EXTRACTION_UNREVIEWED_PENALTY: f64 = 0.85;
+
+/// One entity/relation triple as extracted from a single memory's content,
+/// before entity resolution.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtractedTriple {
+    pub src_name: String,
+    pub src_kind: Option<String>,
+    pub predicate: String,
+    pub dst_name: String,
+    pub dst_kind: Option<String>,
+    pub confidence: f64,
+}
+
+/// Extraction quality guard, shared by the single-fact and batch prompt
+/// builders -- added after the backfill poisoned the graph twice: a fact
+/// describing the "Moses-to-Ivar boss supersession test" (memory #185, a
+/// fact ABOUT the memory system's own testing, not a real supersession)
+/// produced a hallucinated `Ivar --supersedes-as-boss--> Moses` edge, and a
+/// vague fact about the user's chain of command produced a garbage
+/// `user --has-boss--> boss` edge naming a placeholder role rather than an
+/// actual person. Both invalidated manually (relation ids 352, 372); this
+/// guard is the prompt-level fix so the extraction judge doesn't repeat
+/// either mistake.
+fn extraction_quality_guard() -> &'static str {
+    "Do not extract any relation from a fact that is merely describing a test, hypothetical, \
+     example, or the memory system's own mechanics (e.g. a fact explaining how a supersession or \
+     dedupe test works, narrating an example scenario, or documenting this very knowledge-bank \
+     feature) -- such a fact yields NO relational edges about the people or things it happens to \
+     mention, even if it names them by their real names.\n\n\
+     Never invent a generic-role entity such as \"boss\", \"the user's boss\", or \"the project\" \
+     as SRC_NAME or DST_NAME -- an entity must be an actual named thing (a real person's name, a \
+     project's name, a technology's name, etc.), never a placeholder role or description. The \
+     reserved name \"user\" is the one exception.\n\n"
+}
+
+/// Builds the graph-extraction judge's one-haiku-call prompt for a single
+/// memory: asks for 0-4 entity/relation triples the fact actually states.
+/// Entities are explicitly not just people, and affective/behavioral
+/// predicates are explicitly allowed and wanted (per the user's own framing
+/// of this feature: "User -> angry -> claude way of doing requests" is as
+/// legitimate an edge as "user works-on Umoja"). "user" is reserved for the
+/// user themself, so the model names them consistently rather than
+/// inventing a synonym.
+pub fn build_extraction_prompt(memory_content: &str) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "You extract a durable knowledge graph from a personal knowledge bank. An entity is any \
+         durable, nameable thing -- not just a person: a project, a technology, a game engine, a \
+         practice, a concept, an organization. A relation connects two entities with a short verb \
+         phrase, including affective or behavioral relations (e.g. \"frustrated-by\", \"prefers\", \
+         \"boss-of\", \"works-on\", \"built-with\", \"part-of\") -- these are explicitly allowed and \
+         wanted, not just factual/organizational links.\n\n\
+         The special entity name \"user\" is reserved for the user themself -- use it whenever the \
+         fact is about the user directly, rather than inventing a name.\n\n",
+    );
+    s.push_str(extraction_quality_guard());
+    s.push_str("Fact:\n");
+    s.push_str(memory_content);
+    s.push_str(
+        "\n\nList only relations this fact actually states -- never infer or guess beyond what's \
+         written. Reply with 0 to 4 lines, one relation per line, in exactly this form and no other \
+         text:\n\
+         SRC_NAME | SRC_KIND | PREDICATE | DST_NAME | DST_KIND | CONFIDENCE\n\n\
+         SRC_NAME/DST_NAME -- short canonical names (\"Moses\", \"Umoja\", \"C++\"), never full \
+         sentences.\n\
+         SRC_KIND/DST_KIND -- a short free-text label; person, project, technology, concept, \
+         practice, or organization is a good default vocabulary, but use whatever fits.\n\
+         PREDICATE -- 1 to 3 words, lowercase, hyphenated (e.g. \"boss-of\", \"works-on\", \
+         \"built-with\", \"frustrated-by\", \"prefers\").\n\
+         CONFIDENCE -- your confidence this relation is correctly stated, 0.0 to 1.0.\n\n\
+         If this fact states no relation between two nameable things, reply with exactly: NONE\n",
+    );
+    s
+}
+
+/// Normalizes a predicate to the extraction rule's own shape (lowercase,
+/// hyphenated) regardless of exactly how the model formatted it -- spaces
+/// collapse to hyphens -- so `store::relations_conflicting_with`'s exact
+/// (case-insensitive) predicate match stays reliable even against a
+/// slightly off-format reply.
+fn normalize_predicate(raw: &str) -> String {
+    raw.trim().to_lowercase().split_whitespace().collect::<Vec<_>>().join("-")
+}
+
+/// Parses the extraction judge's reply into up to
+/// `GRAPH_EXTRACTION_MAX_TRIPLES` triples. Deliberately permissive -- a
+/// malformed line is simply skipped rather than failing the whole reply
+/// (this is still a successful LLM call, so the memory is marked extracted
+/// either way); `NONE`, empty output, or a reply with no parseable lines all
+/// produce an empty vec, never an error.
+pub fn parse_extraction(output: &str) -> Vec<ExtractedTriple> {
+    let mut out = Vec::new();
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.eq_ignore_ascii_case("none") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('|').map(|p| p.trim()).collect();
+        if parts.len() != 6 {
+            continue;
+        }
+        let src_name = parts[0];
+        let predicate_raw = parts[2];
+        let dst_name = parts[3];
+        if src_name.is_empty() || dst_name.is_empty() || predicate_raw.is_empty() {
+            continue;
+        }
+        let src_kind = if parts[1].is_empty() { None } else { Some(parts[1].to_string()) };
+        let dst_kind = if parts[4].is_empty() { None } else { Some(parts[4].to_string()) };
+        let confidence = parts[5]
+            .parse::<f64>()
+            .ok()
+            .map(|c| c.clamp(0.0, 1.0))
+            .unwrap_or(GRAPH_EXTRACTION_DEFAULT_CONFIDENCE);
+        out.push(ExtractedTriple {
+            src_name: src_name.to_string(),
+            src_kind,
+            predicate: normalize_predicate(predicate_raw),
+            dst_name: dst_name.to_string(),
+            dst_kind,
+            confidence,
+        });
+        if out.len() >= GRAPH_EXTRACTION_MAX_TRIPLES {
+            break;
+        }
+    }
+    out
+}
+
+// --- graph extraction: batched calls ---
+//
+// The corpus backfill (348 entities, 447 relations over the whole pre-
+// existing memory store) took hours under the one-`claude -p`-spawn-per-
+// memory design above: each spawn pays 5-15s of process overhead alone,
+// dwarfing the model's own latency. Batching turns a run's whole candidate
+// set into a handful of calls instead of one per memory, without changing
+// any of the per-memory extraction semantics `parse_extraction` and
+// `build_extraction_prompt` already established -- `parse_batch_extraction`
+// applies the exact same per-triple parsing rules, just per numbered fact.
+
+/// This many candidate memories are offered to one batched haiku call,
+/// rather than one call per memory -- picked from the middle of the user's
+/// own "10-15 memories per call" target. `reflect::GRAPH_EXTRACTION_MAX_PER_RUN`
+/// (40) still bounds how many memories a whole run examines; this only
+/// changes how many `claude -p` spawns that costs (`ceil(40 / 12)` = 4
+/// batches instead of 40 individual calls).
+pub const GRAPH_EXTRACTION_BATCH_SIZE: usize = 12;
+
+/// A batch call parses and replies about several facts at once, so it
+/// needs more headroom than a single-fact call's `TIMEOUT_HAIKU`.
+pub const TIMEOUT_HAIKU_BATCH: Duration = Duration::from_secs(60);
+
+/// Builds the graph-extraction judge's one-call prompt for a whole batch of
+/// memories at once: each fact is numbered, and the model is required to
+/// address every number in its reply (either relation lines or an explicit
+/// `N: NONE`) so the caller can tell "this fact yielded zero relations"
+/// (`NONE`, a legitimate outcome) apart from "the model's reply never
+/// touched this fact at all" (absent from the reply entirely, a parse
+/// failure worth retrying) -- see `parse_batch_extraction`'s own doc
+/// comment for how that distinction is used.
+pub fn build_batch_extraction_prompt(facts: &[&str]) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "You extract a durable knowledge graph from a personal knowledge bank. An entity is any \
+         durable, nameable thing -- not just a person: a project, a technology, a game engine, a \
+         practice, a concept, an organization. A relation connects two entities with a short verb \
+         phrase, including affective or behavioral relations (e.g. \"frustrated-by\", \"prefers\", \
+         \"boss-of\", \"works-on\", \"built-with\", \"part-of\") -- these are explicitly allowed and \
+         wanted, not just factual/organizational links.\n\n\
+         The special entity name \"user\" is reserved for the user themself -- use it whenever a \
+         fact is about the user directly, rather than inventing a name.\n\n",
+    );
+    s.push_str(extraction_quality_guard());
+    s.push_str("Here are several facts, numbered:\n\n");
+    for (i, fact) in facts.iter().enumerate() {
+        s.push_str(&format!("{}: {}\n", i + 1, fact));
+    }
+    s.push_str(&format!(
+        "\nFor EACH fact number above (1 to {}), list only relations that fact actually states -- \
+         never infer or guess beyond what's written. Reply with, for every fact number, either one \
+         or more relation lines or a single NONE line, each prefixed with that fact's number and a \
+         colon, in exactly this form and no other text:\n\
+         N: SRC_NAME | SRC_KIND | PREDICATE | DST_NAME | DST_KIND | CONFIDENCE\n\
+         N: NONE\n\n\
+         SRC_NAME/DST_NAME -- short canonical names (\"Moses\", \"Umoja\", \"C++\"), never full \
+         sentences.\n\
+         SRC_KIND/DST_KIND -- a short free-text label; person, project, technology, concept, \
+         practice, or organization is a good default vocabulary, but use whatever fits.\n\
+         PREDICATE -- 1 to 3 words, lowercase, hyphenated (e.g. \"boss-of\", \"works-on\", \
+         \"built-with\", \"frustrated-by\", \"prefers\").\n\
+         CONFIDENCE -- your confidence this relation is correctly stated, 0.0 to 1.0.\n\n\
+         Every fact number from 1 to {} MUST appear at least once in your reply -- use `N: NONE` \
+         for a fact that states no relation between two nameable things. Do not skip a number.\n",
+        facts.len(),
+        facts.len()
+    ));
+    s
+}
+
+/// Parses a batch extraction reply into a map from fact number (1-based,
+/// matching `build_batch_extraction_prompt`'s own numbering) to the triples
+/// extracted for it. Per-fact attribution, strict about which fact a line
+/// belongs to: a line is only ever counted for the fact number it names.
+///
+/// A fact number is present in the returned map only when the reply
+/// actually addressed it -- an explicit `N: NONE` (mapped to an empty
+/// `Vec`) or at least one well-formed relation line. A malformed relation
+/// line for a fact that has no other valid line for it is simply dropped,
+/// same as `parse_extraction`'s own permissiveness -- but critically, that
+/// dropped line does NOT insert an entry into the map. This is the house
+/// rule the caller (`cli::run_graph_extraction_pass`) depends on: a fact
+/// whose triples fail to parse is never watermarked as extracted, so it's
+/// retried on a later run rather than silently treated as "no relations" —
+/// exactly like a whole failed LLM call already isn't watermarked (see
+/// `Memory::graph_extracted_at`'s own doc comment), just decided per-fact
+/// instead of per-call now that one call covers many facts.
+pub fn parse_batch_extraction(output: &str, num_facts: usize) -> HashMap<usize, Vec<ExtractedTriple>> {
+    let mut out: HashMap<usize, Vec<ExtractedTriple>> = HashMap::new();
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (num_str, rest) = match line.split_once(':') {
+            Some(v) => v,
+            None => continue,
+        };
+        let num: usize = match num_str.trim().parse() {
+            Ok(n) if n >= 1 && n <= num_facts => n,
+            _ => continue,
+        };
+        let rest = rest.trim();
+        if rest.eq_ignore_ascii_case("none") {
+            out.entry(num).or_default();
+            continue;
+        }
+        let parts: Vec<&str> = rest.split('|').map(|p| p.trim()).collect();
+        if parts.len() != 6 {
+            continue; // malformed -- never inserted, so this fact stays unaddressed unless another line covers it
+        }
+        let src_name = parts[0];
+        let predicate_raw = parts[2];
+        let dst_name = parts[3];
+        if src_name.is_empty() || dst_name.is_empty() || predicate_raw.is_empty() {
+            continue;
+        }
+        let src_kind = if parts[1].is_empty() { None } else { Some(parts[1].to_string()) };
+        let dst_kind = if parts[4].is_empty() { None } else { Some(parts[4].to_string()) };
+        let confidence = parts[5]
+            .parse::<f64>()
+            .ok()
+            .map(|c| c.clamp(0.0, 1.0))
+            .unwrap_or(GRAPH_EXTRACTION_DEFAULT_CONFIDENCE);
+        let entry = out.entry(num).or_default();
+        if entry.len() < GRAPH_EXTRACTION_MAX_TRIPLES {
+            entry.push(ExtractedTriple {
+                src_name: src_name.to_string(),
+                src_kind,
+                predicate: normalize_predicate(predicate_raw),
+                dst_name: dst_name.to_string(),
+                dst_kind,
+                confidence,
+            });
+        }
+    }
+    out
+}
+
+/// Outcome of the id-free edge-contradiction judge (`mach kb reflect`'s
+/// graph-extraction pass, on every new edge that shares an entity and
+/// predicate with an existing active one). No `ConflictRetro` counterpart
+/// here (unlike the memory-level patrol's `ContradictionVerdict`): an
+/// edge's own `created_at`/insertion order is this graph's only notion of
+/// "current", there is no separate retrospective-note distinction to make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeContradictionVerdict {
+    /// The two edges describe the same role/relationship and cannot both
+    /// be current. The caller always treats the newly inserted edge as the
+    /// winner (it is, by construction, the more recently created one) and
+    /// tombstones the other -- the model is never asked to name a winner
+    /// (see `build_edge_contradiction_prompt`'s own doc comment for why).
+    Conflict,
+    /// Both edges are compatible (different entities, or a relation that
+    /// isn't exclusive) -- neither is touched.
+    BothHold,
+    /// The judge couldn't tell, or its reply was empty or unrecognized --
+    /// neither edge is touched, same as `BothHold`.
+    Unclear,
+}
+
+/// Parses the edge-contradiction judge's reply -- same tolerant, id-free
+/// line scan `parse_contradiction_verdict` uses for the memory-level
+/// patrol, just a three-way verdict (no `CONFLICT_RETRO`).
+pub fn parse_edge_contradiction_verdict(output: &str) -> EdgeContradictionVerdict {
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match line.to_uppercase().as_str() {
+            "CONFLICT" => return EdgeContradictionVerdict::Conflict,
+            "BOTH_HOLD" => return EdgeContradictionVerdict::BothHold,
+            "UNCLEAR" => return EdgeContradictionVerdict::Unclear,
+            _ => continue,
+        }
+    }
+    EdgeContradictionVerdict::Unclear
+}
+
+/// Builds the edge-contradiction judge's one-haiku-call prompt, describing
+/// both edges by their entity names and predicate only -- deliberately
+/// id-free, the same lesson `build_contradiction_pass_prompt` already
+/// learned the hard way for memories (haiku reliably *inverts* a
+/// "SUPERSEDES <id>"-shaped answer, favoring the grammatically-read loser
+/// over the intended winner, no matter how the instruction is worded). The
+/// model is never asked to name a winner here either -- only whether the two
+/// edges conflict. Winner resolution (the newly inserted edge always wins)
+/// happens entirely in Rust. `a`/`b` are each `(src_name, predicate,
+/// dst_name)`.
+pub fn build_edge_contradiction_prompt(a: (&str, &str, &str), b: (&str, &str, &str)) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "You are checking a personal knowledge graph for contradictions between two edges that \
+         share an entity and the same kind of relation -- decide the single correct relationship \
+         between them.\n\n",
+    );
+    s.push_str(&format!("Edge 1: {} --{}--> {}\n", a.0, a.1, a.2));
+    s.push_str(&format!("Edge 2: {} --{}--> {}\n\n", b.0, b.1, b.2));
+    s.push_str(
+        "Reply with exactly one line and no other text: CONFLICT, BOTH_HOLD, or UNCLEAR.\n\
+         CONFLICT -- these describe the same role or relationship and cannot both be current (e.g. \
+         two different people both currently \"boss-of\" the same person). You don't need to say \
+         which one wins; the more recently recorded edge will automatically be treated as current.\n\
+         BOTH_HOLD -- these are compatible and can both be true at once (different entities, or a \
+         relation that isn't exclusive).\n\
+         UNCLEAR -- you cannot tell from what's shown.\n",
+    );
+    s
+}
+
+// --- graph extraction: batched edge-conflict judging ---
+//
+// The old path ran one haiku call per new edge that shared an entity and
+// predicate with an existing active one -- on a backfill that inserts
+// hundreds of edges, most of them never conflicting with anything, that's
+// still hundreds of wasted-on-nothing spawns whenever even a handful do
+// conflict. Collecting every candidate conflict pair a whole run produced
+// and judging them in ONE call cuts that to (at most) one spawn regardless
+// of how many pairs there are.
+
+/// Builds the edge-contradiction judge's one-call prompt for a whole batch
+/// of candidate conflict pairs at once: each pair is numbered, id-free (same
+/// "never ask the model to name a winner" rationale as the single-pair
+/// prompt), and the model is asked to address every number.
+pub fn build_batch_edge_contradiction_prompt(pairs: &[((&str, &str, &str), (&str, &str, &str))]) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "You are checking a personal knowledge graph for contradictions between pairs of edges. \
+         Each numbered pair below shares an entity and the same kind of relation -- decide, for \
+         EACH pair, the single correct relationship between its two edges.\n\n",
+    );
+    for (i, (a, b)) in pairs.iter().enumerate() {
+        s.push_str(&format!("Pair {}:\n  Edge 1: {} --{}--> {}\n  Edge 2: {} --{}--> {}\n\n", i + 1, a.0, a.1, a.2, b.0, b.1, b.2));
+    }
+    s.push_str(&format!(
+        "For EACH pair number above (1 to {}), reply with exactly one line in the form `N: VERDICT`, \
+         where VERDICT is one of CONFLICT, BOTH_HOLD, or UNCLEAR. Every pair number from 1 to {} \
+         MUST appear exactly once.\n\
+         CONFLICT -- the two edges in that pair describe the same role or relationship and cannot \
+         both be current (e.g. two different people both currently \"boss-of\" the same person). \
+         You don't need to say which one wins; the more recently recorded edge will automatically \
+         be treated as current.\n\
+         BOTH_HOLD -- the two edges are compatible and can both be true at once (different \
+         entities, or a relation that isn't exclusive).\n\
+         UNCLEAR -- you cannot tell from what's shown.\n",
+        pairs.len(),
+        pairs.len()
+    ));
+    s
+}
+
+/// Parses a batch edge-contradiction reply into a map from pair number
+/// (1-based, matching `build_batch_edge_contradiction_prompt`'s own
+/// numbering) to its verdict. A pair number absent from the reply is simply
+/// absent from the map -- unlike the extraction batch's own per-fact
+/// watermark concern, there is no retry queue for an edge-conflict check
+/// (it's a one-time judgment made while a new edge is being inserted, not a
+/// backlog drained across runs), so the caller treats a missing verdict
+/// exactly like an explicit `UNCLEAR`: leave both edges active.
+pub fn parse_batch_edge_contradiction_verdicts(output: &str, num_pairs: usize) -> HashMap<usize, EdgeContradictionVerdict> {
+    let mut out = HashMap::new();
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (num_str, rest) = match line.split_once(':') {
+            Some(v) => v,
+            None => continue,
+        };
+        let num: usize = match num_str.trim().parse() {
+            Ok(n) if n >= 1 && n <= num_pairs => n,
+            _ => continue,
+        };
+        let verdict = match rest.trim().to_uppercase().as_str() {
+            "CONFLICT" => EdgeContradictionVerdict::Conflict,
+            "BOTH_HOLD" => EdgeContradictionVerdict::BothHold,
+            "UNCLEAR" => EdgeContradictionVerdict::Unclear,
+            _ => continue,
+        };
+        out.entry(num).or_insert(verdict);
+    }
+    out
+}
+
+// --- curation pass: schema-accelerated consolidation ---
+//
+// Tse-style schema-linked consolidation (Tse et al. 2007, 2011): new
+// information consistent with an existing "schema" -- here, the insight/
+// theme layer `mach kb reflect` has already built up -- consolidates faster
+// than an orphan fact with nothing to attach to. Applied at the one point
+// `mach kb reflect` already judges a fact's coherence with what's known
+// (the curation pass's PROMOTE verdict, and its engagement fast path): no
+// extra LLM call, just an extra stability multiplier on top of whatever the
+// row already had.
+
+/// Stability multiplier applied when a promoted candidate sits close enough
+/// (`CURATION_SCHEMA_COHERENCE_MIN_SIM`) to an existing active insight or
+/// theme -- see `cli::apply_schema_fast_path`'s own doc comment for how
+/// it's applied (same 365-day cap `store::touch`/`halve_stability` use).
+pub const CURATION_SCHEMA_STABILITY_MULTIPLIER: f64 = 1.5;
+/// Minimum cosine similarity between a promoted candidate and its closest
+/// active insight/theme for the multiplier above to apply -- reuses
+/// `META_CLUSTER_MIN_SIM`'s own "genuinely related, not just superficially
+/// similar" bar (the same threshold meta-reflection already uses to decide
+/// two insights "genuinely share" a theme).
+pub const CURATION_SCHEMA_COHERENCE_MIN_SIM: f32 = META_CLUSTER_MIN_SIM;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2001,5 +2478,244 @@ mod tests {
         assert!(p.contains("STANDS"));
         assert!(p.contains("STALE"));
         assert!(p.contains("CONFLICT"));
+    }
+
+    // --- graph extraction: prompt contract + parsing ---
+
+    #[test]
+    fn build_extraction_prompt_includes_fact_and_reserved_user_note() {
+        let p = build_extraction_prompt("the user works on a project called Umoja");
+        assert!(p.contains("the user works on a project called Umoja"));
+        assert!(p.contains("\"user\""), "must explain the reserved \"user\" entity name");
+        assert!(p.contains("SRC_NAME | SRC_KIND | PREDICATE | DST_NAME | DST_KIND | CONFIDENCE"));
+        assert!(p.contains("NONE"));
+        assert!(p.contains("frustrated-by"), "affective/behavioral predicates must be explicitly invited");
+    }
+
+    #[test]
+    fn parse_extraction_accepts_a_well_formed_triple() {
+        let out = "user | | works-on | Umoja | project | 0.9";
+        let triples = parse_extraction(out);
+        assert_eq!(triples.len(), 1);
+        assert_eq!(triples[0].src_name, "user");
+        assert_eq!(triples[0].src_kind, None);
+        assert_eq!(triples[0].predicate, "works-on");
+        assert_eq!(triples[0].dst_name, "Umoja");
+        assert_eq!(triples[0].dst_kind.as_deref(), Some("project"));
+        assert!((triples[0].confidence - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_extraction_normalizes_predicate_spacing_and_case() {
+        let out = "Moses | person | Boss Of | user | | 0.8";
+        let triples = parse_extraction(out);
+        assert_eq!(triples[0].predicate, "boss-of");
+    }
+
+    #[test]
+    fn parse_extraction_none_or_empty_output_yields_no_triples() {
+        assert!(parse_extraction("NONE").is_empty());
+        assert!(parse_extraction("  none  \n").is_empty());
+        assert!(parse_extraction("").is_empty());
+        assert!(parse_extraction("I don't see a relation here.").is_empty());
+    }
+
+    #[test]
+    fn parse_extraction_skips_malformed_lines_but_keeps_well_formed_ones() {
+        let out = "this line has no pipes at all\nuser | | prefers | dark mode | concept | 0.7";
+        let triples = parse_extraction(out);
+        assert_eq!(triples.len(), 1);
+        assert_eq!(triples[0].dst_name, "dark mode");
+    }
+
+    #[test]
+    fn parse_extraction_defaults_confidence_when_unparseable() {
+        let out = "user | | prefers | tea | | not-a-number";
+        let triples = parse_extraction(out);
+        assert_eq!(triples[0].confidence, GRAPH_EXTRACTION_DEFAULT_CONFIDENCE);
+    }
+
+    #[test]
+    fn parse_extraction_clamps_out_of_range_confidence() {
+        let out = "user | | prefers | tea | | 1.5";
+        let triples = parse_extraction(out);
+        assert_eq!(triples[0].confidence, 1.0);
+    }
+
+    #[test]
+    fn parse_extraction_caps_at_max_triples_even_if_the_model_sends_more() {
+        let mut out = String::new();
+        for i in 0..8 {
+            out.push_str(&format!("user | | knows | entity{} | | 0.5\n", i));
+        }
+        let triples = parse_extraction(&out);
+        assert_eq!(triples.len(), GRAPH_EXTRACTION_MAX_TRIPLES);
+    }
+
+    #[test]
+    fn parse_extraction_rejects_a_triple_missing_src_dst_or_predicate() {
+        assert!(parse_extraction(" | person | boss-of | user | | 0.8").is_empty(), "empty src_name");
+        assert!(parse_extraction("Moses | person |  | user | | 0.8").is_empty(), "empty predicate");
+        assert!(parse_extraction("Moses | person | boss-of |  | | 0.8").is_empty(), "empty dst_name");
+    }
+
+    // --- graph extraction: edge-contradiction judge ---
+
+    #[test]
+    fn parse_edge_contradiction_verdict_accepts_the_three_tokens() {
+        assert_eq!(parse_edge_contradiction_verdict("CONFLICT"), EdgeContradictionVerdict::Conflict);
+        assert_eq!(parse_edge_contradiction_verdict("  both_hold  \n"), EdgeContradictionVerdict::BothHold);
+        assert_eq!(parse_edge_contradiction_verdict("UNCLEAR"), EdgeContradictionVerdict::Unclear);
+    }
+
+    #[test]
+    fn parse_edge_contradiction_verdict_scans_past_leading_chatter() {
+        let out = "Sure, here's my answer:\nCONFLICT";
+        assert_eq!(parse_edge_contradiction_verdict(out), EdgeContradictionVerdict::Conflict);
+    }
+
+    #[test]
+    fn parse_edge_contradiction_verdict_malformed_or_empty_is_unclear() {
+        assert_eq!(parse_edge_contradiction_verdict(""), EdgeContradictionVerdict::Unclear);
+        assert_eq!(parse_edge_contradiction_verdict("I'm not sure."), EdgeContradictionVerdict::Unclear);
+        // Deliberately strict, same as the memory-level parser: a line
+        // naming an id must never match any of the three fixed tokens.
+        assert_eq!(parse_edge_contradiction_verdict("CONFLICT 12"), EdgeContradictionVerdict::Unclear);
+    }
+
+    #[test]
+    fn build_edge_contradiction_prompt_is_id_free_and_names_both_edges() {
+        let p = build_edge_contradiction_prompt(("Moses", "boss-of", "user"), ("Ivar", "boss-of", "user"));
+        assert!(p.contains("Edge 1: Moses --boss-of--> user"));
+        assert!(p.contains("Edge 2: Ivar --boss-of--> user"));
+        assert!(p.contains("CONFLICT"));
+        assert!(p.contains("BOTH_HOLD"));
+        assert!(p.contains("UNCLEAR"));
+        assert!(!p.contains("SUPERSEDES"), "the model must never be asked to name a winner id");
+        assert!(!p.contains('#'), "edges are described by name only, never by id");
+    }
+
+    // --- extraction quality guard ---
+
+    #[test]
+    fn build_extraction_prompt_includes_the_quality_guard() {
+        let p = build_extraction_prompt("some fact");
+        assert!(p.contains("test, hypothetical"), "must warn against test/hypothetical facts");
+        assert!(p.contains("memory system's own mechanics"), "must warn against self-referential facts");
+        assert!(p.contains("generic-role entity"), "must warn against generic-role entities like \"boss\"");
+        assert!(p.contains("\"boss\""));
+        assert!(p.contains("one exception"), "the reserved \"user\" name must still be explicitly allowed");
+    }
+
+    // --- graph extraction: batched calls ---
+
+    #[test]
+    fn build_batch_extraction_prompt_numbers_every_fact_and_includes_the_quality_guard() {
+        let p = build_batch_extraction_prompt(&["Moses is the user's boss", "the user works on Umoja"]);
+        assert!(p.contains("1: Moses is the user's boss"));
+        assert!(p.contains("2: the user works on Umoja"));
+        assert!(p.contains("1 to 2"), "must tell the model exactly how many facts to address");
+        assert!(p.contains("test, hypothetical"));
+        assert!(p.contains("generic-role entity"));
+        assert!(p.contains("N: NONE"));
+    }
+
+    #[test]
+    fn parse_batch_extraction_attributes_triples_to_the_right_fact_number() {
+        let out = "1: user | | works-on | Umoja | project | 0.9\n2: NONE\n3: Moses | person | boss-of | user | | 0.8";
+        let parsed = parse_batch_extraction(out, 3);
+        assert_eq!(parsed.len(), 3, "all three facts were addressed");
+        assert_eq!(parsed[&1].len(), 1);
+        assert_eq!(parsed[&1][0].dst_name, "Umoja");
+        assert!(parsed[&2].is_empty(), "an explicit NONE is addressed with zero triples");
+        assert_eq!(parsed[&3].len(), 1);
+        assert_eq!(parsed[&3][0].src_name, "Moses");
+    }
+
+    #[test]
+    fn parse_batch_extraction_a_fact_can_yield_more_than_one_triple() {
+        let out = "1: user | | works-on | Umoja | project | 0.9\n1: user | | prefers | Rust | language | 0.7";
+        let parsed = parse_batch_extraction(out, 1);
+        assert_eq!(parsed[&1].len(), 2);
+    }
+
+    #[test]
+    fn parse_batch_extraction_never_marks_an_unaddressed_fact() {
+        // Fact 2 never appears anywhere in the reply -- must be absent from
+        // the map entirely (never watermarked, retried next run), distinct
+        // from fact 2 explicitly replying NONE.
+        let out = "1: user | | works-on | Umoja | project | 0.9";
+        let parsed = parse_batch_extraction(out, 2);
+        assert!(parsed.contains_key(&1));
+        assert!(!parsed.contains_key(&2), "an unaddressed fact must not be marked seen");
+    }
+
+    #[test]
+    fn parse_batch_extraction_a_malformed_line_for_a_fact_with_no_other_line_leaves_it_unaddressed() {
+        // Fact 1's only line is garbled (wrong pipe-field count) -- must not
+        // count as "addressed with zero triples" the way an explicit NONE
+        // does; it's indistinguishable from never having been touched.
+        let out = "1: this is not the right shape at all";
+        let parsed = parse_batch_extraction(out, 1);
+        assert!(!parsed.contains_key(&1));
+    }
+
+    #[test]
+    fn parse_batch_extraction_out_of_range_fact_numbers_are_ignored() {
+        let out = "0: user | | works-on | Umoja | project | 0.9\n99: user | | prefers | tea | | 0.7";
+        let parsed = parse_batch_extraction(out, 3);
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn parse_batch_extraction_caps_triples_per_fact() {
+        let mut out = String::new();
+        for i in 0..8 {
+            out.push_str(&format!("1: user | | knows | entity{} | | 0.5\n", i));
+        }
+        let parsed = parse_batch_extraction(&out, 1);
+        assert_eq!(parsed[&1].len(), GRAPH_EXTRACTION_MAX_TRIPLES);
+    }
+
+    // --- graph extraction: batched edge-conflict judging ---
+
+    #[test]
+    fn build_batch_edge_contradiction_prompt_numbers_every_pair_and_is_id_free() {
+        let pairs = [
+            (("Moses", "boss-of", "user"), ("Ivar", "boss-of", "user")),
+            (("user", "prefers", "tea"), ("user", "prefers", "coffee")),
+        ];
+        let p = build_batch_edge_contradiction_prompt(&pairs);
+        assert!(p.contains("Pair 1:"));
+        assert!(p.contains("Edge 1: Moses --boss-of--> user"));
+        assert!(p.contains("Pair 2:"));
+        assert!(p.contains("Edge 2: user --prefers--> coffee"));
+        assert!(p.contains("1 to 2"));
+        assert!(!p.contains("SUPERSEDES"));
+        assert!(!p.contains('#'));
+    }
+
+    #[test]
+    fn parse_batch_edge_contradiction_verdicts_attributes_per_pair() {
+        let out = "1: CONFLICT\n2: BOTH_HOLD";
+        let verdicts = parse_batch_edge_contradiction_verdicts(out, 2);
+        assert_eq!(verdicts[&1], EdgeContradictionVerdict::Conflict);
+        assert_eq!(verdicts[&2], EdgeContradictionVerdict::BothHold);
+    }
+
+    #[test]
+    fn parse_batch_edge_contradiction_verdicts_missing_pair_is_absent() {
+        let out = "1: CONFLICT";
+        let verdicts = parse_batch_edge_contradiction_verdicts(out, 2);
+        assert!(verdicts.contains_key(&1));
+        assert!(!verdicts.contains_key(&2), "an unaddressed pair has no verdict -- caller treats it like UNCLEAR");
+    }
+
+    #[test]
+    fn parse_batch_edge_contradiction_verdicts_scans_past_chatter_and_ignores_bad_numbers() {
+        let out = "Sure, here goes:\n1: CONFLICT\n99: UNCLEAR\nbanana: BOTH_HOLD";
+        let verdicts = parse_batch_edge_contradiction_verdicts(out, 1);
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[&1], EdgeContradictionVerdict::Conflict);
     }
 }

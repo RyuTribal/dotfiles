@@ -68,6 +68,11 @@ fn print_help() {
     println!("                          session-digest hook). No args: sweeps every session");
     println!("                          transcript idle >=10min and not yet processed. --session-id:");
     println!("                          processes exactly that session now (the SessionEnd trigger)");
+    println!("  entity <name>           association graph for one entity — active edges both");
+    println!("                          directions, with evidence memory + date (exact name");
+    println!("                          match first, else embedding similarity)");
+    println!("  graph --stats           entity/edge counts by kind — a compact view of the");
+    println!("                          association graph `mach kb reflect` has derived so far");
 }
 
 /// Runs the kb CLI given the arguments following `kb` in `mach kb ...`.
@@ -88,6 +93,8 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Some("export") => cmd_export(args),
         Some("import") => cmd_import(args),
         Some("ingest-sessions") => cmd_ingest_sessions(args),
+        Some("entity") => cmd_entity(args),
+        Some("graph") => cmd_graph(args),
         Some("-h") | Some("--help") => {
             print_help();
             Ok(())
@@ -290,6 +297,178 @@ pub(crate) fn insight_to_hit(h: InsightHit) -> SearchHit {
     }
 }
 
+/// One association-graph edge (or, for a 2-hop connection, a two-edge
+/// chain) surfaced alongside a search's ordinary hits — never logged/shown
+/// as ids (no reinforcement semantics for the graph in this first version,
+/// unlike a memory hit's own `--touch`), just a plain "here's something
+/// connected to what you asked about" note.
+///
+/// `hops` is `1` for a direct edge touching the query-matched entity
+/// (`src_name`/`predicate`/`dst_name` describe it exactly as stored, same
+/// shape this struct always had) or `2` for a spreading-activation hop
+/// through one of that edge's own neighbors — in which case `predicate2`/
+/// `dst_name2` continue the chain: `src_name --predicate--> dst_name
+/// --predicate2--> dst_name2`. Both are `None` for a 1-hop connection (and
+/// omitted from JSON entirely via `skip_serializing_if`, so an old consumer
+/// reading only `src_name`/`predicate`/`dst_name`/`evidence_date` sees no
+/// shape change).
+#[derive(Serialize, Clone)]
+pub struct ConnectionHit {
+    pub src_name: String,
+    pub predicate: String,
+    pub dst_name: String,
+    pub evidence_date: String,
+    pub hops: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predicate2: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dst_name2: Option<String>,
+}
+
+/// `mach kb search`'s full response shape: the ordinary ranked hits plus, if
+/// the query itself named something close enough to a known entity, a
+/// handful of that entity's active edges. A wrapping object rather than a
+/// bare array (the shape `mach kb search --json`/the kb socket used to
+/// return) precisely because there are now two independent things to carry
+/// — `connections` has no natural home inside one `SearchHit` row, since it
+/// belongs to the *query*, not to any single hit.
+#[derive(Serialize)]
+pub struct SearchResponse {
+    pub hits: Vec<SearchHit>,
+    pub connections: Vec<ConnectionHit>,
+}
+
+/// At or above this cosine similarity between the query embedding and an
+/// entity's own name embedding, that entity's connections are surfaced
+/// alongside search results — deliberately lower than
+/// `reflect::ENTITY_RESOLUTION_SIM_THRESHOLD` (which governs whether two
+/// *candidate entity names* are treated as the same thing): a query is
+/// ordinary prose, not a short canonical name, so it will never be as close
+/// to an entity's embedding as another well-formed name would be, and this
+/// path is additive/informational rather than a dedup decision.
+pub const SEARCH_ENTITY_CONNECTION_SIM_THRESHOLD: f32 = 0.75;
+
+/// Overall cap on how many connections (1-hop and 2-hop combined) are
+/// surfaced per search — a handful of "you might also want to know"
+/// connections, not a full `mach kb entity <name>` dump. Hop-1 connections
+/// fill this first ("full weight" — no confidence gate of their own, same
+/// as before this cap covered 2 hops), so a matched entity with 5 or more
+/// direct edges alone already exhausts the cap and no 2-hop walk ever runs.
+pub const SEARCH_MAX_CONNECTIONS: usize = 5;
+
+/// A hop-1 edge only seeds a hop-2 walk through its own far entity when its
+/// own confidence is at or above this floor — a low-confidence direct edge
+/// is shaky enough evidence on its own without compounding it with a second
+/// hop's worth of uncertainty.
+pub const SEARCH_HOP2_MIN_CONFIDENCE: f64 = 0.6;
+
+/// At most this many hop-2 edges are taken through any single hop-1
+/// neighbor — bounds how much one well-connected neighbor can dominate the
+/// overall cap.
+pub const SEARCH_HOP2_MAX_PER_NEIGHBOR: usize = 2;
+
+/// Builds one hop's `ConnectionHit` from a relation row, in the relation's
+/// own stored `src`/`dst` order (never swapped — direction is never
+/// something this enrichment corrects for, same as before this function
+/// existed in its own right).
+fn connection_hit_for_edge(conn: &Connection, e: &store::Relation, hops: u8) -> Option<ConnectionHit> {
+    let src_name = store::get_entity(conn, e.src).ok().flatten()?.name;
+    let dst_name = store::get_entity(conn, e.dst).ok().flatten()?.name;
+    let evidence_date = e
+        .evidence_memory_id
+        .and_then(|id| store::get(conn, id).ok().flatten())
+        .map(|m| m.created_at.get(..10).unwrap_or(&m.created_at).to_string())
+        .unwrap_or_default();
+    Some(ConnectionHit { src_name, predicate: e.predicate.clone(), dst_name, evidence_date, hops, predicate2: None, dst_name2: None })
+}
+
+/// If `q_emb` is close enough (`SEARCH_ENTITY_CONNECTION_SIM_THRESHOLD`) to
+/// a known entity's own name embedding, returns up to
+/// `SEARCH_MAX_CONNECTIONS` connections as `ConnectionHit`s — a bounded
+/// 2-hop spreading-activation walk from that entity: every active edge
+/// touching it directly (hop 1, "full weight" — no confidence gate, exactly
+/// like this enrichment behaved before hop 2 existed), and, for each hop-1
+/// edge whose own confidence clears `SEARCH_HOP2_MIN_CONFIDENCE`, up to
+/// `SEARCH_HOP2_MAX_PER_NEIGHBOR` of that edge's far entity's own active
+/// edges (hop 2) — deduped by edge id (an edge already surfaced, at either
+/// hop, is never surfaced twice) and never walking straight back to the
+/// original matched entity (that's not new information). Hop-1 connections
+/// fill the overall cap first, so they're never displaced by hop-2 ones.
+///
+/// Evidence date only — never a bare memory id, per this feature's
+/// "connections are never logged/shown as ids" contract. Any lookup
+/// failure along the way (no match, a vanished entity/memory row) simply
+/// yields fewer or zero connections, never an error — this is enrichment,
+/// not a required part of a search response.
+fn entity_connections_for_query(conn: &Connection, q_emb: &[f32]) -> Vec<ConnectionHit> {
+    let entity = match store::find_entity_by_similarity(conn, q_emb, SEARCH_ENTITY_CONNECTION_SIM_THRESHOLD) {
+        Ok(Some((e, _sim))) => e,
+        _ => return Vec::new(),
+    };
+    let hop1_edges = store::active_relations_for_entity(conn, entity.id).unwrap_or_default();
+    let mut out: Vec<ConnectionHit> = Vec::new();
+    let mut used_edge_ids: HashSet<i64> = HashSet::new();
+
+    for e in &hop1_edges {
+        if out.len() >= SEARCH_MAX_CONNECTIONS {
+            return out;
+        }
+        if let Some(hit) = connection_hit_for_edge(conn, e, 1) {
+            used_edge_ids.insert(e.id);
+            out.push(hit);
+        }
+    }
+
+    for e1 in &hop1_edges {
+        if out.len() >= SEARCH_MAX_CONNECTIONS {
+            break;
+        }
+        if e1.confidence.unwrap_or(0.0) < SEARCH_HOP2_MIN_CONFIDENCE {
+            continue;
+        }
+        let pivot_id = if e1.src == entity.id { e1.dst } else { e1.src };
+        let pivot = match store::get_entity(conn, pivot_id) {
+            Ok(Some(p)) => p,
+            _ => continue,
+        };
+        let hop2_edges = store::active_relations_for_entity(conn, pivot_id).unwrap_or_default();
+        let mut taken_for_this_neighbor = 0usize;
+        for e2 in &hop2_edges {
+            if out.len() >= SEARCH_MAX_CONNECTIONS || taken_for_this_neighbor >= SEARCH_HOP2_MAX_PER_NEIGHBOR {
+                break;
+            }
+            if used_edge_ids.contains(&e2.id) {
+                continue; // dedup: this exact edge already surfaced (e.g. as hop 1)
+            }
+            let far_id = if e2.src == pivot_id { e2.dst } else { e2.src };
+            if far_id == entity.id {
+                continue; // a trivial walk straight back to the matched entity -- not new information
+            }
+            let far_name = match store::get_entity(conn, far_id) {
+                Ok(Some(f)) => f.name,
+                _ => continue,
+            };
+            let evidence_date = e2
+                .evidence_memory_id
+                .and_then(|id| store::get(conn, id).ok().flatten())
+                .map(|m| m.created_at.get(..10).unwrap_or(&m.created_at).to_string())
+                .unwrap_or_default();
+            out.push(ConnectionHit {
+                src_name: entity.name.clone(),
+                predicate: e1.predicate.clone(),
+                dst_name: pivot.name.clone(),
+                evidence_date,
+                hops: 2,
+                predicate2: Some(e2.predicate.clone()),
+                dst_name2: Some(far_name),
+            });
+            used_edge_ids.insert(e2.id);
+            taken_for_this_neighbor += 1;
+        }
+    }
+    out
+}
+
 /// Ranked top-N search + insight blend, embedding `query` itself — the same
 /// merge `cmd_search` performs for `mach kb search --json` (mem hits and
 /// insight hits fetched independently, combined, sorted by score, truncated
@@ -307,6 +486,12 @@ pub(crate) fn insight_to_hit(h: InsightHit) -> SearchHit {
 /// reinforcement is also out of scope here — `kb-recall.sh` never sets it
 /// (engagement-gated reinforcement now happens later, via `mach kb
 /// ingest-sessions`), so neither call site needs it.
+///
+/// Also computes the query's own entity-connections enrichment
+/// (`entity_connections_for_query`) from the same query embedding — one
+/// embed call serves both the ordinary hit ranking and this additive
+/// "here's something connected to what you asked about" field, so this is
+/// the one shared path both the kb socket and `mach kb search` build on.
 pub fn search_hits<E: Embedder>(
     conn: &Connection,
     embedder: &E,
@@ -316,7 +501,7 @@ pub fn search_hits<E: Embedder>(
     include_superseded: bool,
     min_score: f32,
     now: &str,
-) -> Result<Vec<SearchHit>, KbError> {
+) -> Result<SearchResponse, KbError> {
     let q_emb = embedder.embed(query)?;
     let mem_hits = store::search_ranked(conn, &q_emb, limit, reviewed_only, include_superseded, 0.0, now)?;
     let insight_hits = store::search_insights_ranked(conn, &q_emb, limit, now)?;
@@ -327,7 +512,8 @@ pub fn search_hits<E: Embedder>(
     if min_score > 0.0 {
         combined.retain(|h| h.score >= min_score);
     }
-    Ok(combined)
+    let connections = entity_connections_for_query(conn, &q_emb);
+    Ok(SearchResponse { hits: combined, connections })
 }
 
 fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
@@ -376,24 +562,18 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let conn = store::open().map_err(to_io)?;
     let now = store::now_rfc3339();
     let embedder = OllamaEmbedder::new();
-    // Blend memory hits and insight hits into one ranked list: fetch up to
-    // `limit` unfiltered candidates from each side, merge, sort by score,
-    // truncate to `limit`, then apply `min_score` — this reduces to the
-    // original single-source behavior whenever there are no insights yet.
-    let mut hits: Vec<SearchHit> = match embedder.embed(&query) {
-        Ok(q_emb) => {
-            let mem_hits =
-                store::search_ranked(&conn, &q_emb, limit, reviewed_only, include_superseded, 0.0, &now).map_err(to_io)?;
+    // The shared merge (mem hits + insight hits + entity-connections
+    // enrichment) lives in `search_hits`, so this is the exact same path
+    // the kb socket daemon uses for `kb-recall.sh`'s fast path — only the
+    // substring-fallback branch below is unique to this subprocess entry
+    // point.
+    let mut response = match search_hits(&conn, &embedder, &query, limit, reviewed_only, include_superseded, 0.0, &now) {
+        Ok(r) => {
             if touch {
-                let ids: Vec<i64> = mem_hits.iter().map(|h| h.memory.id).collect();
+                let ids: Vec<i64> = r.hits.iter().filter(|h| !h.derived).map(|h| h.id).collect();
                 store::touch(&conn, &ids, &now).map_err(to_io)?;
             }
-            let insight_hits = store::search_insights_ranked(&conn, &q_emb, limit, &now).map_err(to_io)?;
-            let mut combined: Vec<SearchHit> =
-                mem_hits.into_iter().map(to_hit).chain(insight_hits.into_iter().map(insight_to_hit)).collect();
-            combined.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-            combined.truncate(limit);
-            combined
+            r
         }
         Err(e) => {
             eprintln!(
@@ -403,32 +583,36 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
             // No insight fallback here: substring match forces every hit to
             // score 1.0 (not a meaningful ranking to begin with), and
             // insights have no independent text-substring path worth adding
-            // for what's already a degraded mode.
+            // for what's already a degraded mode. No connections either —
+            // an embed failure means there's no query embedding to match an
+            // entity against.
             let subs = store::search_substring(&conn, &query, limit, reviewed_only, include_superseded).map_err(to_io)?;
             let ids: Vec<i64> = subs.iter().map(|(m, _)| m.id).collect();
             if touch {
                 store::touch(&conn, &ids, &now).map_err(to_io)?;
             }
-            subs.into_iter()
+            let hits = subs
+                .into_iter()
                 .map(|(m, score)| {
                     let superseded = m.is_superseded();
                     to_hit(RankedHit { memory: m, score, sim: score, recency: 0.0, strength: 0.0, superseded })
                 })
-                .collect()
+                .collect();
+            SearchResponse { hits, connections: Vec::new() }
         }
     };
 
     if min_score > 0.0 {
-        hits.retain(|h| h.score >= min_score);
+        response.hits.retain(|h| h.score >= min_score);
     }
 
     if json {
-        println!("{}", serde_json::to_string(&hits)?);
-    } else if hits.is_empty() {
+        println!("{}", serde_json::to_string(&response)?);
+    } else if response.hits.is_empty() {
         println!("no matches");
     } else {
         let mut any_superseded = false;
-        for h in &hits {
+        for h in &response.hits {
             any_superseded |= h.superseded && !h.derived;
             let flag = if h.derived { 'D' } else { ' ' };
             let sup = if h.superseded { '!' } else { ' ' };
@@ -452,11 +636,17 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
                 suffix
             );
         }
-        if hits.iter().any(|h| h.derived) {
+        if response.hits.iter().any(|h| h.derived) {
             println!("\n(D = derived insight from `mach kb reflect` — see `mach kb insights`)");
         }
         if any_superseded {
             println!("(! = superseded — scored ×0.1, shown via --include-superseded)");
+        }
+    }
+    if !response.connections.is_empty() {
+        println!("\nconnections:");
+        for c in &response.connections {
+            println!("  [connection] {} —{}→ {} (learned {})", c.src_name, c.predicate, c.dst_name, c.evidence_date);
         }
     }
     Ok(())
@@ -768,7 +958,13 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     // there's nothing new or due — this is the only early exit before the
     // connectivity guard below.
     let verification_queue = store::insights_due_for_verification(&conn, REFLECT_VERIFICATION_SAMPLE).map_err(to_io)?;
-    if !has_new && !force_meta && verification_queue.is_empty() {
+    // Same "must still be able to run" reasoning extends to the graph-
+    // extraction pass's own backlog (`store::has_graph_extraction_candidates`)
+    // — a database with nothing new, no insight due for verification, and no
+    // unprocessed memory must not early-exit before that pass ever gets a
+    // look, since (like curation/dormancy) it runs unconditionally below.
+    let graph_backlog = store::has_graph_extraction_candidates(&conn).map_err(to_io)?;
+    if !has_new && !force_meta && verification_queue.is_empty() && !graph_backlog {
         println!("mach kb reflect: nothing new");
         return Ok(());
     }
@@ -1065,6 +1261,20 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         run_strength_review_pass(&conn, &llm, &now).map_err(to_io)?;
     llm_failed = llm_failed || strength_llm_failed;
 
+    // Step 4.63: graph extraction — entities/relations derived from facts
+    // that have now been through this run's own truth-maintenance (the
+    // contradiction patrol and strength review above), so extraction reads
+    // already-resolved facts rather than a stale one a later pass this same
+    // run might still have tombstoned. Runs every invocation regardless of
+    // has_new, same as curation/dormancy — it drains the not-yet-extracted
+    // backlog (`store::graph_extraction_candidates`), not just this run's
+    // new material. Deliberately before dormancy: a memory dormancy is about
+    // to put to sleep this very run is still exactly the kind of fact worth
+    // extracting a durable edge from before it drops out of active view.
+    let (graph_examined, graph_edges, graph_entities, graph_llm_failed) =
+        run_graph_extraction_pass(&conn, &embedder, &llm, &now).map_err(to_io)?;
+    llm_failed = llm_failed || graph_llm_failed;
+
     // Step 4.65: dormancy — put stale, low-importance, uncited memories to
     // sleep (reviewed and unreviewed alike, on the exact same criteria —
     // see store::memory_qualifies_for_dormancy's own doc comment; there is
@@ -1112,7 +1322,8 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     println!(
         "mach kb reflect: examined={} questions={} insights_added={} reinforced={} \
          themes_added={} flagged={} verified={} curated={} promoted={} demoted={} dormant={} \
-         consolidated={} deduped={} contradictions={} mem_verified={} mem_stale={} mem_routed={}{}",
+         consolidated={} deduped={} contradictions={} mem_verified={} mem_stale={} mem_routed={} \
+         graph_examined={} graph_edges={} graph_entities={}{}",
         examined,
         questions_count,
         insights_added,
@@ -1130,6 +1341,9 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         mem_verified,
         mem_stale,
         mem_routed,
+        graph_examined,
+        graph_edges,
+        graph_entities,
         if llm_failed { " (degraded: some claude calls failed — watermark not advanced)" } else { "" }
     );
     Ok(())
@@ -1546,6 +1760,34 @@ fn apply_contradiction_verdict(
 /// Returns `(examined, promoted, demoted, any_judge_call_failed)`. Generic
 /// over `ReflectLlm`, same as `run_dedupe_pass`/`run_contradiction_pass`,
 /// so it's exercised in tests against a fake that can fail on demand.
+/// Tse-style schema-accelerated consolidation (Tse et al. 2007, 2011): a
+/// candidate the curation pass just promoted — durable, coherent with what's
+/// already known — gets an extra stability boost when its content sits
+/// close enough (`reflect::CURATION_SCHEMA_COHERENCE_MIN_SIM`) to an
+/// existing active insight or theme: the durable "schema" `mach kb reflect`
+/// has already built up. Information that fits an existing schema
+/// consolidates faster than an orphan fact with nothing to attach to, so it
+/// gets `reflect::CURATION_SCHEMA_STABILITY_MULTIPLIER`x its current
+/// stability (capped at 365 days, same as `store::touch`); an orphan
+/// promotion — nothing close enough among active insights/themes — keeps
+/// its ordinary default, no multiplier applied. No extra LLM call: this
+/// reuses the embedding already on the row and the insight index already in
+/// the store. Called from every place this pass promotes a row (both the
+/// engagement fast path and an explicit PROMOTE verdict), since either one
+/// already IS "judged coherent with what's known."
+fn apply_schema_fast_path(conn: &Connection, m: &Memory) -> Result<(), KbError> {
+    let emb = match &m.embedding {
+        Some(e) if !e.is_empty() => e,
+        _ => return Ok(()),
+    };
+    let near = store::top_similar_insights(conn, emb, 1)?;
+    let coherent = near.first().map(|(_, sim)| *sim >= reflect::CURATION_SCHEMA_COHERENCE_MIN_SIM).unwrap_or(false);
+    if coherent {
+        store::multiply_stability(conn, m.id, reflect::CURATION_SCHEMA_STABILITY_MULTIPLIER)?;
+    }
+    Ok(())
+}
+
 fn run_curation_pass<L: ReflectLlm>(conn: &Connection, llm: &L, now: &str) -> Result<(usize, usize, usize, bool), KbError> {
     let candidates =
         store::curation_candidates(conn, now, reflect::CURATION_MIN_AGE_DAYS, reflect::CURATION_MAX_PER_RUN)?;
@@ -1557,6 +1799,7 @@ fn run_curation_pass<L: ReflectLlm>(conn: &Connection, llm: &L, now: &str) -> Re
     for m in candidates {
         if m.access_count >= reflect::CURATION_ENGAGEMENT_FAST_PATH {
             store::set_reviewed(conn, m.id, true)?;
+            apply_schema_fast_path(conn, &m)?;
             promoted += 1;
             continue;
         }
@@ -1587,6 +1830,7 @@ fn run_curation_pass<L: ReflectLlm>(conn: &Connection, llm: &L, now: &str) -> Re
         match reflect::parse_curation_verdict(&raw) {
             reflect::CurationVerdict::Promote => {
                 store::set_reviewed(conn, m.id, true)?;
+                apply_schema_fast_path(conn, &m)?;
                 promoted += 1;
             }
             reflect::CurationVerdict::Demote => {
@@ -1716,6 +1960,231 @@ fn run_strength_review_pass<L: ReflectLlm>(conn: &Connection, llm: &L, now: &str
     Ok((stands, stale, routed, llm_failed))
 }
 
+
+/// Resolves `name` to an entity id: exact case-insensitive name match first
+/// (`store::find_entity_by_name`), else embedding similarity reuse at or
+/// above `reflect::ENTITY_RESOLUTION_SIM_THRESHOLD`
+/// (`store::find_entity_by_similarity`), else a fresh entity is created
+/// (embedding the name itself, best-effort -- a failed embed just means the
+/// new entity can only ever be matched again by exact name, never by
+/// similarity). Returns `(id, true)` when a new entity was actually
+/// created, `(id, false)` when an existing one was reused, so callers can
+/// report how many genuinely new entities a pass added.
+fn resolve_or_create_entity<E: Embedder>(
+    conn: &Connection,
+    embedder: &E,
+    name: &str,
+    kind: Option<&str>,
+) -> Result<(i64, bool), KbError> {
+    let name = name.trim();
+    if let Some(existing) = store::find_entity_by_name(conn, name)? {
+        return Ok((existing.id, false));
+    }
+    let embedding = embedder.embed(name).ok();
+    if let Some(emb) = &embedding {
+        if let Some((existing, _)) =
+            store::find_entity_by_similarity(conn, emb, reflect::ENTITY_RESOLUTION_SIM_THRESHOLD)?
+        {
+            return Ok((existing.id, false));
+        }
+    }
+    let id = store::insert_entity(conn, name, kind, embedding.as_deref())?;
+    Ok((id, true))
+}
+
+/// Looks up a relation's own entity names for the id-free edge-conflict
+/// prompt (`reflect::build_batch_edge_contradiction_prompt`'s description
+/// tuples). `None` if either entity has since vanished (shouldn't happen —
+/// entities are never deleted — but never worth a panic over).
+fn describe_relation(conn: &Connection, r: &store::Relation) -> Result<Option<(String, String, String)>, KbError> {
+    let src = store::get_entity(conn, r.src)?;
+    let dst = store::get_entity(conn, r.dst)?;
+    match (src, dst) {
+        (Some(s), Some(d)) => Ok(Some((s.name, r.predicate.clone(), d.name))),
+        _ => Ok(None),
+    }
+}
+
+/// Batch-judges every "new edge vs. a pre-existing edge it conflicts with"
+/// candidate pair collected while a whole `mach kb reflect` graph-extraction
+/// run's batches were being inserted, in ONE haiku call covering every pair
+/// — the batched replacement for the old one-judge-call-per-edge path. The
+/// newly inserted edge always wins a `Conflict` verdict, same as before (see
+/// `reflect::EdgeContradictionVerdict::Conflict`'s own doc comment for why
+/// the model is never asked to name a winner). `pending` is `(new_edge_id,
+/// old_edge_id)` pairs, in the order they were discovered.
+///
+/// Deduped and re-checked against current state before building the prompt:
+/// the same pair can be collected more than once (two triples resolving to
+/// the same edge names), and an old edge already tombstoned earlier in this
+/// same resolution (as an even-earlier pair's loser) needs no judgment at
+/// all — `store::supersede_relation`'s own `invalidated_at IS NULL` guard
+/// would just no-op on it anyway, but skipping it here also means it never
+/// wastes a slot in the one batched prompt.
+///
+/// Unlike the memory-level graph-extraction watermark, a pair the model's
+/// reply never addresses is simply left alone (both edges stay active) —
+/// there is no backlog/retry concept for an edge-conflict check, it's a
+/// one-time judgment made at insertion time, not a queue drained across
+/// runs (see `reflect::parse_batch_edge_contradiction_verdicts`'s own doc
+/// comment). Returns whether the batched call itself failed outright (no
+/// pairs touched at all in that case) — this still gates the caller's
+/// overall `llm_failed`, same as the old per-edge path did, even though it
+/// never blocks marking a memory extracted.
+fn resolve_pending_conflicts<L: ReflectLlm>(
+    conn: &Connection,
+    llm: &L,
+    pending: &[(i64, i64)],
+    now: &str,
+) -> Result<bool, KbError> {
+    if pending.is_empty() {
+        return Ok(false);
+    }
+    let mut seen_pairs: HashSet<(i64, i64)> = HashSet::new();
+    let mut resolved: Vec<(i64, i64, (String, String, String), (String, String, String))> = Vec::new();
+    for &(new_id, old_id) in pending {
+        if !seen_pairs.insert((new_id, old_id)) {
+            continue;
+        }
+        let (new_rel, old_rel) = match (store::get_relation(conn, new_id)?, store::get_relation(conn, old_id)?) {
+            (Some(n), Some(o)) => (n, o),
+            _ => continue,
+        };
+        if !old_rel.is_active() {
+            continue; // already resolved earlier in this same batch
+        }
+        let (old_desc, new_desc) = match (describe_relation(conn, &old_rel)?, describe_relation(conn, &new_rel)?) {
+            (Some(o), Some(n)) => (o, n),
+            _ => continue,
+        };
+        resolved.push((new_id, old_id, old_desc, new_desc));
+    }
+    if resolved.is_empty() {
+        return Ok(false);
+    }
+
+    let prompt_pairs: Vec<((&str, &str, &str), (&str, &str, &str))> = resolved
+        .iter()
+        .map(|(_, _, old, new)| ((old.0.as_str(), old.1.as_str(), old.2.as_str()), (new.0.as_str(), new.1.as_str(), new.2.as_str())))
+        .collect();
+    let prompt = reflect::build_batch_edge_contradiction_prompt(&prompt_pairs);
+    let raw = match llm.call("haiku", &prompt, reflect::TIMEOUT_HAIKU_BATCH) {
+        Ok(out) => out,
+        Err(_) => return Ok(true), // whole batch call failed -- llm_failed, no edges touched
+    };
+    let verdicts = reflect::parse_batch_edge_contradiction_verdicts(&raw, resolved.len());
+    for (i, (new_id, old_id, _, _)) in resolved.iter().enumerate() {
+        if verdicts.get(&(i + 1)) == Some(&reflect::EdgeContradictionVerdict::Conflict) {
+            store::supersede_relation(conn, *old_id, *new_id, now)?;
+        }
+    }
+    Ok(false)
+}
+
+/// The graph-extraction pass (runs inside `mach kb reflect`, right after
+/// strength review and before dormancy — reading facts the contradiction
+/// patrol and strength review have already truth-maintained this run,
+/// before dormancy sweeps stale ones out of the active pool): offers every
+/// not-yet-extracted ACTIVE memory (`store::graph_extraction_candidates`,
+/// capped at `reflect::GRAPH_EXTRACTION_MAX_PER_RUN`, oldest first) to a
+/// batched haiku call, `reflect::GRAPH_EXTRACTION_BATCH_SIZE` facts at a
+/// time, extracting 0-4 entity/relation triples per fact
+/// (`reflect::parse_batch_extraction`). Each triple's entities are resolved
+/// via `resolve_or_create_entity` and the edge is inserted directly
+/// (`store::insert_relation`); every "new edge vs. pre-existing edge"
+/// conflict candidate this whole run turns up is collected and judged in
+/// ONE batched call at the very end (`resolve_pending_conflicts`), rather
+/// than one judge call per edge — the same batching philosophy the
+/// extraction call itself uses, applied to the conflict check.
+///
+/// A memory is marked extracted (`store::mark_graph_extracted`) only when
+/// its own fact number was actually addressed by its batch's reply (an
+/// explicit `NONE` or at least one well-formed triple) — never when its
+/// whole batch call failed outright, and never when the reply simply never
+/// touched that fact number (a malformed or truncated reply) — either way
+/// it stays retry-able next run (see `Memory::graph_extracted_at`'s own doc
+/// comment and `reflect::parse_batch_extraction`'s). The end-of-run
+/// conflict-judge call failing is tracked in the returned `llm_failed` flag
+/// (which gates the reflect watermark, same as every other sub-pass) but
+/// never blocks marking a memory itself extracted — the call that row's own
+/// retry-ability depends on already succeeded; a missed conflict check
+/// simply leaves both edges active, same outcome as an `Unclear`/`BothHold`
+/// verdict, surfaceable later via `mach kb entity`.
+///
+/// Runs every invocation regardless of `has_new`, same as curation/dormancy
+/// — it drains the not-yet-extracted backlog, not just this run's new
+/// material (this is what makes a one-time full backfill over a pre-
+/// existing corpus just "run `mach kb reflect` until the backlog is empty").
+///
+/// Returns `(examined, edges_created, entities_created, any_llm_call_failed)`.
+fn run_graph_extraction_pass<E: Embedder, L: ReflectLlm>(
+    conn: &Connection,
+    embedder: &E,
+    llm: &L,
+    now: &str,
+) -> Result<(usize, usize, usize, bool), KbError> {
+    let candidates = store::graph_extraction_candidates(conn, reflect::GRAPH_EXTRACTION_MAX_PER_RUN)?;
+    let mut examined = 0usize;
+    let mut edges_created = 0usize;
+    let mut entities_created = 0usize;
+    let mut llm_failed = false;
+    // Every "new edge vs. pre-existing edge" conflict candidate this whole
+    // run turns up, judged together in ONE call at the very end (see
+    // `resolve_pending_conflicts`).
+    let mut pending_conflicts: Vec<(i64, i64)> = Vec::new();
+
+    for chunk in candidates.chunks(reflect::GRAPH_EXTRACTION_BATCH_SIZE) {
+        let contents: Vec<&str> = chunk.iter().map(|m| m.content.as_str()).collect();
+        let prompt = reflect::build_batch_extraction_prompt(&contents);
+        let raw = match llm.call("haiku", &prompt, reflect::TIMEOUT_HAIKU_BATCH) {
+            Ok(out) => out,
+            Err(_) => {
+                llm_failed = true;
+                continue; // whole batch never marked extracted -- retried next run
+            }
+        };
+        let parsed = reflect::parse_batch_extraction(&raw, chunk.len());
+
+        for (i, m) in chunk.iter().enumerate() {
+            let fact_num = i + 1;
+            let triples = match parsed.get(&fact_num) {
+                Some(t) => t,
+                None => continue, // unaddressed -- not marked extracted, retried next run
+            };
+            examined += 1;
+
+            // Edges from an unreviewed source memory get the same organic
+            // confidence penalty `store::UNREVIEWED_SEARCH_PENALTY` applies
+            // to search — see `reflect::GRAPH_EXTRACTION_UNREVIEWED_PENALTY`.
+            let source_penalty = if m.reviewed { 1.0 } else { reflect::GRAPH_EXTRACTION_UNREVIEWED_PENALTY };
+
+            for t in triples {
+                let (src_id, src_new) = resolve_or_create_entity(conn, embedder, &t.src_name, t.src_kind.as_deref())?;
+                let (dst_id, dst_new) = resolve_or_create_entity(conn, embedder, &t.dst_name, t.dst_kind.as_deref())?;
+                entities_created += src_new as usize + dst_new as usize;
+
+                let confidence = t.confidence * source_penalty;
+                let new_edge_id =
+                    store::insert_relation(conn, src_id, &t.predicate, dst_id, Some(m.id), Some(confidence), now)?;
+                edges_created += 1;
+
+                for old in store::relations_conflicting_with(conn, src_id, &t.predicate, dst_id)? {
+                    if old.id == new_edge_id {
+                        continue; // defensive: relations_conflicting_with already excludes the literal same edge
+                    }
+                    pending_conflicts.push((new_edge_id, old.id));
+                }
+            }
+            store::mark_graph_extracted(conn, m.id, now)?;
+        }
+    }
+
+    let conflict_llm_failed = resolve_pending_conflicts(conn, llm, &pending_conflicts, now)?;
+    llm_failed = llm_failed || conflict_llm_failed;
+
+    Ok((examined, edges_created, entities_created, llm_failed))
+}
+
 fn cmd_insights(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut flagged_only = false;
     while let Some(a) = args.next() {
@@ -1796,6 +2265,141 @@ fn print_insight_node(conn: &Connection, ins: &Insight, indent: &str) {
             }
         }
     }
+}
+
+/// Resolves `name` to an `Entity` for `mach kb entity`/search enrichment's
+/// own purposes: exact case-insensitive match first, else embedding
+/// similarity at or above `reflect::ENTITY_RESOLUTION_SIM_THRESHOLD` — the
+/// same resolution rule extraction itself uses to avoid minting a
+/// near-duplicate, reused here so `mach kb entity <name>` finds "the same
+/// thing" a slightly-off-spelled query names.
+fn resolve_entity_for_lookup(conn: &Connection, embedder: &OllamaEmbedder, name: &str) -> Option<store::Entity> {
+    if let Ok(Some(e)) = store::find_entity_by_name(conn, name) {
+        return Some(e);
+    }
+    let emb = embedder.embed(name).ok()?;
+    store::find_entity_by_similarity(conn, &emb, reflect::ENTITY_RESOLUTION_SIM_THRESHOLD).ok().flatten().map(|(e, _)| e)
+}
+
+/// `mach kb entity <name>` — the association-graph lookup: resolves `name`
+/// to an entity (exact match first, else embedding similarity), then prints
+/// every active edge touching it in either direction, each with the other
+/// entity's name, the predicate, and the evidence memory's content snippet
+/// and date. A trailing footnote counts invalidated (tombstoned) edges
+/// without printing them — this command is about the graph's current,
+/// active belief, not its audit trail (`mach kb list --superseded` is the
+/// memory-level equivalent).
+fn cmd_entity(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut name: Option<String> = None;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "-h" | "--help" => {
+                println!("usage: mach kb entity <name>");
+                return Ok(());
+            }
+            other => {
+                if name.is_none() {
+                    name = Some(other.to_string());
+                } else {
+                    eprintln!("mach kb entity: unexpected argument '{}'", other);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    let name = match name {
+        Some(n) => n,
+        None => {
+            eprintln!("mach kb entity: missing <name> argument");
+            std::process::exit(1);
+        }
+    };
+
+    let conn = store::open().map_err(to_io)?;
+    let embedder = OllamaEmbedder::new();
+    let entity = match resolve_entity_for_lookup(&conn, &embedder, &name) {
+        Some(e) => e,
+        None => {
+            println!("no entity found matching '{}'", name);
+            return Ok(());
+        }
+    };
+
+    println!("#{} {} ({})", entity.id, entity.name, entity.kind.as_deref().unwrap_or("unspecified"));
+
+    let edges = store::active_relations_for_entity(&conn, entity.id).map_err(to_io)?;
+    if edges.is_empty() {
+        println!("  no active connections");
+    } else {
+        for e in &edges {
+            let other_id = if e.src == entity.id { e.dst } else { e.src };
+            let other_name = match store::get_entity(&conn, other_id).map_err(to_io)? {
+                Some(o) => o.name,
+                None => format!("#{}", other_id),
+            };
+            let evidence = e
+                .evidence_memory_id
+                .and_then(|id| store::get(&conn, id).ok().flatten());
+            let snippet = match &evidence {
+                Some(m) => {
+                    let date = m.created_at.get(..10).unwrap_or(&m.created_at);
+                    format!("  — {} ({})", truncate(&m.content, 70), date)
+                }
+                None => String::new(),
+            };
+            if e.src == entity.id {
+                println!("  {} —{}→ {}{}", entity.name, e.predicate, other_name, snippet);
+            } else {
+                println!("  {} —{}→ {}{}", other_name, e.predicate, entity.name, snippet);
+            }
+        }
+    }
+    let invalidated = store::invalidated_relation_count_for_entity(&conn, entity.id).map_err(to_io)?;
+    if invalidated > 0 {
+        println!(
+            "  ({} invalidated connection{} not shown — mach kb list --superseded style audit trail)",
+            invalidated,
+            if invalidated == 1 { "" } else { "s" }
+        );
+    }
+    Ok(())
+}
+
+/// `mach kb graph --stats` — a compact view of the association graph `mach
+/// kb reflect`'s extraction pass has derived so far: total entities (broken
+/// down by `kind`) and edge counts (active vs. invalidated).
+fn cmd_graph(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut stats = false;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--stats" => stats = true,
+            "-h" | "--help" => {
+                println!("usage: mach kb graph --stats");
+                return Ok(());
+            }
+            other => {
+                eprintln!("mach kb graph: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+    if !stats {
+        eprintln!("mach kb graph: missing --stats");
+        std::process::exit(1);
+    }
+
+    let conn = store::open().map_err(to_io)?;
+    let total_entities = store::entity_count(&conn).map_err(to_io)?;
+    let by_kind = store::entity_counts_by_kind(&conn).map_err(to_io)?;
+    let active_edges = store::active_relation_count(&conn).map_err(to_io)?;
+    let invalidated_edges = store::invalidated_relation_count(&conn).map_err(to_io)?;
+
+    println!("entities: {}", total_entities);
+    for (kind, count) in &by_kind {
+        println!("  {}: {}", kind, count);
+    }
+    println!("edges: {} active, {} invalidated", active_edges, invalidated_edges);
+    Ok(())
 }
 
 fn cmd_tree(mut args: impl Iterator<Item = String>) -> io::Result<()> {
@@ -2786,6 +3390,80 @@ mod tests {
         assert_eq!(examined, reflect::CURATION_MAX_PER_RUN);
     }
 
+    // --- curation pass: schema-accelerated consolidation ---
+
+    fn insert_settled_unreviewed_with_embedding(conn: &Connection, content: &str, importance: i64, embedding: &[f32]) -> i64 {
+        let id = store::insert(conn, content, Some("session-digest"), None, false, Some(embedding), importance).unwrap();
+        let old_ts = store::now_rfc3339_from_secs(store::now_secs() - 10 * 86400);
+        conn.execute("UPDATE memories SET created_at = ?1 WHERE id = ?2", params![old_ts, id]).unwrap();
+        id
+    }
+
+    #[test]
+    fn run_curation_pass_promote_near_an_existing_insight_gets_the_schema_stability_boost() {
+        let conn = mem_conn();
+        let emb = unit_vec(4, 0);
+        store::insert_insight(&conn, "an existing durable insight", 0.7, &["1".to_string(), "2".to_string()], Some(&emb)).unwrap();
+        let id = insert_settled_unreviewed_with_embedding(&conn, "a fact that fits the existing schema", 5, &emb);
+        // stability starts at importance * 7.0 = 35.0
+        assert_eq!(store::get(&conn, id).unwrap().unwrap().stability, Some(35.0));
+
+        let llm = FixedReflectLlm { reply: Ok("PROMOTE") };
+        let (_examined, promoted, _demoted, failed) = run_curation_pass(&conn, &llm, &store::now_rfc3339()).unwrap();
+        assert_eq!(promoted, 1);
+        assert!(!failed);
+        let m = store::get(&conn, id).unwrap().unwrap();
+        assert!(m.reviewed);
+        assert_eq!(
+            m.stability,
+            Some(35.0 * reflect::CURATION_SCHEMA_STABILITY_MULTIPLIER),
+            "a promotion coherent with an existing insight must get the schema-consolidation boost"
+        );
+    }
+
+    #[test]
+    fn run_curation_pass_promote_an_orphan_fact_keeps_the_default_stability() {
+        let conn = mem_conn();
+        let emb = unit_vec(4, 0);
+        // An insight exists, but its embedding is orthogonal to the
+        // promoted fact's own -- nothing coherent to attach to.
+        store::insert_insight(&conn, "an unrelated insight", 0.7, &["1".to_string(), "2".to_string()], Some(&unit_vec(4, 1)))
+            .unwrap();
+        let id = insert_settled_unreviewed_with_embedding(&conn, "an orphan fact", 5, &emb);
+
+        let llm = FixedReflectLlm { reply: Ok("PROMOTE") };
+        let (_examined, promoted, _demoted, failed) = run_curation_pass(&conn, &llm, &store::now_rfc3339()).unwrap();
+        assert_eq!(promoted, 1);
+        assert!(!failed);
+        let m = store::get(&conn, id).unwrap().unwrap();
+        assert_eq!(m.stability, Some(35.0), "an orphan promotion must keep its ordinary default stability");
+    }
+
+    #[test]
+    fn run_curation_pass_engagement_fast_path_also_gets_the_schema_boost() {
+        let conn = mem_conn();
+        let emb = unit_vec(4, 0);
+        store::insert_insight(&conn, "an existing durable insight", 0.7, &["1".to_string(), "2".to_string()], Some(&emb)).unwrap();
+        let id = insert_settled_unreviewed_with_embedding(&conn, "used twice, and coherent with the schema", 5, &emb);
+        let now = store::now_rfc3339();
+        store::touch(&conn, &[id], &now).unwrap();
+        store::touch(&conn, &[id], &now).unwrap();
+
+        let llm = FixedReflectLlm { reply: Err("must never be called") };
+        let (_examined, promoted, _demoted, failed) = run_curation_pass(&conn, &llm, &now).unwrap();
+        assert_eq!(promoted, 1);
+        assert!(!failed);
+        let m = store::get(&conn, id).unwrap().unwrap();
+        // touch() itself grows stability by 1.3x twice before the schema
+        // multiplier applies on top -- 35.0 * 1.3 * 1.3 * 1.5.
+        let expected = (35.0f64 * 1.3 * 1.3 * reflect::CURATION_SCHEMA_STABILITY_MULTIPLIER).min(365.0);
+        assert!(
+            (m.stability.unwrap() - expected).abs() < 1e-6,
+            "the fast path is still a promotion and must get the schema boost too, got {:?}",
+            m.stability
+        );
+    }
+
     #[test]
     fn a_row_demoted_this_run_can_never_be_swept_dormant_in_the_same_run() {
         // Direct proof of the pass-ordering invariant: curation's own
@@ -3300,5 +3978,454 @@ mod tests {
     fn list_transcript_files_on_missing_root_is_empty() {
         let missing = std::env::temp_dir().join("mach-kb-ingest-test-definitely-missing-root");
         assert_eq!(list_transcript_files(&missing), Vec::<PathBuf>::new());
+    }
+
+    // --- graph layer: entity resolution, edge conflict, extraction pass ---
+
+    /// An `Embedder` test double that always returns the same fixed vector
+    /// regardless of input text -- lets a connections/search test control
+    /// exactly which entity a query embedding matches, without depending on
+    /// `FakeEmbedder`'s byte-length-sensitive cosine behavior.
+    struct FixedVecEmbedder(Vec<f32>);
+
+    impl Embedder for FixedVecEmbedder {
+        fn embed(&self, _text: &str) -> Result<Vec<f32>, KbError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn resolve_or_create_entity_reuses_an_exact_case_insensitive_name_match() {
+        let conn = mem_conn();
+        let existing = store::insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let (id, created) = resolve_or_create_entity(&conn, &FakeEmbedder, "MOSES", Some("person")).unwrap();
+        assert_eq!(id, existing);
+        assert!(!created);
+    }
+
+    #[test]
+    fn resolve_or_create_entity_reuses_via_embedding_similarity() {
+        let conn = mem_conn();
+        // Same byte length, one letter apart -- FakeEmbedder's byte-vector
+        // cosine between these two is comfortably above
+        // ENTITY_RESOLUTION_SIM_THRESHOLD, and the exact-name path can never
+        // catch this (the strings differ).
+        let existing = store::insert_entity(&conn, "Moses", Some("person"), Some(&FakeEmbedder.embed("Moses").unwrap())).unwrap();
+        let (id, created) = resolve_or_create_entity(&conn, &FakeEmbedder, "Moxes", Some("person")).unwrap();
+        assert_eq!(id, existing, "a near-spelling must resolve to the same entity via similarity");
+        assert!(!created);
+    }
+
+    #[test]
+    fn resolve_or_create_entity_creates_a_new_entity_when_nothing_matches() {
+        let conn = mem_conn();
+        let (id, created) = resolve_or_create_entity(&conn, &FakeEmbedder, "Umoja", Some("project")).unwrap();
+        assert!(created);
+        let e = store::get_entity(&conn, id).unwrap().unwrap();
+        assert_eq!(e.name, "Umoja");
+        assert_eq!(e.kind.as_deref(), Some("project"));
+    }
+
+    #[test]
+    fn resolve_pending_conflicts_conflict_supersedes_the_older_edge() {
+        // The boss test: "Moses boss-of user" already active; a candidate
+        // pair naming it as the "old" edge against a newly inserted "Ivar
+        // boss-of user" edge, with a CONFLICT verdict, must tombstone the
+        // Moses edge in favor of the new one -- the newly inserted edge
+        // always wins, no timestamp comparison needed.
+        let conn = mem_conn();
+        let moses = store::insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let ivar = store::insert_entity(&conn, "Ivar", Some("person"), None).unwrap();
+        let user = store::insert_entity(&conn, "user", None, None).unwrap();
+        let now = store::now_rfc3339();
+        let old_edge = store::insert_relation(&conn, moses, "boss-of", user, None, Some(0.9), &now).unwrap();
+        let new_edge = store::insert_relation(&conn, ivar, "boss-of", user, None, Some(0.9), &now).unwrap();
+
+        let llm = FixedReflectLlm { reply: Ok("1: CONFLICT") };
+        let failed = resolve_pending_conflicts(&conn, &llm, &[(new_edge, old_edge)], &now).unwrap();
+        assert!(!failed);
+        assert!(store::get_relation(&conn, new_edge).unwrap().unwrap().is_active());
+        assert!(!store::get_relation(&conn, old_edge).unwrap().unwrap().is_active(), "the older edge must be tombstoned");
+        assert_eq!(store::get_relation(&conn, old_edge).unwrap().unwrap().superseded_by, Some(new_edge));
+    }
+
+    #[test]
+    fn resolve_pending_conflicts_both_hold_leaves_both_edges_active() {
+        let conn = mem_conn();
+        let moses = store::insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let ivar = store::insert_entity(&conn, "Ivar", Some("person"), None).unwrap();
+        let user = store::insert_entity(&conn, "user", None, None).unwrap();
+        let now = store::now_rfc3339();
+        let old_edge = store::insert_relation(&conn, moses, "boss-of", user, None, Some(0.9), &now).unwrap();
+        let new_edge = store::insert_relation(&conn, ivar, "boss-of", user, None, Some(0.9), &now).unwrap();
+
+        let llm = FixedReflectLlm { reply: Ok("1: BOTH_HOLD") };
+        let _failed = resolve_pending_conflicts(&conn, &llm, &[(new_edge, old_edge)], &now).unwrap();
+        assert!(store::get_relation(&conn, old_edge).unwrap().unwrap().is_active());
+        assert!(store::get_relation(&conn, new_edge).unwrap().unwrap().is_active());
+    }
+
+    #[test]
+    fn resolve_pending_conflicts_failed_judge_call_leaves_both_edges_active_and_reports_failure() {
+        let conn = mem_conn();
+        let moses = store::insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let ivar = store::insert_entity(&conn, "Ivar", Some("person"), None).unwrap();
+        let user = store::insert_entity(&conn, "user", None, None).unwrap();
+        let now = store::now_rfc3339();
+        let old_edge = store::insert_relation(&conn, moses, "boss-of", user, None, Some(0.9), &now).unwrap();
+        let new_edge = store::insert_relation(&conn, ivar, "boss-of", user, None, Some(0.9), &now).unwrap();
+
+        let llm = FixedReflectLlm { reply: Err("offline") };
+        let failed = resolve_pending_conflicts(&conn, &llm, &[(new_edge, old_edge)], &now).unwrap();
+        assert!(failed);
+        assert!(store::get_relation(&conn, old_edge).unwrap().unwrap().is_active());
+        assert!(store::get_relation(&conn, new_edge).unwrap().unwrap().is_active());
+    }
+
+    #[test]
+    fn resolve_pending_conflicts_judges_multiple_pairs_in_one_call() {
+        let conn = mem_conn();
+        let moses = store::insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let ivar = store::insert_entity(&conn, "Ivar", Some("person"), None).unwrap();
+        let elena = store::insert_entity(&conn, "Elena", Some("person"), None).unwrap();
+        let user = store::insert_entity(&conn, "user", None, None).unwrap();
+        let tea = store::insert_entity(&conn, "tea", Some("concept"), None).unwrap();
+        let coffee = store::insert_entity(&conn, "coffee", Some("concept"), None).unwrap();
+        let now = store::now_rfc3339();
+        let old_boss = store::insert_relation(&conn, moses, "boss-of", user, None, Some(0.9), &now).unwrap();
+        let new_boss = store::insert_relation(&conn, ivar, "boss-of", user, None, Some(0.9), &now).unwrap();
+        let old_pref = store::insert_relation(&conn, user, "prefers", tea, None, Some(0.9), &now).unwrap();
+        let new_pref = store::insert_relation(&conn, user, "prefers", coffee, None, Some(0.9), &now).unwrap();
+        let _ = elena; // unused entity, just padding the graph a bit for realism
+
+        // One call, one reply covering both pairs -- a pair-numbered verdict
+        // per line, no ids anywhere in the prompt or reply.
+        let llm = FixedReflectLlm { reply: Ok("1: CONFLICT\n2: BOTH_HOLD") };
+        let failed =
+            resolve_pending_conflicts(&conn, &llm, &[(new_boss, old_boss), (new_pref, old_pref)], &now).unwrap();
+        assert!(!failed);
+        assert!(!store::get_relation(&conn, old_boss).unwrap().unwrap().is_active());
+        assert!(store::get_relation(&conn, old_pref).unwrap().unwrap().is_active(), "BOTH_HOLD leaves both active");
+        assert!(store::get_relation(&conn, new_pref).unwrap().unwrap().is_active());
+    }
+
+    #[test]
+    fn resolve_pending_conflicts_skips_a_pair_already_resolved_earlier_in_the_same_batch() {
+        // Both pairs name the SAME old edge as their loser -- once the first
+        // pair's CONFLICT verdict tombstones it, the second pair must be a
+        // silent no-op rather than erroring or double-tombstoning.
+        let conn = mem_conn();
+        let moses = store::insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let ivar = store::insert_entity(&conn, "Ivar", Some("person"), None).unwrap();
+        let elena = store::insert_entity(&conn, "Elena", Some("person"), None).unwrap();
+        let user = store::insert_entity(&conn, "user", None, None).unwrap();
+        let now = store::now_rfc3339();
+        let old_edge = store::insert_relation(&conn, moses, "boss-of", user, None, Some(0.9), &now).unwrap();
+        let ivar_edge = store::insert_relation(&conn, ivar, "boss-of", user, None, Some(0.9), &now).unwrap();
+        let elena_edge = store::insert_relation(&conn, elena, "boss-of", user, None, Some(0.9), &now).unwrap();
+
+        let llm = FixedReflectLlm { reply: Ok("1: CONFLICT\n2: CONFLICT") };
+        let failed = resolve_pending_conflicts(&conn, &llm, &[(ivar_edge, old_edge), (elena_edge, old_edge)], &now).unwrap();
+        assert!(!failed);
+        assert!(!store::get_relation(&conn, old_edge).unwrap().unwrap().is_active());
+        assert_eq!(store::get_relation(&conn, old_edge).unwrap().unwrap().superseded_by, Some(ivar_edge));
+        assert!(store::get_relation(&conn, ivar_edge).unwrap().unwrap().is_active());
+        assert!(store::get_relation(&conn, elena_edge).unwrap().unwrap().is_active());
+    }
+
+    #[test]
+    fn run_graph_extraction_pass_extracts_edges_resolves_entities_and_marks_extracted() {
+        let conn = mem_conn();
+        let id = store::insert(&conn, "the user works on a project called Umoja", None, None, true, None, 5).unwrap();
+        let llm = FixedReflectLlm { reply: Ok("1: user | | works-on | Umoja | project | 0.9") };
+
+        let (examined, edges, entities, failed) =
+            run_graph_extraction_pass(&conn, &FakeEmbedder, &llm, &store::now_rfc3339()).unwrap();
+        assert_eq!(examined, 1);
+        assert_eq!(edges, 1);
+        assert_eq!(entities, 2, "both \"user\" and \"Umoja\" are newly created");
+        assert!(!failed);
+
+        let mem = store::get(&conn, id).unwrap().unwrap();
+        assert!(mem.graph_extracted_at.is_some());
+
+        let user = store::find_entity_by_name(&conn, "user").unwrap().unwrap();
+        let edges_for_user = store::active_relations_for_entity(&conn, user.id).unwrap();
+        assert_eq!(edges_for_user.len(), 1);
+        assert_eq!(edges_for_user[0].predicate, "works-on");
+        assert_eq!(edges_for_user[0].evidence_memory_id, Some(id));
+    }
+
+    #[test]
+    fn run_graph_extraction_pass_none_reply_still_marks_the_memory_extracted() {
+        let conn = mem_conn();
+        let id = store::insert(&conn, "a fact with no stated relation", None, None, true, None, 5).unwrap();
+        let llm = FixedReflectLlm { reply: Ok("1: NONE") };
+
+        let (examined, edges, entities, failed) =
+            run_graph_extraction_pass(&conn, &FakeEmbedder, &llm, &store::now_rfc3339()).unwrap();
+        assert_eq!(examined, 1);
+        assert_eq!(edges, 0);
+        assert_eq!(entities, 0);
+        assert!(!failed);
+        assert!(store::get(&conn, id).unwrap().unwrap().graph_extracted_at.is_some());
+    }
+
+    #[test]
+    fn run_graph_extraction_pass_failed_call_never_marks_extracted() {
+        let conn = mem_conn();
+        let id = store::insert(&conn, "a fact", None, None, true, None, 5).unwrap();
+        let llm = FixedReflectLlm { reply: Err("offline") };
+
+        let (examined, edges, entities, failed) =
+            run_graph_extraction_pass(&conn, &FakeEmbedder, &llm, &store::now_rfc3339()).unwrap();
+        assert_eq!(examined, 0);
+        assert_eq!(edges, 0);
+        assert_eq!(entities, 0);
+        assert!(failed);
+        assert!(
+            store::get(&conn, id).unwrap().unwrap().graph_extracted_at.is_none(),
+            "a failed call must never mark the memory extracted -- it must be retried next run"
+        );
+    }
+
+    #[test]
+    fn run_graph_extraction_pass_penalizes_confidence_for_an_unreviewed_source() {
+        let conn = mem_conn();
+        store::insert(&conn, "an unreviewed fact about tea", None, None, false, None, 5).unwrap();
+        let llm = FixedReflectLlm { reply: Ok("1: user | | prefers | tea | | 1.0") };
+
+        run_graph_extraction_pass(&conn, &FakeEmbedder, &llm, &store::now_rfc3339()).unwrap();
+        let user = store::find_entity_by_name(&conn, "user").unwrap().unwrap();
+        let edge = &store::active_relations_for_entity(&conn, user.id).unwrap()[0];
+        assert!(
+            (edge.confidence.unwrap() - reflect::GRAPH_EXTRACTION_UNREVIEWED_PENALTY).abs() < 1e-9,
+            "confidence 1.0 * the unreviewed penalty, got {:?}",
+            edge.confidence
+        );
+    }
+
+    // --- graph extraction: batching ---
+
+    #[test]
+    fn run_graph_extraction_pass_batches_multiple_memories_into_one_call() {
+        struct CountingLlm {
+            reply: &'static str,
+            calls: std::cell::Cell<usize>,
+        }
+        impl ReflectLlm for CountingLlm {
+            fn call(&self, _model: &str, _prompt: &str, _timeout: std::time::Duration) -> Result<String, String> {
+                self.calls.set(self.calls.get() + 1);
+                Ok(self.reply.to_string())
+            }
+        }
+
+        let conn = mem_conn();
+        for i in 0..3 {
+            store::insert(&conn, &format!("fact number {}", i), None, None, true, None, 5).unwrap();
+        }
+        let llm = CountingLlm { reply: "1: NONE\n2: NONE\n3: NONE", calls: std::cell::Cell::new(0) };
+        let (examined, edges, entities, failed) =
+            run_graph_extraction_pass(&conn, &FakeEmbedder, &llm, &store::now_rfc3339()).unwrap();
+        assert_eq!(examined, 3);
+        assert_eq!(edges, 0);
+        assert_eq!(entities, 0);
+        assert!(!failed);
+        assert_eq!(llm.calls.get(), 1, "three memories well under the batch size must cost exactly one call");
+    }
+
+    #[test]
+    fn run_graph_extraction_pass_splits_into_multiple_batches_over_the_batch_size() {
+        struct CountingLlm {
+            calls: std::cell::Cell<usize>,
+        }
+        impl ReflectLlm for CountingLlm {
+            fn call(&self, _model: &str, _prompt: &str, _timeout: std::time::Duration) -> Result<String, String> {
+                self.calls.set(self.calls.get() + 1);
+                // Generously covers the largest possible batch -- entries
+                // beyond a smaller chunk's own fact count are simply
+                // out-of-range and ignored by `parse_batch_extraction`.
+                let mut out = String::new();
+                for i in 1..=reflect::GRAPH_EXTRACTION_BATCH_SIZE {
+                    out.push_str(&format!("{}: NONE\n", i));
+                }
+                Ok(out)
+            }
+        }
+
+        let conn = mem_conn();
+        let total = reflect::GRAPH_EXTRACTION_BATCH_SIZE + 5;
+        for i in 0..total {
+            store::insert(&conn, &format!("fact number {}", i), None, None, true, None, 5).unwrap();
+        }
+        let llm = CountingLlm { calls: std::cell::Cell::new(0) };
+        let (examined, _edges, _entities, failed) =
+            run_graph_extraction_pass(&conn, &FakeEmbedder, &llm, &store::now_rfc3339()).unwrap();
+        assert_eq!(examined, total);
+        assert!(!failed);
+        assert_eq!(llm.calls.get(), 2, "batch_size + 5 candidates at a batch size of batch_size must take exactly 2 calls");
+    }
+
+    #[test]
+    fn run_graph_extraction_pass_partial_batch_reply_only_marks_addressed_facts_extracted() {
+        let conn = mem_conn();
+        let id1 = store::insert(&conn, "fact one", None, None, true, None, 5).unwrap();
+        let id2 = store::insert(&conn, "fact two", None, None, true, None, 5).unwrap();
+        // The reply never mentions fact 2 at all -- a truncated/malformed
+        // batch reply, not a legitimate NONE for it.
+        let llm = FixedReflectLlm { reply: Ok("1: NONE") };
+        let (examined, _edges, _entities, failed) =
+            run_graph_extraction_pass(&conn, &FakeEmbedder, &llm, &store::now_rfc3339()).unwrap();
+        assert_eq!(examined, 1);
+        assert!(!failed, "the call itself succeeded -- only part of its reply was usable");
+        assert!(store::get(&conn, id1).unwrap().unwrap().graph_extracted_at.is_some());
+        assert!(
+            store::get(&conn, id2).unwrap().unwrap().graph_extracted_at.is_none(),
+            "an unaddressed fact must stay retry-able next run, never silently treated as NONE"
+        );
+    }
+
+    // --- search enrichment: entity connections ---
+
+    #[test]
+    fn search_hits_surfaces_connections_for_a_closely_matching_entity() {
+        let conn = mem_conn();
+        let q = unit_vec(4, 0);
+        let moses = store::insert_entity(&conn, "Moses", Some("person"), Some(&q)).unwrap();
+        let user = store::insert_entity(&conn, "user", None, None).unwrap();
+        let mem_id = store::insert(&conn, "Moses is the user's boss", None, None, true, None, 5).unwrap();
+        store::insert_relation(&conn, moses, "boss-of", user, Some(mem_id), Some(0.9), &store::now_rfc3339()).unwrap();
+
+        let embedder = FixedVecEmbedder(q);
+        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &store::now_rfc3339())
+            .unwrap();
+        assert_eq!(resp.connections.len(), 1);
+        assert_eq!(resp.connections[0].src_name, "Moses");
+        assert_eq!(resp.connections[0].predicate, "boss-of");
+        assert_eq!(resp.connections[0].dst_name, "user");
+        assert_eq!(resp.connections[0].evidence_date.len(), 10);
+    }
+
+    #[test]
+    fn search_hits_connections_empty_when_nothing_clears_the_threshold() {
+        let conn = mem_conn();
+        // An entity exists but its embedding is orthogonal to the query.
+        store::insert_entity(&conn, "Moses", Some("person"), Some(&unit_vec(4, 1))).unwrap();
+        let embedder = FixedVecEmbedder(unit_vec(4, 0));
+        let resp =
+            search_hits(&conn, &embedder, "anything", 10, false, false, 0.0, &store::now_rfc3339()).unwrap();
+        assert!(resp.connections.is_empty());
+    }
+
+    // --- search enrichment: 2-hop spreading activation ---
+
+    #[test]
+    fn entity_connections_walks_a_second_hop_when_hop1_confidence_clears_the_floor() {
+        let conn = mem_conn();
+        let q = unit_vec(4, 0);
+        let moses = store::insert_entity(&conn, "Moses", Some("person"), Some(&q)).unwrap();
+        let user = store::insert_entity(&conn, "user", None, None).unwrap();
+        let umoja = store::insert_entity(&conn, "Umoja", Some("project"), None).unwrap();
+        let now = store::now_rfc3339();
+        let mem1 = store::insert(&conn, "Moses is the user's boss", None, None, true, None, 5).unwrap();
+        store::insert_relation(&conn, moses, "boss-of", user, Some(mem1), Some(0.9), &now).unwrap();
+        let mem2 = store::insert(&conn, "the user works on Umoja", None, None, true, None, 5).unwrap();
+        store::insert_relation(&conn, user, "works-on", umoja, Some(mem2), Some(0.8), &now).unwrap();
+
+        let embedder = FixedVecEmbedder(q);
+        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &now).unwrap();
+        assert_eq!(resp.connections.len(), 2, "one hop-1 edge plus one hop-2 chain through it");
+
+        let hop1 = &resp.connections[0];
+        assert_eq!(hop1.hops, 1);
+        assert_eq!(hop1.src_name, "Moses");
+        assert_eq!(hop1.dst_name, "user");
+        assert!(hop1.predicate2.is_none());
+
+        let hop2 = &resp.connections[1];
+        assert_eq!(hop2.hops, 2);
+        assert_eq!(hop2.src_name, "Moses");
+        assert_eq!(hop2.predicate, "boss-of");
+        assert_eq!(hop2.dst_name, "user");
+        assert_eq!(hop2.predicate2.as_deref(), Some("works-on"));
+        assert_eq!(hop2.dst_name2.as_deref(), Some("Umoja"));
+    }
+
+    #[test]
+    fn entity_connections_skips_second_hop_below_the_confidence_floor() {
+        let conn = mem_conn();
+        let q = unit_vec(4, 0);
+        let moses = store::insert_entity(&conn, "Moses", Some("person"), Some(&q)).unwrap();
+        let user = store::insert_entity(&conn, "user", None, None).unwrap();
+        let umoja = store::insert_entity(&conn, "Umoja", Some("project"), None).unwrap();
+        let now = store::now_rfc3339();
+        // Hop-1 edge confidence sits below SEARCH_HOP2_MIN_CONFIDENCE (0.6).
+        store::insert_relation(&conn, moses, "boss-of", user, None, Some(0.5), &now).unwrap();
+        store::insert_relation(&conn, user, "works-on", umoja, None, Some(0.9), &now).unwrap();
+
+        let embedder = FixedVecEmbedder(q);
+        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &now).unwrap();
+        assert_eq!(resp.connections.len(), 1, "a low-confidence hop-1 edge must not seed a hop-2 walk");
+        assert_eq!(resp.connections[0].hops, 1);
+    }
+
+    #[test]
+    fn entity_connections_never_double_counts_a_reverse_edge_to_the_matched_entity_as_a_new_hop2() {
+        let conn = mem_conn();
+        let q = unit_vec(4, 0);
+        let moses = store::insert_entity(&conn, "Moses", Some("person"), Some(&q)).unwrap();
+        let user = store::insert_entity(&conn, "user", None, None).unwrap();
+        let now = store::now_rfc3339();
+        store::insert_relation(&conn, moses, "boss-of", user, None, Some(0.9), &now).unwrap();
+        // A second, distinct edge between the same two entities, in the
+        // other direction -- both are genuine hop-1 edges (each touches the
+        // matched entity directly), but walking the pivot's own edges for
+        // hop 2 must not rediscover either of them as new "hop 2"
+        // information -- a spurious cycle straight back to the matched
+        // entity, whether caught by edge-id dedup or the explicit
+        // "not the matched entity" check.
+        store::insert_relation(&conn, user, "frustrated-by", moses, None, Some(0.9), &now).unwrap();
+
+        let embedder = FixedVecEmbedder(q);
+        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &now).unwrap();
+        assert_eq!(resp.connections.len(), 2, "both direct edges between Moses and user are hop-1 connections");
+        assert!(resp.connections.iter().all(|c| c.hops == 1), "neither edge must be re-surfaced as a spurious hop-2 walk");
+    }
+
+    #[test]
+    fn entity_connections_caps_hop2_at_two_per_neighbor() {
+        let conn = mem_conn();
+        let q = unit_vec(4, 0);
+        let moses = store::insert_entity(&conn, "Moses", Some("person"), Some(&q)).unwrap();
+        let user = store::insert_entity(&conn, "user", None, None).unwrap();
+        let now = store::now_rfc3339();
+        store::insert_relation(&conn, moses, "boss-of", user, None, Some(0.9), &now).unwrap();
+        for i in 0..3 {
+            let far = store::insert_entity(&conn, &format!("Thing{}", i), Some("concept"), None).unwrap();
+            store::insert_relation(&conn, user, "likes", far, None, Some(0.9), &now).unwrap();
+        }
+
+        let embedder = FixedVecEmbedder(q);
+        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &now).unwrap();
+        // 1 hop-1 edge + at most 2 hop-2 edges through the one neighbor.
+        assert_eq!(resp.connections.len(), 3);
+        assert_eq!(resp.connections.iter().filter(|c| c.hops == 2).count(), 2);
+    }
+
+    #[test]
+    fn entity_connections_caps_at_five_total_favoring_hop1() {
+        let conn = mem_conn();
+        let q = unit_vec(4, 0);
+        let moses = store::insert_entity(&conn, "Moses", Some("person"), Some(&q)).unwrap();
+        let now = store::now_rfc3339();
+        for i in 0..6 {
+            let other = store::insert_entity(&conn, &format!("Person{}", i), Some("person"), None).unwrap();
+            store::insert_relation(&conn, moses, "knows", other, None, Some(0.9), &now).unwrap();
+        }
+
+        let embedder = FixedVecEmbedder(q);
+        let resp = search_hits(&conn, &embedder, "who does Moses know", 10, false, false, 0.0, &now).unwrap();
+        assert_eq!(resp.connections.len(), 5, "6 direct edges must still cap at the overall limit");
+        assert!(resp.connections.iter().all(|c| c.hops == 1), "hop-1 edges fill the cap before any hop-2 walk runs");
     }
 }

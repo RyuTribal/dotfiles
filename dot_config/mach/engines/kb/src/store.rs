@@ -82,6 +82,15 @@ pub struct Memory {
     // sampled yet, which sorts first in `memories_due_for_strength_review`'s
     // `ORDER BY ... ASC`, same trick `insights_due_for_verification` uses.
     pub last_verified_at: Option<String>,
+    // Set by `mach kb reflect`'s graph-extraction pass once this row has
+    // been offered to the entity/relation extraction judge (whether or not
+    // it actually yielded any triples) -- never set again after that, so a
+    // memory is only ever offered once. NULL means "not yet extracted",
+    // which is what `graph_extraction_candidates` filters on. A failed LLM
+    // call must never set this (see that pass's own doc comment) -- same
+    // "never mark seen on failure" house rule as `dedupe_seen`/
+    // `contradiction_seen`.
+    pub graph_extracted_at: Option<String>,
 }
 
 impl Memory {
@@ -173,7 +182,8 @@ fn init_schema(conn: &Connection) -> Result<(), KbError> {
             invalidated_at TEXT,
             superseded_by INTEGER,
             dormant_at TEXT,
-            last_verified_at TEXT
+            last_verified_at TEXT,
+            graph_extracted_at TEXT
         );
         CREATE TABLE IF NOT EXISTS insights (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -205,6 +215,26 @@ fn init_schema(conn: &Connection) -> Result<(), KbError> {
         CREATE TABLE IF NOT EXISTS ingested_sessions (
             session_id TEXT PRIMARY KEY,
             ingested_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS entities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            kind TEXT,
+            embedding BLOB,
+            created_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_name_nocase ON entities (name COLLATE NOCASE);
+        CREATE TABLE IF NOT EXISTS relations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            src INTEGER NOT NULL REFERENCES entities(id),
+            predicate TEXT NOT NULL,
+            dst INTEGER NOT NULL REFERENCES entities(id),
+            evidence_memory_id INTEGER REFERENCES memories(id),
+            confidence REAL,
+            created_at TEXT NOT NULL,
+            valid_from TEXT,
+            invalidated_at TEXT,
+            superseded_by INTEGER
         );",
     )?;
     Ok(())
@@ -379,6 +409,25 @@ fn migrate_v7_to_v8(conn: &Connection) -> Result<(), KbError> {
     Ok(())
 }
 
+/// `PRAGMA user_version`-gated, idempotent 8 -> 9 migration: the
+/// entities/relations graph layer. `init_schema`'s `CREATE TABLE IF NOT
+/// EXISTS` already creates `entities` and `relations` (plus the
+/// case-insensitive unique index on `entities.name`) on any database (fresh
+/// or pre-existing) before `migrate` ever runs, and a fresh `memories` table
+/// already has `graph_extracted_at`, so the only real work here is adding
+/// that column to a pre-existing `memories` table that predates it — every
+/// existing row is, by definition, not yet offered to the graph-extraction
+/// pass, which is exactly the column's implicit default (NULL) — and
+/// bumping the version.
+fn migrate_v8_to_v9(conn: &Connection) -> Result<(), KbError> {
+    let cols = existing_columns(conn)?;
+    if !cols.iter().any(|c| c == "graph_extracted_at") {
+        conn.execute("ALTER TABLE memories ADD COLUMN graph_extracted_at TEXT", [])?;
+    }
+    conn.execute("PRAGMA user_version = 9", [])?;
+    Ok(())
+}
+
 fn migrate_v6_to_v7(conn: &Connection) -> Result<(), KbError> {
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(
@@ -473,6 +522,9 @@ fn migrate(conn: &Connection) -> Result<(), KbError> {
     }
     if version < 8 {
         migrate_v7_to_v8(conn)?;
+    }
+    if version < 9 {
+        migrate_v8_to_v9(conn)?;
     }
     Ok(())
 }
@@ -680,6 +732,7 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         superseded_by: row.get("superseded_by")?,
         dormant_at: row.get("dormant_at")?,
         last_verified_at: row.get("last_verified_at")?,
+        graph_extracted_at: row.get("graph_extracted_at")?,
         created_at,
     })
 }
@@ -1899,6 +1952,24 @@ pub fn halve_stability(conn: &Connection, id: i64) -> Result<bool, KbError> {
     Ok(n > 0)
 }
 
+/// Multiplies a memory's effective `stability` by `factor`, capped at 365
+/// days -- the same cap `touch`'s own reinforcement growth uses. Used by
+/// `mach kb reflect`'s curation pass for schema-accelerated consolidation
+/// (`reflect::CURATION_SCHEMA_STABILITY_MULTIPLIER` — see
+/// `cli::apply_schema_fast_path`'s own doc comment): a fact judged coherent
+/// with an existing insight/theme consolidates faster than an orphan fact
+/// with nothing to attach to. `COALESCE` mirrors `touch`/`halve_stability`'s
+/// own fallback to `importance * 7.0` for a row whose `stability` somehow
+/// ended up NULL.
+pub fn multiply_stability(conn: &Connection, id: i64, factor: f64) -> Result<bool, KbError> {
+    let n = conn.execute(
+        "UPDATE memories SET stability = MIN(COALESCE(stability, importance * 7.0) * ?1, 365.0)
+         WHERE id = ?2 AND invalidated_at IS NULL",
+        params![factor, id],
+    )?;
+    Ok(n > 0)
+}
+
 // --- export/import support (mach kb export / mach kb import) ---
 
 /// Every memory row, in every state (reviewed or not, tombstoned, dormant),
@@ -1952,8 +2023,8 @@ pub fn raw_upsert_memory(conn: &Connection, m: &Memory) -> Result<(), KbError> {
         "INSERT INTO memories
             (id, content, source, project, created_at, reviewed, embedding, importance, stability,
              access_count, first_accessed_at, last_accessed_at, valid_from, invalidated_at,
-             superseded_by, dormant_at, last_verified_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+             superseded_by, dormant_at, last_verified_at, graph_extracted_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
          ON CONFLICT(id) DO UPDATE SET
             content = excluded.content, source = excluded.source, project = excluded.project,
             created_at = excluded.created_at, reviewed = excluded.reviewed, embedding = excluded.embedding,
@@ -1961,7 +2032,8 @@ pub fn raw_upsert_memory(conn: &Connection, m: &Memory) -> Result<(), KbError> {
             access_count = excluded.access_count, first_accessed_at = excluded.first_accessed_at,
             last_accessed_at = excluded.last_accessed_at, valid_from = excluded.valid_from,
             invalidated_at = excluded.invalidated_at, superseded_by = excluded.superseded_by,
-            dormant_at = excluded.dormant_at, last_verified_at = excluded.last_verified_at",
+            dormant_at = excluded.dormant_at, last_verified_at = excluded.last_verified_at,
+            graph_extracted_at = excluded.graph_extracted_at",
         params![
             m.id,
             m.content,
@@ -1980,6 +2052,7 @@ pub fn raw_upsert_memory(conn: &Connection, m: &Memory) -> Result<(), KbError> {
             m.superseded_by,
             m.dormant_at,
             m.last_verified_at,
+            m.graph_extracted_at,
         ],
     )?;
     Ok(())
@@ -2028,6 +2101,7 @@ pub fn memory_last_modified(m: &Memory) -> &str {
         m.invalidated_at.as_deref(),
         m.dormant_at.as_deref(),
         m.last_verified_at.as_deref(),
+        m.graph_extracted_at.as_deref(),
     ] {
         if let Some(c) = candidate {
             if c > latest {
@@ -2082,6 +2156,305 @@ pub fn mark_session_ingested(conn: &Connection, session_id: &str, now: &str) -> 
         params![session_id, now],
     )?;
     Ok(())
+}
+
+
+// --- entities/relations: the graph layer ---
+//
+// Entities are not just people: a project, a technology, a game engine, a
+// practice, a concept, an organization -- anything durable and nameable that
+// `mach kb reflect`'s graph-extraction pass judged worth naming from a fact
+// it already holds. `kind` is free text with a suggested vocabulary but
+// never enforced. This augments the memory it came from, never replaces it
+// -- every edge carries an `evidence_memory_id` pointing back at the fact it
+// was extracted from.
+
+/// One durable, nameable entity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entity {
+    pub id: i64,
+    pub name: String,
+    pub kind: Option<String>,
+    pub embedding: Option<Vec<f32>>,
+    pub created_at: String,
+}
+
+/// One directed edge between two entities -- "src predicate dst". Same
+/// bi-temporal tombstone semantics as `Memory`/`Insight`: an invalidated
+/// edge is never deleted, just excluded from active queries, and
+/// `superseded_by` points at the edge that replaced it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Relation {
+    pub id: i64,
+    pub src: i64,
+    pub predicate: String,
+    pub dst: i64,
+    pub evidence_memory_id: Option<i64>,
+    pub confidence: Option<f64>,
+    pub created_at: String,
+    pub valid_from: Option<String>,
+    pub invalidated_at: Option<String>,
+    pub superseded_by: Option<i64>,
+}
+
+impl Relation {
+    pub fn is_active(&self) -> bool {
+        self.invalidated_at.is_none()
+    }
+}
+
+fn row_to_entity(row: &rusqlite::Row) -> rusqlite::Result<Entity> {
+    let blob: Option<Vec<u8>> = row.get("embedding")?;
+    Ok(Entity {
+        id: row.get("id")?,
+        name: row.get("name")?,
+        kind: row.get("kind")?,
+        embedding: blob.map(|b| decode_embedding(&b)),
+        created_at: row.get("created_at")?,
+    })
+}
+
+fn row_to_relation(row: &rusqlite::Row) -> rusqlite::Result<Relation> {
+    Ok(Relation {
+        id: row.get("id")?,
+        src: row.get("src")?,
+        predicate: row.get("predicate")?,
+        dst: row.get("dst")?,
+        evidence_memory_id: row.get("evidence_memory_id")?,
+        confidence: row.get("confidence")?,
+        created_at: row.get("created_at")?,
+        valid_from: row.get("valid_from")?,
+        invalidated_at: row.get("invalidated_at")?,
+        superseded_by: row.get("superseded_by")?,
+    })
+}
+
+/// Exact, case-insensitive name lookup -- the entity-resolution fast path.
+/// Relies on `idx_entities_name_nocase`.
+pub fn find_entity_by_name(conn: &Connection, name: &str) -> Result<Option<Entity>, KbError> {
+    let mut stmt = conn.prepare("SELECT * FROM entities WHERE name = ?1 COLLATE NOCASE")?;
+    Ok(stmt.query_row(params![name], row_to_entity).optional()?)
+}
+
+pub fn get_entity(conn: &Connection, id: i64) -> Result<Option<Entity>, KbError> {
+    let mut stmt = conn.prepare("SELECT * FROM entities WHERE id = ?1")?;
+    Ok(stmt.query_row(params![id], row_to_entity).optional()?)
+}
+
+/// Every entity, unordered -- the pool `find_entity_by_similarity` scans.
+/// Personal-scale (comfortably under a few thousand entities), so a linear
+/// scan mirrors `top_similar_active`'s own brute-force cosine approach
+/// rather than adding a vector index for this size of corpus.
+pub fn all_entities(conn: &Connection) -> Result<Vec<Entity>, KbError> {
+    let mut stmt = conn.prepare("SELECT * FROM entities")?;
+    let rows = stmt.query_map([], row_to_entity)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Best entity match by name-embedding cosine similarity, if any clears
+/// `min_sim` -- shared by entity resolution during extraction (its own,
+/// higher, reuse threshold) and by search enrichment (its own, lower,
+/// threshold for surfacing connections), each supplying its own floor.
+pub fn find_entity_by_similarity(
+    conn: &Connection,
+    query_embedding: &[f32],
+    min_sim: f32,
+) -> Result<Option<(Entity, f32)>, KbError> {
+    let mut best: Option<(Entity, f32)> = None;
+    for e in all_entities(conn)? {
+        let sim = match &e.embedding {
+            Some(v) if !v.is_empty() => cosine(query_embedding, v),
+            _ => continue,
+        };
+        if sim >= min_sim && best.as_ref().map(|(_, b)| sim > *b).unwrap_or(true) {
+            best = Some((e, sim));
+        }
+    }
+    Ok(best)
+}
+
+/// Inserts a new entity and returns its id. Name collision (case-
+/// insensitive, via `idx_entities_name_nocase`) is the caller's job to rule
+/// out first (`find_entity_by_name`) -- this always inserts, and a caller
+/// that skipped that check would simply surface the unique-index violation
+/// as a `KbError::Db`.
+pub fn insert_entity(
+    conn: &Connection,
+    name: &str,
+    kind: Option<&str>,
+    embedding: Option<&[f32]>,
+) -> Result<i64, KbError> {
+    let created_at = now_rfc3339();
+    let blob = embedding.map(encode_embedding);
+    conn.execute(
+        "INSERT INTO entities (name, kind, embedding, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![name, kind, blob, created_at],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Entity counts grouped by `kind` (NULL/blank folded into `"unspecified"`),
+/// most populous first -- `mach kb graph --stats`.
+pub fn entity_counts_by_kind(conn: &Connection) -> Result<Vec<(String, i64)>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(NULLIF(TRIM(kind), ''), 'unspecified') AS k, COUNT(*) AS n
+         FROM entities GROUP BY k ORDER BY n DESC, k ASC",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+pub fn entity_count(conn: &Connection) -> Result<i64, KbError> {
+    conn.query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0)).map_err(Into::into)
+}
+
+pub fn active_relation_count(conn: &Connection) -> Result<i64, KbError> {
+    conn.query_row("SELECT COUNT(*) FROM relations WHERE invalidated_at IS NULL", [], |r| r.get(0)).map_err(Into::into)
+}
+
+pub fn invalidated_relation_count(conn: &Connection) -> Result<i64, KbError> {
+    conn.query_row("SELECT COUNT(*) FROM relations WHERE invalidated_at IS NOT NULL", [], |r| r.get(0))
+        .map_err(Into::into)
+}
+
+/// Inserts a new active edge (`src` --`predicate`--> `dst`) and returns its
+/// id. Pure insert -- conflict detection/resolution against existing active
+/// edges is the caller's own job (`cli::insert_edge_with_conflict_check`),
+/// the same separation `supersede` keeps from the memory-level contradiction
+/// patrol's verdict logic.
+pub fn insert_relation(
+    conn: &Connection,
+    src: i64,
+    predicate: &str,
+    dst: i64,
+    evidence_memory_id: Option<i64>,
+    confidence: Option<f64>,
+    now: &str,
+) -> Result<i64, KbError> {
+    conn.execute(
+        "INSERT INTO relations (src, predicate, dst, evidence_memory_id, confidence, created_at, valid_from)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+        params![src, predicate, dst, evidence_memory_id, confidence, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn get_relation(conn: &Connection, id: i64) -> Result<Option<Relation>, KbError> {
+    let mut stmt = conn.prepare("SELECT * FROM relations WHERE id = ?1")?;
+    Ok(stmt.query_row(params![id], row_to_relation).optional()?)
+}
+
+/// Tombstones `old_id` in favor of `new_id` -- the edge-graph counterpart of
+/// `supersede`. Never deletes; the row stays as an audit trail. Returns
+/// `false` (no-op) if `old_id` doesn't exist or is already tombstoned.
+pub fn supersede_relation(conn: &Connection, old_id: i64, new_id: i64, now: &str) -> Result<bool, KbError> {
+    let n = conn.execute(
+        "UPDATE relations SET invalidated_at = ?1, superseded_by = ?2 WHERE id = ?3 AND invalidated_at IS NULL",
+        params![now, new_id, old_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Active edges touching `entity_id` in either direction, newest first --
+/// `mach kb entity <name>` and the search-enrichment "connections" field.
+pub fn active_relations_for_entity(conn: &Connection, entity_id: i64) -> Result<Vec<Relation>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM relations WHERE (src = ?1 OR dst = ?1) AND invalidated_at IS NULL ORDER BY id DESC",
+    )?;
+    let rows = stmt.query_map(params![entity_id], row_to_relation)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Count of invalidated (tombstoned) edges touching `entity_id` in either
+/// direction -- `mach kb entity <name>`'s "N invalidated" footnote.
+pub fn invalidated_relation_count_for_entity(conn: &Connection, entity_id: i64) -> Result<i64, KbError> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM relations WHERE (src = ?1 OR dst = ?1) AND invalidated_at IS NOT NULL",
+        params![entity_id],
+        |r| r.get(0),
+    )
+    .map_err(Into::into)
+}
+
+/// ACTIVE edges that plausibly conflict with a candidate `(src, predicate,
+/// dst)` edge before it's inserted: same predicate (case-insensitive exact
+/// match -- extraction produces short, hyphenated, normalized predicates,
+/// making this a reliable enough proxy for "the same kind of relationship"
+/// without an extra embedding call per edge) sharing `src` or `dst` with the
+/// candidate, excluding the literal same edge. The boss test is exactly
+/// this shape: "Moses boss-of user" and "Ivar boss-of user" share
+/// `predicate` ("boss-of") and `dst` (user) while `src` differs.
+pub fn relations_conflicting_with(conn: &Connection, src: i64, predicate: &str, dst: i64) -> Result<Vec<Relation>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM relations
+         WHERE invalidated_at IS NULL
+           AND predicate = ?1 COLLATE NOCASE
+           AND (src = ?2 OR dst = ?3)
+           AND NOT (src = ?2 AND dst = ?3)
+         ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map(params![predicate, src, dst], row_to_relation)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+// --- graph extraction pass (mach kb reflect) ---
+
+/// Up to `cap` ACTIVE memories (not invalidated, not dormant) never yet
+/// offered to the graph-extraction judge (`graph_extracted_at IS NULL`),
+/// oldest first -- same "drains a backlog in stable order across runs"
+/// rationale as `curation_candidates`.
+pub fn graph_extraction_candidates(conn: &Connection, cap: usize) -> Result<Vec<Memory>, KbError> {
+    let sql = format!(
+        "SELECT * FROM memories WHERE graph_extracted_at IS NULL AND invalidated_at IS NULL AND dormant_at IS NULL \
+         ORDER BY id ASC LIMIT {}",
+        cap
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], row_to_memory)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Cheap existence check for the early-exit guard at the top of `mach kb
+/// reflect`: whether there is at least one row `graph_extraction_candidates`
+/// would return, without materializing any of them -- so a database with no
+/// due insight re-verification and nothing newly added still runs the
+/// graph-extraction pass when it has an unprocessed backlog (e.g. this
+/// feature's own one-time backfill).
+pub fn has_graph_extraction_candidates(conn: &Connection) -> Result<bool, KbError> {
+    let n: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memories WHERE graph_extracted_at IS NULL AND invalidated_at IS NULL AND dormant_at IS NULL)",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(n != 0)
+}
+
+/// Marks a memory as offered to the graph-extraction judge -- call only
+/// after a successful LLM call (see `Memory::graph_extracted_at`'s own doc
+/// comment for why a failed call must never call this).
+pub fn mark_graph_extracted(conn: &Connection, id: i64, now: &str) -> Result<bool, KbError> {
+    let n = conn.execute("UPDATE memories SET graph_extracted_at = ?1 WHERE id = ?2", params![now, id])?;
+    Ok(n > 0)
 }
 
 #[cfg(test)]
@@ -2576,7 +2949,7 @@ mod tests {
         // AUTOINCREMENT rebuild), then v7->v8 (`ingested_sessions`),
         // landing at the current version.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1);
@@ -2725,7 +3098,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 8,
+            version, 9,
             "v1->v2 (reflection tables), v2->v3 (insights level column), v3->v4 (dormant_at), \
              v4->v5 (dedupe_seen), v5->v6 (last_verified_at + contradiction_seen), \
              v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions) all run"
@@ -2750,7 +3123,7 @@ mod tests {
     fn fresh_database_lands_at_current_user_version() {
         let conn = mem_conn();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[test]
@@ -2958,7 +3331,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 8,
+            version, 9,
             "v2->v3 (level column), v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, \
              v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions) all run"
         );
@@ -3002,7 +3375,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 8,
+            version, 9,
             "v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild), \
              v7->v8 (ingested_sessions) all run"
         );
@@ -3047,7 +3420,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 8,
+            version, 9,
             "v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 \
              (ingested_sessions) all run"
         );
@@ -3095,7 +3468,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 8, "v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) all run");
+        assert_eq!(version, 9, "v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) all run");
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -3155,7 +3528,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 8, "v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) both run");
+        assert_eq!(version, 9, "v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) both run");
 
         // Every row and its data survive the rebuild, ids included.
         let rows = list(&conn, None, false).unwrap();
@@ -3316,7 +3689,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 8, "v7->v8 (ingested_sessions) runs");
+        assert_eq!(version, 9, "v7->v8 (ingested_sessions) runs");
 
         assert_eq!(list(&conn, None, false).unwrap().len(), 1, "existing memory row must survive the migration");
 
@@ -3685,6 +4058,7 @@ mod tests {
             superseded_by: None,
             dormant_at: None,
             last_verified_at: None,
+            graph_extracted_at: None,
         }
     }
 
@@ -4003,5 +4377,229 @@ mod tests {
         updated.text = "overwritten insight".to_string();
         raw_upsert_insight(&conn, &updated).unwrap();
         assert_eq!(get_insight(&conn, 7).unwrap().unwrap().text, "overwritten insight");
+    }
+
+    // --- entities/relations: the graph layer ---
+
+    fn unit_vec(dims: usize, hot: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; dims];
+        v[hot] = 1.0;
+        v
+    }
+
+    #[test]
+    fn migration_v8_to_v9_adds_graph_extracted_at_and_creates_entities_relations() {
+        // Build a v8-era database by hand: every table exactly as
+        // `migrate_v7_to_v8` leaves it, no `graph_extracted_at` column, no
+        // `entities`/`relations` tables, user_version = 8.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, source TEXT, project TEXT,
+                created_at TEXT NOT NULL, reviewed INTEGER NOT NULL DEFAULT 1, embedding BLOB,
+                importance INTEGER NOT NULL DEFAULT 5, stability REAL, access_count INTEGER NOT NULL DEFAULT 0,
+                first_accessed_at TEXT, last_accessed_at TEXT, valid_from TEXT, invalidated_at TEXT,
+                superseded_by INTEGER, dormant_at TEXT, last_verified_at TEXT
+            );
+            CREATE TABLE insights (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, created_at TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.5, source_ids TEXT NOT NULL, embedding BLOB,
+                invalidated_at TEXT, flagged_at TEXT, last_verified_at TEXT, level INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE reflect_state (id INTEGER PRIMARY KEY CHECK (id = 1), last_run_at TEXT, last_memory_id INTEGER);
+            CREATE TABLE dedupe_seen (id_a INTEGER NOT NULL, id_b INTEGER NOT NULL, PRIMARY KEY (id_a, id_b));
+            CREATE TABLE contradiction_seen (id_a INTEGER NOT NULL, id_b INTEGER NOT NULL, PRIMARY KEY (id_a, id_b));
+            CREATE TABLE ingested_sessions (session_id TEXT PRIMARY KEY, ingested_at TEXT NOT NULL);
+            INSERT INTO memories (content, created_at, valid_from, stability, importance)
+            VALUES ('a v8 memory', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 35.0, 7);
+            PRAGMA user_version = 8;",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 9, "v8->v9 (graph layer) runs");
+
+        let rows = list(&conn, None, false).unwrap();
+        assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
+        assert!(rows[0].graph_extracted_at.is_none(), "pre-existing row must backfill to never-extracted (NULL)");
+
+        // entities/relations exist and behave — round-trip through the
+        // store functions that use them.
+        let e1 = insert_entity(&conn, "Umoja", Some("project"), None).unwrap();
+        let e2 = insert_entity(&conn, "user", None, None).unwrap();
+        let rel_id = insert_relation(&conn, e2, "works-on", e1, Some(rows[0].id), Some(0.8), "2026-01-02T00:00:00Z").unwrap();
+        assert!(get_relation(&conn, rel_id).unwrap().unwrap().is_active());
+
+        // idempotent on repeat
+        migrate(&conn).unwrap();
+        assert_eq!(list(&conn, None, false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn find_entity_by_name_is_case_insensitive() {
+        let conn = mem_conn();
+        let id = insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let found = find_entity_by_name(&conn, "moses").unwrap().unwrap();
+        assert_eq!(found.id, id);
+        assert_eq!(found.name, "Moses");
+        assert!(find_entity_by_name(&conn, "nobody").unwrap().is_none());
+    }
+
+    #[test]
+    fn insert_entity_rejects_case_insensitive_duplicate_name() {
+        let conn = mem_conn();
+        insert_entity(&conn, "Moses", None, None).unwrap();
+        let err = insert_entity(&conn, "MOSES", None, None);
+        assert!(err.is_err(), "the case-insensitive unique index must reject a duplicate name");
+    }
+
+    #[test]
+    fn find_entity_by_similarity_picks_the_closest_match_above_threshold() {
+        let conn = mem_conn();
+        insert_entity(&conn, "Umoja", Some("project"), Some(&unit_vec(4, 0))).unwrap();
+        let far = insert_entity(&conn, "C++", Some("technology"), Some(&unit_vec(4, 1))).unwrap();
+
+        let close_match = find_entity_by_similarity(&conn, &unit_vec(4, 0), 0.85).unwrap();
+        assert_eq!(close_match.unwrap().0.name, "Umoja");
+
+        // A query embedding orthogonal to every entity's own must clear
+        // nothing at a high threshold.
+        let no_match = find_entity_by_similarity(&conn, &unit_vec(4, 2), 0.85).unwrap();
+        assert!(no_match.is_none());
+        let _ = far;
+    }
+
+    #[test]
+    fn entity_counts_by_kind_folds_null_and_blank_into_unspecified() {
+        let conn = mem_conn();
+        insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        insert_entity(&conn, "Ivar", Some("person"), None).unwrap();
+        insert_entity(&conn, "Umoja", Some(""), None).unwrap();
+        insert_entity(&conn, "mystery", None, None).unwrap();
+
+        let counts = entity_counts_by_kind(&conn).unwrap();
+        assert_eq!(counts.iter().find(|(k, _)| k == "person").unwrap().1, 2);
+        assert_eq!(counts.iter().find(|(k, _)| k == "unspecified").unwrap().1, 2);
+        assert_eq!(entity_count(&conn).unwrap(), 4);
+    }
+
+    #[test]
+    fn active_relations_for_entity_finds_both_directions_and_excludes_invalidated() {
+        let conn = mem_conn();
+        let moses = insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let user = insert_entity(&conn, "user", None, None).unwrap();
+        let now = now_rfc3339();
+        let r1 = insert_relation(&conn, moses, "boss-of", user, None, Some(0.9), &now).unwrap();
+        let r2 = insert_relation(&conn, user, "works-on", moses, None, Some(0.5), &now).unwrap();
+
+        let for_moses = active_relations_for_entity(&conn, moses).unwrap();
+        assert_eq!(for_moses.len(), 2);
+
+        supersede_relation(&conn, r1, r2, &now).unwrap();
+        let for_moses_after = active_relations_for_entity(&conn, moses).unwrap();
+        assert_eq!(for_moses_after.len(), 1, "the invalidated edge must be excluded");
+        assert_eq!(invalidated_relation_count_for_entity(&conn, moses).unwrap(), 1);
+        assert!(!get_relation(&conn, r1).unwrap().unwrap().is_active());
+    }
+
+    #[test]
+    fn relations_conflicting_with_finds_the_boss_test_shape() {
+        // "Moses boss-of user" already active; a candidate "Ivar boss-of
+        // user" edge shares predicate + dst (user), src differs -- exactly
+        // the shape the edge-contradiction judge needs to see.
+        let conn = mem_conn();
+        let moses = insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let ivar = insert_entity(&conn, "Ivar", Some("person"), None).unwrap();
+        let user = insert_entity(&conn, "user", None, None).unwrap();
+        let now = now_rfc3339();
+        insert_relation(&conn, moses, "boss-of", user, None, Some(0.9), &now).unwrap();
+
+        let candidates = relations_conflicting_with(&conn, ivar, "boss-of", user).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].src, moses);
+
+        // A different predicate on the same pair must never match.
+        assert!(relations_conflicting_with(&conn, ivar, "friend-of", user).unwrap().is_empty());
+        // A same-predicate edge sharing neither src nor dst must never match.
+        let other = insert_entity(&conn, "Umoja", Some("project"), None).unwrap();
+        assert!(relations_conflicting_with(&conn, ivar, "boss-of", other).unwrap().is_empty());
+    }
+
+    #[test]
+    fn relations_conflicting_with_excludes_the_literal_same_edge() {
+        let conn = mem_conn();
+        let moses = insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let user = insert_entity(&conn, "user", None, None).unwrap();
+        let now = now_rfc3339();
+        insert_relation(&conn, moses, "boss-of", user, None, Some(0.9), &now).unwrap();
+        assert!(
+            relations_conflicting_with(&conn, moses, "boss-of", user).unwrap().is_empty(),
+            "the exact same (src, predicate, dst) must never be its own conflict candidate"
+        );
+    }
+
+    #[test]
+    fn graph_extraction_candidates_excludes_extracted_dormant_and_superseded() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let a = insert(&conn, "never extracted", None, None, true, None, 5).unwrap();
+        let b = insert(&conn, "already extracted", None, None, true, None, 5).unwrap();
+        let c = insert(&conn, "dormant memory", None, None, true, None, 5).unwrap();
+        let d = insert(&conn, "superseded memory", None, None, true, None, 5).unwrap();
+
+        assert!(has_graph_extraction_candidates(&conn).unwrap());
+        mark_graph_extracted(&conn, b, &now).unwrap();
+        set_dormant(&conn, c, &now).unwrap();
+        supersede(&conn, d, a, &now).unwrap();
+
+        let candidates = graph_extraction_candidates(&conn, 10).unwrap();
+        let ids: Vec<i64> = candidates.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![a], "only the never-extracted, active, non-dormant row remains");
+    }
+
+    #[test]
+    fn has_graph_extraction_candidates_is_false_once_everything_is_marked() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        assert!(!has_graph_extraction_candidates(&conn).unwrap(), "an empty store has nothing to extract");
+        let a = insert(&conn, "a fact", None, None, true, None, 5).unwrap();
+        assert!(has_graph_extraction_candidates(&conn).unwrap());
+        mark_graph_extracted(&conn, a, &now).unwrap();
+        assert!(!has_graph_extraction_candidates(&conn).unwrap());
+    }
+
+    // --- multiply_stability: schema-accelerated consolidation ---
+
+    #[test]
+    fn multiply_stability_scales_by_the_given_factor() {
+        let conn = mem_conn();
+        let id = insert(&conn, "a fact", None, None, true, None, 5).unwrap(); // stability = 35.0
+        assert!(multiply_stability(&conn, id, 1.5).unwrap());
+        let m = get(&conn, id).unwrap().unwrap();
+        assert_eq!(m.stability, Some(52.5));
+    }
+
+    #[test]
+    fn multiply_stability_caps_at_365_days() {
+        let conn = mem_conn();
+        let id = insert(&conn, "a fact", None, None, true, None, 10).unwrap(); // stability = 70.0
+        for _ in 0..10 {
+            multiply_stability(&conn, id, 1.5).unwrap();
+        }
+        let m = get(&conn, id).unwrap().unwrap();
+        assert_eq!(m.stability, Some(365.0));
+    }
+
+    #[test]
+    fn multiply_stability_is_a_noop_on_a_superseded_or_missing_row() {
+        let conn = mem_conn();
+        let old = insert(&conn, "old fact", None, None, true, None, 5).unwrap();
+        let new = insert(&conn, "new fact", None, None, true, None, 5).unwrap();
+        supersede(&conn, old, new, &now_rfc3339()).unwrap();
+        assert!(!multiply_stability(&conn, old, 1.5).unwrap(), "a superseded row must not be boosted");
+        assert!(!multiply_stability(&conn, 999_999, 1.5).unwrap());
     }
 }

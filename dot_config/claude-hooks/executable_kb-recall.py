@@ -51,6 +51,14 @@ def read_input():
     )
 
 
+def _valid_response(data):
+    """A successful response is `{"hits": [...], "connections": [...]}`
+    (see engines/kb/src/cli.rs's `SearchResponse`); an `{"error": ...}`
+    object, a bare list (the pre-graph-layer shape), or anything else means
+    fall back."""
+    return data if isinstance(data, dict) and isinstance(data.get("hits"), list) else None
+
+
 def search_via_socket(query):
     """machd's kb socket subsystem (engines/kb/src/socket.rs) keeps a warm
     db connection + a warm ollama HTTP agent alive. Tried first; ANY failure
@@ -81,9 +89,7 @@ def search_via_socket(query):
             buf += chunk
         s.close()
         data = json.loads(buf.split(b"\n", 1)[0])
-        # Only a JSON array is a successful hit list (matches `mach kb
-        # search --json` exactly); an {"error": ...} object means fall back.
-        return data if isinstance(data, list) else None
+        return _valid_response(data)
     except Exception:
         return None
 
@@ -110,7 +116,7 @@ def search_via_subprocess(query):
         data = json.loads(proc.stdout)
     except Exception:
         return None
-    return data if isinstance(data, list) else None
+    return _valid_response(data)
 
 
 def source_phrase(source):
@@ -160,15 +166,45 @@ def suppressed_ids(log_path):
     return out
 
 
+def connection_line(c):
+    """Renders one association-graph connection (engines/kb/src/cli.rs's
+    `ConnectionHit`) as either a 1-hop edge — "- [connection] Moses
+    —boss-of→ user (learned 2026-09-07)" — or, for a 2-hop spreading-
+    activation connection (`hops == 2`), a two-edge chain continuing
+    through `predicate2`/`dst_name2` — "- [connection, 2 hops] Moses
+    —boss-of→ user —works-on→ Umoja". Never logged/shown as ids —
+    connections carry no reinforcement semantics in this first version,
+    unlike a memory hit's own id (see `suppressed_ids`/the recall log
+    below)."""
+    src = (c.get("src_name") or "").strip()
+    predicate = (c.get("predicate") or "").strip()
+    dst = (c.get("dst_name") or "").strip()
+    if not src or not predicate or not dst:
+        return None
+    if c.get("hops") == 2:
+        predicate2 = (c.get("predicate2") or "").strip()
+        dst2 = (c.get("dst_name2") or "").strip()
+        if not predicate2 or not dst2:
+            return None
+        return "- [connection, 2 hops] {} —{}→ {} —{}→ {}".format(src, predicate, dst, predicate2, dst2)
+    date = (c.get("evidence_date") or "").strip()
+    when = " (learned {})".format(date) if date else ""
+    return "- [connection] {} —{}→ {}{}".format(src, predicate, dst, when)
+
+
 def main():
     prompt, session_id = read_input()
     if not prompt or len(prompt) < MIN_PROMPT_LEN or prompt.startswith("/"):
         return
 
-    hits = search_via_socket(prompt)
-    if hits is None:
-        hits = search_via_subprocess(prompt)
-    if not hits:
+    resp = search_via_socket(prompt)
+    if resp is None:
+        resp = search_via_subprocess(prompt)
+    if not resp:
+        return
+    hits = resp.get("hits") or []
+    connections = resp.get("connections") or []
+    if not hits and not connections:
         return
 
     log_path = os.path.join(RECALL_LOG_DIR, session_id + ".jsonl") if session_id else ""
@@ -207,11 +243,19 @@ def main():
             if isinstance(mem_id, int):
                 ids.append(mem_id)
 
-    if lines:
+    connection_lines = [ln for ln in (connection_line(c) for c in connections) if ln]
+
+    if lines or connection_lines:
         print("You remember (your memory of this user from past sessions — "
               "use it first rather than re-exploring; each entry notes how "
               "it was learned):")
         for l in lines:
+            print(l)
+        # Connections render after memory lines, never logged/suppressed by
+        # id (see connection_line's own doc comment) — a plain association
+        # the graph layer (`mach kb reflect`'s extraction pass) has derived
+        # alongside whatever verbatim memories matched.
+        for l in connection_lines:
             print(l)
 
     # Only ids actually rendered above are logged — the engagement sweep

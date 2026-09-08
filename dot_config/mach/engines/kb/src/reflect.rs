@@ -1797,10 +1797,18 @@ pub fn build_batch_graph_audit_prompt(edges: &[(&str, &str, &str, &str, &str, &s
         "For EACH edge number above (1 to {}), reply with exactly one line in the form `N: VERDICT`, \
          where VERDICT is KEEP, POISONED, or GENERIC. Every edge number from 1 to {} MUST appear \
          exactly once.\n\
-         KEEP -- a genuine, correctly-derived relation between two real named things.\n\
-         POISONED -- derived from a fact merely describing a test, hypothetical, example, or the \
-         memory system's own mechanics.\n\
-         GENERIC -- one endpoint is a generic-role placeholder, not an actual named thing.\n",
+         KEEP -- a genuine, correctly-derived relation. Abstract concepts, practices, and \
+         preferences are FIRST-CLASS entities in this graph by design: edges like \
+         `user --dislikes--> fluff`, `user --prefers--> end-to-end ownership`, or \
+         `user --interested-in--> memory systems` are exactly what it exists to hold. KEEP them.\n\
+         POISONED -- derived from a fact merely describing a test, hypothetical, or example \
+         (e.g. an edge asserting a relationship that a fact only mentions as a test scenario).\n\
+         GENERIC -- an endpoint is an anonymous stand-in for some specific unnamed thing: a role \
+         word used in place of a person's name (`boss` instead of the person), `the project`, \
+         `configuration`, `codebase`. A named concept is NOT generic; only unnamed stand-ins are.\n\
+         Self-loops (identical endpoints) are always GENERIC.\n\
+         When in doubt, KEEP -- invalidating a good edge destroys knowledge; keeping a mediocre \
+         one costs nothing.\n",
         edges.len(),
         edges.len()
     ));

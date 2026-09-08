@@ -278,6 +278,24 @@ fn init_schema(conn: &Connection) -> Result<(), KbError> {
             last_relation_id INTEGER,
             last_completed_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS entity_cards (
+            entity_id INTEGER PRIMARY KEY,
+            text TEXT NOT NULL,
+            source_ids TEXT NOT NULL,
+            embedding BLOB,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            built_watermark INTEGER NOT NULL,
+            mention_count INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS memory_entities (
+            memory_id INTEGER NOT NULL,
+            entity_id INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (memory_id, entity_id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_memory_entities_entity ON memory_entities (entity_id);
         CREATE TABLE IF NOT EXISTS entities (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -656,6 +674,95 @@ fn migrate_v14_to_v15(conn: &Connection) -> Result<(), KbError> {
     Ok(())
 }
 
+/// `PRAGMA user_version`-gated, idempotent 15 -> 16 migration: the
+/// `memory_entities` mention table (created by `init_schema`) backfilled for
+/// every existing row from two deterministic sources -- the entity graph's
+/// own evidence pointers (a relation's evidence memory mentions both its
+/// endpoints) and a word-boundary name scan of each memory against every
+/// entity name (`name_mentioned`). No LLM. Re-running only re-inserts
+/// already-present pairs (`INSERT OR IGNORE`).
+fn migrate_v15_to_v16(conn: &Connection) -> Result<(), KbError> {
+    let now = now_rfc3339();
+    backfill_mentions(conn, &now)?;
+    conn.execute("PRAGMA user_version = 16", [])?;
+    Ok(())
+}
+
+/// `PRAGMA user_version`-gated, idempotent 16 -> 17 migration: the
+/// `entity_cards` table (created by `init_schema`; nothing to backfill --
+/// `mach kb reflect`'s card pass fills it in from mentions).
+fn migrate_v16_to_v17(conn: &Connection) -> Result<(), KbError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS entity_cards (
+            entity_id INTEGER PRIMARY KEY,
+            text TEXT NOT NULL,
+            source_ids TEXT NOT NULL,
+            embedding BLOB,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            built_watermark INTEGER NOT NULL,
+            mention_count INTEGER NOT NULL
+        );",
+    )?;
+    conn.execute("PRAGMA user_version = 17", [])?;
+    Ok(())
+}
+
+/// True when `table` exists in this database. Migrations that read a table
+/// another migration (or `init_schema`) normally provides must tolerate its
+/// absence: a hand-built older-era database in a test, or a repair run on a
+/// partial file, legitimately lacks it.
+fn table_exists(conn: &Connection, table: &str) -> Result<bool, KbError> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table','view') AND name = ?1",
+        params![table],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// The v16 backfill body, also reusable as a repair (`mach kb graph
+/// relink`, if ever wanted). Returns the number of mention rows inserted.
+/// Each source is skipped when its table is absent, so this is safe on a
+/// partial database.
+pub fn backfill_mentions(conn: &Connection, now: &str) -> Result<usize, KbError> {
+    let mut n = 0usize;
+    if !table_exists(conn, "memory_entities")? || !table_exists(conn, "memories")? || !table_exists(conn, "entities")? {
+        return Ok(0);
+    }
+    // (a) evidence pointers: every active relation's evidence memory mentions src and dst
+    if table_exists(conn, "relations")? {
+        let mut stmt =
+            conn.prepare("SELECT evidence_memory_id, src, dst FROM relations WHERE evidence_memory_id IS NOT NULL")?;
+        let rows: Vec<(i64, i64, i64)> =
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+        for (mid, src, dst) in rows {
+            // A dangling evidence pointer (memory or entity already gone) must
+            // not abort the backfill -- the FK-less schema allows it.
+            if get(conn, mid)?.is_none() {
+                continue;
+            }
+            for eid in [src, dst] {
+                if get_entity(conn, eid)?.is_some() {
+                    n += link_mention(conn, mid, eid, MENTION_SOURCE_BACKFILL, now)? as usize;
+                }
+            }
+        }
+    }
+    // (b) name scan of every memory against every entity name
+    let entities = all_entities(conn)?;
+    let mut stmt = conn.prepare("SELECT id, content FROM memories")?;
+    let mems: Vec<(i64, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    for (mid, content) in &mems {
+        for e in &entities {
+            if name_mentioned(content, &e.name) {
+                n += link_mention(conn, *mid, e.id, MENTION_SOURCE_BACKFILL, now)? as usize;
+            }
+        }
+    }
+    Ok(n)
+}
+
 fn migrate_v6_to_v7(conn: &Connection) -> Result<(), KbError> {
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(
@@ -771,6 +878,12 @@ fn migrate(conn: &Connection) -> Result<(), KbError> {
     }
     if version < 15 {
         migrate_v14_to_v15(conn)?;
+    }
+    if version < 16 {
+        migrate_v15_to_v16(conn)?;
+    }
+    if version < 17 {
+        migrate_v16_to_v17(conn)?;
     }
     Ok(())
 }
@@ -1035,7 +1148,12 @@ pub fn insert_with_basis(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?4, ?9)",
         params![content, source, project, created_at, reviewed as i64, blob, importance, stability, basis],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = conn.last_insert_rowid();
+    // Cheap deterministic mention links at write time (every entity name the
+    // text contains). The graph-extraction pass adds the LLM-resolved ones
+    // later; both land in the same table. Never fatal to the insert.
+    let _ = link_mentions_by_name_scan(conn, id, content, &created_at);
+    Ok(id)
 }
 
 /// Sets `basis` on an existing row (used by `mach kb add`, whose insert
@@ -3006,6 +3124,505 @@ fn row_to_relation(row: &rusqlite::Row) -> rusqlite::Result<Relation> {
 
 /// Exact, case-insensitive name lookup -- the entity-resolution fast path.
 /// Relies on `idx_entities_name_nocase`.
+// --- memory <-> entity mentions (the substrate for graph recall and entity cards) ---
+
+pub const MENTION_SOURCE_EXTRACTION: &str = "extraction";
+pub const MENTION_SOURCE_NAME_SCAN: &str = "name-scan";
+pub const MENTION_SOURCE_BACKFILL: &str = "backfill";
+
+/// Case-insensitive word-boundary containment of `name` in `text`. Names
+/// shorter than 3 characters and the reserved "user" never match (they
+/// would link everything). Shared by the recall connections lookup, the
+/// write-time mention scan, and the v16 backfill so all three agree on what
+/// "mentions" means.
+pub fn name_mentioned(text: &str, name: &str) -> bool {
+    let name = name.trim().to_lowercase();
+    if name.chars().count() < 3 || name == "user" {
+        return false;
+    }
+    let t = text.to_lowercase();
+    let tb = t.as_bytes();
+    let mut start = 0usize;
+    while let Some(pos) = t[start..].find(&name) {
+        let abs = start + pos;
+        let end = abs + name.len();
+        let left_ok = abs == 0 || !tb[abs - 1].is_ascii_alphanumeric();
+        let right_ok = end == t.len() || !tb[end].is_ascii_alphanumeric();
+        if left_ok && right_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
+}
+
+/// Records that memory `memory_id` mentions entity `entity_id`. Returns
+/// `true` when the pair was new. Idempotent (`INSERT OR IGNORE`).
+pub fn link_mention(conn: &Connection, memory_id: i64, entity_id: i64, source: &str, now: &str) -> Result<bool, KbError> {
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id, source, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![memory_id, entity_id, source, now],
+    )?;
+    Ok(n > 0)
+}
+
+/// Links `memory_id` to every entity whose name `content` mentions.
+pub fn link_mentions_by_name_scan(conn: &Connection, memory_id: i64, content: &str, now: &str) -> Result<usize, KbError> {
+    let mut n = 0;
+    for e in all_entities(conn)? {
+        if name_mentioned(content, &e.name) {
+            n += link_mention(conn, memory_id, e.id, MENTION_SOURCE_NAME_SCAN, now)? as usize;
+        }
+    }
+    Ok(n)
+}
+
+/// The reverse scan for a NEW entity: links every active memory whose text
+/// mentions `name`. Called when graph extraction mints an entity, so older
+/// memories that named it before it existed as a node are linked too.
+pub fn link_entity_mentions_by_name_scan(conn: &Connection, entity_id: i64, name: &str, now: &str) -> Result<usize, KbError> {
+    let mut stmt = conn.prepare("SELECT id, content FROM memories WHERE invalidated_at IS NULL")?;
+    let mems: Vec<(i64, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    let mut n = 0;
+    for (mid, content) in &mems {
+        if name_mentioned(content, name) {
+            n += link_mention(conn, *mid, entity_id, MENTION_SOURCE_NAME_SCAN, now)? as usize;
+        }
+    }
+    Ok(n)
+}
+
+pub fn entities_of_memory(conn: &Connection, memory_id: i64) -> Result<Vec<Entity>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT e.* FROM entities e JOIN memory_entities me ON me.entity_id = e.id WHERE me.memory_id = ?1 ORDER BY e.name",
+    )?;
+    let rows = stmt.query_map(params![memory_id], row_to_entity)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Active (not superseded, not dormant) memories mentioning `entity_id`,
+/// newest first, optionally capped.
+pub fn memories_mentioning(conn: &Connection, entity_id: i64, limit: Option<usize>) -> Result<Vec<Memory>, KbError> {
+    let sql = format!(
+        "SELECT m.* FROM memories m JOIN memory_entities me ON me.memory_id = m.id
+         WHERE me.entity_id = ?1 AND m.invalidated_at IS NULL AND m.dormant_at IS NULL
+         ORDER BY m.id DESC{}",
+        limit.map(|n| format!(" LIMIT {}", n)).unwrap_or_default()
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![entity_id], row_to_memory)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// How many ACTIVE memories mention `entity_id`.
+pub fn mention_degree(conn: &Connection, entity_id: i64) -> Result<i64, KbError> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM memory_entities me JOIN memories m ON m.id = me.memory_id
+         WHERE me.entity_id = ?1 AND m.invalidated_at IS NULL AND m.dormant_at IS NULL",
+        params![entity_id],
+        |r| r.get(0),
+    )?)
+}
+
+pub fn count_active_memories(conn: &Connection) -> Result<i64, KbError> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM memories WHERE invalidated_at IS NULL AND dormant_at IS NULL",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+/// Moves every mention off `old_id` onto `new_id` (entity merge), deduping.
+pub fn repoint_entity_mentions(conn: &Connection, old_id: i64, new_id: i64) -> Result<usize, KbError> {
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id, source, created_at)
+         SELECT memory_id, ?1, source, created_at FROM memory_entities WHERE entity_id = ?2",
+        params![new_id, old_id],
+    )?;
+    conn.execute("DELETE FROM memory_entities WHERE entity_id = ?1", params![old_id])?;
+    Ok(n)
+}
+
+// --- entity cards: a consolidated profile per entity, any kind ---
+
+/// A distilled profile of one entity, rebuilt by `mach kb reflect` from the
+/// memories that mention it. The generic form of Honcho's peer card and
+/// Hindsight's observation: the same mechanism serves a person ("how Moses
+/// argues"), a project ("what Umoja is and where it stands"), a practice
+/// ("what audit-before-build means here"), or a tool. Replaced wholesale on
+/// rebuild rather than accumulated, so it never drifts out of step with its
+/// evidence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityCard {
+    pub entity_id: i64,
+    pub text: String,
+    /// Memory ids the card was distilled from, newest-first at build time.
+    pub source_ids: Vec<String>,
+    pub embedding: Option<Vec<f32>>,
+    pub created_at: String,
+    pub updated_at: String,
+    /// Highest mentioning-memory id seen at build time: a newer mention means
+    /// the card is behind its evidence and due for a rebuild.
+    pub built_watermark: i64,
+    /// Active mention count at build time: a DROP (dormancy, supersession)
+    /// also makes the card stale even with no new mention.
+    pub mention_count: i64,
+}
+
+fn row_to_entity_card(row: &rusqlite::Row) -> rusqlite::Result<EntityCard> {
+    let ids: String = row.get("source_ids")?;
+    let blob: Option<Vec<u8>> = row.get("embedding")?;
+    Ok(EntityCard {
+        entity_id: row.get("entity_id")?,
+        text: row.get("text")?,
+        source_ids: serde_json::from_str(&ids).unwrap_or_default(),
+        embedding: blob.map(|b| decode_embedding(&b)),
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+        built_watermark: row.get("built_watermark")?,
+        mention_count: row.get("mention_count")?,
+    })
+}
+
+pub fn get_entity_card(conn: &Connection, entity_id: i64) -> Result<Option<EntityCard>, KbError> {
+    let mut stmt = conn.prepare("SELECT * FROM entity_cards WHERE entity_id = ?1")?;
+    Ok(stmt.query_row(params![entity_id], row_to_entity_card).optional()?)
+}
+
+/// Writes (or replaces) an entity's card. `created_at` is preserved across
+/// rebuilds so a card's age reflects when it was first formed.
+pub fn upsert_entity_card(
+    conn: &Connection,
+    entity_id: i64,
+    text: &str,
+    source_ids: &[String],
+    embedding: Option<&[f32]>,
+    watermark: i64,
+    mention_count: i64,
+    now: &str,
+) -> Result<(), KbError> {
+    let ids = serde_json::to_string(source_ids).unwrap_or_else(|_| "[]".to_string());
+    let blob = embedding.map(encode_embedding);
+    conn.execute(
+        "INSERT INTO entity_cards (entity_id, text, source_ids, embedding, created_at, updated_at, built_watermark, mention_count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)
+         ON CONFLICT(entity_id) DO UPDATE SET
+            text = excluded.text, source_ids = excluded.source_ids, embedding = excluded.embedding,
+            updated_at = excluded.updated_at, built_watermark = excluded.built_watermark,
+            mention_count = excluded.mention_count",
+        params![entity_id, text, ids, blob, now, watermark, mention_count],
+    )?;
+    Ok(())
+}
+
+pub fn delete_entity_card(conn: &Connection, entity_id: i64) -> Result<bool, KbError> {
+    Ok(conn.execute("DELETE FROM entity_cards WHERE entity_id = ?1", params![entity_id])? > 0)
+}
+
+pub fn count_mentions(conn: &Connection) -> Result<i64, KbError> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM memory_entities", [], |r| r.get(0))?)
+}
+
+pub fn count_entity_cards(conn: &Connection) -> Result<i64, KbError> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM entity_cards", [], |r| r.get(0))?)
+}
+
+/// Highest ACTIVE mentioning-memory id for `entity_id` (0 when none) --
+/// the card staleness watermark.
+pub fn max_mention_memory_id(conn: &Connection, entity_id: i64) -> Result<i64, KbError> {
+    Ok(conn.query_row(
+        "SELECT COALESCE(MAX(me.memory_id), 0) FROM memory_entities me JOIN memories m ON m.id = me.memory_id
+         WHERE me.entity_id = ?1 AND m.invalidated_at IS NULL AND m.dormant_at IS NULL",
+        params![entity_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// An entity needs at least this many ACTIVE mentioning memories before a
+/// card is worth building: below it, the memories themselves are a better
+/// answer than a summary of them.
+pub const CARD_MIN_MENTIONS: i64 = 4;
+/// Memories handed to the card prompt, newest first.
+pub const CARD_EVIDENCE_LIMIT: usize = 14;
+/// Entities re-carded per reflect run, so one run is bounded.
+pub const CARD_MAX_PER_RUN: usize = 6;
+
+/// Entities due for a card: at least `CARD_MIN_MENTIONS` active mentions and
+/// either no card yet, or a card built before the newest mention, or a card
+/// whose mention count no longer matches (evidence died under it). Ordered
+/// by "most evidence the card has not seen yet" first, then by degree, so a
+/// busy entity is refreshed before a quiet one. Never returns the reserved
+/// "user" entity: everything in the bank is about the user, so its card
+/// would be the whole bank -- that job belongs to `mach kb model`.
+pub fn entity_card_candidates(conn: &Connection, cap: usize) -> Result<Vec<Entity>, KbError> {
+    // The per-entity aggregates are correlated subqueries, so the staleness
+    // test lives in an outer WHERE (a bare HAVING with no GROUP BY would
+    // collapse everything into one aggregate row).
+    let mut stmt = conn.prepare(
+        "SELECT * FROM (
+            SELECT e.*,
+                (SELECT COUNT(*) FROM memory_entities me JOIN memories m ON m.id = me.memory_id
+                  WHERE me.entity_id = e.id AND m.invalidated_at IS NULL AND m.dormant_at IS NULL) AS deg,
+                (SELECT COALESCE(MAX(me.memory_id), 0) FROM memory_entities me JOIN memories m ON m.id = me.memory_id
+                  WHERE me.entity_id = e.id AND m.invalidated_at IS NULL AND m.dormant_at IS NULL) AS hi,
+                c.built_watermark AS wm, c.mention_count AS mc
+            FROM entities e LEFT JOIN entity_cards c ON c.entity_id = e.id
+            WHERE e.name <> 'user' COLLATE NOCASE
+         )
+         WHERE deg >= ?1 AND (wm IS NULL OR hi > wm OR mc <> deg)
+         ORDER BY (hi - COALESCE(wm, 0)) DESC, deg DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![CARD_MIN_MENTIONS, cap as i64], row_to_entity)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+// --- spreading activation over the memory graph (Hindsight-style recall hop) ---
+
+/// Steps of breadth-first propagation from the seeds. Two: "a memory that
+/// shares an entity with a memory that shares an entity with a hit" is as
+/// far as relevance survives the decay below.
+pub const SPREAD_STEPS: usize = 2;
+/// Activation lost per hop. A perfect step-1 neighbor of a seed scored `s`
+/// lands at `s * SPREAD_DECAY * mu` -- always below the seed with the
+/// multipliers here, so a hop never outranks the hit that led to it.
+pub const SPREAD_DECAY: f32 = 0.6;
+/// Link-type multipliers (Hindsight's mu(l)): shared entity is the strongest
+/// evidence of relatedness, Hebbian co-engagement next, time proximity the
+/// weakest (a busy day links unrelated things).
+pub const SPREAD_MU_ENTITY: f32 = 1.2;
+pub const SPREAD_MU_ASSOC: f32 = 1.0;
+// Deliberately NO temporal edge. Hindsight links memories by when the
+// described events OCCURRED, which it extracts per fact; all we have is
+// `created_at`, i.e. when the fact was written down. One session digest
+// writes up to 25 unrelated facts within the same second, so a
+// proximity-in-created_at edge would link everything ingested together at
+// full weight -- noise, not relatedness. Time belongs in the query channel
+// (filter by a date range the query asks for), not in the graph.
+/// An entity mentioned by more than this share of active memories (or more
+/// than the absolute cap) is a hub ("umoja", "Claude") and carries no
+/// relatedness signal; it is skipped as an edge. Every other shared entity
+/// is a full-weight link (as in Hindsight, where entity edges carry w = 1.0
+/// and relevance is decided elsewhere): what varies the weight here is the
+/// entity's affinity to the query, not its rarity. An earlier IDF-style
+/// `1 / ln(1 + degree)` term was removed because it fought the affinity
+/// term -- the entity a query is ABOUT is usually one of the more common
+/// ones, so the two together cancelled out and no hop cleared the recall
+/// score floor.
+pub const SPREAD_HUB_SHARE: f64 = 0.15;
+pub const SPREAD_HUB_ABS: i64 = 40;
+/// The share rule only applies from this degree up. In a small bank almost
+/// any entity exceeds a 15% share (2 of 12 memories is 17%) without being a
+/// hub in any useful sense; below this, only the absolute cap can disqualify
+/// an entity.
+pub const SPREAD_HUB_MIN_DEGREE: i64 = 8;
+/// Per-node fan-out cap per link type, and the overall cap on returned hops.
+pub const SPREAD_FANOUT: usize = 12;
+pub const SPREAD_MAX_OUT: usize = 3;
+/// At most this many hops may arrive over the SAME link. Every memory
+/// sharing one entity with a seed gets identical activation, so without
+/// this one well-connected entity fills the whole hop budget with near
+/// duplicates; one hop each from three different links says far more per
+/// token than three from one.
+pub const SPREAD_MAX_PER_EDGE: usize = 1;
+/// Query affinity assumed for an entity with no name embedding: neutral,
+/// neither favoured nor suppressed.
+pub const SPREAD_AFFINITY_DEFAULT: f32 = 0.5;
+/// A shared entity is only walked when its own name embedding is at least
+/// this fraction as close to the query as the closest shared entity of that
+/// node. Two memories often share several entities, and only some are what
+/// the query is ABOUT: "deploy zenith to popobawa" shares "orchestrator"
+/// (the subject) and "systemd" (incidental) with its neighbours, and
+/// without this the incidental one hops just as readily. Relative, not an
+/// absolute cosine floor, because a prose query is never as close to a
+/// short entity name as another name would be -- the calibration has to
+/// come from the candidates themselves. Set to admit any shared entity in
+/// the same relevance league as the best one, not only the single best: the
+/// entity that finally carries a hop is usually a rare, specific one
+/// (rareness is what earns weight in `entity_edge_weight`), and a floor
+/// tight enough to keep only the top entity dropped those too, leaving no
+/// hops at all above the recall score floor.
+pub const SPREAD_AFFINITY_REL_FLOOR: f32 = 0.6;
+
+/// One memory reached by spreading activation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphHit {
+    pub id: i64,
+    pub activation: f32,
+    /// The seed hit this activation traces back to.
+    pub via_seed: i64,
+    /// The edge that first reached it: "entity:<name>" or "assoc".
+    pub via_edge: String,
+}
+
+fn entity_edge_weight(degree: i64, total_active: i64) -> Option<f32> {
+    if degree <= 0 {
+        return None;
+    }
+    let share_hub =
+        degree >= SPREAD_HUB_MIN_DEGREE && total_active > 0 && degree as f64 > SPREAD_HUB_SHARE * total_active as f64;
+    if degree > SPREAD_HUB_ABS || share_hub {
+        return None; // hub
+    }
+    Some(1.0)
+}
+
+/// Neighbors of `id` over shared entities: `(other_id, weight, entity_name)`,
+/// hubs excluded, query-affinity weighted (`SPREAD_AFFINITY_REL_FLOOR`),
+/// best weight per neighbor, capped at `SPREAD_FANOUT`.
+fn entity_neighbors(
+    conn: &Connection,
+    id: i64,
+    total_active: i64,
+    q_emb: Option<&[f32]>,
+) -> Result<Vec<(i64, f32, String)>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT e.id, e.name, e.embedding,
+                (SELECT COUNT(*) FROM memory_entities x JOIN memories mm ON mm.id = x.memory_id
+                  WHERE x.entity_id = e.id AND mm.invalidated_at IS NULL AND mm.dormant_at IS NULL) AS deg
+         FROM memory_entities me JOIN entities e ON e.id = me.entity_id WHERE me.memory_id = ?1",
+    )?;
+    let raw: Vec<(i64, String, Option<Vec<u8>>, i64)> = stmt
+        .query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<Result<_, _>>()?;
+
+    // Query affinity per shared entity, and the node's best, so the floor
+    // below is relative to what this node actually offers.
+    let mut ents: Vec<(i64, String, i64, f32)> = Vec::new();
+    for (eid, name, blob, deg) in raw {
+        let affinity = match (q_emb, blob) {
+            (Some(q), Some(b)) => {
+                let v = decode_embedding(&b);
+                if v.is_empty() {
+                    SPREAD_AFFINITY_DEFAULT
+                } else {
+                    cosine(q, &v).clamp(0.0, 1.0)
+                }
+            }
+            _ => SPREAD_AFFINITY_DEFAULT,
+        };
+        ents.push((eid, name, deg, affinity));
+    }
+    let best_affinity = ents.iter().map(|(_, _, _, a)| *a).fold(0.0f32, f32::max);
+
+    let mut best: HashMap<i64, (f32, String)> = HashMap::new();
+    for (eid, name, deg, affinity) in ents {
+        let rel = if best_affinity > 0.0 { affinity / best_affinity } else { 1.0 };
+        if rel < SPREAD_AFFINITY_REL_FLOOR {
+            continue; // shared, but not what the query is about
+        }
+        let Some(base) = entity_edge_weight(deg, total_active) else { continue };
+        let w = base * rel;
+        let mut stmt = conn.prepare(
+            "SELECT me.memory_id FROM memory_entities me JOIN memories m ON m.id = me.memory_id
+             WHERE me.entity_id = ?1 AND me.memory_id != ?2 AND m.invalidated_at IS NULL AND m.dormant_at IS NULL
+             ORDER BY m.id DESC LIMIT ?3",
+        )?;
+        let others: Vec<i64> =
+            stmt.query_map(params![eid, id, SPREAD_FANOUT as i64], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        for o in others {
+            let e = best.entry(o).or_insert((0.0, String::new()));
+            if w > e.0 {
+                *e = (w, name.clone());
+            }
+        }
+    }
+    let mut out: Vec<(i64, f32, String)> = best.into_iter().map(|(k, (w, n))| (k, w, n)).collect();
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    out.truncate(SPREAD_FANOUT);
+    Ok(out)
+}
+
+/// Spreading activation from `seeds` (`(memory_id, score)`) over two link
+/// types -- shared entity and Hebbian co-engagement -- for `SPREAD_STEPS`
+/// steps with `A(j) = max(A(i) * w * SPREAD_DECAY * mu)`.
+/// Returns up to `SPREAD_MAX_OUT` memories that are neither seeds nor in
+/// `exclude`, best activation first, each tagged with the seed it traces to
+/// and the edge that first reached it. `q_emb` (the query embedding, when
+/// the caller has one) steers which shared entity is worth walking; without
+/// it every shared entity is treated as equally relevant. Pure read.
+pub fn spread_activation(
+    conn: &Connection,
+    seeds: &[(i64, f32)],
+    exclude: &std::collections::HashSet<i64>,
+    now: &str,
+    q_emb: Option<&[f32]>,
+) -> Result<Vec<GraphHit>, KbError> {
+    if seeds.is_empty() {
+        return Ok(Vec::new());
+    }
+    let total_active = count_active_memories(conn)?;
+    let seed_ids: std::collections::HashSet<i64> = seeds.iter().map(|(id, _)| *id).collect();
+    // id -> (activation, via_seed, via_edge)
+    let mut act: HashMap<i64, (f32, i64, String)> = HashMap::new();
+    let mut frontier: Vec<(i64, f32, i64)> = seeds.iter().map(|(id, s)| (*id, *s, *id)).collect();
+    for _ in 0..SPREAD_STEPS {
+        let mut next: Vec<(i64, f32, i64)> = Vec::new();
+        for (node, a, seed) in &frontier {
+            let mut relax = |other: i64, w: f32, mu: f32, edge: String, next: &mut Vec<(i64, f32, i64)>| {
+                if seed_ids.contains(&other) || exclude.contains(&other) {
+                    return;
+                }
+                let na = a * w * SPREAD_DECAY * mu;
+                if na <= 0.0 {
+                    return;
+                }
+                let better = act.get(&other).map(|(cur, _, _)| na > *cur).unwrap_or(true);
+                if better {
+                    act.insert(other, (na, *seed, edge));
+                    next.push((other, na, *seed));
+                }
+            };
+            for (o, w, name) in entity_neighbors(conn, *node, total_active, q_emb)? {
+                relax(o, w, SPREAD_MU_ENTITY, format!("entity:{}", name), &mut next);
+            }
+            for (o, w) in assoc_neighbors(conn, *node, now)? {
+                relax(o, 1.0 - (-w).exp(), SPREAD_MU_ASSOC, "assoc".to_string(), &mut next);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    let mut ranked: Vec<GraphHit> = act
+        .into_iter()
+        .map(|(id, (activation, via_seed, via_edge))| GraphHit { id, activation, via_seed, via_edge })
+        .collect();
+    // Strongest first, then a stable tiebreak: equal-activation hops (the
+    // common case -- one entity, many neighbours) resolve to the newest
+    // memory rather than to whatever order the map happened to yield.
+    ranked.sort_by(|a, b| {
+        b.activation.partial_cmp(&a.activation).unwrap_or(std::cmp::Ordering::Equal).then(b.id.cmp(&a.id))
+    });
+    let mut per_edge: HashMap<String, usize> = HashMap::new();
+    let mut out: Vec<GraphHit> = Vec::new();
+    for hit in ranked {
+        if out.len() >= SPREAD_MAX_OUT {
+            break;
+        }
+        let n = per_edge.entry(hit.via_edge.clone()).or_insert(0);
+        if *n >= SPREAD_MAX_PER_EDGE {
+            continue;
+        }
+        *n += 1;
+        out.push(hit);
+    }
+    Ok(out)
+}
+
 pub fn find_entity_by_name(conn: &Connection, name: &str) -> Result<Option<Entity>, KbError> {
     let mut stmt = conn.prepare("SELECT * FROM entities WHERE name = ?1 COLLATE NOCASE")?;
     Ok(stmt.query_row(params![name], row_to_entity).optional()?)
@@ -3396,6 +4013,10 @@ pub fn repoint_entity_relations(conn: &Connection, old_id: i64, new_id: i64, now
 
     conn.execute("UPDATE relations SET src = ?1 WHERE src = ?2", params![new_id, old_id])?;
     conn.execute("UPDATE relations SET dst = ?1 WHERE dst = ?2", params![new_id, old_id])?;
+    repoint_entity_mentions(conn, old_id, new_id)?;
+    // The survivor inherited evidence its card never saw; drop the card so the
+    // next reflect rebuilds it (a card is cheap to regenerate, wrong to keep).
+    delete_entity_card(conn, new_id)?;
 
     let mut stmt = conn.prepare(
         "SELECT id, src, predicate, dst FROM relations
@@ -3426,6 +4047,8 @@ pub fn repoint_entity_relations(conn: &Connection, old_id: i64, new_id: i64, now
 /// relation off it, so by the time this runs the row has zero remaining
 /// references. Returns whether a row existed.
 pub fn delete_entity(conn: &Connection, id: i64) -> Result<bool, KbError> {
+    conn.execute("DELETE FROM memory_entities WHERE entity_id = ?1", params![id])?;
+    conn.execute("DELETE FROM entity_cards WHERE entity_id = ?1", params![id])?;
     let n = conn.execute("DELETE FROM entities WHERE id = ?1", params![id])?;
     Ok(n > 0)
 }
@@ -3505,6 +4128,247 @@ mod tests {
         assert!(insert_with_basis(&conn, "x", None, None, true, None, 5, Some("guessed")).is_err());
         assert!(set_basis(&conn, a, "guessed").is_err());
         assert_eq!(get(&conn, a).unwrap().unwrap().basis.as_deref(), Some("stated"), "a rejected write must not touch the row");
+    }
+
+    #[test]
+    fn entity_cards_round_trip_and_go_stale_on_new_or_dead_evidence() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let moses = insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..CARD_MIN_MENTIONS {
+            ids.push(insert(&conn, &format!("Moses said thing {}", i), None, None, true, None, 5).unwrap());
+        }
+        // due: enough mentions, no card yet
+        let due = entity_card_candidates(&conn, 10).unwrap();
+        assert_eq!(due.iter().map(|e| e.id).collect::<Vec<_>>(), vec![moses]);
+
+        let wm = max_mention_memory_id(&conn, moses).unwrap();
+        let deg = mention_degree(&conn, moses).unwrap();
+        let src: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        upsert_entity_card(&conn, moses, "- pragmatic about hotfixes", &src, None, wm, deg, &now).unwrap();
+        let card = get_entity_card(&conn, moses).unwrap().unwrap();
+        assert_eq!(card.source_ids.len(), CARD_MIN_MENTIONS as usize);
+        assert_eq!(card.built_watermark, wm);
+        assert!(entity_card_candidates(&conn, 10).unwrap().is_empty(), "a current card is not due");
+
+        // a new mention makes it stale
+        let newer = insert(&conn, "Moses asked about NORAD ids", None, None, true, None, 5).unwrap();
+        assert_eq!(entity_card_candidates(&conn, 10).unwrap().len(), 1);
+        let wm2 = max_mention_memory_id(&conn, moses).unwrap();
+        assert_eq!(wm2, newer);
+        upsert_entity_card(&conn, moses, "- v2", &src, None, wm2, mention_degree(&conn, moses).unwrap(), &now).unwrap();
+        assert!(entity_card_candidates(&conn, 10).unwrap().is_empty());
+        // created_at survives a rebuild, updated_at is rewritten
+        let rebuilt = get_entity_card(&conn, moses).unwrap().unwrap();
+        assert_eq!(rebuilt.created_at, card.created_at);
+        assert_eq!(rebuilt.text, "- v2");
+
+        // evidence dying under the card also makes it stale
+        conn.execute("UPDATE memories SET dormant_at = ?1 WHERE id = ?2", params![now, newer]).unwrap();
+        assert_eq!(entity_card_candidates(&conn, 10).unwrap().len(), 1, "mention_count no longer matches");
+    }
+
+    #[test]
+    fn entity_card_candidates_skip_thin_entities_and_the_reserved_user() {
+        let conn = mem_conn();
+        let thin = insert_entity(&conn, "Ivar", Some("person"), None).unwrap();
+        insert(&conn, "Ivar reported a drift bug", None, None, true, None, 5).unwrap();
+        let user = insert_entity(&conn, "user", None, None).unwrap();
+        let now = now_rfc3339();
+        for i in 0..10 {
+            let m = insert(&conn, &format!("a fact {}", i), None, None, true, None, 5).unwrap();
+            link_mention(&conn, m, user, MENTION_SOURCE_EXTRACTION, &now).unwrap();
+        }
+        let due: Vec<i64> = entity_card_candidates(&conn, 10).unwrap().iter().map(|e| e.id).collect();
+        assert!(!due.contains(&thin), "one mention is below CARD_MIN_MENTIONS");
+        assert!(!due.contains(&user), "the reserved user entity never gets a card");
+    }
+
+    #[test]
+    fn merging_an_entity_drops_the_survivors_stale_card_and_the_loser_row() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let keep = insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let drop_ = insert_entity(&conn, "Dr Moses", Some("person"), None).unwrap();
+        let m = insert(&conn, "a fact", None, None, true, None, 5).unwrap();
+        link_mention(&conn, m, drop_, MENTION_SOURCE_EXTRACTION, &now).unwrap();
+        upsert_entity_card(&conn, keep, "- old card", &[], None, 0, 0, &now).unwrap();
+        upsert_entity_card(&conn, drop_, "- doomed", &[], None, 0, 0, &now).unwrap();
+        repoint_entity_relations(&conn, drop_, keep, &now).unwrap();
+        delete_entity(&conn, drop_).unwrap();
+        assert!(get_entity_card(&conn, keep).unwrap().is_none(), "survivor's card is dropped for a rebuild");
+        assert!(get_entity_card(&conn, drop_).unwrap().is_none());
+        assert_eq!(mention_degree(&conn, keep).unwrap(), 1);
+    }
+
+    #[test]
+    fn spread_takes_one_hop_per_link_not_a_cluster_from_one_entity() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let e1 = insert_entity(&conn, "orchestrator", Some("component"), None).unwrap();
+        let e2 = insert_entity(&conn, "popobawa", Some("infrastructure"), None).unwrap();
+        let seed = insert(&conn, "seed", None, None, true, None, 5).unwrap();
+        link_mention(&conn, seed, e1, MENTION_SOURCE_EXTRACTION, &now).unwrap();
+        link_mention(&conn, seed, e2, MENTION_SOURCE_EXTRACTION, &now).unwrap();
+        // five neighbours behind e1, one behind e2
+        for i in 0..5 {
+            let m = insert(&conn, &format!("orchestrator fact {}", i), None, None, true, None, 5).unwrap();
+            link_mention(&conn, m, e1, MENTION_SOURCE_EXTRACTION, &now).unwrap();
+        }
+        let only = insert(&conn, "a popobawa fact", None, None, true, None, 5).unwrap();
+        link_mention(&conn, only, e2, MENTION_SOURCE_EXTRACTION, &now).unwrap();
+
+        let hits =
+            spread_activation(&conn, &[(seed, 0.9)], &std::collections::HashSet::new(), &now, None).unwrap();
+        assert!(hits.len() <= SPREAD_MAX_OUT);
+        assert_eq!(hits.iter().filter(|h| h.via_edge == "entity:orchestrator").count(), SPREAD_MAX_PER_EDGE);
+        assert!(hits.iter().any(|h| h.id == only), "the quiet second link still gets its hop: {:?}", hits);
+    }
+
+    #[test]
+    fn spread_prefers_the_shared_entity_the_query_is_about() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        // "orchestrator" sits on the query's axis; "systemd" is orthogonal.
+        let subject = insert_entity(&conn, "orchestrator", Some("component"), Some(&unit_vec(4, 0))).unwrap();
+        let incidental = insert_entity(&conn, "systemd", Some("technology"), Some(&unit_vec(4, 3))).unwrap();
+        let seed = insert(&conn, "seed memory", None, None, true, None, 5).unwrap();
+        let on_topic = insert(&conn, "an orchestrator fact", None, None, true, None, 5).unwrap();
+        let off_topic = insert(&conn, "a systemd unit fact", None, None, true, None, 5).unwrap();
+        for (m, e) in [(seed, subject), (seed, incidental), (on_topic, subject), (off_topic, incidental)] {
+            link_mention(&conn, m, e, MENTION_SOURCE_EXTRACTION, &now).unwrap();
+        }
+        let q = unit_vec(4, 0);
+        let empty = std::collections::HashSet::new();
+
+        let steered = spread_activation(&conn, &[(seed, 0.9)], &empty, &now, Some(&q)).unwrap();
+        let ids: Vec<i64> = steered.iter().map(|h| h.id).collect();
+        assert!(ids.contains(&on_topic), "{:?}", steered);
+        assert!(!ids.contains(&off_topic), "an incidental shared entity must not hop: {:?}", steered);
+
+        // With no query embedding both are equally walkable.
+        let blind = spread_activation(&conn, &[(seed, 0.9)], &empty, &now, None).unwrap();
+        let ids: Vec<i64> = blind.iter().map(|h| h.id).collect();
+        assert!(ids.contains(&on_topic) && ids.contains(&off_topic), "{:?}", blind);
+    }
+
+    #[test]
+    fn entity_edge_weight_only_calls_a_hub_a_hub_above_the_degree_floor() {
+        // small bank: 2 of 5 memories is 40% share but only degree 2 -- not a hub
+        assert!(entity_edge_weight(2, 5).is_some());
+        // big enough degree AND share -> hub
+        assert!(entity_edge_weight(SPREAD_HUB_MIN_DEGREE, 10).is_none());
+        // big degree, tiny share -> still a real link
+        assert!(entity_edge_weight(SPREAD_HUB_MIN_DEGREE, 1000).is_some());
+        // above the absolute cap -> hub regardless of share
+        assert!(entity_edge_weight(SPREAD_HUB_ABS + 1, 100_000).is_none());
+        assert!(entity_edge_weight(0, 10).is_none());
+        // not a hub means full weight, whatever the degree
+        assert_eq!(entity_edge_weight(2, 1000).unwrap(), 1.0);
+        assert_eq!(entity_edge_weight(30, 1000).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn backfill_mentions_tolerates_a_database_without_the_graph_tables() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT NOT NULL, created_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        assert_eq!(backfill_mentions(&conn, &now_rfc3339()).unwrap(), 0);
+    }
+
+    #[test]
+    fn name_mentioned_is_word_bounded_case_insensitive_and_skips_short_or_user() {
+        assert!(name_mentioned("deployed to popobawa yesterday", "Popobawa"));
+        assert!(!name_mentioned("the umojan portal", "umoja"));
+        assert!(name_mentioned("the umoja portal", "umoja"));
+        assert!(!name_mentioned("the user said", "user"));
+        assert!(!name_mentioned("go go go", "go"));
+        assert!(name_mentioned("mach kb search", "mach kb"));
+    }
+
+    #[test]
+    fn insert_links_mentions_by_name_scan_and_new_entity_links_back() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let moses = insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let m1 = insert(&conn, "Moses asked for TLE ownership", None, None, true, None, 5).unwrap();
+        let m2 = insert(&conn, "the sim agent runs on popobawa", None, None, true, None, 5).unwrap();
+        assert_eq!(entities_of_memory(&conn, m1).unwrap().iter().map(|e| e.id).collect::<Vec<_>>(), vec![moses]);
+        assert!(entities_of_memory(&conn, m2).unwrap().is_empty());
+        let host = insert_entity(&conn, "popobawa", Some("infrastructure"), None).unwrap();
+        assert_eq!(link_entity_mentions_by_name_scan(&conn, host, "popobawa", &now).unwrap(), 1);
+        assert_eq!(memories_mentioning(&conn, host, None).unwrap()[0].id, m2);
+        assert_eq!(mention_degree(&conn, host).unwrap(), 1);
+        // merge: mentions follow the survivor, and the dropped entity's rows are gone
+        let dup = insert_entity(&conn, "Dr Moses", Some("person"), None).unwrap();
+        link_mention(&conn, m2, dup, MENTION_SOURCE_EXTRACTION, &now).unwrap();
+        repoint_entity_relations(&conn, dup, moses, &now).unwrap();
+        delete_entity(&conn, dup).unwrap();
+        assert_eq!(mention_degree(&conn, moses).unwrap(), 2);
+        assert_eq!(conn.query_row::<i64, _, _>("SELECT COUNT(*) FROM memory_entities WHERE entity_id = ?1", params![dup], |r| r.get(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn migrate_v15_to_v16_backfills_mentions_from_relations_and_names() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, source TEXT, project TEXT,
+                created_at TEXT NOT NULL, reviewed INTEGER NOT NULL DEFAULT 1, embedding BLOB,
+                importance INTEGER NOT NULL DEFAULT 5, stability REAL, access_count INTEGER NOT NULL DEFAULT 0,
+                first_accessed_at TEXT, last_accessed_at TEXT, valid_from TEXT, invalidated_at TEXT,
+                superseded_by INTEGER, dormant_at TEXT, last_verified_at TEXT, graph_extracted_at TEXT, basis TEXT);
+             CREATE TABLE entities (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, kind TEXT, embedding BLOB, created_at TEXT NOT NULL);
+             CREATE TABLE relations (id INTEGER PRIMARY KEY AUTOINCREMENT, src INTEGER NOT NULL, predicate TEXT NOT NULL, dst INTEGER NOT NULL,
+                evidence_memory_id INTEGER, confidence REAL, created_at TEXT NOT NULL, valid_from TEXT, invalidated_at TEXT, superseded_by INTEGER);
+             INSERT INTO memories (content, created_at) VALUES ('Ivar approved the redesign', '2026-01-01T00:00:00Z');
+             INSERT INTO memories (content, created_at) VALUES ('nothing named here', '2026-01-01T00:00:00Z');
+             INSERT INTO entities (name, kind, created_at) VALUES ('Ivar', 'person', '2026-01-01T00:00:00Z');
+             INSERT INTO entities (name, kind, created_at) VALUES ('RHI redesign', 'project', '2026-01-01T00:00:00Z');
+             INSERT INTO relations (src, predicate, dst, evidence_memory_id, created_at) VALUES (1, 'approved', 2, 1, '2026-01-01T00:00:00Z');
+             PRAGMA user_version = 15;",
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 17);
+        let ents = entities_of_memory(&conn, 1).unwrap();
+        assert_eq!(ents.len(), 2, "Ivar by name scan AND relation evidence, RHI redesign by relation evidence only");
+        assert!(entities_of_memory(&conn, 2).unwrap().is_empty());
+        migrate(&conn).unwrap(); // idempotent
+        assert_eq!(entities_of_memory(&conn, 1).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn spread_activation_reaches_a_memory_through_a_shared_entity_but_not_a_hub() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let hub = insert_entity(&conn, "umoja", Some("project"), None).unwrap();
+        let seed = insert(&conn, "Moses wants TLE ownership in umoja", None, None, true, None, 5).unwrap();
+        let via_moses = insert(&conn, "Moses prefers hotfix pragmatism", None, None, true, None, 5).unwrap();
+        // 60 memories mention only the hub -> hub degree far above the cap
+        let mut hub_only = Vec::new();
+        for i in 0..60 {
+            hub_only.push(insert(&conn, &format!("umoja note {}", i), None, None, true, None, 5).unwrap());
+        }
+        assert!(mention_degree(&conn, hub).unwrap() > SPREAD_HUB_ABS);
+        let hits = spread_activation(&conn, &[(seed, 0.9)], &std::collections::HashSet::new(), &now, None).unwrap();
+        let ids: Vec<i64> = hits.iter().map(|h| h.id).collect();
+        assert!(ids.contains(&via_moses), "{:?}", hits);
+        let m = hits.iter().find(|h| h.id == via_moses).unwrap();
+        assert_eq!(m.via_seed, seed);
+        assert_eq!(m.via_edge, "entity:Moses");
+        assert!(m.activation < 0.9, "a hop never outranks its seed");
+        assert!(m.activation > 0.3, "{:?}", m);
+        assert!(hits.iter().filter(|h| h.via_edge == "entity:Moses").count() <= SPREAD_MAX_PER_EDGE);
+        // nothing arrives through the hub entity, so the 60 hub-only notes stay out entirely
+        assert!(hits.iter().all(|h| !hub_only.contains(&h.id)), "{:?}", hits);
+        assert!(hits.len() <= SPREAD_MAX_OUT);
     }
 
     #[test]
@@ -3628,7 +4492,7 @@ mod tests {
         init_schema(&conn).unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 15);
+        assert_eq!(v, 17);
         assert!(lexical_scores(&conn, "43005", 10).unwrap().contains_key(&1), "pre-existing rows get indexed by the rebuild");
         migrate(&conn).unwrap(); // idempotent
     }
@@ -3671,7 +4535,7 @@ mod tests {
         init_schema(&conn).unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 15);
+        assert_eq!(v, 17);
         let m = get(&conn, 1).unwrap().unwrap();
         assert_eq!(m.basis, None, "pre-existing rows stay basis-unknown");
         // idempotent
@@ -4123,7 +4987,7 @@ mod tests {
         // (`improve_state` + `ingested_sessions.skill_usage`), landing at the
         // current version.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 17);
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1);
@@ -4272,7 +5136,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 15,
+            version, 17,
             "v1->v2 (reflection tables), v2->v3 (insights level column), v3->v4 (dormant_at), \
              v4->v5 (dedupe_seen), v5->v6 (last_verified_at + contradiction_seen), \
              v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions), v8->v9 (graph layer), \
@@ -4298,7 +5162,7 @@ mod tests {
     fn fresh_database_lands_at_current_user_version() {
         let conn = mem_conn();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 17);
     }
 
     #[test]
@@ -4527,7 +5391,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 15,
+            version, 17,
             "v2->v3 (level column), v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, \
              v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions), v8->v9, v9->v10 all run"
         );
@@ -4571,7 +5435,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 15,
+            version, 17,
             "v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild), \
              v7->v8 (ingested_sessions), v8->v9, v9->v10 all run"
         );
@@ -4616,7 +5480,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 15,
+            version, 17,
             "v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 \
              (ingested_sessions), v8->v9, v9->v10 all run"
         );
@@ -4664,7 +5528,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 15, "v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) all run");
+        assert_eq!(version, 17, "v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) all run");
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -4724,7 +5588,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 15, "v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) both run");
+        assert_eq!(version, 17, "v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) both run");
 
         // Every row and its data survive the rebuild, ids included.
         let rows = list(&conn, None, false).unwrap();
@@ -4885,7 +5749,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 15, "v7->v8 (ingested_sessions) runs");
+        assert_eq!(version, 17, "v7->v8 (ingested_sessions) runs");
 
         assert_eq!(list(&conn, None, false).unwrap().len(), 1, "existing memory row must survive the migration");
 
@@ -5617,7 +6481,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 15, "v8->v9 (graph layer) runs");
+        assert_eq!(version, 17, "v8->v9 (graph layer) runs");
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -5678,7 +6542,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 15, "v9->v10 (last_completed_at + entity_merge_seen) runs");
+        assert_eq!(version, 17, "v9->v10 (last_completed_at + entity_merge_seen) runs");
 
         // The pre-existing watermark row survives, and last_completed_at
         // backfills to NULL (never completed under the new field yet).

@@ -77,8 +77,8 @@ def merge_responses(primary, secondary):
     `id` space). Either side may be None."""
     if not primary and not secondary:
         return None
-    out = {"hits": [], "connections": []}
-    seen_ids, seen_text, seen_conn = set(), set(), set()
+    out = {"hits": [], "connections": [], "cards": []}
+    seen_ids, seen_text, seen_conn, seen_cards = set(), set(), set(), set()
     for resp in (primary, secondary):
         if not resp:
             continue
@@ -98,6 +98,14 @@ def merge_responses(primary, secondary):
                 continue
             seen_conn.add(k)
             out["connections"].append(c)
+        for card in resp.get("cards") or []:
+            if not isinstance(card, dict):
+                continue
+            name = (card.get("entity") or "").strip()
+            if not name or name in seen_cards:
+                continue
+            seen_cards.add(name)
+            out["cards"].append(card)
     return out
 
 
@@ -239,6 +247,42 @@ def suppressed_ids(log_path):
     return {n for n in _suppressed_field(log_path, "ids") if isinstance(n, int)}
 
 
+def suppressed_cards(log_path):
+    """Same sliding-window session dedupe as memory hits, for entity cards
+    (keyed on entity name): a card injected in the last DEDUPE_WINDOW
+    prompts is not re-injected. A card is the longest single thing recall
+    can inject, so repeating it every prompt about the same entity is the
+    most expensive kind of waste."""
+    return {k for k in _suppressed_field(log_path, "cards") if isinstance(k, str)}
+
+
+def card_lines(card):
+    """Renders one entity card (`cli::CardHit`): a header naming the entity,
+    its kind, when it was last rebuilt and from how much evidence, then its
+    body lines indented under it. `None` when too malformed to render."""
+    name = (card.get("entity") or "").strip()
+    text = (card.get("text") or "").strip()
+    if not name or not text:
+        return None
+    kind = (card.get("kind") or "").strip()
+    updated = (card.get("updated") or "").strip()
+    evidence = card.get("evidence")
+    meta = []
+    if kind:
+        meta.append(kind)
+    if updated:
+        meta.append("as of " + updated)
+    if isinstance(evidence, int) and evidence > 0:
+        meta.append("from {} memories".format(evidence))
+    head = "- {}{}:".format(name, " (" + ", ".join(meta) + ")" if meta else "")
+    out = [head]
+    for line in text.splitlines():
+        line = line.strip()
+        if line:
+            out.append("  " + line)
+    return out
+
+
 def suppressed_conns(log_path):
     """Same sliding-window session dedupe as `suppressed_ids`, but for
     association-graph connections (see `connection_key`) rather than memory
@@ -325,12 +369,14 @@ def main():
         return
     hits = resp.get("hits") or []
     connections = resp.get("connections") or []
-    if not hits and not connections:
+    cards = resp.get("cards") or []
+    if not hits and not connections and not cards:
         return
 
     log_path = os.path.join(RECALL_LOG_DIR, session_id + ".jsonl") if session_id else ""
     suppressed = suppressed_ids(log_path)
     suppressed_conn_keys = suppressed_conns(log_path)
+    suppressed_card_keys = suppressed_cards(log_path)
 
     lines = []
     ids = []
@@ -369,10 +415,15 @@ def main():
             via = h.get("via_assoc")
             how = source_phrase(h.get("source"), h.get("basis"))
             if isinstance(via, int):
-                # spreading activation over Hebbian memory_assoc edges: this
-                # did not match the prompt, it has been useful alongside a
-                # hit that did
-                how = how + "; recalled by association"
+                # Spreading activation over the memory graph: this did not
+                # match the prompt, it was reached from a hit that did. The
+                # edge says how — a shared entity, or Hebbian co-engagement
+                # (engaged together in an earlier session).
+                edge = (h.get("via_edge") or "").strip()
+                if edge.startswith("entity:"):
+                    how = how + "; reached via " + edge.split(":", 1)[1]
+                else:
+                    how = how + "; recalled by association"
             lines.append("- [{}] {} ({})".format(date, content, how))
             if isinstance(mem_id, int):
                 ids.append(mem_id)
@@ -401,6 +452,31 @@ def main():
         connection_lines.append(line)
         conn_keys.append(key)
 
+    # Entity cards: `mach kb reflect`'s consolidated profile of something
+    # this prompt named — a person, project, practice or tool. Rendered
+    # before the individual memories because it is the summary those
+    # memories were distilled into.
+    card_block = []
+    card_keys = []
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        name = (card.get("entity") or "").strip()
+        if not name or name in suppressed_card_keys:
+            continue
+        rendered = card_lines(card)
+        if not rendered:
+            continue
+        card_block.extend(rendered)
+        card_keys.append(name)
+
+    if card_block:
+        print("What you know about what this prompt names (consolidated from many "
+              "memories by reflection; the memories themselves follow):")
+        for l in card_block:
+            print(l)
+        print()
+
     if lines or connection_lines:
         print("You remember (your memory of this user from past sessions — "
               "use it first rather than re-exploring; each entry notes how "
@@ -422,7 +498,7 @@ def main():
     # hook's own session dedupe and carries no reinforcement semantics, so
     # ingest.rs's own parsing must (and does) simply ignore it. Best-effort:
     # any failure means no log line, never a failed hook.
-    if session_id and (ids or conn_keys):
+    if session_id and (ids or conn_keys or card_keys):
         try:
             os.makedirs(RECALL_LOG_DIR, exist_ok=True)
             import datetime
@@ -432,6 +508,8 @@ def main():
                 entry["scores"] = scores
             if conn_keys:
                 entry["conn"] = conn_keys
+            if card_keys:
+                entry["cards"] = card_keys
             with open(log_path, "a") as f:
                 f.write(json.dumps(entry) + "\n")
         except Exception:

@@ -815,19 +815,6 @@ impl Outcome {
         }
     }
 
-    /// One-line desktop notification; `None` for a clean no-op.
-    pub fn notification(&self) -> Option<String> {
-        match self {
-            Outcome::Applied { result, sha } => Some(format!(
-                "mach kb improve: {} {} ({})",
-                result.action.as_str(),
-                result.files.iter().filter_map(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).collect::<Vec<_>>().join(", "),
-                sha
-            )),
-            Outcome::Nothing { .. } => None,
-            Outcome::Failed { reason } => Some(format!("mach kb improve failed: {}", reason)),
-        }
-    }
 }
 
 /// Whether `mach kb health`'s improve check passes: a completion within
@@ -943,11 +930,6 @@ impl Vcs for ProcessChezmoi {
         run_ok(Command::new("git").arg("-C").arg(&src).args(["commit", "-q", "-m", message]))?;
         run_ok(Command::new("git").arg("-C").arg(&src).args(["rev-parse", "--short", "HEAD"])).map(|s| s.trim().to_string())
     }
-}
-
-/// Fire-and-forget desktop notification, same posture as `note::ProcessNotifier`.
-pub fn notify(summary: &str) {
-    let _ = Command::new("notify-send").arg("-u").arg("normal").arg("-a").arg("mach kb improve").arg(summary).spawn();
 }
 
 #[cfg(test)]
@@ -1141,9 +1123,7 @@ mod tests {
         let applied = Outcome::Applied { result: r, sha: "abc123".into() };
         assert_eq!(applied.memory_source("2026-09-08T10:00:00Z"), "improve 2026-09-08T10:00:00Z abc123");
         assert!(applied.memory_text().contains("chezmoi commit abc123"));
-        assert!(applied.notification().unwrap().contains("create SKILL.md"));
         let none = Outcome::Nothing { rationale: "quiet".into() };
-        assert!(none.notification().is_none());
         assert!(none.memory_source("t").ends_with(" none"));
         let failed = Outcome::Failed { reason: "bash -n".into() };
         assert!(failed.is_failure());

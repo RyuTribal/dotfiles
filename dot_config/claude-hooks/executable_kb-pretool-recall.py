@@ -162,7 +162,8 @@ def main():
     if not resp:
         return
     hits = resp.get("hits") or []
-    if not hits:
+    cards = resp.get("cards") or []
+    if not hits and not cards:
         return
 
     log_path = os.path.join(kb_recall.RECALL_LOG_DIR, session_id + ".jsonl") if session_id else ""
@@ -192,7 +193,11 @@ def main():
             how = kb_recall.source_phrase(h.get("source"), h.get("basis"))
             via = h.get("via_assoc")
             if isinstance(via, int):
-                how += "; recalled by association"
+                edge = (h.get("via_edge") or "").strip()
+                if edge.startswith("entity:"):
+                    how += "; reached via " + edge.split(":", 1)[1]
+                else:
+                    how += "; recalled by association"
             lines.append("- [{}] {} ({})".format(date, content, how))
             if isinstance(mem_id, int):
                 ids.append(mem_id)
@@ -202,6 +207,12 @@ def main():
                     round(float(h.get("strength") or 0), 3),
                     round(score, 3),
                 ] + ([via] if isinstance(via, int) else [])
+    for card in cards:
+        if isinstance(card, dict):
+            rendered = kb_recall.card_lines(card)
+            if rendered:
+                lines = rendered + lines
+
     if not lines:
         return
 

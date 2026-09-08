@@ -78,17 +78,19 @@ fn print_help() {
     println!("                          ~/.claude/skills, CLAUDE.md, settings.json and claude-hooks;");
     println!("                          verifies, commits via chezmoi, records the outcome as a memory.");
     println!("                          --dry-run prints the prompt; --force ignores the threshold");
-    println!("  entity <name>           association graph for one entity — active edges both");
-    println!("                          directions, with evidence memory + date (exact name");
-    println!("                          match first, else embedding similarity)");
+    println!("  entity <name>           one entity: its reflection-built CARD (a consolidated");
+    println!("                          profile of a person, project, practice or tool) plus its");
+    println!("                          association-graph edges both directions, with evidence");
+    println!("                          memory + date (exact name match first, else embedding");
+    println!("                          similarity)");
     println!("  why <id> | why insight <id>");
     println!("                          provenance trace for one memory (or insight/theme):");
     println!("                          source + basis, supersession chain, likely origin");
     println!("                          session/meeting transcript, insights that cite it,");
     println!("                          graph edges it evidences, Hebbian associates,");
     println!("                          engagement + how often recall has shown it. Read-only.");
-    println!("  graph --stats           entity/edge counts by kind — a compact view of the");
-    println!("                          association graph `mach kb reflect` has derived so far");
+    println!("  graph --stats           entity/edge/mention/card counts by kind — a compact view");
+    println!("                          of the graph `mach kb reflect` has derived so far");
     println!("  graph audit             batched KEEP/POISONED/GENERIC judgment over every active");
     println!("                          edge; POISONED/GENERIC edges are invalidated (never deleted)");
     println!("  health [--notify]       operational self-check (ollama, kb.db, kb socket, reflect");
@@ -290,6 +292,11 @@ pub struct SearchHit {
     // whose id this is (see `spread_assoc`). Omitted from JSON otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub via_assoc: Option<i64>,
+    // With `via_assoc`: which link first reached this memory in spreading
+    // activation -- "entity:<name>", "assoc" (Hebbian co-engagement), or
+    // "temporal". Omitted on direct hits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via_edge: Option<String>,
     // `Memory::basis` ("stated" | "inferred") when the row recorded one;
     // omitted otherwise (legacy rows, insights, channels that don't
     // classify). Lets kb-recall.py say "you told me" vs "I inferred".
@@ -325,6 +332,7 @@ pub(crate) fn to_hit(h: RankedHit) -> SearchHit {
         confidence: None,
         level: None,
         via_assoc: None,
+        via_edge: None,
         basis: h.memory.basis,
         lexical: h.lexical,
     }
@@ -348,6 +356,7 @@ pub(crate) fn insight_to_hit(h: InsightHit) -> SearchHit {
         confidence: Some(h.insight.confidence),
         level: Some(h.insight.level),
         via_assoc: None,
+        via_edge: None,
         basis: None,
         lexical: 0.0,
     }
@@ -402,7 +411,29 @@ pub struct ConnectionHit {
 pub struct SearchResponse {
     pub hits: Vec<SearchHit>,
     pub connections: Vec<ConnectionHit>,
+    /// The card of the entity this query named, when it has one -- a
+    /// consolidated profile injected instead of leaving recall to
+    /// reassemble the same picture from scattered memories. At most
+    /// `SEARCH_MAX_CARDS`; empty (and omitted from JSON) otherwise.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cards: Vec<CardHit>,
 }
+
+/// One entity card surfaced alongside a search's hits.
+#[derive(Serialize, Clone)]
+pub struct CardHit {
+    pub entity: String,
+    pub kind: Option<String>,
+    pub text: String,
+    /// When the card was last rebuilt (date only).
+    pub updated: String,
+    /// How many active memories it was distilled from.
+    pub evidence: usize,
+}
+
+/// Cards surfaced per search. One: the query's own named entity. A second
+/// would already be as long as the hits it is meant to summarize.
+pub const SEARCH_MAX_CARDS: usize = 1;
 
 /// At or above this cosine similarity between the query embedding and an
 /// entity's own name embedding, that entity's connections are surfaced
@@ -490,31 +521,43 @@ fn active_relations_for_recall(conn: &Connection, entity_id: i64) -> Vec<store::
 /// that only paraphrase an entity.
 fn entity_named_in_query(conn: &Connection, query: &str) -> Option<store::Entity> {
     let q = query.to_lowercase();
-    let q_bytes = q.as_bytes();
     let mut best: Option<store::Entity> = None;
     for e in store::all_entities(conn).unwrap_or_default() {
         let name = e.name.to_lowercase();
         if name.len() < 3 || name == "user" {
             continue; // too short to be a reliable mention; "user" matches everything
         }
-        let mut start = 0usize;
-        let mut found = false;
-        while let Some(pos) = q[start..].find(&name) {
-            let abs = start + pos;
-            let end = abs + name.len();
-            let left_ok = abs == 0 || !q_bytes[abs - 1].is_ascii_alphanumeric();
-            let right_ok = end == q.len() || !q_bytes[end].is_ascii_alphanumeric();
-            if left_ok && right_ok {
-                found = true;
-                break;
-            }
-            start = abs + 1;
-        }
+        let found = store::name_mentioned(&q, &name);
         if found && best.as_ref().map_or(true, |b| name.len() > b.name.len()) {
             best = Some(e);
         }
     }
     best
+}
+
+/// The card of the entity this query names (or, failing a literal name, the
+/// closest entity by name embedding -- the same resolution
+/// `entity_connections_for_query` uses). Enrichment: any lookup failure
+/// yields no cards, never an error.
+fn cards_for_query(conn: &Connection, query: &str, q_emb: &[f32]) -> Vec<CardHit> {
+    let entity = match entity_named_in_query(conn, query) {
+        Some(e) => Some(e),
+        None => match store::find_entity_by_similarity(conn, q_emb, SEARCH_ENTITY_CONNECTION_SIM_THRESHOLD) {
+            Ok(Some((e, _))) => Some(e),
+            _ => None,
+        },
+    };
+    let Some(entity) = entity else { return Vec::new() };
+    match store::get_entity_card(conn, entity.id) {
+        Ok(Some(card)) => vec![CardHit {
+            entity: entity.name,
+            kind: entity.kind,
+            text: card.text,
+            updated: card.updated_at.get(..10).unwrap_or(&card.updated_at).to_string(),
+            evidence: card.source_ids.len(),
+        }],
+        _ => Vec::new(),
+    }
 }
 
 fn entity_connections_for_query(conn: &Connection, query: &str, q_emb: &[f32]) -> Vec<ConnectionHit> {
@@ -607,7 +650,9 @@ fn entity_connections_for_query(conn: &Connection, query: &str, q_emb: &[f32]) -
 /// Ranked top-N search + insight blend, embedding `query` itself — the same
 /// merge `cmd_search` performs for `mach kb search --json` (mem hits and
 /// insight hits fetched independently, combined, sorted by score, truncated
-/// to `limit`, then `min_score`-filtered). Extracted as its own `pub`
+/// to `limit`, then `min_score`-filtered). `limit` bounds the QUERY MATCHES;
+/// graph hops (`spread_graph`) are appended after that cut as enrichment,
+/// so a response holds at most `limit + store::SPREAD_MAX_OUT` hits. Extracted as its own `pub`
 /// function so the kb socket daemon (`socket::run`, serving
 /// `$XDG_RUNTIME_DIR/mach-kb.sock` for `kb-recall.sh`'s fast path) can
 /// produce the exact same `SearchHit` shape without going through a
@@ -645,15 +690,18 @@ pub fn search_hits<E: Embedder>(
     let insight_hits = store::search_insights_ranked(conn, &q_emb, limit, now)?;
     let mut mem_hits: Vec<SearchHit> = mem_hits.into_iter().map(to_hit).collect();
     // Threshold the query matches before spreading: a memory that only
-    // scraped in under the floor by embedding must still be reachable as an
-    // associate of a real hit (and then carries the associate's score).
+    // scraped in under the floor by embedding must still be reachable as a
+    // graph neighbour of a real hit (and then carries the neighbour score).
     // Equivalent to the post-limit threshold below for the matches
     // themselves -- both are "top-N among rows clearing the floor".
     if min_score > 0.0 {
         mem_hits.retain(|h| h.score >= min_score);
     }
-    let associates = spread_assoc(conn, &mem_hits, now)?;
-    mem_hits.extend(associates);
+    // `limit` is the budget for QUERY MATCHES. Graph hops are enrichment on
+    // top of it, not competitors for its slots: a hop always scores below
+    // the hit it was reached through (by construction), so letting them into
+    // the same sort meant they were always the first thing truncated away --
+    // with the recall hook's limit of 4 a hop could never be seen at all.
     let mut combined: Vec<SearchHit> =
         mem_hits.into_iter().chain(insight_hits.into_iter().map(insight_to_hit)).collect();
     combined.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
@@ -661,60 +709,61 @@ pub fn search_hits<E: Embedder>(
     if min_score > 0.0 {
         combined.retain(|h| h.score >= min_score);
     }
+    // Spread from the matches that survived, and append what it reaches
+    // (already capped at `store::SPREAD_MAX_OUT`, and held to the same score
+    // floor so a faint hop is never injected).
+    let mut hops = spread_graph(conn, &combined, now, Some(&q_emb))?;
+    if min_score > 0.0 {
+        hops.retain(|h| h.score >= min_score);
+    }
+    combined.extend(hops);
     let connections = entity_connections_for_query(conn, query, &q_emb);
-    Ok(SearchResponse { hits: combined, connections })
+    let cards = cards_for_query(conn, query, &q_emb);
+    Ok(SearchResponse { hits: combined, connections, cards })
 }
 
-/// Spreading activation over Hebbian `memory_assoc` edges: from each of the
-/// top `ASSOC_SPREAD_SOURCES` memory hits, pull up to `ASSOC_SPREAD_PER_HIT`
-/// associates not already among the hits. An associate's score is the
-/// source hit's score damped by `ASSOC_DAMPING` and by how strong the edge
-/// is (`1 - exp(-weight)`, saturating), so a weak or stale association never
-/// outranks the query match that led to it. Each associate is tagged with
-/// the id it came through (`SearchHit::via_assoc`).
-pub const ASSOC_SPREAD_SOURCES: usize = 3;
-pub const ASSOC_SPREAD_PER_HIT: usize = 2;
-pub const ASSOC_DAMPING: f32 = 0.7;
+/// Spreading activation over the memory graph (`store::spread_activation`):
+/// from the top `SPREAD_SEED_HITS` query matches, walk shared-entity,
+/// Hebbian-association, and time-proximity links for two steps and pull in
+/// up to `store::SPREAD_MAX_OUT` memories the query itself missed. A reached
+/// memory's score is its activation (always below the seed it came through)
+/// and it is tagged with that seed (`via_assoc`) and the first link that
+/// reached it (`via_edge`). Hubs (entities mentioned everywhere) carry no
+/// signal and are skipped inside the store.
+pub const SPREAD_SEED_HITS: usize = 4;
 
-fn spread_assoc(conn: &Connection, hits: &[SearchHit], now: &str) -> Result<Vec<SearchHit>, KbError> {
-    let mut present: HashSet<i64> = hits.iter().map(|h| h.id).collect();
+fn spread_graph(
+    conn: &Connection,
+    hits: &[SearchHit],
+    now: &str,
+    q_emb: Option<&[f32]>,
+) -> Result<Vec<SearchHit>, KbError> {
+    let seeds: Vec<(i64, f32)> =
+        hits.iter().filter(|h| !h.superseded && !h.derived).take(SPREAD_SEED_HITS).map(|h| (h.id, h.score)).collect();
+    let present: HashSet<i64> = hits.iter().map(|h| h.id).collect();
     let mut out = Vec::new();
-    for h in hits.iter().filter(|h| !h.superseded).take(ASSOC_SPREAD_SOURCES) {
-        let mut taken = 0;
-        for (other, weight) in store::assoc_neighbors(conn, h.id, now)? {
-            if taken >= ASSOC_SPREAD_PER_HIT {
-                break;
-            }
-            if present.contains(&other) {
-                continue;
-            }
-            let Some(m) = store::get(conn, other)? else { continue };
-            if m.invalidated_at.is_some() || m.dormant_at.is_some() {
-                continue;
-            }
-            let factor = ASSOC_DAMPING * (1.0 - (-weight).exp());
-            present.insert(other);
-            taken += 1;
-            out.push(SearchHit {
-                id: m.id,
-                content: m.content,
-                source: m.source,
-                project: m.project,
-                created_at: m.created_at,
-                score: h.score * factor,
-                sim: 0.0,
-                recency: 0.0,
-                strength: weight,
-                importance: m.importance,
-                superseded: false,
-                derived: false,
-                confidence: None,
-                level: None,
-                via_assoc: Some(h.id),
-                basis: m.basis,
-                lexical: 0.0,
-            });
-        }
+    for g in store::spread_activation(conn, &seeds, &present, now, q_emb)? {
+        let Some(m) = store::get(conn, g.id)? else { continue };
+        out.push(SearchHit {
+            id: m.id,
+            content: m.content,
+            source: m.source,
+            project: m.project,
+            created_at: m.created_at,
+            score: g.activation,
+            sim: 0.0,
+            recency: 0.0,
+            strength: 0.0,
+            importance: m.importance,
+            superseded: false,
+            derived: false,
+            confidence: None,
+            level: None,
+            via_assoc: Some(g.via_seed),
+            via_edge: Some(g.via_edge),
+            basis: m.basis,
+            lexical: 0.0,
+        });
     }
     Ok(out)
 }
@@ -801,7 +850,7 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
                     to_hit(RankedHit { memory: m, score, sim: score, recency: 0.0, strength: 0.0, superseded, lexical: 0.0 })
                 })
                 .collect();
-            SearchResponse { hits, connections: Vec::new() }
+            SearchResponse { hits, connections: Vec::new(), cards: Vec::new() }
         }
     };
 
@@ -849,6 +898,20 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     // Human-readable only: with --json the connections are already inside
     // the JSON object above, and trailing text would break every consumer
     // that json-parses stdout (kb-recall.py's subprocess fallback did).
+    if !json {
+        for c in &response.cards {
+            println!(
+                "\ncard: {} ({}) — rebuilt {} from {} memories",
+                c.entity,
+                c.kind.as_deref().unwrap_or("kind unspecified"),
+                c.updated,
+                c.evidence
+            );
+            for line in c.text.lines() {
+                println!("  {}", line);
+            }
+        }
+    }
     if !json && !response.connections.is_empty() {
         println!("\nconnections:");
         for c in &response.connections {
@@ -1536,6 +1599,16 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let (dormant, consolidated, dormancy_llm_failed) = run_dormancy_pass(&conn, &embedder, &llm, &now).map_err(to_io)?;
     llm_failed = llm_failed || dormancy_llm_failed;
 
+    // Step 4.66: entity cards — rebuild the consolidated profile of every
+    // entity whose evidence has moved since its card was written. Runs after
+    // merges (so a card is never built for an entity about to be merged
+    // away) and after dormancy (so it reflects what actually survived), and
+    // like those, every invocation regardless of has_new: staleness is
+    // measured against the mention watermark, not this run's new material.
+    let (cards_examined, cards_built, cards_llm_failed) =
+        run_entity_card_pass(&conn, &embedder, &llm, &now).map_err(to_io)?;
+    llm_failed = llm_failed || cards_llm_failed;
+
     // Step 5: meta-reflection (theme) pass — only when triggered, or
     // forced via --meta for manual runs.
     let level1_active = store::count_active_insights_level(&conn, 1).map_err(to_io)?;
@@ -1576,7 +1649,8 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         "mach kb reflect: examined={} questions={} insights_added={} reinforced={} \
          themes_added={} flagged={} verified={} curated={} promoted={} demoted={} dormant={} \
          consolidated={} deduped={} contradictions={} mem_verified={} mem_stale={} mem_routed={} \
-         graph_examined={} graph_edges={} graph_entities={} evidence_dead={} entities_merged={}{}",
+         graph_examined={} graph_edges={} graph_entities={} evidence_dead={} entities_merged={} \
+         cards_examined={} cards_built={}{}",
         examined,
         questions_count,
         insights_added,
@@ -1599,6 +1673,8 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         graph_entities,
         evidence_dead,
         entities_merged,
+        cards_examined,
+        cards_built,
         if llm_failed { " (degraded: some claude calls failed — watermark not advanced)" } else { "" }
     );
     Ok(())
@@ -2417,6 +2493,17 @@ fn run_graph_extraction_pass<E: Embedder, L: ReflectLlm>(
                 let (src_id, src_new) = resolve_or_create_entity(conn, embedder, &t.src_name, t.src_kind.as_deref())?;
                 let (dst_id, dst_new) = resolve_or_create_entity(conn, embedder, &t.dst_name, t.dst_kind.as_deref())?;
                 entities_created += src_new as usize + dst_new as usize;
+                // The memory mentions both endpoints (the substrate graph
+                // recall and entity cards walk); a freshly minted entity also
+                // gets linked back to every older memory that already named it.
+                store::link_mention(conn, m.id, src_id, store::MENTION_SOURCE_EXTRACTION, now)?;
+                store::link_mention(conn, m.id, dst_id, store::MENTION_SOURCE_EXTRACTION, now)?;
+                if src_new {
+                    store::link_entity_mentions_by_name_scan(conn, src_id, &t.src_name, now)?;
+                }
+                if dst_new {
+                    store::link_entity_mentions_by_name_scan(conn, dst_id, &t.dst_name, now)?;
+                }
 
                 let confidence = t.confidence * source_penalty;
                 let new_edge_id =
@@ -2438,6 +2525,80 @@ fn run_graph_extraction_pass<E: Embedder, L: ReflectLlm>(
     llm_failed = llm_failed || conflict_llm_failed;
 
     Ok((examined, edges_created, entities_created, llm_failed))
+}
+
+/// The entity-card pass (inside `mach kb reflect`, after graph hygiene and
+/// dormancy): for every entity whose card is missing or behind its evidence
+/// (`store::entity_card_candidates`), one haiku call distills the memories
+/// that mention it into a short profile (`reflect::build_entity_card_prompt`).
+/// This is the generic form of a "who is this person" model: the same pass
+/// profiles a person, a project, a practice, or a tool, because the card is
+/// keyed on the entity, not on its kind.
+///
+/// Returns `(examined, built, any_llm_call_failed)`. A failed or NONE reply
+/// leaves the previous card untouched and the entity due again next run --
+/// never a half-written card, same "never mark seen on failure" rule the
+/// other passes follow.
+fn run_entity_card_pass<E: Embedder, L: ReflectLlm>(
+    conn: &Connection,
+    embedder: &E,
+    llm: &L,
+    now: &str,
+) -> Result<(usize, usize, bool), KbError> {
+    let candidates = store::entity_card_candidates(conn, store::CARD_MAX_PER_RUN)?;
+    let mut examined = 0usize;
+    let mut built = 0usize;
+    let mut llm_failed = false;
+
+    for entity in candidates {
+        let mems = store::memories_mentioning(conn, entity.id, Some(store::CARD_EVIDENCE_LIMIT))?;
+        if (mems.len() as i64) < store::CARD_MIN_MENTIONS {
+            continue; // raced with dormancy/supersession since the candidate query
+        }
+        examined += 1;
+        let evidence: Vec<(i64, String)> = mems.iter().map(|m| (m.id, m.content.clone())).collect();
+        let existing = store::get_entity_card(conn, entity.id)?;
+        let prompt = reflect::build_entity_card_prompt(
+            &entity.name,
+            entity.kind.as_deref(),
+            &evidence,
+            existing.as_ref().map(|c| c.text.as_str()),
+        );
+        let raw = match llm.call("haiku", &prompt, reflect::TIMEOUT_HAIKU) {
+            Ok(out) => out,
+            Err(_) => {
+                llm_failed = true;
+                continue;
+            }
+        };
+        let Some(card) = reflect::parse_entity_card(&raw) else {
+            continue; // NONE or malformed: keep whatever card is already there
+        };
+        // Only ids that are really among this entity's evidence -- a
+        // hallucinated citation must never end up in a card's provenance.
+        let allowed: HashSet<i64> = mems.iter().map(|m| m.id).collect();
+        let cited: Vec<String> =
+            card.memory_ids.iter().filter(|id| allowed.contains(id)).map(|id| id.to_string()).collect();
+        if cited.is_empty() {
+            continue;
+        }
+        let embedding = embedder.embed(&format!("{} — {}", entity.name, card.text)).ok();
+        let watermark = store::max_mention_memory_id(conn, entity.id)?;
+        let mention_count = store::mention_degree(conn, entity.id)?;
+        store::upsert_entity_card(
+            conn,
+            entity.id,
+            &card.text,
+            &cited,
+            embedding.as_deref(),
+            watermark,
+            mention_count,
+            now,
+        )?;
+        built += 1;
+    }
+
+    Ok((examined, built, llm_failed))
 }
 
 /// The graph hygiene pass (runs inside `mach kb reflect`, right after graph
@@ -2898,6 +3059,25 @@ pub fn why_report(
                     ));
                 }
             }
+            let mentions = store::entities_of_memory(conn, id)?;
+            if !mentions.is_empty() {
+                let names: Vec<String> = mentions
+                    .iter()
+                    .map(|e| {
+                        let on_card = store::get_entity_card(conn, e.id)
+                            .ok()
+                            .flatten()
+                            .map(|c| c.source_ids.iter().any(|sid| sid.parse::<i64>() == Ok(id)))
+                            .unwrap_or(false);
+                        if on_card {
+                            format!("{} (on its card)", e.name)
+                        } else {
+                            e.name.clone()
+                        }
+                    })
+                    .collect();
+                out.push_str(&format!("  mentions: {}\n", names.join(", ")));
+            }
             let edges = store::relations_evidenced_by(conn, id)?;
             if !edges.is_empty() {
                 out.push_str("  evidence for graph edges:\n");
@@ -3026,6 +3206,25 @@ fn cmd_entity(mut args: impl Iterator<Item = String>) -> io::Result<()> {
 
     println!("#{} {} ({})", entity.id, entity.name, entity.kind.as_deref().unwrap_or("unspecified"));
 
+    let degree = store::mention_degree(&conn, entity.id).map_err(to_io)?;
+    match store::get_entity_card(&conn, entity.id).map_err(to_io)? {
+        Some(card) => {
+            println!(
+                "  card (rebuilt {} from {} of {} mentioning memories):",
+                card.updated_at.get(..10).unwrap_or(&card.updated_at),
+                card.source_ids.len(),
+                degree
+            );
+            for line in card.text.lines() {
+                println!("    {}", line);
+            }
+        }
+        None if degree >= store::CARD_MIN_MENTIONS => {
+            println!("  card: none yet ({} mentioning memories; due at the next `mach kb reflect`)", degree)
+        }
+        None => println!("  card: none ({} mentioning memories, {} needed)", degree, store::CARD_MIN_MENTIONS),
+    }
+
     let edges = store::active_relations_for_entity(&conn, entity.id).map_err(to_io)?;
     if edges.is_empty() {
         println!("  no active connections");
@@ -3108,6 +3307,13 @@ fn cmd_graph(args: impl Iterator<Item = String>) -> io::Result<()> {
         println!("  {}: {}", kind, count);
     }
     println!("edges: {} active, {} invalidated", active_edges, invalidated_edges);
+    println!(
+        "memory→entity mentions: {} (the substrate graph recall hops over and cards are built from)",
+        store::count_mentions(&conn).map_err(to_io)?
+    );
+    let cards = store::count_entity_cards(&conn).map_err(to_io)?;
+    let due = store::entity_card_candidates(&conn, 1000).map_err(to_io)?.len();
+    println!("entity cards: {} built, {} due for a rebuild", cards, due);
     Ok(())
 }
 
@@ -4357,9 +4563,10 @@ fn run_improve<E: Embedder, L: ImproveLlm, V: Vcs>(
             )?;
         }
         store::mark_improve_completed(conn, now)?;
-        if let Some(line) = outcome.notification() {
-            improve::notify(&line);
-        }
+        // Deliberately no desktop notification: this pass runs unattended on
+        // a timer and its result is not something to interrupt the user for.
+        // Every outcome is already recorded as a memory (above) and a run of
+        // consecutive failures is surfaced by `mach kb health`.
         Ok(ImproveRun::Done(outcome))
     };
     let fail = |reason: String| finish(improve::Outcome::Failed { reason }, false);
@@ -5809,6 +6016,131 @@ mod tests {
         assert!(store::get_relation(&conn, elena_edge).unwrap().unwrap().is_active());
     }
 
+    // --- run_entity_card_pass ---
+
+    /// Replies with a well-formed card citing the first two memory ids the
+    /// prompt actually lists, so a batch of different entities each get a
+    /// valid citation (a fixed reply could only ever cite one entity's rows).
+    struct CardEchoLlm;
+
+    impl ReflectLlm for CardEchoLlm {
+        fn call(&self, _model: &str, prompt: &str, _timeout: std::time::Duration) -> Result<String, String> {
+            let ids: Vec<String> = prompt
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix('[').and_then(|r| r.split(']').next()).map(str::to_string))
+                .filter(|t| t.parse::<i64>().is_ok())
+                .take(2)
+                .collect();
+            Ok(format!("- a durable line\n- another durable line\nevidence: {}", ids.join(", ")))
+        }
+    }
+
+    fn carded_entity(conn: &Connection, name: &str, kind: &str, n: i64) -> i64 {
+        let id = store::insert_entity(conn, name, Some(kind), None).unwrap();
+        for i in 0..n {
+            store::insert(conn, &format!("{} did thing {}", name, i), None, None, true, None, 5).unwrap();
+        }
+        id
+    }
+
+    #[test]
+    fn run_entity_card_pass_builds_a_card_and_stops_being_due() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let moses = carded_entity(&conn, "Moses", "person", store::CARD_MIN_MENTIONS);
+        let llm = FixedReflectLlm {
+            reply: Ok("- argues hotfixes are underrated\n- pushes for owner-settable TLEs\nevidence: 1, 2, 999"),
+        };
+        let (examined, built, failed) = run_entity_card_pass(&conn, &FakeEmbedder, &llm, &now).unwrap();
+        assert_eq!((examined, built, failed), (1, 1, false));
+
+        let card = store::get_entity_card(&conn, moses).unwrap().unwrap();
+        assert!(card.text.starts_with("- argues hotfixes"));
+        assert_eq!(card.source_ids, vec!["1".to_string(), "2".to_string()], "the hallucinated id 999 is dropped");
+        assert_eq!(card.mention_count, store::CARD_MIN_MENTIONS);
+        assert!(card.embedding.is_some());
+        assert!(store::entity_card_candidates(&conn, 10).unwrap().is_empty(), "not due again until evidence moves");
+    }
+
+    #[test]
+    fn run_entity_card_pass_keeps_the_old_card_on_none_or_failure() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let moses = carded_entity(&conn, "Moses", "person", store::CARD_MIN_MENTIONS);
+        store::upsert_entity_card(&conn, moses, "- the old card", &["1".to_string()], None, 0, 0, &now).unwrap();
+
+        let none = FixedReflectLlm { reply: Ok("NONE") };
+        let (examined, built, failed) = run_entity_card_pass(&conn, &FakeEmbedder, &none, &now).unwrap();
+        assert_eq!((examined, built, failed), (1, 0, false));
+        assert_eq!(store::get_entity_card(&conn, moses).unwrap().unwrap().text, "- the old card");
+
+        let broken = FixedReflectLlm { reply: Err("offline") };
+        let (examined, built, failed) = run_entity_card_pass(&conn, &FakeEmbedder, &broken, &now).unwrap();
+        assert_eq!((examined, built), (1, 0));
+        assert!(failed, "a failed call is reported so the caller can degrade");
+        assert_eq!(store::get_entity_card(&conn, moses).unwrap().unwrap().text, "- the old card");
+        assert!(!store::entity_card_candidates(&conn, 10).unwrap().is_empty(), "still due after a failure");
+    }
+
+    #[test]
+    fn run_entity_card_pass_is_capped_per_run_and_skips_thin_entities() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        for i in 0..(store::CARD_MAX_PER_RUN + 2) {
+            carded_entity(&conn, &format!("Entity{}", i), "concept", store::CARD_MIN_MENTIONS);
+        }
+        carded_entity(&conn, "Thin", "person", 1);
+        let (examined, built, _) = run_entity_card_pass(&conn, &FakeEmbedder, &CardEchoLlm, &now).unwrap();
+        assert_eq!(examined, store::CARD_MAX_PER_RUN, "one run never re-cards the whole graph");
+        assert_eq!(built, store::CARD_MAX_PER_RUN);
+        // the two entities the cap left out are still due next run
+        assert_eq!(store::entity_card_candidates(&conn, 10).unwrap().len(), 2);
+        let thin = store::find_entity_by_name(&conn, "Thin").unwrap().unwrap();
+        assert!(store::get_entity_card(&conn, thin.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn graph_hops_are_appended_after_the_limit_not_squeezed_out_by_it() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        store::insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let q = unit_vec(4, 0);
+        // Two strong direct matches fill limit=2 outright.
+        for i in 0..2 {
+            store::insert(&conn, &format!("Moses direct match {}", i), None, None, true, Some(&q), 5).unwrap();
+        }
+        // Orthogonal to the query, reachable only over the shared entity.
+        let hop = store::insert(&conn, "Moses prefers pragmatic hotfixes", None, None, true, Some(&unit_vec(4, 1)), 5)
+            .unwrap();
+        let embedder = FixedVecEmbedder(q);
+        let resp = search_hits(&conn, &embedder, "what about Moses", 2, false, false, 0.3, &now).unwrap();
+        let direct: Vec<&SearchHit> = resp.hits.iter().filter(|h| h.via_assoc.is_none()).collect();
+        assert_eq!(direct.len(), 2, "the limit still bounds query matches");
+        let hopped = resp.hits.iter().find(|h| h.id == hop).expect("the hop is appended, not truncated away");
+        assert_eq!(hopped.via_edge.as_deref(), Some("entity:Moses"));
+        assert!(resp.hits.len() <= 2 + store::SPREAD_MAX_OUT);
+    }
+
+    #[test]
+    fn search_surfaces_the_card_of_a_named_entity() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let moses = store::insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        store::insert(&conn, "Moses asked about TLEs", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        store::upsert_entity_card(&conn, moses, "- argues hotfixes are underrated", &["1".to_string()], None, 1, 1, &now)
+            .unwrap();
+        let embedder = FixedVecEmbedder(unit_vec(4, 0));
+        let resp = search_hits(&conn, &embedder, "what does Moses want", 5, false, false, 0.0, &now).unwrap();
+        assert_eq!(resp.cards.len(), 1);
+        assert_eq!(resp.cards[0].entity, "Moses");
+        assert_eq!(resp.cards[0].kind.as_deref(), Some("person"));
+        assert_eq!(resp.cards[0].evidence, 1);
+        assert!(resp.cards[0].text.contains("hotfixes"));
+
+        let none = search_hits(&conn, &embedder, "unrelated question about nothing", 5, false, false, 0.0, &now).unwrap();
+        assert!(none.cards.is_empty());
+    }
+
     #[test]
     fn run_graph_extraction_pass_extracts_edges_resolves_entities_and_marks_extracted() {
         let conn = mem_conn();
@@ -6026,6 +6358,26 @@ mod tests {
         assert_eq!(hop2.predicate2.as_deref(), Some("works-on"));
         assert_eq!(hop2.src_name2.as_deref(), Some("user"));
         assert_eq!(hop2.dst_name2.as_deref(), Some("Umoja"));
+    }
+
+    #[test]
+    fn search_hits_pulls_in_a_memory_through_a_shared_entity() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        store::insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let q = unit_vec(4, 0);
+        let direct = store::insert(&conn, "Moses wants TLE ownership", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        let hop = store::insert(&conn, "Moses prefers pragmatic hotfixes", None, None, true, Some(&unit_vec(4, 1)), 5).unwrap();
+        let embedder = FixedVecEmbedder(q);
+        // min_score above what recency alone earns, so the orthogonal row is
+        // NOT a direct hit and has to arrive over the entity link.
+        let resp = search_hits(&conn, &embedder, "who wants ownership", 10, false, false, 0.3, &now).unwrap();
+        let d = resp.hits.iter().find(|h| h.id == direct).expect("direct hit");
+        let h = resp.hits.iter().find(|h| h.id == hop).expect("hop hit");
+        assert!(d.via_assoc.is_none());
+        assert_eq!(h.via_assoc, Some(direct));
+        assert_eq!(h.via_edge.as_deref(), Some("entity:Moses"));
+        assert!(h.score < d.score);
     }
 
     #[test]

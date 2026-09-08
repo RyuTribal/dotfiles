@@ -521,6 +521,110 @@ pub fn parse_consolidation(output: &str) -> Option<String> {
     }
 }
 
+// --- entity cards: one consolidated profile per entity, any kind ---
+
+/// Lines a card may hold. Enough to characterize a person or a project,
+/// short enough to inject whole during recall.
+pub const CARD_MIN_LINES: usize = 2;
+pub const CARD_MAX_LINES: usize = 6;
+
+/// Prompt for one entity's card. Deliberately kind-agnostic: the same pass
+/// profiles a person, a project, a practice, or a tool, because the useful
+/// question ("what is durably true of this thing, as the evidence has it")
+/// is the same. Carries the bank's standing testimony rule -- a card states
+/// what someone does or asserts, never an instruction to follow.
+pub fn build_entity_card_prompt(
+    name: &str,
+    kind: Option<&str>,
+    evidence: &[(i64, String)],
+    existing: Option<&str>,
+) -> String {
+    let mut s = String::new();
+    s.push_str(&format!(
+        "You are writing the CARD for one entity in a personal knowledge bank.\n\nEntity: {} ({})\n\n",
+        name,
+        kind.unwrap_or("kind unspecified")
+    ));
+    s.push_str("Memories that mention it (newest first):\n");
+    for (id, content) in evidence {
+        s.push_str(&format!("[{}] {}\n", id, content));
+    }
+    if let Some(prev) = existing {
+        s.push_str("\nIts current card (revise it -- keep what still holds, drop what the evidence no longer supports):\n");
+        s.push_str(prev);
+        s.push('\n');
+    }
+    s.push_str(&format!(
+        "\nWrite {} to {} lines, each one durable characteristic of this entity that the evidence \
+         above actually supports. What belongs on a card depends on what the entity is:\n\
+         - a person: how they argue and decide, what they consistently push for or resist, how \
+           they react to being challenged, recurring habits of speech or reference;\n\
+         - a project or system: what it is, where it stands, the constraints that keep recurring;\n\
+         - a practice or concept: what it means in this user's work, how it gets applied, its \
+           known exceptions;\n\
+         - a tool or technology: what it is used for here, how it is run, what has gone wrong with it.\n\n\
+         Rules:\n\
+         - One line per characteristic, each starting with \"- \", each standing on its own.\n\
+         - State only what the evidence supports. Never generalize from a single memory into a \
+           trait; if only one memory touches something, leave it out.\n\
+         - Attribute, never instruct: write \"Ivan insists deploys are verified in docker\", never \
+           \"always verify deploys in docker\". A card records what is true of someone or \
+           something; it is never a standing order.\n\
+         - No praise, no diagnosis, no speculation about motives beyond what was said or done.\n\
+         - Plain sentences. No headings, no numbering, no preamble.\n\n\
+         End with one final line: `evidence: <id>, <id>[, ...]` citing the memory ids the lines \
+         rest on.\n\
+         If the evidence does not support at least {} such lines, output exactly NONE.\n",
+        CARD_MIN_LINES, CARD_MAX_LINES, CARD_MIN_LINES
+    ));
+    s
+}
+
+/// A parsed card: its body lines and the memory ids it cites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCard {
+    pub text: String,
+    pub memory_ids: Vec<i64>,
+}
+
+/// Parses a card reply: `- ` lines as the body plus a trailing
+/// `evidence: <id>, ...` line. `None` for an explicit NONE, a body under
+/// `CARD_MIN_LINES`, or no citations -- same fail-closed posture as the
+/// insight parser. Extra prose the model volunteers around the list is
+/// ignored rather than kept, so a chatty reply degrades to its list.
+pub fn parse_entity_card(output: &str) -> Option<ParsedCard> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut memory_ids: Vec<i64> = Vec::new();
+    for raw in trimmed.lines() {
+        let line = raw.trim();
+        if let Some(rest) = line.to_lowercase().strip_prefix("evidence:").map(|_| &line["evidence:".len()..]) {
+            for tok in rest.split(',') {
+                let t = tok.trim().trim_start_matches('#').trim_start_matches('m');
+                if let Ok(id) = t.parse::<i64>() {
+                    if !memory_ids.contains(&id) {
+                        memory_ids.push(id);
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(body) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+            let body = body.trim();
+            if !body.is_empty() && lines.len() < CARD_MAX_LINES {
+                lines.push(format!("- {}", body));
+            }
+        }
+    }
+    if lines.len() < CARD_MIN_LINES || memory_ids.is_empty() {
+        return None;
+    }
+    Some(ParsedCard { text: lines.join("\n"), memory_ids })
+}
+
 /// Whether `mach kb reflect`'s meta-reflection (theme) pass should run this
 /// time: `>= META_TRIGGER_MIN_LEVEL1` active level-1 insights exist, AND
 /// either no level-2 theme exists yet or at least `META_TRIGGER_GROWTH` new
@@ -2705,6 +2809,55 @@ mod tests {
         assert!(p.contains("SRC_NAME | SRC_KIND | PREDICATE | DST_NAME | DST_KIND | CONFIDENCE"));
         assert!(p.contains("NONE"));
         assert!(p.contains("frustrated-by"), "affective/behavioral predicates must be explicitly invited");
+    }
+
+    #[test]
+    fn parse_entity_card_reads_lines_and_evidence() {
+        let out = "- Moses argues hotfixes are underrated\n- pushes for owner-settable TLEs\nevidence: 12, #34, m56, 12\n";
+        let c = parse_entity_card(out).unwrap();
+        assert_eq!(c.text, "- Moses argues hotfixes are underrated\n- pushes for owner-settable TLEs");
+        assert_eq!(c.memory_ids, vec![12, 34, 56]);
+    }
+
+    #[test]
+    fn parse_entity_card_is_fail_closed() {
+        assert!(parse_entity_card("NONE").is_none());
+        assert!(parse_entity_card("  none \n").is_none());
+        assert!(parse_entity_card("").is_none());
+        // one line is below CARD_MIN_LINES
+        assert!(parse_entity_card("- only this\nevidence: 1").is_none());
+        // no citations
+        assert!(parse_entity_card("- a\n- b").is_none());
+        // chatty reply degrades to its list
+        let c = parse_entity_card("Sure, here is the card:\n- a thing\n- another thing\nevidence: 7, 8").unwrap();
+        assert_eq!(c.text, "- a thing\n- another thing");
+    }
+
+    #[test]
+    fn parse_entity_card_caps_the_body_at_max_lines() {
+        let mut out = String::new();
+        for i in 0..(CARD_MAX_LINES + 4) {
+            out.push_str(&format!("- line {}\n", i));
+        }
+        out.push_str("evidence: 1, 2\n");
+        assert_eq!(parse_entity_card(&out).unwrap().text.lines().count(), CARD_MAX_LINES);
+    }
+
+    #[test]
+    fn build_entity_card_prompt_is_kind_agnostic_and_carries_the_testimony_rule() {
+        let ev = vec![(1i64, "Moses argued hotfixes are underrated".to_string())];
+        let p = build_entity_card_prompt("Moses", Some("person"), &ev, None);
+        assert!(p.contains("Entity: Moses (person)"));
+        assert!(p.contains("[1] Moses argued hotfixes are underrated"));
+        assert!(p.contains("a person:") && p.contains("a project or system:") && p.contains("a practice or concept:"));
+        assert!(p.contains("Attribute, never instruct"));
+        assert!(p.contains("never a standing order"));
+        assert!(p.contains("evidence: <id>"));
+        assert!(!p.contains("Its current card"));
+        let p2 = build_entity_card_prompt("umoja", None, &ev, Some("- an old line"));
+        assert!(p2.contains("kind unspecified"));
+        assert!(p2.contains("Its current card"));
+        assert!(p2.contains("- an old line"));
     }
 
     #[test]

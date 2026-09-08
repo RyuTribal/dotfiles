@@ -92,7 +92,8 @@ pub struct Memory {
     // "never mark seen on failure" house rule as `dedupe_seen`/
     // `contradiction_seen`.
     pub graph_extracted_at: Option<String>,
-    // How this memory came to be known -- Honcho's explicit/deductive split.
+    // How this memory came to be known -- Honcho's explicit/deductive split
+    // plus Hindsight's experience network as a third value.
     // `Some("stated")`: the user (or a named person) said it in so many
     // words: `mach kb add`, `mach note`, a decision cue, a digest line the
     // model tagged STATED. `Some("inferred")`: deduced from behavior, code,
@@ -102,6 +103,14 @@ pub struct Memory {
     // Never affects ranking; it exists so recall can say "you told me" vs
     // "I inferred" honestly.
     pub basis: Option<String>,
+    // When the fact's CONTENT happened, as an inclusive date range
+    // ("2026-09-07".."2026-09-08"), distinct from `created_at`, which is
+    // when it was written down. NULL means unknown, never "same as
+    // created_at": every memory here was written on one of a handful of
+    // ingest days, so treating ingest time as event time would make every
+    // temporal question answer "today".
+    pub occurred_from: Option<String>,
+    pub occurred_to: Option<String>,
 }
 
 impl Memory {
@@ -218,7 +227,9 @@ fn init_schema(conn: &Connection) -> Result<(), KbError> {
             dormant_at TEXT,
             last_verified_at TEXT,
             graph_extracted_at TEXT,
-            basis TEXT
+            basis TEXT,
+            occurred_from TEXT,
+            occurred_to TEXT
         );
         CREATE TABLE IF NOT EXISTS insights (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -324,10 +335,14 @@ fn init_schema(conn: &Connection) -> Result<(), KbError> {
 /// FTS5 external-content index over `memories.content`, kept in step by
 /// triggers. `content='memories'` means the index stores no copy of the
 /// text -- it reads the row back from `memories` by rowid -- so it costs
-/// only the inverted index. Tokenizer `unicode61` folds case and splits on
-/// punctuation: "10.8.0.63" indexes as four numeric tokens, "react-app" as
-/// two words, a NORAD id "43005" as itself -- exactly the exact-token
-/// matches cosine over an embedding blurs. Idempotent (`IF NOT EXISTS`
+/// only the inverted index. Tokenizer `porter unicode61` folds case, splits
+/// on punctuation and stems: "10.8.0.63" indexes as four numeric tokens,
+/// "react-app" as two words, a NORAD id "43005" as itself, and
+/// "reported"/"reporting"/"reports" all as one term -- exactly the
+/// exact-token matches cosine over an embedding blurs. Stemming matters
+/// more in a personal bank than in web search: the bank is small, so a
+/// query and the one memory answering it often differ only in inflection
+/// ("who reported the drift bug" vs "Ivar ... reporting bugs ... drift"). Idempotent (`IF NOT EXISTS`
 /// everywhere); the v14 -> v15 migration additionally issues a 'rebuild'
 /// so rows written before the index existed are indexed.
 ///
@@ -339,7 +354,7 @@ fn ensure_fts(conn: &Connection) -> Result<(), KbError> {
             content,
             content='memories',
             content_rowid='id',
-            tokenize='unicode61 remove_diacritics 2'
+            tokenize='porter unicode61 remove_diacritics 2'
         );
         CREATE TRIGGER IF NOT EXISTS memories_fts_ai AFTER INSERT ON memories BEGIN
             INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
@@ -691,6 +706,98 @@ fn migrate_v15_to_v16(conn: &Connection) -> Result<(), KbError> {
 /// `PRAGMA user_version`-gated, idempotent 16 -> 17 migration: the
 /// `entity_cards` table (created by `init_schema`; nothing to backfill --
 /// `mach kb reflect`'s card pass fills it in from mentions).
+/// `PRAGMA user_version`-gated, idempotent 17 -> 18 migration: the FTS
+/// index gains the `porter` stemmer. That changes how terms are stored, so
+/// the index and its triggers are dropped and rebuilt rather than reused.
+/// `PRAGMA user_version`-gated, idempotent 18 -> 19 migration: adds
+/// `occurred_from`/`occurred_to` (when the fact's CONTENT happened, as
+/// distinct from `created_at`, when it was written down) and backfills them
+/// for existing rows by scanning the text for ISO dates. The distinction is
+/// what makes a temporal question answerable: "what shipped on 2026-08-31"
+/// is about an event, and every memory in the bank was written down on a
+/// handful of ingest days.
+fn migrate_v18_to_v19(conn: &Connection) -> Result<(), KbError> {
+    add_column_if_missing(conn, "memories", "occurred_from", "TEXT")?;
+    add_column_if_missing(conn, "memories", "occurred_to", "TEXT")?;
+    backfill_occurrence_from_text(conn)?;
+    conn.execute("PRAGMA user_version = 19", [])?;
+    Ok(())
+}
+
+/// Fills `occurred_from`/`occurred_to` from ISO dates written in the text,
+/// for rows that have none. A memory saying "as of 2026-09-07" or "shipped
+/// 2026-08-31" is dated by its own content; the earliest and latest date it
+/// mentions bound the occurrence. Rows with no date in the text are left
+/// NULL rather than defaulted to `created_at`, because "I do not know when
+/// this happened" and "this happened the day it was written" are different
+/// claims and only one of them is true.
+pub fn backfill_occurrence_from_text(conn: &Connection) -> Result<usize, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, content FROM memories WHERE occurred_from IS NULL AND occurred_to IS NULL",
+    )?;
+    let rows: Vec<(i64, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    let mut n = 0;
+    for (id, content) in rows {
+        let dates = iso_dates_in(&content);
+        if dates.is_empty() {
+            continue;
+        }
+        let from = dates.first().unwrap();
+        let to = dates.last().unwrap();
+        conn.execute(
+            "UPDATE memories SET occurred_from = ?1, occurred_to = ?2 WHERE id = ?3",
+            params![from, to, id],
+        )?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Every `YYYY-MM-DD` in `text`, sorted and deduped. Deliberately strict:
+/// a looser matcher would read version numbers, IP addresses and NORAD ids
+/// as dates.
+pub fn iso_dates_in(text: &str) -> Vec<String> {
+    let b = text.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let digits = |i: usize, n: usize| -> bool {
+        i + n <= b.len() && b[i..i + n].iter().all(|c| c.is_ascii_digit())
+    };
+    let mut i = 0usize;
+    while i + 10 <= b.len() {
+        if digits(i, 4) && b[i + 4] == b'-' && digits(i + 5, 2) && b[i + 7] == b'-' && digits(i + 8, 2) {
+            // reject a longer number running into it (e.g. "12026-01-01")
+            let left_ok = i == 0 || !b[i - 1].is_ascii_digit();
+            let right_ok = i + 10 == b.len() || !b[i + 10].is_ascii_digit();
+            if left_ok && right_ok {
+                let d = &text[i..i + 10];
+                let month: u32 = text[i + 5..i + 7].parse().unwrap_or(0);
+                let day: u32 = text[i + 8..i + 10].parse().unwrap_or(0);
+                if (1..=12).contains(&month) && (1..=31).contains(&day) && !out.iter().any(|x| x == d) {
+                    out.push(d.to_string());
+                }
+                i += 10;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.sort();
+    out
+}
+
+fn migrate_v17_to_v18(conn: &Connection) -> Result<(), KbError> {
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS memories_fts_ai;
+         DROP TRIGGER IF EXISTS memories_fts_ad;
+         DROP TRIGGER IF EXISTS memories_fts_au;
+         DROP TABLE IF EXISTS memories_fts;",
+    )?;
+    ensure_fts(conn)?;
+    conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')", [])?;
+    conn.execute("PRAGMA user_version = 18", [])?;
+    Ok(())
+}
+
 fn migrate_v16_to_v17(conn: &Connection) -> Result<(), KbError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS entity_cards (
@@ -832,8 +939,40 @@ fn migrate_v6_to_v7(conn: &Connection) -> Result<(), KbError> {
 /// Runs every migration step whose version gate hasn't been cleared yet.
 /// Runs on every `open`, but the version gate makes every call after the
 /// first one a single cheap `PRAGMA` read.
+/// Every column `Memory` reads, with its `ALTER TABLE ADD COLUMN`
+/// declaration. Applied by `ensure_memory_columns` BEFORE any version-gated
+/// step runs.
+///
+/// Why up front rather than each in its own migration: several migrations
+/// read memory ROWS (the v16 mention backfill, the v19 occurrence
+/// backfill), and reading a row goes through `row_to_memory`, which needs
+/// every column the current struct declares. A column added at v19 is
+/// therefore already required at v16, so column creation cannot be ordered
+/// by version at all. Idempotent, so this is safe to run on every open.
+const MEMORY_COLUMNS: &[(&str, &str)] = &[
+    ("dormant_at", "TEXT"),
+    ("last_verified_at", "TEXT"),
+    ("graph_extracted_at", "TEXT"),
+    ("basis", "TEXT"),
+    ("occurred_from", "TEXT"),
+    ("occurred_to", "TEXT"),
+];
+
+fn ensure_memory_columns(conn: &Connection) -> Result<(), KbError> {
+    if !table_exists(conn, "memories")? {
+        return Ok(());
+    }
+    for (name, decl) in MEMORY_COLUMNS {
+        add_column_if_missing(conn, "memories", name, decl)?;
+    }
+    Ok(())
+}
+
 fn migrate(conn: &Connection) -> Result<(), KbError> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    // Columns first: a later migration's column can be needed by an earlier
+    // migration's row reads (see `MEMORY_COLUMNS`).
+    ensure_memory_columns(conn)?;
     if version < 1 {
         migrate_v0_to_v1(conn)?;
     }
@@ -884,6 +1023,12 @@ fn migrate(conn: &Connection) -> Result<(), KbError> {
     }
     if version < 17 {
         migrate_v16_to_v17(conn)?;
+    }
+    if version < 18 {
+        migrate_v17_to_v18(conn)?;
+    }
+    if version < 19 {
+        migrate_v18_to_v19(conn)?;
     }
     Ok(())
 }
@@ -1093,6 +1238,8 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         last_verified_at: row.get("last_verified_at")?,
         graph_extracted_at: row.get("graph_extracted_at")?,
         basis: row.get("basis")?,
+        occurred_from: row.get("occurred_from")?,
+        occurred_to: row.get("occurred_to")?,
         created_at,
     })
 }
@@ -1115,9 +1262,15 @@ pub fn insert(
 /// the write boundary so the column never accumulates free text.
 pub const BASIS_STATED: &str = "stated";
 pub const BASIS_INFERRED: &str = "inferred";
+/// The agent's own conduct: what Claude proposed, built, got wrong, and how
+/// the user responded. Hindsight's experience network as a third basis
+/// rather than a fourth table -- "I did this and watched it land" is a
+/// distinct GROUND for holding a belief, alongside "the user said it" and
+/// "I deduced it", so it belongs on the same axis.
+pub const BASIS_EXPERIENCE: &str = "experience";
 
 pub fn is_valid_basis(b: &str) -> bool {
-    b == BASIS_STATED || b == BASIS_INFERRED
+    b == BASIS_STATED || b == BASIS_INFERRED || b == BASIS_EXPERIENCE
 }
 
 /// `insert` plus an explicit `basis` (see `Memory::basis`). `None` leaves
@@ -1153,7 +1306,35 @@ pub fn insert_with_basis(
     // text contains). The graph-extraction pass adds the LLM-resolved ones
     // later; both land in the same table. Never fatal to the insert.
     let _ = link_mentions_by_name_scan(conn, id, content, &created_at);
+    // Occurrence dates the text states itself, same rule as the v19
+    // backfill. An explicit `set_occurrence` call (from a digest's `when:`
+    // tag) overwrites this.
+    let dates = iso_dates_in(content);
+    if let (Some(from), Some(to)) = (dates.first(), dates.last()) {
+        let _ = conn.execute(
+            "UPDATE memories SET occurred_from = ?1, occurred_to = ?2 WHERE id = ?3",
+            params![from, to, id],
+        );
+    }
     Ok(id)
+}
+
+/// Records when a memory's content happened. Both ends inclusive; pass the
+/// same date twice for a single day. Validated as `YYYY-MM-DD` so the
+/// column stays comparable with plain string ordering, the way every other
+/// date in this schema is.
+pub fn set_occurrence(conn: &Connection, id: i64, from: &str, to: &str) -> Result<(), KbError> {
+    for d in [from, to] {
+        if iso_dates_in(d).len() != 1 || d.len() != 10 {
+            return Err(KbError::Other(format!("occurrence must be YYYY-MM-DD (got {:?})", d)));
+        }
+    }
+    let (from, to) = if from <= to { (from, to) } else { (to, from) };
+    conn.execute(
+        "UPDATE memories SET occurred_from = ?1, occurred_to = ?2 WHERE id = ?3",
+        params![from, to, id],
+    )?;
+    Ok(())
 }
 
 /// Sets `basis` on an existing row (used by `mach kb add`, whose insert
@@ -1579,7 +1760,147 @@ pub fn search_ranked(
     min_score: f32,
     now: &str,
 ) -> Result<Vec<RankedHit>, KbError> {
-    rank_with_lexical(conn, query_embedding, &HashMap::new(), limit, reviewed_only, include_superseded, min_score, now)
+    rank_with_lexical(
+        conn,
+        query_embedding,
+        &HashMap::new(),
+        None,
+        limit,
+        reviewed_only,
+        include_superseded,
+        min_score,
+        now,
+    )
+}
+
+/// How the retrieval channels are combined. `max` takes the strongest
+/// single channel; `rrf` uses Reciprocal Rank Fusion, which scores by RANK
+/// rather than raw score and so rewards a memory that several channels
+/// agree on. Selected by `MACH_KB_FUSION`, default below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fusion {
+    Max,
+    Rrf,
+}
+
+/// RRF's rank-smoothing constant, `1 / (k + rank)`. 60 is the value from
+/// the original Cormack et al. formulation and what Hindsight uses.
+pub const RRF_K: f32 = 60.0;
+
+pub fn fusion_mode() -> Fusion {
+    static F: std::sync::OnceLock<Fusion> = std::sync::OnceLock::new();
+    *F.get_or_init(|| match env::var("MACH_KB_FUSION").unwrap_or_default().to_lowercase().as_str() {
+        "rrf" => Fusion::Rrf,
+        "max" => Fusion::Max,
+        _ => DEFAULT_FUSION,
+    })
+}
+
+/// `max` measured better than `rrf` on this bank (28-question harness, at
+/// every score floor tried): 75% versus 68%, and RRF injected 60% more
+/// characters to get the worse number. RRF discards magnitude by design,
+/// and on a 250-memory bank the magnitude IS the signal -- a rank-1 lexical
+/// match on one common term earns the same reciprocal weight as a rank-1
+/// semantic match at 0.8 cosine, so noise is promoted to parity with real
+/// answers. Rank fusion is a large-corpus technique: it needs many strong
+/// candidates per channel for ranks to be informative. Kept selectable
+/// (`MACH_KB_FUSION=rrf`) so the comparison stays re-runnable as the bank
+/// grows, since this conclusion should flip at some size.
+pub const DEFAULT_FUSION: Fusion = Fusion::Max;
+
+/// Reciprocal-rank contribution of a 0-based rank.
+pub fn rrf_contrib(rank: usize) -> f32 {
+    1.0 / (RRF_K + rank as f32 + 1.0)
+}
+
+/// Weight of a perfect temporal match (the memory's occurrence range
+/// overlaps the date range the query asked about) relative to a perfect
+/// cosine match. Below the lexical weight: a date is strong evidence of
+/// relevance but a weaker one than the query's own words, since many
+/// unrelated things happen on the same day.
+pub const TEMPORAL_WEIGHT: f32 = 0.75;
+
+/// A calendar date range, both ends inclusive, as `YYYY-MM-DD`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DateRange {
+    pub from: String,
+    pub to: String,
+}
+
+impl DateRange {
+    pub fn overlaps(&self, from: &str, to: &str) -> bool {
+        // String comparison is date comparison for zero-padded ISO dates.
+        from <= self.to.as_str() && to >= self.from.as_str()
+    }
+}
+
+/// The date range a query is asking about, or `None` when it names no time.
+///
+/// Rule-based on purpose (Hindsight runs the same heuristic path first and
+/// only falls back to a seq2seq model for the leftovers): an explicit ISO
+/// date, or a relative expression resolved against `today`. Everything else
+/// yields `None`, which simply means the temporal channel sits out -- a
+/// wrong date range is worse than no date range, because it would boost
+/// whatever happened on some unrelated day.
+pub fn query_date_range(query: &str, today: &str) -> Option<DateRange> {
+    let q = query.to_lowercase();
+    // An explicit ISO date (or two) wins: it is unambiguous.
+    let explicit = iso_dates_in(query);
+    if let (Some(a), Some(b)) = (explicit.first(), explicit.last()) {
+        return Some(DateRange { from: a.clone(), to: b.clone() });
+    }
+    let today_secs = parse_rfc3339(&format!("{}T12:00:00Z", today))?;
+    let day = 86400i64;
+    let shift = |days: i64| -> String {
+        now_rfc3339_from_secs((today_secs + days * day).max(0) as u64)[..10].to_string()
+    };
+    let single = |d: String| Some(DateRange { from: d.clone(), to: d });
+
+    if q.contains("today") {
+        return single(shift(0));
+    }
+    if q.contains("yesterday") {
+        return single(shift(-1));
+    }
+    if q.contains("last week") || q.contains("past week") || q.contains("this week") {
+        return Some(DateRange { from: shift(-7), to: shift(0) });
+    }
+    if q.contains("last month") || q.contains("past month") {
+        return Some(DateRange { from: shift(-31), to: shift(0) });
+    }
+    // "in june", "in june 2026", "june 2026"
+    const MONTHS: [&str; 12] = [
+        "january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
+        "november", "december",
+    ];
+    for (i, name) in MONTHS.iter().enumerate() {
+        if !q.contains(name) {
+            continue;
+        }
+        let month = i + 1;
+        // A year written next to the month, else the current one.
+        let year: i64 = q
+            .split(|c: char| !c.is_ascii_digit())
+            .filter_map(|t| t.parse::<i64>().ok())
+            .find(|y| (2000..=2100).contains(y))
+            .unwrap_or_else(|| today[..4].parse().unwrap_or(2026));
+        let last_day = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            _ => {
+                if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+                    29
+                } else {
+                    28
+                }
+            }
+        };
+        return Some(DateRange {
+            from: format!("{:04}-{:02}-01", year, month),
+            to: format!("{:04}-{:02}-{:02}", year, month, last_day),
+        });
+    }
+    None
 }
 
 /// Weight of a perfect lexical match relative to a perfect cosine match.
@@ -1588,9 +1909,60 @@ pub fn search_ranked(
 /// whichever is higher, never the sum (so nothing is double counted).
 pub const LEXICAL_WEIGHT: f32 = 0.9;
 
-/// How many FTS rows to pull per query. Only the top few ever matter for
-/// ranking; this bounds the join work on a large bank.
-pub const LEXICAL_CANDIDATES: usize = 50;
+/// Cosine similarity that two UNRELATED English texts already score under
+/// `nomic-embed-text`. Measured on this bank with `mach kb eval`: questions
+/// the bank genuinely cannot answer ("what is the capital of Mongolia")
+/// still peak at 0.38-0.55 cosine, while answerable ones run 0.49-0.80.
+/// Raw cosine therefore has no usable zero, and a score floor applied to it
+/// cannot tell "nothing relevant" from "weakly relevant" -- before this,
+/// recall injected memories for every single unanswerable question.
+pub const SIM_NOISE_FLOOR: f32 = 0.40;
+
+/// Ranking blend weights: `score = W_SIM*sim + W_RECENCY*recency +
+/// W_STRENGTH*strength`. Overridable per process via `MACH_KB_W_SIM`,
+/// `MACH_KB_W_RECENCY` and `MACH_KB_W_STRENGTH` so `mach kb eval` can sweep
+/// them against the question set instead of them being guessed once and
+/// never revisited. Read once per process.
+/// Defaults measured with `mach kb eval` (28 questions) after `normalize_sim`
+/// gave the similarity term a real zero. The old 0.70/0.20/0.10 was set
+/// against RAW cosine, whose useful range was roughly 0.5-0.8; normalizing
+/// widened that range to 0-1 and so halved recency's relative influence
+/// requirement -- at the old weights a merely recent memory outranked an
+/// older one that actually answered the question, and multi-session recall
+/// fell from 83% to 50%. Sweep results at min_score 0.30:
+///   0.70/0.20/0.10 -> 71%   0.85/0.10/0.05 -> 75%   1.00/0.00/0.00 -> 79%
+/// Pure similarity scores best on the harness and is still NOT chosen: no
+/// question in the set depends on recency or engagement, so a zero there
+/// optimizes the metric by deleting a signal the metric cannot see. These
+/// weights keep decay and reinforcement in the blend at the smallest weight
+/// that does not cost measured accuracy.
+pub const DEFAULT_W_SIM: f32 = 0.85;
+pub const DEFAULT_W_RECENCY: f32 = 0.10;
+pub const DEFAULT_W_STRENGTH: f32 = 0.05;
+
+pub fn ranking_weights() -> (f32, f32, f32) {
+    static W: std::sync::OnceLock<(f32, f32, f32)> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        let read = |k: &str, d: f32| env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(d);
+        (
+            read("MACH_KB_W_SIM", DEFAULT_W_SIM),
+            read("MACH_KB_W_RECENCY", DEFAULT_W_RECENCY),
+            read("MACH_KB_W_STRENGTH", DEFAULT_W_STRENGTH),
+        )
+    })
+}
+
+/// Rescales raw cosine so `SIM_NOISE_FLOOR` maps to 0 and 1.0 stays 1.0,
+/// making the similarity term mean "how far above chance is this" -- which
+/// is what a threshold needs it to mean.
+pub fn normalize_sim(raw: f32) -> f32 {
+    ((raw - SIM_NOISE_FLOOR) / (1.0 - SIM_NOISE_FLOOR)).clamp(0.0, 1.0)
+}
+
+/// How many lexical candidates to keep, ordered by term coverage. Bounds
+/// what the ranking scan carries, not which rows are considered -- coverage
+/// is computed over every row matching any query term.
+pub const LEXICAL_CANDIDATES: usize = 200;
 
 /// `search_ranked` plus the FTS5 lexical channel (Honcho-style hybrid):
 /// the query's exact tokens are looked up in `memories_fts`, BM25 is
@@ -1612,7 +1984,18 @@ pub fn search_hybrid(
     now: &str,
 ) -> Result<Vec<RankedHit>, KbError> {
     let lexical = lexical_scores(conn, query_text, LEXICAL_CANDIDATES).unwrap_or_default();
-    rank_with_lexical(conn, query_embedding, &lexical, limit, reviewed_only, include_superseded, min_score, now)
+    let range = query_date_range(query_text, &now[..10.min(now.len())]);
+    rank_with_lexical(
+        conn,
+        query_embedding,
+        &lexical,
+        range.as_ref(),
+        limit,
+        reviewed_only,
+        include_superseded,
+        min_score,
+        now,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1620,6 +2003,7 @@ fn rank_with_lexical(
     conn: &Connection,
     query_embedding: &[f32],
     lexical: &HashMap<i64, f32>,
+    range: Option<&DateRange>,
     limit: usize,
     reviewed_only: bool,
     include_superseded: bool,
@@ -1627,27 +2011,106 @@ fn rank_with_lexical(
     now: &str,
 ) -> Result<Vec<RankedHit>, KbError> {
     let now_secs = parse_rfc3339(now).unwrap_or(0);
-    let mut scored: Vec<RankedHit> = candidates(conn, !reviewed_only, include_superseded)?
+    // Pass 1: per-candidate channel scores, no fusion yet -- RRF needs each
+    // candidate's RANK within each channel, which is only knowable once
+    // every candidate has been scored.
+    struct Cand {
+        memory: Memory,
+        sim: f32,
+        lex: f32,
+        temporal: f32,
+        recency: f32,
+        strength: f32,
+        superseded: bool,
+    }
+    let mut cands: Vec<Cand> = candidates(conn, !reviewed_only, include_superseded)?
         .into_iter()
         .filter_map(|m| {
             let lex = lexical.get(&m.id).copied().unwrap_or(0.0);
             let sim = match &m.embedding {
-                Some(e) if !e.is_empty() => cosine(query_embedding, e).clamp(0.0, 1.0),
+                Some(e) if !e.is_empty() => normalize_sim(cosine(query_embedding, e)),
                 _ if lex > 0.0 => 0.0,
                 _ => return None,
             };
-            let sim_eff = sim.max(LEXICAL_WEIGHT * lex);
+            // Temporal channel: 1.0 when the query named a date range and
+            // this memory's own occurrence range overlaps it. Only ever a
+            // bonus -- a memory with no occurrence date is not penalised,
+            // since "undated" is the normal state of most facts.
+            let temporal = match (range, m.occurred_from.as_deref(), m.occurred_to.as_deref()) {
+                (Some(r), Some(from), Some(to)) if r.overlaps(from, to) => 1.0,
+                _ => 0.0,
+            };
             let recency = compute_recency(&m, now_secs);
             let strength = compute_strength(&m, now_secs);
             let superseded = m.is_superseded();
-            let mut score = 0.70 * sim_eff + 0.20 * recency + 0.10 * strength;
-            if superseded {
+            Some(Cand { memory: m, sim, lex, temporal, recency, strength, superseded })
+        })
+        .collect();
+
+    // Pass 2: fuse the channels into one relevance term.
+    let relevance: HashMap<i64, f32> = match fusion_mode() {
+        Fusion::Max => cands
+            .iter()
+            .map(|c| {
+                (c.memory.id, c.sim.max(LEXICAL_WEIGHT * c.lex).max(TEMPORAL_WEIGHT * c.temporal))
+            })
+            .collect(),
+        Fusion::Rrf => {
+            let mut rrf: HashMap<i64, f32> = cands.iter().map(|c| (c.memory.id, 0.0)).collect();
+            // One ranked list per channel; a candidate scoring 0 on a
+            // channel is simply absent from that list and contributes
+            // nothing, which is RRF's own robustness-to-missing-items rule.
+            for key in [0u8, 1u8, 2u8] {
+                let mut ranked: Vec<(i64, f32)> = cands
+                    .iter()
+                    .map(|c| {
+                        (c.memory.id, match key {
+                            0 => c.sim,
+                            1 => c.lex,
+                            _ => c.temporal,
+                        })
+                    })
+                    .filter(|(_, v)| *v > 0.0)
+                    .collect();
+                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                for (rank, (id, _)) in ranked.iter().enumerate() {
+                    *rrf.entry(*id).or_insert(0.0) += rrf_contrib(rank);
+                }
+            }
+            // Normalized against the best fused candidate so the result
+            // stays on the same 0-1 scale the blend and the score floor
+            // expect. RRF is rank-based, so its absolute magnitude is
+            // meaningless on its own.
+            let best = rrf.values().copied().fold(0.0f32, f32::max);
+            if best > 0.0 {
+                rrf.into_iter().map(|(id, v)| (id, v / best)).collect()
+            } else {
+                rrf
+            }
+        }
+    };
+
+    let (w_sim, w_rec, w_str) = ranking_weights();
+    let mut scored: Vec<RankedHit> = cands
+        .drain(..)
+        .map(|c| {
+            let rel = relevance.get(&c.memory.id).copied().unwrap_or(0.0);
+            let mut score = w_sim * rel + w_rec * c.recency + w_str * c.strength;
+            if c.superseded {
                 score *= 0.1;
             }
-            if !m.reviewed {
+            if !c.memory.reviewed {
                 score *= UNREVIEWED_SEARCH_PENALTY;
             }
-            Some(RankedHit { memory: m, score, sim, recency, strength, superseded, lexical: lex })
+            RankedHit {
+                memory: c.memory,
+                score,
+                sim: c.sim,
+                recency: c.recency,
+                strength: c.strength,
+                superseded: c.superseded,
+                lexical: c.lex,
+            }
         })
         .collect();
     scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
@@ -1666,7 +2129,20 @@ const FTS_STOPWORDS: &[&str] = &[
     "how", "why", "when", "where", "which", "who", "whom", "can", "could", "would", "should", "will", "just",
     "into", "than", "then", "there", "here", "also", "any", "all", "some", "more", "most", "want", "wants", "know",
     "like", "one", "two", "use", "used", "using", "get", "got", "make", "made", "please", "tell", "remember",
+    // Quantifiers and placeholders. Contentless, but common enough in the
+    // bank that one of them alone produced a 0.5 coverage score: "how many
+    // siblings do I have" matched an unrelated memory purely on "many".
+    "many", "much", "few", "several", "other", "another", "thing", "things", "something", "anything",
+    "everything", "really", "actually", "very", "still", "even", "only", "same", "such", "each", "every",
 ];
+
+/// Minimum term coverage for the lexical channel to count at all. Below
+/// this a "lexical match" is one or two shared common words, which is not
+/// evidence: "what is the staging postgres password" matched a deploy
+/// memory on "staging" alone at 0.33 coverage and scored high enough to
+/// inject. Set at half the query's terms, which is also the coverage real
+/// paraphrase answers reach (measured 0.5 to 1.0 on the harness).
+pub const LEXICAL_MIN_COVERAGE: f32 = 0.5;
 
 /// Turns free text into a safe FTS5 MATCH expression: lowercase alphanumeric
 /// tokens (unicode61's own idea of a word), stopwords and 1-2 letter words
@@ -1675,6 +2151,23 @@ const FTS_STOPWORDS: &[&str] = &[
 /// stray quote) can leak through, joined with OR. `None` when nothing
 /// survives, in which case the lexical channel is skipped entirely.
 pub fn fts_query(text: &str) -> Option<String> {
+    let terms = fts_terms(text);
+    if terms.is_empty() {
+        return None;
+    }
+    Some(or_match_expr(&terms))
+}
+
+/// One safe FTS5 MATCH expression matching any of `terms`.
+fn or_match_expr(terms: &[String]) -> String {
+    terms.iter().map(|t| format!("\"{}\"", t)).collect::<Vec<_>>().join(" OR ")
+}
+
+/// The content tokens of `text`, deduped and capped -- the shared basis for
+/// the MATCH expression AND for the coverage denominator, so "how many
+/// terms did this memory match" is always measured against exactly the
+/// terms that were searched for.
+pub fn fts_terms(text: &str) -> Vec<String> {
     let mut seen: Vec<String> = Vec::new();
     for raw in text.split(|c: char| !c.is_alphanumeric()) {
         if raw.is_empty() {
@@ -1696,46 +2189,57 @@ pub fn fts_query(text: &str) -> Option<String> {
             break;
         }
     }
-    if seen.is_empty() {
-        return None;
-    }
-    Some(seen.into_iter().map(|t| format!("\"{}\"", t)).collect::<Vec<_>>().join(" OR "))
+    seen
 }
 
-/// `memory id -> normalized lexical score` for the query's tokens, from the
-/// FTS5 index: BM25 (negative, more negative is better) divided by the best
-/// row's BM25, so the top lexical hit is exactly 1.0 and the rest fall off
-/// toward 0. Empty when the query has no usable tokens or nothing matches.
-/// Errors (index missing, syntax) propagate; `search_hybrid` treats them as
-/// "no lexical channel".
+/// `memory id -> lexical score` for the query's terms, from the FTS5 index.
+/// The score is the FRACTION OF THE QUERY'S CONTENT TERMS the memory
+/// contains, computed from a per-term MATCH and capped at `limit` rows by
+/// coverage.
+///
+/// Two earlier designs failed here, both worth naming:
+///
+/// 1. BM25 normalized against the best hit in the result set made the top
+///    lexical hit exactly 1.0 however weak it was -- "what is the staging
+///    postgres password" scored a memory that merely contains "staging" as
+///    a PERFECT lexical match, and a perfect lexical match outranks
+///    everything.
+/// 2. Coverage computed only over the top-N BM25 rows dropped real answers:
+///    BM25 on an OR query rewards rows matching RARE terms, so a memory
+///    matching three common query terms ("rust", "agent", "vendor") could
+///    sit outside the window and score 0. Coverage is now built from the
+///    per-term matches directly, so the candidate set is exactly "every row
+///    matching any query term" and the window only bounds the OUTPUT.
+///
+/// Empty when the query has no usable terms or nothing matches. Errors
+/// (index missing, syntax) propagate; `search_hybrid` treats them as "no
+/// lexical channel at all".
 pub fn lexical_scores(conn: &Connection, query_text: &str, limit: usize) -> Result<HashMap<i64, f32>, KbError> {
-    let Some(expr) = fts_query(query_text) else {
+    let terms = fts_terms(query_text);
+    if terms.is_empty() {
         return Ok(HashMap::new());
-    };
-    let mut stmt = conn.prepare(
-        "SELECT rowid, bm25(memories_fts) FROM memories_fts WHERE memories_fts MATCH ?1 ORDER BY bm25(memories_fts) LIMIT ?2",
-    )?;
-    let rows = stmt.query_map(params![expr, limit as i64], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))?;
-    let mut ranked: Vec<(i64, f64)> = Vec::new();
-    for r in rows {
-        ranked.push(r?);
     }
-    let mut out = HashMap::new();
-    let Some(&(_, best)) = ranked.first() else {
-        return Ok(out);
-    };
-    if best >= 0.0 {
-        // bm25() is negative for every real match; a non-negative best means
-        // nothing usable came back.
-        return Ok(out);
-    }
-    for (id, bm) in ranked {
-        let lex = if bm < 0.0 { (bm / best).clamp(0.0, 1.0) as f32 } else { 0.0 };
-        if lex > 0.0 {
-            out.insert(id, lex);
+    // One MATCH per term. No stemmer of our own: FTS5's porter tokenizer
+    // decides what "contains" means for both sides, so "reported" in the
+    // query finds "reporting" in the text.
+    let mut matched: HashMap<i64, usize> = HashMap::new();
+    for term in &terms {
+        let mut stmt = conn.prepare("SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?1")?;
+        let hits = stmt.query_map(params![format!("\"{}\"", term)], |r| r.get::<_, i64>(0))?;
+        for h in hits {
+            *matched.entry(h?).or_insert(0) += 1;
         }
     }
-    Ok(out)
+    let total = terms.len() as f32;
+    let mut scored: Vec<(i64, f32)> = matched
+        .into_iter()
+        .map(|(id, n)| (id, (n as f32 / total).clamp(0.0, 1.0)))
+        .filter(|(_, cov)| *cov >= LEXICAL_MIN_COVERAGE)
+        .collect();
+    // Highest coverage first, id as a stable tiebreak, then bound the output.
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(b.0.cmp(&a.0)));
+    scored.truncate(limit);
+    Ok(scored.into_iter().collect())
 }
 
 /// Fallback search when embedding the query failed (e.g. ollama is down):
@@ -2042,11 +2546,44 @@ pub fn delete_insight(conn: &Connection, id: i64) -> Result<bool, KbError> {
     Ok(n > 0)
 }
 
+/// How much an insight's confidence moves per verification outcome.
+/// Reinforcement (in `reinforce_insight`) raises it; a contradiction found
+/// by re-verification lowers it by twice as much, following Hindsight's
+/// opinion-update rule (`+a` reinforce, `-2a` contradict): evidence AGAINST
+/// a belief is stronger information than one more instance of evidence for
+/// it, because a belief only survives by not being contradicted.
+///
+/// Before this, confidence was monotonically increasing -- reinforcement
+/// raised it, capped at 0.9, and a contradiction only set `flagged_at`. A
+/// belief could therefore be flagged as doubted while still displaying the
+/// highest confidence in the bank, which is exactly backwards.
+pub const INSIGHT_CONFIDENCE_STEP: f64 = 0.1;
+pub const INSIGHT_CONFIDENCE_FLOOR: f64 = 0.05;
+
 /// Marks an insight flagged by re-verification (evidence no longer
-/// supports it). Never cleared automatically — `mach kb insight-forget` is
-/// the only way a flagged insight goes away.
+/// supports it) AND lowers its confidence by `2 * INSIGHT_CONFIDENCE_STEP`.
+/// The flag is never cleared automatically — `mach kb insight-forget` is
+/// the only way a flagged insight goes away — but the confidence keeps
+/// moving, so a belief contradicted repeatedly decays toward the floor
+/// instead of sitting at a fixed "doubted but confident".
 pub fn flag_insight(conn: &Connection, id: i64, now: &str) -> Result<bool, KbError> {
-    let n = conn.execute("UPDATE insights SET flagged_at = ?1 WHERE id = ?2", params![now, id])?;
+    let n = conn.execute(
+        "UPDATE insights SET flagged_at = ?1,
+             confidence = MAX(?2, confidence - ?3)
+         WHERE id = ?4",
+        params![now, INSIGHT_CONFIDENCE_FLOOR, 2.0 * INSIGHT_CONFIDENCE_STEP, id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Lowers an insight's confidence by one step without flagging it: the
+/// "weaken" verdict between "still holds" and "contradicted", used when
+/// evidence has thinned rather than turned.
+pub fn weaken_insight(conn: &Connection, id: i64, now: &str) -> Result<bool, KbError> {
+    let n = conn.execute(
+        "UPDATE insights SET confidence = MAX(?1, confidence - ?2), last_verified_at = ?3 WHERE id = ?4",
+        params![INSIGHT_CONFIDENCE_FLOOR, INSIGHT_CONFIDENCE_STEP, now, id],
+    )?;
     Ok(n > 0)
 }
 
@@ -2101,8 +2638,32 @@ fn compute_insight_recency(insight: &Insight, now: i64) -> f32 {
 }
 
 /// Ranked top-N search over active insights, for blending into `mach kb
-/// search`: `score = 0.70*sim + 0.20*recency` (the 0.10 strength term of
-/// the memory blend is simply omitted, i.e. fixed at 0).
+/// search`. Uses `normalize_sim` and the SAME `ranking_weights` the memory
+/// blend uses, with the strength term fixed at 0 (insights are never
+/// engagement-reinforced).
+///
+/// Sharing the scale is not cosmetic. When memories moved to normalized
+/// similarity and insights kept raw cosine, every insight outscored every
+/// memory -- a paraphrase query returned six derived beliefs and not one
+/// fact, and measured multi-session recall fell from 83% to 50%. Two
+/// blends that get sorted into one list must be on one scale.
+/// Minimum NORMALIZED similarity for an insight to be injected at all.
+/// Insights are deliberately general ("user prefers direct technical
+/// communication"), which makes them weakly similar to almost any
+/// question -- once they shared the memory scale they started answering
+/// questions the bank has nothing to say about, and measured abstention
+/// fell from 80% to 40%. A summary has to be MORE clearly on-topic than a
+/// fact to be worth injecting, not less. Overridable for sweeps via
+/// `MACH_KB_INSIGHT_MIN_SIM`.
+pub const DEFAULT_INSIGHT_MIN_SIM: f32 = 0.30;
+
+pub fn insight_min_sim() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        env::var("MACH_KB_INSIGHT_MIN_SIM").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_INSIGHT_MIN_SIM)
+    })
+}
+
 pub fn search_insights_ranked(
     conn: &Connection,
     query_embedding: &[f32],
@@ -2114,11 +2675,15 @@ pub fn search_insights_ranked(
         .into_iter()
         .filter_map(|insight| {
             let sim = match &insight.embedding {
-                Some(e) if !e.is_empty() => cosine(query_embedding, e).clamp(0.0, 1.0),
+                Some(e) if !e.is_empty() => normalize_sim(cosine(query_embedding, e)),
                 _ => return None,
             };
+            if sim < insight_min_sim() {
+                return None;
+            }
             let recency = compute_insight_recency(&insight, now_secs);
-            let score = 0.70 * sim + 0.20 * recency;
+            let (w_sim, w_rec, _) = ranking_weights();
+            let score = w_sim * sim + w_rec * recency;
             Some(InsightHit { insight, score, sim, recency })
         })
         .collect();
@@ -2767,8 +3332,9 @@ pub fn raw_upsert_memory(conn: &Connection, m: &Memory) -> Result<(), KbError> {
         "INSERT INTO memories
             (id, content, source, project, created_at, reviewed, embedding, importance, stability,
              access_count, first_accessed_at, last_accessed_at, valid_from, invalidated_at,
-             superseded_by, dormant_at, last_verified_at, graph_extracted_at, basis)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
+             superseded_by, dormant_at, last_verified_at, graph_extracted_at, basis,
+             occurred_from, occurred_to)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)
          ON CONFLICT(id) DO UPDATE SET
             content = excluded.content, source = excluded.source, project = excluded.project,
             created_at = excluded.created_at, reviewed = excluded.reviewed, embedding = excluded.embedding,
@@ -2777,7 +3343,8 @@ pub fn raw_upsert_memory(conn: &Connection, m: &Memory) -> Result<(), KbError> {
             last_accessed_at = excluded.last_accessed_at, valid_from = excluded.valid_from,
             invalidated_at = excluded.invalidated_at, superseded_by = excluded.superseded_by,
             dormant_at = excluded.dormant_at, last_verified_at = excluded.last_verified_at,
-            graph_extracted_at = excluded.graph_extracted_at, basis = excluded.basis",
+            graph_extracted_at = excluded.graph_extracted_at, basis = excluded.basis,
+            occurred_from = excluded.occurred_from, occurred_to = excluded.occurred_to",
         params![
             m.id,
             m.content,
@@ -2798,6 +3365,8 @@ pub fn raw_upsert_memory(conn: &Connection, m: &Memory) -> Result<(), KbError> {
             m.last_verified_at,
             m.graph_extracted_at,
             m.basis,
+            m.occurred_from,
+            m.occurred_to,
         ],
     )?;
     Ok(())
@@ -3354,6 +3923,41 @@ pub const CARD_MIN_MENTIONS: i64 = 4;
 pub const CARD_EVIDENCE_LIMIT: usize = 14;
 /// Entities re-carded per reflect run, so one run is bounded.
 pub const CARD_MAX_PER_RUN: usize = 6;
+
+/// How novel a memory is against what the bank already holds: `1 - max
+/// cosine to any other active memory`. A restatement of something already
+/// known scores near 0; a genuinely new fact scores high.
+///
+/// Used to ORDER what reflection looks at first (Honcho's Dreamer
+/// prioritizes by surprisal for the same reason): passes are capped per
+/// run, so the cap decides what gets examined, and "oldest unexamined" is a
+/// worse basis for that choice than "least like anything we already know".
+/// A fact that restates the bank teaches reflection nothing.
+pub fn surprisal(conn: &Connection, m: &Memory) -> Result<f32, KbError> {
+    let Some(emb) = m.embedding.as_deref().filter(|e| !e.is_empty()) else {
+        return Ok(0.5); // unknown novelty: neither promoted nor buried
+    };
+    let mut best = 0.0f32;
+    for other in candidates(conn, true, false)? {
+        if other.id == m.id {
+            continue;
+        }
+        if let Some(o) = other.embedding.as_deref().filter(|e| !e.is_empty()) {
+            best = best.max(cosine(emb, o));
+        }
+    }
+    Ok((1.0 - normalize_sim(best)).clamp(0.0, 1.0))
+}
+
+/// Reorders `rows` most-surprising-first. Fails soft: any row whose
+/// surprisal cannot be computed keeps the neutral 0.5 and stays mid-pack,
+/// so this never drops work from a pass, only reorders it.
+pub fn order_by_surprisal(conn: &Connection, rows: Vec<Memory>) -> Vec<Memory> {
+    let mut scored: Vec<(f32, Memory)> =
+        rows.into_iter().map(|m| (surprisal(conn, &m).unwrap_or(0.5), m)).collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.id.cmp(&b.1.id)));
+    scored.into_iter().map(|(_, m)| m).collect()
+}
 
 /// Entities due for a card: at least `CARD_MIN_MENTIONS` active mentions and
 /// either no card yet, or a card built before the newest mention, or a card
@@ -4335,7 +4939,7 @@ mod tests {
         init_schema(&conn).unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 17);
+        assert_eq!(v, 19);
         let ents = entities_of_memory(&conn, 1).unwrap();
         assert_eq!(ents.len(), 2, "Ivar by name scan AND relation evidence, RHI redesign by relation evidence only");
         assert!(entities_of_memory(&conn, 2).unwrap().is_empty());
@@ -4492,7 +5096,7 @@ mod tests {
         init_schema(&conn).unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 17);
+        assert_eq!(v, 19);
         assert!(lexical_scores(&conn, "43005", 10).unwrap().contains_key(&1), "pre-existing rows get indexed by the rebuild");
         migrate(&conn).unwrap(); // idempotent
     }
@@ -4535,11 +5139,253 @@ mod tests {
         init_schema(&conn).unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 17);
+        assert_eq!(v, 19);
         let m = get(&conn, 1).unwrap().unwrap();
         assert_eq!(m.basis, None, "pre-existing rows stay basis-unknown");
         // idempotent
         migrate(&conn).unwrap();
+    }
+
+    #[test]
+    fn ensure_memory_columns_lets_an_early_migration_read_rows() {
+        // A v15-era table lacks basis/occurred_*, and the v16 mention
+        // backfill reads rows through `row_to_memory`, which needs them.
+        // This is the ordering trap `ensure_memory_columns` exists for.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, source TEXT, project TEXT,
+                created_at TEXT NOT NULL, reviewed INTEGER NOT NULL DEFAULT 1, embedding BLOB,
+                importance INTEGER NOT NULL DEFAULT 5, stability REAL, access_count INTEGER NOT NULL DEFAULT 0,
+                first_accessed_at TEXT, last_accessed_at TEXT, valid_from TEXT, invalidated_at TEXT,
+                superseded_by INTEGER);
+             INSERT INTO memories (content, created_at) VALUES ('dated 2026-09-07', '2026-01-01T00:00:00Z');
+             PRAGMA user_version = 15;",
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+        migrate(&conn).unwrap();
+        for (name, _) in MEMORY_COLUMNS {
+            assert!(existing_columns(&conn).unwrap().iter().any(|c| c == name), "missing {}", name);
+        }
+        // and the v19 backfill still ran over it
+        assert_eq!(get(&conn, 1).unwrap().unwrap().occurred_from.as_deref(), Some("2026-09-07"));
+    }
+
+    #[test]
+    fn insight_confidence_moves_both_ways() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let id = insert_insight(&conn, "a belief", 0.8, &["1".to_string()], None).unwrap();
+        weaken_insight(&conn, id, &now).unwrap();
+        let after_weaken = get_insight(&conn, id).unwrap().unwrap();
+        assert!((after_weaken.confidence - 0.7).abs() < 1e-9, "one step down: {}", after_weaken.confidence);
+        assert!(!after_weaken.is_flagged(), "weakening is not doubting");
+
+        flag_insight(&conn, id, &now).unwrap();
+        let after_flag = get_insight(&conn, id).unwrap().unwrap();
+        assert!((after_flag.confidence - 0.5).abs() < 1e-9, "two steps down: {}", after_flag.confidence);
+        assert!(after_flag.is_flagged());
+
+        // and it floors rather than going negative
+        for _ in 0..10 {
+            flag_insight(&conn, id, &now).unwrap();
+        }
+        assert_eq!(get_insight(&conn, id).unwrap().unwrap().confidence, INSIGHT_CONFIDENCE_FLOOR);
+    }
+
+    #[test]
+    fn surprisal_ranks_a_novel_fact_above_a_restatement() {
+        let conn = mem_conn();
+        insert5(&conn, "the orchestrator deploys to popobawa", Some(&[1.0, 0.0]));
+        let restatement = insert5(&conn, "the orchestrator is deployed to the popobawa host", Some(&[0.999, 0.045]));
+        let novel = insert5(&conn, "something entirely unrelated", Some(&[0.0, 1.0]));
+
+        let s_novel = surprisal(&conn, &get(&conn, novel).unwrap().unwrap()).unwrap();
+        let s_restate = surprisal(&conn, &get(&conn, restatement).unwrap().unwrap()).unwrap();
+        assert!(s_novel > s_restate, "novel {} vs restatement {}", s_novel, s_restate);
+
+        let rows = vec![
+            get(&conn, restatement).unwrap().unwrap(),
+            get(&conn, novel).unwrap().unwrap(),
+        ];
+        let ordered = order_by_surprisal(&conn, rows);
+        assert_eq!(ordered[0].id, novel, "the surprising row is examined first");
+
+        // no embedding -> neutral, never dropped
+        let blind = insert(&conn, "no embedding", None, None, true, None, 5).unwrap();
+        let s_blind = surprisal(&conn, &get(&conn, blind).unwrap().unwrap()).unwrap();
+        assert_eq!(s_blind, 0.5);
+        assert_eq!(order_by_surprisal(&conn, vec![get(&conn, blind).unwrap().unwrap()]).len(), 1);
+    }
+
+    #[test]
+    fn a_single_common_word_is_not_a_lexical_match() {
+        let conn = mem_conn();
+        let id = insert(&conn, "deploying react-app to staging needs the built bundle", None, None, true, None, 5).unwrap();
+        // One content term of three ("staging") -> 0.33 coverage, under the floor.
+        assert!(lexical_scores(&conn, "what is the staging postgres password", 200).unwrap().get(&id).is_none());
+        // Two of three clears it.
+        assert!(lexical_scores(&conn, "how is staging react-app deployed", 200).unwrap().get(&id).is_some());
+        // A pure quantifier is not a term at all.
+        assert!(fts_terms("how many siblings do I have").iter().all(|t| t != "many"));
+    }
+
+    #[test]
+    fn insights_and_memories_are_scored_on_the_same_scale() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let q: Vec<f32> = vec![1.0, 0.0];
+        // Same embedding, so any score gap is the BLEND's fault, not the
+        // content's. Before both used `normalize_sim` and one set of
+        // weights, the insight scored roughly triple the memory.
+        insert5(&conn, "a memory about the thing", Some(&[0.9, 0.436]));
+        insert_insight(&conn, "an insight about the thing", 0.8, &["1".to_string()], Some(&[0.9, 0.436])).unwrap();
+        let mem = search_ranked(&conn, &q, 5, false, false, 0.0, &now).unwrap();
+        let ins = search_insights_ranked(&conn, &q, 5, &now).unwrap();
+        assert!(!mem.is_empty() && !ins.is_empty());
+        let gap = (mem[0].score - ins[0].score).abs();
+        assert!(gap < 0.12, "memory {} vs insight {} must be comparable", mem[0].score, ins[0].score);
+    }
+
+    #[test]
+    fn lexical_coverage_finds_a_row_matching_several_common_terms() {
+        let conn = mem_conn();
+        // The target matches 3 of 4 query terms but each of those terms is
+        // common in the bank, so BM25 on the OR query ranks it poorly --
+        // the case that made coverage-over-a-BM25-window return nothing.
+        let target = insert(&conn, "the Rust agent wraps vendor modems behind a ModemDriver trait", None, None, true, None, 5).unwrap();
+        for i in 0..60 {
+            insert(&conn, &format!("another rust agent note number {}", i), None, None, true, None, 5).unwrap();
+        }
+        let scores = lexical_scores(&conn, "what abstracts vendor hardware in the rust agent", 200).unwrap();
+        let got = scores.get(&target).copied().unwrap_or(0.0);
+        // terms: abstract, vendor, hardware, rust, agent -> matches vendor/rust/agent
+        assert!(got >= 0.55, "coverage {} should reflect 3 of 5 terms", got);
+        // and the decoys, matching only rust+agent, score strictly lower
+        let decoy = scores.iter().filter(|(id, _)| **id != target).map(|(_, v)| *v).fold(0.0f32, f32::max);
+        assert!(got > decoy, "target {} vs decoy {}", got, decoy);
+    }
+
+    #[test]
+    fn iso_dates_in_finds_real_dates_and_rejects_lookalikes() {
+        assert_eq!(iso_dates_in("shipped 2026-08-31 and again 2026-09-07"), vec!["2026-08-31", "2026-09-07"]);
+        assert_eq!(iso_dates_in("sorted"), Vec::<String>::new());
+        assert!(iso_dates_in("version 1.2.3 at 10.8.0.63, NORAD 43005").is_empty());
+        assert!(iso_dates_in("2026-13-01").is_empty(), "month 13");
+        assert!(iso_dates_in("2026-00-10").is_empty(), "month 0");
+        assert!(iso_dates_in("12026-01-01").is_empty(), "a longer number is not a date");
+        // deduped and ordered
+        assert_eq!(iso_dates_in("2026-09-08 then 2026-09-07 then 2026-09-08"), vec!["2026-09-07", "2026-09-08"]);
+    }
+
+    #[test]
+    fn query_date_range_reads_explicit_and_relative_time() {
+        let today = "2026-09-08";
+        assert_eq!(
+            query_date_range("what shipped on 2026-08-31", today),
+            Some(DateRange { from: "2026-08-31".into(), to: "2026-08-31".into() })
+        );
+        assert_eq!(
+            query_date_range("between 2026-09-01 and 2026-09-05", today),
+            Some(DateRange { from: "2026-09-01".into(), to: "2026-09-05".into() })
+        );
+        assert_eq!(query_date_range("what did I do today", today).unwrap().from, "2026-09-08");
+        assert_eq!(query_date_range("what did I do yesterday", today).unwrap().from, "2026-09-07");
+        let wk = query_date_range("what changed last week", today).unwrap();
+        assert_eq!((wk.from.as_str(), wk.to.as_str()), ("2026-09-01", "2026-09-08"));
+        let jun = query_date_range("what did we decide in June", today).unwrap();
+        assert_eq!((jun.from.as_str(), jun.to.as_str()), ("2026-06-01", "2026-06-30"));
+        let feb = query_date_range("february 2024 decisions", today).unwrap();
+        assert_eq!(feb.to, "2024-02-29", "leap year");
+        // no time reference at all -> the channel sits out
+        assert_eq!(query_date_range("what host does zenith deploy to", today), None);
+    }
+
+    #[test]
+    fn date_range_overlap_is_inclusive_at_both_ends() {
+        let r = DateRange { from: "2026-09-05".into(), to: "2026-09-07".into() };
+        assert!(r.overlaps("2026-09-07", "2026-09-09"), "touching at the end");
+        assert!(r.overlaps("2026-09-01", "2026-09-05"), "touching at the start");
+        assert!(r.overlaps("2026-09-06", "2026-09-06"), "inside");
+        assert!(r.overlaps("2026-01-01", "2027-01-01"), "spanning");
+        assert!(!r.overlaps("2026-09-08", "2026-09-09"));
+        assert!(!r.overlaps("2026-09-01", "2026-09-04"));
+    }
+
+    #[test]
+    fn a_dated_query_surfaces_the_memory_that_happened_then() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        // Both rows are equally unrelated to the query text; only the date
+        // separates them, and only one carries an occurrence.
+        let dated = insert(&conn, "satellite identity switched to a uuid", None, None, true, Some(&[0.0, 1.0]), 5).unwrap();
+        set_occurrence(&conn, dated, "2026-08-31", "2026-08-31").unwrap();
+        let undated = insert(&conn, "some other note entirely", None, None, true, Some(&[0.0, 1.0]), 5).unwrap();
+
+        let q: Vec<f32> = vec![1.0, 0.0]; // orthogonal: no semantic signal at all
+        let hits = search_hybrid(&conn, "what shipped on 2026-08-31", &q, 5, false, false, 0.0, &now).unwrap();
+        assert_eq!(hits[0].memory.id, dated, "the dated match must outrank the undated row");
+        assert!(hits[0].score > 0.6, "a temporal match alone clears the injection floor: {}", hits[0].score);
+        let undated_hit = hits.iter().find(|h| h.memory.id == undated).unwrap();
+        assert!(hits[0].score > undated_hit.score);
+
+        // The same query without a date gives the temporal channel nothing.
+        let plain = search_hybrid(&conn, "what shipped", &q, 5, false, false, 0.0, &now).unwrap();
+        assert!(plain.iter().all(|h| h.score < 0.6));
+    }
+
+    #[test]
+    fn occurrence_is_taken_from_the_text_on_insert_and_validated_on_set() {
+        let conn = mem_conn();
+        let id = insert(&conn, "On 2026-09-07 Ivan tested the recorder", None, None, true, None, 5).unwrap();
+        let m = get(&conn, id).unwrap().unwrap();
+        assert_eq!(m.occurred_from.as_deref(), Some("2026-09-07"));
+        assert_eq!(m.occurred_to.as_deref(), Some("2026-09-07"));
+
+        let undated = insert(&conn, "no date in this one", None, None, true, None, 5).unwrap();
+        assert_eq!(get(&conn, undated).unwrap().unwrap().occurred_from, None, "undated stays NULL, never created_at");
+
+        // reversed input is normalized, garbage is rejected
+        set_occurrence(&conn, undated, "2026-09-09", "2026-09-01").unwrap();
+        let m = get(&conn, undated).unwrap().unwrap();
+        assert_eq!((m.occurred_from.as_deref(), m.occurred_to.as_deref()), (Some("2026-09-01"), Some("2026-09-09")));
+        assert!(set_occurrence(&conn, undated, "yesterday", "today").is_err());
+        assert!(set_occurrence(&conn, undated, "2026-13-01", "2026-13-02").is_err());
+    }
+
+    #[test]
+    fn migrate_v18_to_v19_backfills_occurrence_from_the_text() {
+        let conn = mem_conn();
+        // Simulate pre-v19 rows by clearing what insert() derived.
+        let dated = insert(&conn, "As of 2026-09-07, the bank held 150 memories", None, None, true, None, 5).unwrap();
+        let undated = insert(&conn, "nothing dated here", None, None, true, None, 5).unwrap();
+        conn.execute("UPDATE memories SET occurred_from = NULL, occurred_to = NULL", []).unwrap();
+        let n = backfill_occurrence_from_text(&conn).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(get(&conn, dated).unwrap().unwrap().occurred_from.as_deref(), Some("2026-09-07"));
+        assert_eq!(get(&conn, undated).unwrap().unwrap().occurred_from, None);
+        assert_eq!(backfill_occurrence_from_text(&conn).unwrap(), 0, "idempotent");
+    }
+
+    #[test]
+    fn rrf_contrib_falls_off_with_rank_and_rewards_agreement() {
+        assert!(rrf_contrib(0) > rrf_contrib(1));
+        assert!(rrf_contrib(1) > rrf_contrib(9));
+        // Two channels agreeing at rank 2 beat one channel at rank 0 --
+        // the whole point of fusing by rank rather than by score.
+        assert!(rrf_contrib(2) * 2.0 > rrf_contrib(0));
+    }
+
+    #[test]
+    fn normalize_sim_gives_cosine_a_usable_zero() {
+        assert_eq!(normalize_sim(SIM_NOISE_FLOOR), 0.0);
+        assert_eq!(normalize_sim(0.0), 0.0, "below the noise floor is still nothing");
+        assert_eq!(normalize_sim(1.0), 1.0);
+        // an unanswerable query's best cosine (measured 0.38-0.55) lands low
+        assert!(normalize_sim(0.55) < 0.26);
+        // an answerable one's (measured 0.67-0.80) lands high
+        assert!(normalize_sim(0.67) > 0.44);
     }
 
     #[test]
@@ -4805,13 +5651,18 @@ mod tests {
     #[test]
     fn ranking_favors_high_similarity_when_all_else_equal() {
         let conn = mem_conn();
-        insert5(&conn, "the boss wants Q4 retention metrics", Some(&fake_embed("the boss wants Q4 retention metrics")));
-        insert5(&conn, "unrelated quantum chess trivia", Some(&fake_embed("unrelated quantum chess trivia")));
+        // Explicit vectors rather than `fake_embed`: scores now run through
+        // `normalize_sim`, which floors everything under SIM_NOISE_FLOOR at
+        // 0, and fake_embed's whole cosine range sits below that floor -- so
+        // both rows would tie at 0 and the test would prove nothing.
+        insert5(&conn, "the boss wants Q4 retention metrics", Some(&[1.0, 0.05]));
+        insert5(&conn, "unrelated quantum chess trivia", Some(&[0.6, 0.8]));
         insert(&conn, "no embedding stored for this one", None, None, true, None, 5).unwrap();
 
         let now = now_rfc3339();
-        let query = fake_embed("what does my boss want for Q4");
+        let query: Vec<f32> = vec![1.0, 0.0];
         let results = search_ranked(&conn, &query, 5, false, false, 0.0, &now).unwrap();
+        assert!(results[0].sim > results.last().unwrap().sim, "the near-parallel row is more similar");
 
         // the no-embedding row must never surface from a cosine search
         assert!(results.iter().all(|h| h.memory.content != "no embedding stored for this one"));
@@ -4987,7 +5838,7 @@ mod tests {
         // (`improve_state` + `ingested_sessions.skill_usage`), landing at the
         // current version.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 17);
+        assert_eq!(version, 19);
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1);
@@ -5136,7 +5987,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 17,
+            version, 19,
             "v1->v2 (reflection tables), v2->v3 (insights level column), v3->v4 (dormant_at), \
              v4->v5 (dedupe_seen), v5->v6 (last_verified_at + contradiction_seen), \
              v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions), v8->v9 (graph layer), \
@@ -5162,7 +6013,7 @@ mod tests {
     fn fresh_database_lands_at_current_user_version() {
         let conn = mem_conn();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 17);
+        assert_eq!(version, 19);
     }
 
     #[test]
@@ -5391,7 +6242,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 17,
+            version, 19,
             "v2->v3 (level column), v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, \
              v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions), v8->v9, v9->v10 all run"
         );
@@ -5435,7 +6286,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 17,
+            version, 19,
             "v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild), \
              v7->v8 (ingested_sessions), v8->v9, v9->v10 all run"
         );
@@ -5480,7 +6331,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 17,
+            version, 19,
             "v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 \
              (ingested_sessions), v8->v9, v9->v10 all run"
         );
@@ -5528,7 +6379,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 17, "v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) all run");
+        assert_eq!(version, 19, "v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) all run");
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -5588,7 +6439,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 17, "v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) both run");
+        assert_eq!(version, 19, "v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) both run");
 
         // Every row and its data survive the rebuild, ids included.
         let rows = list(&conn, None, false).unwrap();
@@ -5749,7 +6600,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 17, "v7->v8 (ingested_sessions) runs");
+        assert_eq!(version, 19, "v7->v8 (ingested_sessions) runs");
 
         assert_eq!(list(&conn, None, false).unwrap().len(), 1, "existing memory row must survive the migration");
 
@@ -6120,6 +6971,8 @@ mod tests {
             last_verified_at: None,
             graph_extracted_at: None,
             basis: None,
+            occurred_from: None,
+            occurred_to: None,
         }
     }
 
@@ -6481,7 +7334,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 17, "v8->v9 (graph layer) runs");
+        assert_eq!(version, 19, "v8->v9 (graph layer) runs");
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -6542,7 +7395,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 17, "v9->v10 (last_completed_at + entity_merge_seen) runs");
+        assert_eq!(version, 19, "v9->v10 (last_completed_at + entity_merge_seen) runs");
 
         // The pre-existing watermark row survives, and last_completed_at
         // backfills to NULL (never completed under the new field yet).

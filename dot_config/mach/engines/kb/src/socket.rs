@@ -67,6 +67,12 @@ struct Req {
     limit: Option<usize>,
     #[serde(default)]
     min_score: Option<f32>,
+    /// Token budget for the response. When set, `limit` bounds how many
+    /// candidates are CONSIDERED and this bounds what is returned, packed
+    /// greedily in rank order (`cli::pack_to_budget`). A count is the wrong
+    /// unit for an injection: four one-line preferences and four
+    /// paragraph-long facts cost the same four slots.
+    budget: Option<usize>,
 }
 
 /// Matches `kb-recall.sh`'s own defaults (`--limit 4 --min-score 0.45`) so a
@@ -104,9 +110,14 @@ fn run_one_search(
     query: &str,
     limit: usize,
     min_score: f32,
+    budget: Option<usize>,
 ) -> Result<Value, KbError> {
     let now = store::now_rfc3339();
     let resp = search_hits(conn, embedder, query, limit, false, false, min_score, &now)?;
+    let resp = match budget {
+        Some(b) => crate::cli::pack_to_budget(resp, b),
+        None => resp,
+    };
     Ok(serde_json::to_value(&resp)?)
 }
 
@@ -124,13 +135,14 @@ fn handle_search(req: &Req, conn: &mut Connection, embedder: &OllamaEmbedder) ->
     };
     let limit = req.limit.unwrap_or(DEFAULT_LIMIT);
     let min_score = req.min_score.unwrap_or(DEFAULT_MIN_SCORE);
+    let budget = req.budget;
 
-    match run_one_search(conn, embedder, query, limit, min_score) {
+    match run_one_search(conn, embedder, query, limit, min_score, budget) {
         Ok(v) => v,
         Err(_first_err) => match store::open() {
             Ok(fresh) => {
                 *conn = fresh;
-                match run_one_search(conn, embedder, query, limit, min_score) {
+                match run_one_search(conn, embedder, query, limit, min_score, budget) {
                     Ok(v) => v,
                     Err(e) => json!({"error": e.to_string()}),
                 }

@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::classify::{self, Classifier, Verdict};
 use crate::embed::{Embedder, OllamaEmbedder};
+use crate::eval;
 use crate::export;
 use crate::health;
 use crate::improve::{self, ImproveLlm, Vcs};
@@ -89,6 +90,12 @@ fn print_help() {
     println!("                          session/meeting transcript, insights that cite it,");
     println!("                          graph edges it evidences, Hebbian associates,");
     println!("                          engagement + how often recall has shown it. Read-only.");
+    println!("  eval [--file F] [--json] [--verbose]");
+    println!("                          score retrieval against a fixed question set: did recall");
+    println!("                          surface the memory that answers each question? Reports");
+    println!("                          pass rate per category (extraction, multi_session,");
+    println!("                          temporal, knowledge_update, abstention), stale-fact");
+    println!("                          serves, and mean injected characters. Read-only, no LLM.");
     println!("  graph --stats           entity/edge/mention/card counts by kind — a compact view");
     println!("                          of the graph `mach kb reflect` has derived so far");
     println!("  graph audit             batched KEEP/POISONED/GENERIC judgment over every active");
@@ -119,6 +126,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Some("improve") => cmd_improve(args),
         Some("entity") => cmd_entity(args),
         Some("why") => cmd_why(args),
+        Some("eval") => cmd_eval(args),
         Some("graph") => cmd_graph(args),
         Some("health") => cmd_health(args),
         Some("-h") | Some("--help") => {
@@ -776,6 +784,7 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut include_superseded = false;
     let mut touch = false;
     let mut min_score: f32 = 0.0;
+    let mut budget: Option<usize> = None;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -785,9 +794,10 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
             "--include-superseded" => include_superseded = true,
             "--touch" => touch = true,
             "--min-score" => min_score = args.next().and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            "--budget" => budget = args.next().and_then(|v| v.parse().ok()),
             "-h" | "--help" => {
                 println!(
-                    "usage: mach kb search \"<query>\" [--limit N] [--json] [--reviewed-only] [--touch] \
+                    "usage: mach kb search \"<query>\" [--limit N] [--budget N] [--json] [--reviewed-only] [--touch] \
                      [--include-superseded] [--min-score F]"
                 );
                 return Ok(());
@@ -857,6 +867,12 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     if min_score > 0.0 {
         response.hits.retain(|h| h.score >= min_score);
     }
+    // Budget last: packing decides what FITS, and only rows that cleared
+    // the floor are worth spending budget on.
+    let response = match budget {
+        Some(b) => pack_to_budget(response, b),
+        None => response,
+    };
 
     if json {
         println!("{}", serde_json::to_string(&response)?);
@@ -1419,6 +1435,7 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     // share this table and this query), so a theme is just as due for a
     // check as a plain insight.
     let mut flagged = 0usize;
+    let mut weakened = 0usize;
     let mut verified = 0usize;
     let stale = verification_queue;
     for insight in &stale {
@@ -1454,8 +1471,11 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         }
 
         if broken_citation {
-            store::flag_insight(&conn, insight.id, &now).map_err(to_io)?;
-            flagged += 1;
+            // A citation that died under it is thinning evidence, not a
+            // contradiction: weaken by one step and let the next pass judge
+            // the claim itself, rather than flagging it as doubted outright.
+            store::weaken_insight(&conn, insight.id, &now).map_err(to_io)?;
+            weakened += 1;
             continue;
         }
 
@@ -1489,6 +1509,9 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         }
 
         if contradicted {
+            // Flags AND lowers confidence by two steps (see
+            // `store::flag_insight`): a belief the evidence now contradicts
+            // should not keep displaying the confidence it earned before.
             store::flag_insight(&conn, insight.id, &now).map_err(to_io)?;
             flagged += 1;
         } else {
@@ -1647,7 +1670,7 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
 
     println!(
         "mach kb reflect: examined={} questions={} insights_added={} reinforced={} \
-         themes_added={} flagged={} verified={} curated={} promoted={} demoted={} dormant={} \
+         themes_added={} flagged={} weakened={} verified={} curated={} promoted={} demoted={} dormant={} \
          consolidated={} deduped={} contradictions={} mem_verified={} mem_stale={} mem_routed={} \
          graph_examined={} graph_edges={} graph_entities={} evidence_dead={} entities_merged={} \
          cards_examined={} cards_built={}{}",
@@ -1657,6 +1680,7 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         reinforced,
         themes_added,
         flagged,
+        weakened,
         verified,
         curated,
         promoted,
@@ -2454,7 +2478,13 @@ fn run_graph_extraction_pass<E: Embedder, L: ReflectLlm>(
     llm: &L,
     now: &str,
 ) -> Result<(usize, usize, usize, bool), KbError> {
-    let candidates = store::graph_extraction_candidates(conn, reflect::GRAPH_EXTRACTION_MAX_PER_RUN)?;
+    // Most surprising first: the pass is capped per run, so the cap decides
+    // what gets examined, and a fact that restates the bank yields nothing
+    // an existing edge does not already say.
+    let candidates = store::order_by_surprisal(
+        conn,
+        store::graph_extraction_candidates(conn, reflect::GRAPH_EXTRACTION_MAX_PER_RUN)?,
+    );
     let mut examined = 0usize;
     let mut edges_created = 0usize;
     let mut entities_created = 0usize;
@@ -2860,6 +2890,7 @@ pub fn provenance_phrase(source: Option<&str>, basis: Option<&str>) -> String {
         None
     };
     match (basis, where_) {
+        (Some("experience"), w) => format!("I did this in {}", w.unwrap_or("an earlier session")),
         (Some("inferred"), w) => format!("I inferred this from {}", w.unwrap_or("context")),
         (Some("stated"), Some(w)) => format!("you said this in {}", w),
         (_, Some("a meeting")) => "from a meeting".to_string(),
@@ -2954,6 +2985,7 @@ pub fn why_report(
                 match m.basis.as_deref() {
                     Some("stated") => "stated (the user or a named person said it in so many words)",
                     Some("inferred") => "inferred (deduced from behavior, code, or context)",
+                    Some("experience") => "experience (what Claude did here, and how the user responded)",
                     _ => "unknown (written before the basis column existed, or by a channel that does not classify)",
                 }
             ));
@@ -3144,6 +3176,190 @@ pub fn why_report(
         }
     }
     Ok(out)
+}
+
+/// Rough token estimate: English prose runs about four characters per
+/// token, close enough to spend a context budget against without pulling
+/// in a tokenizer for the model that will actually read it.
+pub fn est_tokens(text: &str) -> usize {
+    text.chars().count().div_ceil(4)
+}
+
+/// Greedy token-budget packing (Hindsight's final recall stage): keep
+/// results in rank order until the budget is spent, instead of keeping a
+/// fixed COUNT. A count is the wrong unit for injection -- four one-line
+/// preferences and four paragraph-long project-index facts cost the same
+/// four slots and wildly different context.
+///
+/// The entity card is packed first: it is the consolidation of many
+/// memories, so per token it says the most. Connections are left alone
+/// (they are one short line each and never the bulk of an injection).
+pub fn pack_to_budget(resp: SearchResponse, budget: usize) -> SearchResponse {
+    let mut spent = 0usize;
+    let mut cards = Vec::new();
+    for c in resp.cards {
+        let cost = est_tokens(&c.text);
+        if spent + cost <= budget {
+            spent += cost;
+            cards.push(c);
+        }
+    }
+    let mut hits = Vec::new();
+    for h in resp.hits {
+        let cost = est_tokens(&h.content);
+        if spent + cost > budget {
+            continue; // skip, don't stop: a later shorter hit may still fit
+        }
+        spent += cost;
+        hits.push(h);
+    }
+    SearchResponse { hits, connections: resp.connections, cards }
+}
+
+/// `mach kb eval` — score retrieval against a fixed question set.
+///
+/// Runs every question through the SAME path and settings the recall hook
+/// uses (`search_hits` with the hook's limit and score floor), so the
+/// number reflects what would actually be injected into a session rather
+/// than what a hand-tuned query could dig out. Read-only: nothing is
+/// touched, reinforced or logged.
+///
+/// The default limit/min-score deliberately mirror `kb-recall.py`'s
+/// constants; `--limit`/`--min-score` exist to sweep them, which is the
+/// whole point of having a score at all.
+fn cmd_eval(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    // Mirrors kb-recall.py's SEARCH_LIMIT / SCORE_THRESHOLD.
+    let mut limit: usize = 4;
+    let mut min_score: f32 = 0.45;
+    let mut budget: Option<usize> = None;
+    let mut file: Option<String> = None;
+    let mut json = false;
+    let mut verbose = false;
+
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--file" => file = args.next(),
+            "--limit" => limit = args.next().and_then(|v| v.parse().ok()).unwrap_or(limit),
+            "--min-score" => min_score = args.next().and_then(|v| v.parse().ok()).unwrap_or(min_score),
+            "--budget" => budget = args.next().and_then(|v| v.parse().ok()),
+            "--json" => json = true,
+            "--verbose" | "-v" => verbose = true,
+            "-h" | "--help" => {
+                println!("usage: mach kb eval [--file F] [--limit N] [--min-score F] [--budget N] [--json] [--verbose]");
+                println!("       Scores retrieval, not generation: a question passes when recall injected");
+                println!("       one of the memory ids that answer it (and none of its superseded ones).");
+                println!("       Default question set: ~/{}", eval::DEFAULT_QUESTIONS_PATH);
+                return Ok(());
+            }
+            other => {
+                eprintln!("mach kb eval: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let path = match file {
+        Some(f) => PathBuf::from(f),
+        None => {
+            let home = std::env::var("HOME").unwrap_or_default();
+            Path::new(&home).join(eval::DEFAULT_QUESTIONS_PATH)
+        }
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("mach kb eval: cannot read {}: {}", path.display(), e);
+            std::process::exit(1);
+        }
+    };
+    let questions = eval::parse_questions(&content).map_err(to_io)?;
+
+    let conn = store::open().map_err(to_io)?;
+    let embedder = OllamaEmbedder::new();
+    let now = store::now_rfc3339();
+
+    let mut results = Vec::new();
+    for q in &questions {
+        let resp = match search_hits(&conn, &embedder, &q.query, limit, false, false, min_score, &now) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("mach kb eval: {} — search failed: {}", q.id, e);
+                std::process::exit(1);
+            }
+        };
+        let resp = match budget {
+            Some(b) => pack_to_budget(resp, b),
+            None => resp,
+        };
+        // Memory hits only: an insight id lives in the same numeric space
+        // and would otherwise count as a false hit on an expected id.
+        let injected: Vec<i64> = resp.hits.iter().filter(|h| !h.derived).map(|h| h.id).collect();
+        let chars: usize = resp.hits.iter().map(|h| h.content.chars().count()).sum::<usize>()
+            + resp.cards.iter().map(|c| c.text.chars().count()).sum::<usize>();
+        results.push(eval::score(q, &injected, chars));
+    }
+
+    let (by_cat, overall) = eval::summarize(&results);
+
+    if json {
+        #[derive(Serialize)]
+        struct Report<'a> {
+            limit: usize,
+            min_score: f32,
+            budget: Option<usize>,
+            by_category: &'a BTreeMap<String, eval::Tally>,
+            overall: &'a eval::Tally,
+            results: &'a [eval::QuestionResult],
+        }
+        let report = Report { limit, min_score, budget, by_category: &by_cat, overall: &overall, results: &results };
+        let out = serde_json::to_string_pretty(&report)
+            .map_err(|e| io::Error::other(format!("mach kb eval: {}", e)))?;
+        println!("{}", out);
+        return Ok(());
+    }
+
+    println!("mach kb eval: {} questions, limit={} min_score={}{}", overall.total, limit, min_score,
+        budget.map(|b| format!(" budget={}", b)).unwrap_or_default());
+    for (cat, t) in &by_cat {
+        println!(
+            "  {:<18} {}/{} ({:.0}%)  mean {:.0} chars{}",
+            cat,
+            t.passed,
+            t.total,
+            t.rate() * 100.0,
+            t.mean_chars(),
+            if t.served_stale > 0 { format!("  STALE SERVED x{}", t.served_stale) } else { String::new() }
+        );
+    }
+    println!(
+        "  {:<18} {}/{} ({:.0}%)  mean {:.0} chars{}",
+        "OVERALL",
+        overall.passed,
+        overall.total,
+        overall.rate() * 100.0,
+        overall.mean_chars(),
+        if overall.served_stale > 0 { format!("  STALE SERVED x{}", overall.served_stale) } else { String::new() }
+    );
+
+    if verbose {
+        for r in results.iter().filter(|r| !r.passed) {
+            let q = questions.iter().find(|q| q.id == r.id);
+            println!(
+                "\n  MISS {} [{}] {:?}\n    expected {:?}  injected {:?}",
+                r.id,
+                r.category,
+                r.query,
+                q.map(|q| q.expect.clone()).unwrap_or_default(),
+                r.injected
+            );
+            for id in &r.injected {
+                if let Ok(Some(m)) = store::get(&conn, *id) {
+                    println!("      #{} {}", id, truncate(&m.content, 70));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn cmd_why(args: impl Iterator<Item = String>) -> io::Result<()> {
@@ -3895,11 +4111,12 @@ fn ingest_sessions_impl<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>
                 Ok(out) => {
                     for fact in ingest::parse_digest_facts_with_basis(&out) {
                         let embedding = embedder.embed(&fact.content).ok();
-                        if store::insert_with_basis(
+                        if let Ok(id) = store::insert_with_basis(
                             conn, &fact.content, Some("session-digest"), None, false, embedding.as_deref(), 5, fact.basis,
-                        )
-                        .is_ok()
-                        {
+                        ) {
+                            if let Some((from, to)) = &fact.when {
+                                let _ = store::set_occurrence(conn, id, from, to);
+                            }
                             summary.facts_added += 1;
                         }
                     }
@@ -3929,11 +4146,12 @@ fn ingest_sessions_impl<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>
                 Ok(out) => {
                     for fact in ingest::parse_digest_facts_with_basis(&out) {
                         let embedding = embedder.embed(&fact.content).ok();
-                        if store::insert_with_basis(
+                        if let Ok(id) = store::insert_with_basis(
                             conn, &fact.content, Some("session-digest"), None, false, embedding.as_deref(), 5, fact.basis,
-                        )
-                        .is_ok()
-                        {
+                        ) {
+                            if let Some((from, to)) = &fact.when {
+                                let _ = store::set_occurrence(conn, id, from, to);
+                            }
                             summary.facts_added += 1;
                         }
                     }
@@ -4033,11 +4251,12 @@ fn ingest_sessions_impl<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>
                     Ok(out) => {
                         for fact in ingest::parse_digest_facts_with_basis(&out) {
                             let embedding = embedder.embed(&fact.content).ok();
-                            if store::insert_with_basis(
+                            if let Ok(id) = store::insert_with_basis(
                                 conn, &fact.content, Some("session-digest"), None, false, embedding.as_deref(), 5, fact.basis,
-                            )
-                            .is_ok()
-                            {
+                            ) {
+                                if let Some((from, to)) = &fact.when {
+                                    let _ = store::set_occurrence(conn, id, from, to);
+                                }
                                 summary.facts_added += 1;
                             }
                         }
@@ -6437,6 +6656,7 @@ mod tests {
         assert_eq!(provenance_phrase(Some("memory-backfill:u/x.md"), None), "from earlier project memory");
         assert_eq!(provenance_phrase(Some("note:2026"), Some("stated")), "you told me");
         assert_eq!(provenance_phrase(None, Some("inferred")), "I inferred this from context");
+        assert_eq!(provenance_phrase(Some("session-digest"), Some("experience")), "I did this in a session");
         assert_eq!(provenance_phrase(None, None), "you told me");
     }
 

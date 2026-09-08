@@ -26,6 +26,7 @@
 pub mod classify;
 pub mod cli;
 pub mod embed;
+pub mod eval;
 pub mod export;
 pub mod health;
 pub mod improve;

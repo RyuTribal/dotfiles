@@ -29,7 +29,18 @@ import sys
 
 SCORE_THRESHOLD = 0.45
 MIN_PROMPT_LEN = 12
-SEARCH_LIMIT = 4
+# Candidates CONSIDERED per query. Higher than the old 4 because what is
+# actually injected is now bounded by TOKEN_BUDGET below, not by a count:
+# the ranker gets more to choose from and the budget decides how much of it
+# fits. A count is the wrong unit -- four one-line preferences and four
+# paragraph-long project facts cost the same four slots and wildly different
+# context.
+SEARCH_LIMIT = 8
+# Rough token ceiling for one injection (the server estimates ~4 chars per
+# token). Measured mean injection before the budget existed was ~490 tokens
+# with a hard cap of 4 memories; this holds the same order of cost while
+# letting a query that deserves six short facts have them.
+TOKEN_BUDGET = 400
 SOCKET_TIMEOUT = 0.5
 SUBPROCESS_TIMEOUT = 2.0
 DEDUPE_WINDOW = 10
@@ -134,6 +145,7 @@ def search_via_socket(query):
             "query": query,
             "limit": SEARCH_LIMIT,
             "min_score": SCORE_THRESHOLD,
+            "budget": TOKEN_BUDGET,
         }) + "\n"
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(SOCKET_TIMEOUT)
@@ -157,7 +169,8 @@ def search_via_subprocess(query):
         proc = subprocess.run(
             [MACH_BIN, "kb", "search", query,
              "--limit", str(SEARCH_LIMIT), "--json",
-             "--min-score", str(SCORE_THRESHOLD)],
+             "--min-score", str(SCORE_THRESHOLD),
+             "--budget", str(TOKEN_BUDGET)],
             capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT,
         )
     except Exception:
@@ -185,8 +198,8 @@ def source_phrase(source, basis=None):
     themes never go through this; they keep their own [derived ...] markers,
     a separate axis (a belief ABOUT the user, not a provenance class).
 
-    `basis` is the row's explicit/deductive split (mach kb `memories.basis`,
-    "stated" | "inferred" | None). It refines the phrase, never replaces the
+    `basis` is the row's ground for being believed (mach kb `memories.basis`,
+    "stated" | "inferred" | "experience" | None). It refines the phrase, never replaces the
     source class: an INFERRED digest line reads "I inferred this from a
     session", a STATED one "you said this in a session". A row with no basis
     (written before the column existed, or by a channel that does not
@@ -199,6 +212,9 @@ def source_phrase(source, basis=None):
     elif s == "session-digest" or s.startswith("session-digest:") \
             or s == "transcript-backfill" or s.startswith("transcript-backfill:"):
         where = "a session"
+    if b == "experience":
+        # The agent's own conduct: what Claude did and how the user reacted.
+        return "I did this in {}".format(where or "an earlier session")
     if b == "inferred":
         return "I inferred this from {}".format(where or "context")
     if b == "stated" and where:

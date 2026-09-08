@@ -58,6 +58,16 @@ carry no signal and are skipped. There is deliberately NO time-proximity
 link: `created_at` is when a fact was written down, not when the thing
 happened, so one digest's facts would all link to each other.
 
+**What reflection looks at first.** Passes are capped per run, so the cap
+decides what gets examined. Candidates are ordered by surprisal (`1 - max
+similarity to anything else active`), so a fact that restates the bank waits
+and a genuinely novel one is examined now.
+
+**Confidence moves both ways.** Reinforcement raises an insight's confidence
+by one step; a re-verification contradiction flags it AND lowers it by two;
+a citation dying under it weakens it by one. A doubted belief decays toward
+a floor instead of sitting at high confidence with a warning label.
+
 **Cards.** `mach kb reflect` distills the memories mentioning an entity
 into a short card and rebuilds it whenever that evidence moves. It is
 kind-agnostic on purpose: a person's card says how they argue and what they
@@ -86,6 +96,38 @@ recalled memory looks wrong or surprising before correcting it, and when
 you want to see what evidence an insight or DOUBTED theme actually rests
 on. It touches nothing.
 
+## Measuring retrieval: `mach kb eval`
+
+`mach kb eval` scores retrieval against a fixed question set at
+`~/.local/share/mach/eval/questions.jsonl`: each question names the memory
+ids that answer it, and passes when recall injected one of them (and none of
+its superseded predecessors). Categories mirror LongMemEval's abilities:
+extraction, multi_session, temporal, knowledge_update, abstention. It also
+reports mean injected characters, so accuracy bought with more context is
+visible rather than hidden. Deterministic, read-only, no LLM.
+
+Run it before and after ANY change to ranking, fusion, graph hops, or the
+injection budget, and report both numbers. Sweep with `--min-score`,
+`--limit`, `--budget`, and the `MACH_KB_W_SIM` / `MACH_KB_W_RECENCY` /
+`MACH_KB_W_STRENGTH` / `MACH_KB_FUSION` / `MACH_KB_INSIGHT_MIN_SIM` env
+overrides. Add a question whenever you hit a recall miss worth not
+repeating. Every tuning decision in the current ranking was made this way,
+and three plausible ideas were rejected by it: pure-similarity weights
+(overfits a harness with no recency questions), RRF fusion (worse than
+`max()` on a bank this size), and a time-proximity graph edge.
+
+## Time: occurrence vs ingest
+
+`occurred_from`/`occurred_to` record when a memory's CONTENT happened;
+`created_at` records when it was written down. They are not the same and the
+distinction is what makes dated questions answerable, since everything in
+the bank was written on a handful of ingest days. Occurrence is taken from
+ISO dates in the text at insert, from a digest's `[when: ...]` tag, or set
+with `store::set_occurrence`; it stays NULL when unknown rather than
+defaulting to the write date. A query naming a date or a relative period
+("yesterday", "last week", "in June") activates a temporal channel that
+matches against those ranges.
+
 ## Retrieval is hybrid (since 2026-09-08)
 
 Search and recall rank on `max(cosine, 0.9 * lexical)` blended with recency
@@ -97,12 +139,15 @@ when 0) next to `sim`; a hit with `sim` near 0 and `lexical` 1.0 was found
 by the exact token alone. Stopwords and 1-2 letter words are dropped from
 the lexical query; digits of any length are kept.
 
-## Stated vs inferred (basis)
+## Stated vs inferred vs experience (basis)
 
-Every memory carries a `basis`: **stated** (the user or a named person said
-it in so many words: `mach kb add`, `mach note`, a decision cue, a digest
-line the model tagged STATED) or **inferred** (deduced from behavior, code,
-or context: a digest line tagged INFERRED). Rows written before 2026-09-08
+Every memory carries a `basis`, its ground for being believed: **stated**
+(the user or a named person said it in so many words: `mach kb add`, `mach
+note`, a decision cue, a digest line tagged STATED), **inferred** (deduced
+from behavior, code, or context), or **experience** (what Claude itself did
+in a session and how the user responded: what you proposed, built, got
+wrong, or were corrected on). An experience memory renders as "I did this in
+a session" and is the most useful kind for not repeating a mistake. Rows written before 2026-09-08
 and channels that do not classify (meeting facts, consolidation) have no
 basis and render with the older source-only phrase. Recall shows it in the
 provenance tail: "(you said this in a session)" vs "(I inferred this from a

@@ -87,13 +87,30 @@ fn run_telegram_subsystem(shutdown: &AtomicBool) -> Result<(), String> {
 /// Logs a subsystem thread's outcome and folds it into the process exit
 /// code: a thread panic or an `Err` return both count as failure (`1`), a
 /// clean `Ok(())` (whether from a full run or an immediate no-op) doesn't.
+/// Runs one subsystem on its own thread and logs its error THE MOMENT it
+/// returns, not at process exit. `main` joins both subsystems before it
+/// reports anything, so a kb thread that died at startup (e.g. a migration
+/// race with a concurrent `mach kb` CLI call) used to stay silent for as
+/// long as the telegram thread kept running -- hours of "socket missing"
+/// with nothing in the journal.
+fn spawn_subsystem<F>(name: &'static str, f: F) -> thread::JoinHandle<Result<(), String>>
+where
+    F: FnOnce() -> Result<(), String> + Send + 'static,
+{
+    thread::spawn(move || {
+        let result = f();
+        if let Err(e) = &result {
+            eprintln!("machd: {} subsystem exited with an error: {}", name, e);
+        }
+        result
+    })
+}
+
 fn report(name: &str, result: thread::Result<Result<(), String>>) -> i32 {
     match result {
         Ok(Ok(())) => 0,
-        Ok(Err(e)) => {
-            eprintln!("machd: {} subsystem exited with an error: {}", name, e);
-            1
-        }
+        // already logged by `spawn_subsystem` when it happened
+        Ok(Err(_)) => 1,
         Err(_) => {
             eprintln!("machd: {} subsystem thread panicked", name);
             1
@@ -115,10 +132,10 @@ fn main() {
     install_signal_handlers(&shutdown);
 
     let kb_shutdown = Arc::clone(&shutdown);
-    let kb_thread = thread::spawn(move || kb::socket::run(&kb_shutdown));
+    let kb_thread = spawn_subsystem("kb", move || kb::socket::run(&kb_shutdown));
 
     let tg_shutdown = Arc::clone(&shutdown);
-    let tg_thread = thread::spawn(move || run_telegram_subsystem(&tg_shutdown));
+    let tg_thread = spawn_subsystem("telegram", move || run_telegram_subsystem(&tg_shutdown));
 
     // Both threads block in their own loop until `shutdown` flips (SIGTERM/
     // SIGINT) -- joining here is just waiting for that, same as the old

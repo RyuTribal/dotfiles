@@ -314,6 +314,20 @@ const NEW_COLUMNS: &[(&str, &str)] = &[
     ("superseded_by", "INTEGER"),
 ];
 
+/// `ALTER TABLE <table> ADD COLUMN <col> <decl>`, treating "the column is
+/// already there" as success. Idempotent by construction, so it is safe
+/// when two processes migrate the same file at once (machd starting up
+/// while a `mach kb` CLI call from a hook opens the store): the check-then-
+/// ALTER pattern this replaces lost that race with "duplicate column name"
+/// and killed the daemon's kb thread. Any other error is still an error.
+fn add_column_if_missing(conn: &Connection, table: &str, col: &str, decl: &str) -> Result<(), KbError> {
+    match conn.execute(&format!("ALTER TABLE {} ADD COLUMN {} {}", table, col, decl), []) {
+        Ok(_) => Ok(()),
+        Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn existing_columns(conn: &Connection) -> Result<Vec<String>, KbError> {
     let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
     let cols = stmt
@@ -390,10 +404,7 @@ fn migrate_v2_to_v3(conn: &Connection) -> Result<(), KbError> {
 /// every existing row is, by definition, active (not dormant), which is
 /// exactly the column's implicit default (NULL).
 fn migrate_v3_to_v4(conn: &Connection) -> Result<(), KbError> {
-    let cols = existing_columns(conn)?;
-    if !cols.iter().any(|c| c == "dormant_at") {
-        conn.execute("ALTER TABLE memories ADD COLUMN dormant_at TEXT", [])?;
-    }
+    add_column_if_missing(conn, "memories", "dormant_at", "TEXT")?;
     conn.execute("PRAGMA user_version = 4", [])?;
     Ok(())
 }
@@ -418,10 +429,7 @@ fn migrate_v4_to_v5(conn: &Connection) -> Result<(), KbError> {
 /// column — every existing row is, by definition, never-verified, which is
 /// exactly the column's implicit default (NULL) — and bumping the version.
 fn migrate_v5_to_v6(conn: &Connection) -> Result<(), KbError> {
-    let cols = existing_columns(conn)?;
-    if !cols.iter().any(|c| c == "last_verified_at") {
-        conn.execute("ALTER TABLE memories ADD COLUMN last_verified_at TEXT", [])?;
-    }
+    add_column_if_missing(conn, "memories", "last_verified_at", "TEXT")?;
     conn.execute("PRAGMA user_version = 6", [])?;
     Ok(())
 }
@@ -481,10 +489,7 @@ fn migrate_v7_to_v8(conn: &Connection) -> Result<(), KbError> {
 /// pass, which is exactly the column's implicit default (NULL) — and
 /// bumping the version.
 fn migrate_v8_to_v9(conn: &Connection) -> Result<(), KbError> {
-    let cols = existing_columns(conn)?;
-    if !cols.iter().any(|c| c == "graph_extracted_at") {
-        conn.execute("ALTER TABLE memories ADD COLUMN graph_extracted_at TEXT", [])?;
-    }
+    add_column_if_missing(conn, "memories", "graph_extracted_at", "TEXT")?;
     conn.execute("PRAGMA user_version = 9", [])?;
     Ok(())
 }
@@ -596,10 +601,7 @@ fn migrate_v12_to_v13(conn: &Connection) -> Result<(), KbError> {
 /// every pre-existing row is left NULL -- "basis unknown" -- which is the
 /// honest value for anything written before the split existed.
 fn migrate_v13_to_v14(conn: &Connection) -> Result<(), KbError> {
-    let cols = existing_columns(conn)?;
-    if !cols.iter().any(|c| c == "basis") {
-        conn.execute("ALTER TABLE memories ADD COLUMN basis TEXT", [])?;
-    }
+    add_column_if_missing(conn, "memories", "basis", "TEXT")?;
     conn.execute("PRAGMA user_version = 14", [])?;
     Ok(())
 }
@@ -3228,6 +3230,27 @@ mod tests {
         assert!(insert_with_basis(&conn, "x", None, None, true, None, 5, Some("guessed")).is_err());
         assert!(set_basis(&conn, a, "guessed").is_err());
         assert_eq!(get(&conn, a).unwrap().unwrap().basis.as_deref(), Some("stated"), "a rejected write must not touch the row");
+    }
+
+    #[test]
+    fn add_column_if_missing_is_idempotent_across_a_lost_race() {
+        // Simulates the second of two concurrent migrators: the column
+        // already landed (the other process won), and this one's ALTER
+        // must be a no-op success, not "duplicate column name".
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY);").unwrap();
+        add_column_if_missing(&conn, "t", "basis", "TEXT").unwrap();
+        add_column_if_missing(&conn, "t", "basis", "TEXT").unwrap();
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(t)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(cols.iter().filter(|c| *c == "basis").count(), 1);
+        // a genuinely different failure still surfaces
+        assert!(add_column_if_missing(&conn, "no_such_table", "x", "TEXT").is_err());
     }
 
     #[test]

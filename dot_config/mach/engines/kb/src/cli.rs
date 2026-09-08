@@ -579,10 +579,20 @@ fn entity_connections_for_query(conn: &Connection, query: &str, q_emb: &[f32]) -
     let hop1_edges = active_relations_for_recall(conn, entity.id);
     let mut out: Vec<ConnectionHit> = Vec::new();
     let mut used_edge_ids: HashSet<i64> = HashSet::new();
+    // Distinct STATEMENTS, not distinct rows: the same claim extracted from
+    // two different memories is two active relation rows with identical
+    // endpoints and predicate, and rendering both said one thing twice and
+    // spent two lines of injection on it ("user -deploys-to-> remosspace.com"
+    // appeared twice; "user -works-on-> Helios" exists five times).
+    let mut seen_claims: HashSet<(i64, String, i64)> = HashSet::new();
 
     for e in &hop1_edges {
         if out.len() >= SEARCH_MAX_CONNECTIONS {
             return out;
+        }
+        if !seen_claims.insert((e.src, e.predicate.to_lowercase(), e.dst)) {
+            used_edge_ids.insert(e.id); // same claim: never re-surface it at hop 2 either
+            continue;
         }
         if let Some(hit) = connection_hit_for_edge(conn, e, 1) {
             used_edge_ids.insert(e.id);
@@ -614,6 +624,9 @@ fn entity_connections_for_query(conn: &Connection, query: &str, q_emb: &[f32]) -
             let far_id = if e2.src == pivot_id { e2.dst } else { e2.src };
             if far_id == entity.id {
                 continue; // a trivial walk straight back to the matched entity -- not new information
+            }
+            if !seen_claims.insert((e2.src, e2.predicate.to_lowercase(), e2.dst)) {
+                continue; // a claim already rendered at either hop
             }
             let far_name = match store::get_entity(conn, far_id) {
                 Ok(Some(f)) => f.name,
@@ -6658,6 +6671,30 @@ mod tests {
         assert_eq!(provenance_phrase(None, Some("inferred")), "I inferred this from context");
         assert_eq!(provenance_phrase(Some("session-digest"), Some("experience")), "I did this in a session");
         assert_eq!(provenance_phrase(None, None), "you told me");
+    }
+
+    #[test]
+    fn entity_connections_render_each_claim_once_however_many_rows_back_it() {
+        let conn = mem_conn();
+        let q = unit_vec(4, 0);
+        let user = store::insert_entity(&conn, "user", None, None).unwrap();
+        let site = store::insert_entity(&conn, "remosspace.com", Some("infrastructure"), Some(&q)).unwrap();
+        let now = store::now_rfc3339();
+        // One claim, three separate extractions of it (three evidence rows).
+        for _ in 0..3 {
+            store::insert_relation(&conn, user, "deploys-to", site, None, Some(0.9), &now).unwrap();
+        }
+        // Predicate case must not defeat the dedupe either.
+        store::insert_relation(&conn, user, "Deploys-To", site, None, Some(0.9), &now).unwrap();
+        // A genuinely different claim about the same entity still shows.
+        let dash = store::insert_entity(&conn, "dashboard", Some("component"), None).unwrap();
+        store::insert_relation(&conn, dash, "deployed-to", site, None, Some(0.9), &now).unwrap();
+
+        let embedder = FixedVecEmbedder(q);
+        let resp = search_hits(&conn, &embedder, "remosspace.com", 5, false, false, 0.0, &now).unwrap();
+        let ones: Vec<&ConnectionHit> = resp.connections.iter().filter(|c| c.hops == 1).collect();
+        assert_eq!(ones.len(), 2, "one line per distinct claim: {:?}", ones.iter().map(|c| (&c.src_name, &c.predicate, &c.dst_name)).collect::<Vec<_>>());
+        assert_eq!(ones.iter().filter(|c| c.predicate.eq_ignore_ascii_case("deploys-to")).count(), 1);
     }
 
     #[test]

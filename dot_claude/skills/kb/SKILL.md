@@ -43,6 +43,18 @@ add`) rather than silently overriding it — the next `mach kb reflect` /
 re-verification pass reconciles the belief itself; you don't edit insights
 directly.
 
+## Tracing a memory: `mach kb why`
+
+`mach kb why <id>` (or `mach kb why insight <id>`) is the read-only
+provenance trace: source and basis, supersession chain (what it replaced),
+likely origin (session transcript by ingest proximity, meeting transcript
+path, consolidation sources, retired auto-memory file), insights and themes
+that cite it, graph edges it evidences, Hebbian associates, engagement
+counts, and which sessions recall has injected it into. Use it when a
+recalled memory looks wrong or surprising before correcting it, and when
+you want to see what evidence an insight or DOUBTED theme actually rests
+on. It touches nothing.
+
 ## Retrieval is hybrid (since 2026-09-08)
 
 Search and recall rank on `max(cosine, 0.9 * lexical)` blended with recency

@@ -1794,6 +1794,94 @@ fn insert_insight_leveled(
     Ok(conn.last_insert_rowid())
 }
 
+/// Every ACTIVE insight/theme whose `source_ids` cites `id` (a memory id for
+/// level-1 insights, an insight id for level-2 themes -- the caller knows
+/// which it asked about). `source_ids` is stored as a JSON array of quoted
+/// strings, so the quoted form is matched to avoid `"12"` hitting `"112"`.
+/// Read-only provenance walk for `mach kb why`.
+pub fn insights_citing(conn: &Connection, id: i64) -> Result<Vec<Insight>, KbError> {
+    let needle = format!("%\"{}\"%", id);
+    let mut stmt = conn.prepare(
+        "SELECT * FROM insights WHERE invalidated_at IS NULL AND source_ids LIKE ?1 ORDER BY level ASC, id ASC",
+    )?;
+    let rows = stmt.query_map(params![needle], row_to_insight)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Memories this row replaced: every memory whose `superseded_by` points at
+/// `id` (the classifier's UPDATE/SUPERSEDE tombstones). Newest first.
+pub fn predecessors_of(conn: &Connection, id: i64) -> Result<Vec<Memory>, KbError> {
+    let mut stmt = conn.prepare("SELECT * FROM memories WHERE superseded_by = ?1 ORDER BY id DESC")?;
+    let rows = stmt.query_map(params![id], row_to_memory)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Active graph edges whose evidence is memory `id`.
+pub fn relations_evidenced_by(conn: &Connection, id: i64) -> Result<Vec<Relation>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, src, predicate, dst, evidence_memory_id, confidence, created_at, valid_from, invalidated_at, superseded_by
+         FROM relations WHERE evidence_memory_id = ?1 AND invalidated_at IS NULL ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map(params![id], |r| {
+        Ok(Relation {
+            id: r.get(0)?,
+            src: r.get(1)?,
+            predicate: r.get(2)?,
+            dst: r.get(3)?,
+            evidence_memory_id: r.get(4)?,
+            confidence: r.get(5)?,
+            created_at: r.get(6)?,
+            valid_from: r.get(7)?,
+            invalidated_at: r.get(8)?,
+            superseded_by: r.get(9)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// One session-ingest event near a timestamp: `(session_id, at, kind)` with
+/// `kind` "ingested" (a completed `ingest-sessions` pass, from
+/// `ingested_sessions`) or "checkpoint" (a mid-session `--partial` digest,
+/// from `session_progress`). A `session-digest` memory records no session
+/// id of its own, so `mach kb why` reconstructs the likely origin by
+/// proximity: whatever digest landed within `window_secs` of the memory's
+/// `created_at`. Heuristic, and labelled as such by the caller.
+pub fn sessions_near(conn: &Connection, at: &str, window_secs: i64) -> Result<Vec<(String, String, &'static str)>, KbError> {
+    let Some(t0) = parse_rfc3339(at) else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<(String, String, &'static str)> = Vec::new();
+    for (sql, kind) in [
+        ("SELECT session_id, ingested_at FROM ingested_sessions", "ingested"),
+        ("SELECT session_id, updated_at FROM session_progress", "checkpoint"),
+    ] {
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for r in rows {
+            let (sid, ts) = r?;
+            if let Some(t) = parse_rfc3339(&ts) {
+                if (t - t0).abs() <= window_secs {
+                    out.push((sid, ts, kind));
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    Ok(out)
+}
+
 pub fn get_insight(conn: &Connection, id: i64) -> Result<Option<Insight>, KbError> {
     let mut stmt = conn.prepare("SELECT * FROM insights WHERE id = ?1")?;
     Ok(stmt.query_row(params![id], row_to_insight).optional()?)
@@ -3417,6 +3505,37 @@ mod tests {
         assert!(insert_with_basis(&conn, "x", None, None, true, None, 5, Some("guessed")).is_err());
         assert!(set_basis(&conn, a, "guessed").is_err());
         assert_eq!(get(&conn, a).unwrap().unwrap().basis.as_deref(), Some("stated"), "a rejected write must not touch the row");
+    }
+
+    #[test]
+    fn why_helpers_walk_citations_predecessors_edges_and_nearby_sessions() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let old = insert(&conn, "Moses is the boss", None, None, true, None, 5).unwrap();
+        let new = insert(&conn, "Ivar is the boss", None, None, true, None, 5).unwrap();
+        conn.execute("UPDATE memories SET superseded_by = ?1, invalidated_at = ?2 WHERE id = ?3", params![new, now, old]).unwrap();
+        let ins = insert_insight(&conn, "the boss changed", 0.8, &[new.to_string(), "999".to_string()], None).unwrap();
+        // a memory whose id is a suffix of ours must not be matched (quoted form)
+        let _decoy = insert_insight(&conn, "decoy", 0.5, &[format!("1{}", new)], None).unwrap();
+        let theme = insert_theme(&conn, "leadership shifts", 0.6, &[ins.to_string(), "998".to_string()], None).unwrap();
+        let a = insert_entity(&conn, "Ivar", Some("person"), None).unwrap();
+        let b = insert_entity(&conn, "user", None, None).unwrap();
+        insert_relation(&conn, a, "boss-of", b, Some(new), Some(0.9), &now).unwrap();
+        conn.execute("INSERT INTO ingested_sessions (session_id, ingested_at) VALUES ('sess-A', ?1)", params![now]).unwrap();
+        conn.execute("INSERT INTO session_progress (session_id, last_line, updated_at) VALUES ('sess-B', 10, '2000-01-01T00:00:00Z')", []).unwrap();
+
+        let cites = insights_citing(&conn, new).unwrap();
+        assert_eq!(cites.iter().map(|i| i.id).collect::<Vec<_>>(), vec![ins]);
+        let cites_theme = insights_citing(&conn, ins).unwrap();
+        assert_eq!(cites_theme.iter().map(|i| i.id).collect::<Vec<_>>(), vec![theme]);
+        let preds = predecessors_of(&conn, new).unwrap();
+        assert_eq!(preds.iter().map(|m| m.id).collect::<Vec<_>>(), vec![old]);
+        let edges = relations_evidenced_by(&conn, new).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].predicate, "boss-of");
+        let near = sessions_near(&conn, &now, 120).unwrap();
+        assert_eq!(near.len(), 1, "only the session ingested within the window");
+        assert_eq!((near[0].0.as_str(), near[0].2), ("sess-A", "ingested"));
     }
 
     #[test]

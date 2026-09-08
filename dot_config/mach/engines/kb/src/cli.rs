@@ -81,6 +81,12 @@ fn print_help() {
     println!("  entity <name>           association graph for one entity — active edges both");
     println!("                          directions, with evidence memory + date (exact name");
     println!("                          match first, else embedding similarity)");
+    println!("  why <id> | why insight <id>");
+    println!("                          provenance trace for one memory (or insight/theme):");
+    println!("                          source + basis, supersession chain, likely origin");
+    println!("                          session/meeting transcript, insights that cite it,");
+    println!("                          graph edges it evidences, Hebbian associates,");
+    println!("                          engagement + how often recall has shown it. Read-only.");
     println!("  graph --stats           entity/edge counts by kind — a compact view of the");
     println!("                          association graph `mach kb reflect` has derived so far");
     println!("  graph audit             batched KEEP/POISONED/GENERIC judgment over every active");
@@ -110,6 +116,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Some("ingest-sessions") => cmd_ingest_sessions(args),
         Some("improve") => cmd_improve(args),
         Some("entity") => cmd_entity(args),
+        Some("why") => cmd_why(args),
         Some("graph") => cmd_graph(args),
         Some("health") => cmd_health(args),
         Some("-h") | Some("--help") => {
@@ -2656,6 +2663,331 @@ fn resolve_entity_for_lookup(conn: &Connection, embedder: &OllamaEmbedder, name:
 /// without printing them — this command is about the graph's current,
 /// active belief, not its audit trail (`mach kb list --superseded` is the
 /// memory-level equivalent).
+/// What `mach kb why` was asked about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhyTarget {
+    Memory(i64),
+    Insight(i64),
+}
+
+/// Parses `why`'s positional arguments: `<id>`, `i<id>`, or `insight <id>`.
+pub fn parse_why_target(args: &[String]) -> Option<WhyTarget> {
+    match args {
+        [one] => {
+            if let Some(rest) = one.strip_prefix('i') {
+                rest.parse().ok().map(WhyTarget::Insight)
+            } else {
+                one.parse().ok().map(WhyTarget::Memory)
+            }
+        }
+        [kw, id] if kw == "insight" || kw == "theme" => id.parse().ok().map(WhyTarget::Insight),
+        [kw, id] if kw == "memory" => id.parse().ok().map(WhyTarget::Memory),
+        _ => None,
+    }
+}
+
+/// Rust twin of kb-recall.py's `source_phrase`: how a memory was learned,
+/// refined by its basis. Kept in step with the hook by hand (the hook is
+/// the one users read; this is the audit view).
+pub fn provenance_phrase(source: Option<&str>, basis: Option<&str>) -> String {
+    let s = source.unwrap_or("").trim();
+    let where_ = if s.starts_with("meeting:") {
+        Some("a meeting")
+    } else if s == "session-digest" || s.starts_with("session-digest:") || s.starts_with("transcript-backfill") {
+        Some("a session")
+    } else {
+        None
+    };
+    match (basis, where_) {
+        (Some("inferred"), w) => format!("I inferred this from {}", w.unwrap_or("context")),
+        (Some("stated"), Some(w)) => format!("you said this in {}", w),
+        (_, Some("a meeting")) => "from a meeting".to_string(),
+        _ if s.starts_with("memory-backfill") => "from earlier project memory".to_string(),
+        (_, Some("a session")) => "picked up from a session".to_string(),
+        _ => "you told me".to_string(),
+    }
+}
+
+/// Session ids whose recall log ever injected memory `id`, from
+/// `<recall_dir>/<session>.jsonl`. Empty when the dir is missing.
+fn sessions_that_showed(recall_dir: &Path, id: i64) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(recall_dir) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if ingest::parse_recall_log(&content).contains(&id) {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                out.push(stem.to_string());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// `~/.claude/projects/<any>/<session_id>.jsonl` if such a transcript exists.
+fn find_transcript(session_id: &str) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let projects = Path::new(&home).join(".claude/projects");
+    for entry in std::fs::read_dir(projects).ok()?.flatten() {
+        let candidate = entry.path().join(format!("{}.jsonl", session_id));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// How far a `session-digest` memory's `created_at` may sit from a digest
+/// event for that session to count as its likely origin (the digest writes
+/// its facts within seconds of finishing; 3 minutes covers a slow embed).
+pub const WHY_SESSION_WINDOW_SECS: i64 = 180;
+
+fn memory_line(m: &Memory) -> String {
+    let date = m.created_at.get(..10).unwrap_or(&m.created_at);
+    let basis = m.basis.as_deref().map(|b| format!(", {}", b)).unwrap_or_default();
+    format!("#{} ({}{}) {}", m.id, date, basis, truncate(&m.content, 90))
+}
+
+/// The full provenance report for `mach kb why`, as text. `recall_dir` is
+/// where kb-recall.py logs injections (`None` skips that section, e.g. in
+/// tests); `home_meetings` is `~/.local/share/mach/meetings` (same). Pure
+/// read: touches nothing, reinforces nothing.
+pub fn why_report(
+    conn: &Connection,
+    target: WhyTarget,
+    recall_dir: Option<&Path>,
+    meetings_dir: Option<&Path>,
+) -> Result<String, KbError> {
+    let mut out = String::new();
+    match target {
+        WhyTarget::Memory(id) => {
+            let Some(m) = store::get(conn, id)? else {
+                return Ok(format!("no memory #{}", id));
+            };
+            let date = m.created_at.get(..10).unwrap_or(&m.created_at);
+            out.push_str(&format!(
+                "memory #{}  created {}  importance {}  {}{}\n",
+                m.id,
+                date,
+                m.importance,
+                if m.reviewed { "reviewed" } else { "unreviewed" },
+                m.project.as_deref().map(|p| format!("  project {}", p)).unwrap_or_default(),
+            ));
+            out.push_str(&format!("  {}\n", m.content));
+            out.push_str(&format!(
+                "  provenance: {}  [source {}]\n",
+                provenance_phrase(m.source.as_deref(), m.basis.as_deref()),
+                m.source.as_deref().unwrap_or("none"),
+            ));
+            out.push_str(&format!(
+                "  basis: {}\n",
+                match m.basis.as_deref() {
+                    Some("stated") => "stated (the user or a named person said it in so many words)",
+                    Some("inferred") => "inferred (deduced from behavior, code, or context)",
+                    _ => "unknown (written before the basis column existed, or by a channel that does not classify)",
+                }
+            ));
+            // status
+            let mut status = Vec::new();
+            if let Some(sb) = m.superseded_by {
+                status.push(format!("superseded by #{}{}", sb, m.invalidated_at.as_deref().map(|d| format!(" on {}", &d[..10.min(d.len())])).unwrap_or_default()));
+            } else if m.invalidated_at.is_some() {
+                status.push("invalidated".to_string());
+            }
+            if let Some(d) = &m.dormant_at {
+                status.push(format!("dormant since {}", &d[..10.min(d.len())]));
+            }
+            if status.is_empty() {
+                status.push("active".to_string());
+            }
+            if let Some(v) = &m.last_verified_at {
+                status.push(format!("last verified {}", &v[..10.min(v.len())]));
+            }
+            out.push_str(&format!("  status: {}\n", status.join(", ")));
+            let preds = store::predecessors_of(conn, id)?;
+            for p in &preds {
+                out.push_str(&format!("  supersedes {}\n", memory_line(p)));
+            }
+            // engagement
+            let stab = m.effective_stability();
+            out.push_str(&format!(
+                "  engagement: accessed {}×{}{}, stability {:.0}d\n",
+                m.access_count,
+                m.first_accessed_at.as_deref().map(|d| format!(" (first {}", &d[..10.min(d.len())])).unwrap_or_default(),
+                m.last_accessed_at.as_deref().map(|d| format!(", last {})", &d[..10.min(d.len())])).unwrap_or_else(|| if m.first_accessed_at.is_some() { ")".to_string() } else { String::new() }),
+                stab,
+            ));
+            if let Some(dir) = recall_dir {
+                let shown = sessions_that_showed(dir, id);
+                if shown.is_empty() {
+                    out.push_str("  recall: never injected into a session (per recall log)\n");
+                } else {
+                    let list: Vec<&str> = shown.iter().take(3).map(|s| s.as_str()).collect();
+                    out.push_str(&format!(
+                        "  recall: injected in {} session(s){}: {}{}\n",
+                        shown.len(),
+                        if shown.len() > 3 { ", latest" } else { "" },
+                        list.join(", "),
+                        if shown.len() > 3 { ", …" } else { "" },
+                    ));
+                }
+            }
+            // origin trace by source class
+            let src = m.source.clone().unwrap_or_default();
+            if src == "session-digest" || src.starts_with("session-digest:") {
+                let near = store::sessions_near(conn, &m.created_at, WHY_SESSION_WINDOW_SECS)?;
+                if near.is_empty() {
+                    out.push_str("  origin: a session digest; no ingest event within 3 min of creation (session id unknown)\n");
+                } else {
+                    out.push_str("  origin: a session digest; likely session (by proximity, not a stored link):\n");
+                    for (sid, ts, kind) in near.iter().take(3) {
+                        let transcript = find_transcript(sid)
+                            .map(|p| format!("  transcript {}", p.display()))
+                            .unwrap_or_else(|| "  transcript not found locally".to_string());
+                        out.push_str(&format!("    {} ({} at {}){}\n", sid, kind, &ts[..19.min(ts.len())], transcript));
+                    }
+                }
+            } else if let Some(dir_name) = src.strip_prefix("meeting:") {
+                let path = meetings_dir.map(|d| d.join(dir_name).join("transcript.md"));
+                match path {
+                    Some(p) if p.is_file() => out.push_str(&format!("  origin: meeting transcript {}\n", p.display())),
+                    Some(p) => out.push_str(&format!("  origin: meeting {} (transcript missing at {})\n", dir_name, p.display())),
+                    None => out.push_str(&format!("  origin: meeting {}\n", dir_name)),
+                }
+            } else if let Some(ids) = src.strip_prefix("consolidation:") {
+                out.push_str("  origin: consolidated by reflect from:\n");
+                for part in ids.split(',') {
+                    if let Ok(sid) = part.trim().parse::<i64>() {
+                        match store::get(conn, sid)? {
+                            Some(sm) => out.push_str(&format!("    {}\n", memory_line(&sm))),
+                            None => out.push_str(&format!("    #{} (gone)\n", sid)),
+                        }
+                    }
+                }
+            } else if let Some(file) = src.strip_prefix("memory-backfill:") {
+                out.push_str(&format!(
+                    "  origin: Claude Code auto-memory file {} (retired 2026-09-08; backup in ~/.local/share/mach/backups/)\n",
+                    file
+                ));
+            } else if src.starts_with("note:") || src.starts_with("telegram:") {
+                out.push_str(&format!("  origin: {} (your own words)\n", src));
+            } else if !src.is_empty() {
+                out.push_str(&format!("  origin: {}\n", src));
+            }
+            // downstream
+            let cites = store::insights_citing(conn, id)?;
+            if !cites.is_empty() {
+                out.push_str("  cited by:\n");
+                for i in &cites {
+                    out.push_str(&format!(
+                        "    {} #{} (confidence {:.2}{}) {}\n",
+                        if i.level >= 2 { "theme" } else { "insight" },
+                        i.id,
+                        i.confidence,
+                        if i.is_flagged() { ", DOUBTED" } else { "" },
+                        truncate(&i.text, 90)
+                    ));
+                }
+            }
+            let edges = store::relations_evidenced_by(conn, id)?;
+            if !edges.is_empty() {
+                out.push_str("  evidence for graph edges:\n");
+                for e in &edges {
+                    let name = |eid: i64| store::get_entity(conn, eid).ok().flatten().map(|x| x.name).unwrap_or_else(|| format!("#{}", eid));
+                    out.push_str(&format!("    {} —{}→ {}\n", name(e.src), e.predicate, name(e.dst)));
+                }
+            }
+            let now = store::now_rfc3339();
+            let assoc = store::assoc_neighbors(conn, id, &now)?;
+            if !assoc.is_empty() {
+                out.push_str("  associated (engaged together in past sessions):\n");
+                for (other, w) in assoc.iter().take(5) {
+                    if let Some(om) = store::get(conn, *other)? {
+                        out.push_str(&format!("    w {:.2}  {}\n", w, memory_line(&om)));
+                    }
+                }
+            }
+        }
+        WhyTarget::Insight(id) => {
+            let Some(i) = store::get_insight(conn, id)? else {
+                return Ok(format!("no insight #{}", id));
+            };
+            let date = i.created_at.get(..10).unwrap_or(&i.created_at);
+            out.push_str(&format!(
+                "{} #{}  created {}  confidence {:.2}{}{}\n",
+                if i.level >= 2 { "theme" } else { "insight" },
+                i.id,
+                date,
+                i.confidence,
+                if i.is_flagged() { "  DOUBTED" } else { "" },
+                i.last_verified_at.as_deref().map(|v| format!("  last verified {}", &v[..10.min(v.len())])).unwrap_or_default(),
+            ));
+            out.push_str(&format!("  {}\n", i.text));
+            out.push_str(&format!("  derived from {} source(s):\n", i.source_ids.len()));
+            for sid in &i.source_ids {
+                let Ok(n) = sid.parse::<i64>() else { continue };
+                if i.level >= 2 {
+                    match store::get_insight(conn, n)? {
+                        Some(sub) => out.push_str(&format!(
+                            "    insight #{} (confidence {:.2}, {} memories) {}\n",
+                            sub.id,
+                            sub.confidence,
+                            sub.source_ids.len(),
+                            truncate(&sub.text, 90)
+                        )),
+                        None => out.push_str(&format!("    insight #{} (gone)\n", n)),
+                    }
+                } else {
+                    match store::get(conn, n)? {
+                        Some(m) => out.push_str(&format!(
+                            "    {}  [{}]\n",
+                            memory_line(&m),
+                            provenance_phrase(m.source.as_deref(), m.basis.as_deref())
+                        )),
+                        None => out.push_str(&format!("    #{} (gone)\n", n)),
+                    }
+                }
+            }
+            let cites = store::insights_citing(conn, id)?;
+            for t in cites.iter().filter(|t| t.level >= 2) {
+                out.push_str(&format!("  cited by theme #{} (confidence {:.2}) {}\n", t.id, t.confidence, truncate(&t.text, 90)));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn cmd_why(args: impl Iterator<Item = String>) -> io::Result<()> {
+    let args: Vec<String> = args.collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") || args.is_empty() {
+        println!("usage: mach kb why <memory-id>");
+        println!("       mach kb why insight <insight-id>   (also: mach kb why i<insight-id>)");
+        println!("Read-only provenance trace: where a memory came from, what it replaced, what cites it,");
+        println!("which graph edges it evidences, what it is associated with, and how often recall showed it.");
+        return if args.is_empty() { std::process::exit(1) } else { Ok(()) };
+    }
+    let Some(target) = parse_why_target(&args) else {
+        eprintln!("mach kb why: expected <id> or `insight <id>`, got {:?}", args);
+        std::process::exit(1);
+    };
+    let conn = store::open().map_err(to_io)?;
+    let home = std::env::var("HOME").unwrap_or_default();
+    let recall_dir = Path::new(&home).join(".local/share/mach/recall-log");
+    let meetings_dir = Path::new(&home).join(".local/share/mach/meetings");
+    let report = why_report(&conn, target, Some(&recall_dir), Some(&meetings_dir)).map_err(to_io)?;
+    print!("{}", report);
+    Ok(())
+}
+
 fn cmd_entity(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut name: Option<String> = None;
     while let Some(a) = args.next() {
@@ -5694,6 +6026,66 @@ mod tests {
         assert_eq!(hop2.predicate2.as_deref(), Some("works-on"));
         assert_eq!(hop2.src_name2.as_deref(), Some("user"));
         assert_eq!(hop2.dst_name2.as_deref(), Some("Umoja"));
+    }
+
+    #[test]
+    fn why_report_traces_a_memory_and_an_insight() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let old = store::insert(&conn, "TESTBOSS: Moses is the boss", None, None, true, None, 5).unwrap();
+        let new = store::insert_with_basis(&conn, "TESTBOSS: Ivar is the boss now", Some("session-digest"), None, false, None, 5, Some("stated")).unwrap();
+        conn.execute("UPDATE memories SET superseded_by = ?1, invalidated_at = ?2 WHERE id = ?3", rusqlite::params![new, now, old]).unwrap();
+        let ins = store::insert_insight(&conn, "leadership changed hands", 0.8, &[new.to_string()], None).unwrap();
+        let theme = store::insert_theme(&conn, "org churn", 0.6, &[ins.to_string()], None).unwrap();
+        let a = store::insert_entity(&conn, "Ivar", Some("person"), None).unwrap();
+        let b = store::insert_entity(&conn, "user", None, None).unwrap();
+        store::insert_relation(&conn, a, "boss-of", b, Some(new), Some(0.9), &now).unwrap();
+        conn.execute("INSERT INTO ingested_sessions (session_id, ingested_at) VALUES ('sess-42', ?1)", rusqlite::params![now]).unwrap();
+
+        let r = why_report(&conn, WhyTarget::Memory(new), None, None).unwrap();
+        assert!(r.contains(&format!("memory #{}", new)), "{}", r);
+        assert!(r.contains("you said this in a session"), "{}", r);
+        assert!(r.contains("basis: stated"), "{}", r);
+        assert!(r.contains(&format!("supersedes #{}", old)), "{}", r);
+        assert!(r.contains("likely session"), "{}", r);
+        assert!(r.contains("sess-42"), "{}", r);
+        assert!(r.contains(&format!("insight #{}", ins)), "{}", r);
+        assert!(r.contains("Ivar —boss-of→ user"), "{}", r);
+        assert!(!r.contains("recall:"), "recall section is skipped without a recall dir");
+
+        let r2 = why_report(&conn, WhyTarget::Insight(ins), None, None).unwrap();
+        assert!(r2.contains(&format!("insight #{}", ins)), "{}", r2);
+        assert!(r2.contains("Ivar is the boss now"), "{}", r2);
+        assert!(r2.contains(&format!("cited by theme #{}", theme)), "{}", r2);
+
+        let r3 = why_report(&conn, WhyTarget::Insight(theme), None, None).unwrap();
+        assert!(r3.starts_with(&format!("theme #{}", theme)), "{}", r3);
+        assert!(r3.contains(&format!("insight #{} (confidence 0.80, 1 memories)", ins)), "{}", r3);
+
+        assert_eq!(why_report(&conn, WhyTarget::Memory(9999), None, None).unwrap(), "no memory #9999");
+    }
+
+    #[test]
+    fn parse_why_target_accepts_the_three_spellings() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_why_target(&s(&["214"])), Some(WhyTarget::Memory(214)));
+        assert_eq!(parse_why_target(&s(&["i28"])), Some(WhyTarget::Insight(28)));
+        assert_eq!(parse_why_target(&s(&["insight", "28"])), Some(WhyTarget::Insight(28)));
+        assert_eq!(parse_why_target(&s(&["theme", "3"])), Some(WhyTarget::Insight(3)));
+        assert_eq!(parse_why_target(&s(&["nope"])), None);
+        assert_eq!(parse_why_target(&s(&[])), None);
+    }
+
+    #[test]
+    fn provenance_phrase_matches_the_hook() {
+        assert_eq!(provenance_phrase(Some("session-digest"), None), "picked up from a session");
+        assert_eq!(provenance_phrase(Some("session-digest"), Some("stated")), "you said this in a session");
+        assert_eq!(provenance_phrase(Some("session-digest"), Some("inferred")), "I inferred this from a session");
+        assert_eq!(provenance_phrase(Some("meeting:x"), None), "from a meeting");
+        assert_eq!(provenance_phrase(Some("memory-backfill:u/x.md"), None), "from earlier project memory");
+        assert_eq!(provenance_phrase(Some("note:2026"), Some("stated")), "you told me");
+        assert_eq!(provenance_phrase(None, Some("inferred")), "I inferred this from context");
+        assert_eq!(provenance_phrase(None, None), "you told me");
     }
 
     #[test]

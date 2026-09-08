@@ -33,3 +33,10 @@ ExecStartPre=-%h/.local/bin/mach kb ingest-sessions
 # connectivity, only the summarize step defers -- see markers.rs.
 ExecStartPre=-%h/.local/bin/mach meet process
 ExecStart=%h/.local/bin/mach kb reflect
+# Self-improvement pass, after reflect so any insight or affective edge the
+# reflect run just derived is in this run's evidence. Same best-effort
+# posture: below its signal threshold, offline, or with `claude` missing it
+# exits 0 without doing anything. It edits ~/.claude/skills, CLAUDE.md,
+# settings.json and ~/.config/claude-hooks only through a verified,
+# snapshot-guarded chezmoi commit -- see engines/kb/src/improve.rs.
+ExecStart=-%h/.local/bin/mach kb improve

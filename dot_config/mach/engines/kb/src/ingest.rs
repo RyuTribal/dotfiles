@@ -522,3 +522,233 @@ mod tests {
         assert!(!facts.iter().any(|f| f.to_lowercase().starts_with("always ") || f.to_lowercase().starts_with("never ")));
     }
 }
+
+// --- skill usage: what `mach kb improve` needs to judge existing skills ---
+
+/// Per-skill counts for one session: how often the `Skill` tool invoked it
+/// and how often the user's very next message read as a correction.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SkillUse {
+    pub invocations: u32,
+    pub corrections: u32,
+}
+
+/// Leading phrases that mark a human message as a correction of what
+/// Claude just did. Matched case-insensitively at the start of the trimmed
+/// message, and only when followed by end-of-text or a non-alphanumeric
+/// character, so "no" never matches "now" or "note".
+pub const CORRECTION_CUES: &[&str] = &[
+    "no",
+    "nope",
+    "wrong",
+    "stop",
+    "don't",
+    "dont",
+    "do not",
+    "undo",
+    "revert",
+    "not that",
+    "that's not",
+    "thats not",
+    "why did you",
+    "i didn't ask",
+    "i did not ask",
+];
+
+pub fn is_correction(text: &str) -> bool {
+    let t = text.trim().to_lowercase();
+    CORRECTION_CUES.iter().any(|cue| {
+        t.starts_with(cue) && t[cue.len()..].chars().next().map(|c| !c.is_alphanumeric()).unwrap_or(true)
+    })
+}
+
+/// The human-authored text of a transcript `user` line, or `None` for a
+/// tool-result line (content array of `tool_result` blocks) or anything
+/// unparseable. `origin.kind == "human"` is honored when present; otherwise
+/// a plain string content is taken as human.
+fn human_text(msg: &serde_json::Value) -> Option<String> {
+    if let Some(kind) = msg.get("origin").and_then(|o| o.get("kind")).and_then(|k| k.as_str()) {
+        if kind != "human" {
+            return None;
+        }
+    }
+    let content = msg.get("message")?.get("content")?;
+    if let Some(s) = content.as_str() {
+        return Some(s.to_string());
+    }
+    let arr = content.as_array()?;
+    let mut text = String::new();
+    for block in arr {
+        match block.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                    text.push_str(t);
+                }
+            }
+            Some("tool_result") => return None,
+            _ => {}
+        }
+    }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// No-LLM heuristic over a raw session transcript (Claude Code's JSONL):
+/// counts each `Skill` tool call by skill name (leading `/` stripped) and,
+/// for each, the number of times the next human message was a correction
+/// (`is_correction`). A human message always clears the pending skill, so
+/// a correction is only ever attributed to the most recent skill invoked
+/// before it. Sidechain (subagent) lines are ignored. Unparseable lines are
+/// skipped, never fatal.
+pub fn skill_usage_from_transcript(raw: &str) -> BTreeMap<String, SkillUse> {
+    let mut out: BTreeMap<String, SkillUse> = BTreeMap::new();
+    let mut pending: Option<String> = None;
+    for line in raw.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("isSidechain").and_then(|b| b.as_bool()) == Some(true) {
+            continue;
+        }
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("assistant") => {
+                let Some(blocks) = v.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) else {
+                    continue;
+                };
+                for b in blocks {
+                    if b.get("type").and_then(|t| t.as_str()) != Some("tool_use")
+                        || b.get("name").and_then(|n| n.as_str()) != Some("Skill")
+                    {
+                        continue;
+                    }
+                    let Some(skill) = b.get("input").and_then(|i| i.get("skill")).and_then(|s| s.as_str()) else {
+                        continue;
+                    };
+                    let name = skill.trim().trim_start_matches('/').to_string();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    out.entry(name.clone()).or_default().invocations += 1;
+                    pending = Some(name);
+                }
+            }
+            Some("user") => {
+                if let Some(text) = human_text(&v) {
+                    if let Some(skill) = pending.take() {
+                        if is_correction(&text) {
+                            out.entry(skill).or_default().corrections += 1;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// JSON for `ingested_sessions.skill_usage`; `None` when no skill was ever
+/// invoked, so the column stays NULL rather than `{}`.
+pub fn skill_usage_json(usage: &BTreeMap<String, SkillUse>) -> Option<String> {
+    if usage.is_empty() {
+        None
+    } else {
+        serde_json::to_string(usage).ok()
+    }
+}
+
+/// Per-skill totals across many sessions' `skill_usage` JSON blobs:
+/// `(invocations, corrections, sessions)`. A blob that fails to parse is
+/// skipped.
+pub fn merge_skill_usage<'a>(blobs: impl IntoIterator<Item = &'a str>) -> BTreeMap<String, (u32, u32, u32)> {
+    let mut out: BTreeMap<String, (u32, u32, u32)> = BTreeMap::new();
+    for blob in blobs {
+        let Ok(map) = serde_json::from_str::<BTreeMap<String, SkillUse>>(blob) else {
+            continue;
+        };
+        for (skill, use_) in map {
+            let e = out.entry(skill).or_default();
+            e.0 += use_.invocations;
+            e.1 += use_.corrections;
+            e.2 += 1;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod skill_usage_tests {
+    use super::*;
+
+    fn assistant_skill(skill: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"Skill","input":{{"skill":"{}"}}}}]}}}}"#,
+            skill
+        )
+    }
+    fn human(text: &str) -> String {
+        format!(r#"{{"type":"user","message":{{"role":"user","content":"{}"}},"origin":{{"kind":"human"}}}}"#, text)
+    }
+    fn tool_result() -> String {
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#
+            .to_string()
+    }
+
+    #[test]
+    fn correction_cues_respect_word_boundaries() {
+        assert!(is_correction("No, that's wrong"));
+        assert!(is_correction("  stop"));
+        assert!(is_correction("Don't do that"));
+        assert!(is_correction("why did you touch settings?"));
+        assert!(!is_correction("now build it"));
+        assert!(!is_correction("note this down"));
+        assert!(!is_correction("looks good"));
+    }
+
+    #[test]
+    fn counts_invocations_and_attributes_correction_to_last_skill() {
+        let raw = [
+            human("index this"),
+            assistant_skill("index-project"),
+            tool_result(),
+            human("no, wrong repo"),
+            assistant_skill("/kb"),
+            tool_result(),
+            human("thanks"),
+            assistant_skill("kb"),
+        ]
+        .join("\n");
+        let u = skill_usage_from_transcript(&raw);
+        assert_eq!(u["index-project"], SkillUse { invocations: 1, corrections: 1 });
+        assert_eq!(u["kb"], SkillUse { invocations: 2, corrections: 0 });
+    }
+
+    #[test]
+    fn human_message_clears_pending_so_later_corrections_are_not_attributed() {
+        let raw = [assistant_skill("kb"), human("fine"), human("no stop")].join("\n");
+        let u = skill_usage_from_transcript(&raw);
+        assert_eq!(u["kb"], SkillUse { invocations: 1, corrections: 0 });
+    }
+
+    #[test]
+    fn sidechain_and_garbage_lines_are_ignored() {
+        let side = r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"tool_use","name":"Skill","input":{"skill":"kb"}}]}}"#;
+        let raw = [side.to_string(), "not json".to_string(), assistant_skill("kb")].join("\n");
+        let u = skill_usage_from_transcript(&raw);
+        assert_eq!(u["kb"].invocations, 1);
+    }
+
+    #[test]
+    fn json_is_none_when_empty_and_merges_across_sessions() {
+        assert!(skill_usage_json(&BTreeMap::new()).is_none());
+        let a = skill_usage_from_transcript(&[assistant_skill("kb"), human("no")].join("\n"));
+        let b = skill_usage_from_transcript(&assistant_skill("kb"));
+        let ja = skill_usage_json(&a).unwrap();
+        let jb = skill_usage_json(&b).unwrap();
+        let merged = merge_skill_usage([ja.as_str(), jb.as_str(), "garbage"]);
+        assert_eq!(merged["kb"], (2, 1, 2));
+    }
+}

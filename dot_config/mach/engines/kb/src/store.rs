@@ -166,6 +166,20 @@ pub struct ReflectState {
     pub last_completed_at: Option<String>,
 }
 
+/// Watermarks for `mach kb improve`, same shape and semantics as
+/// `ReflectState`: `last_run_at`/`last_memory_id`/`last_relation_id` move
+/// together only when a run completed with the LLM call succeeding;
+/// `last_completed_at` is set by every invocation that reaches its own end
+/// (including the cheap below-threshold exit) so `mach kb health` can tell
+/// "not running" from "nothing to do".
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ImproveState {
+    pub last_run_at: Option<String>,
+    pub last_memory_id: Option<i64>,
+    pub last_relation_id: Option<i64>,
+    pub last_completed_at: Option<String>,
+}
+
 /// `~/.local/share/mach/kb.db`, the default store location.
 pub fn db_path() -> Result<PathBuf, KbError> {
     let home = env::var("HOME").map_err(|_| KbError::Other("HOME is not set".into()))?;
@@ -229,7 +243,15 @@ fn init_schema(conn: &Connection) -> Result<(), KbError> {
         );
         CREATE TABLE IF NOT EXISTS ingested_sessions (
             session_id TEXT PRIMARY KEY,
-            ingested_at TEXT NOT NULL
+            ingested_at TEXT NOT NULL,
+            skill_usage TEXT
+        );
+        CREATE TABLE IF NOT EXISTS improve_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            last_run_at TEXT,
+            last_memory_id INTEGER,
+            last_relation_id INTEGER,
+            last_completed_at TEXT
         );
         CREATE TABLE IF NOT EXISTS entities (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -469,6 +491,47 @@ fn migrate_v9_to_v10(conn: &Connection) -> Result<(), KbError> {
     Ok(())
 }
 
+fn existing_ingested_sessions_columns(conn: &Connection) -> Result<Vec<String>, KbError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(ingested_sessions)")?;
+    let cols = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(cols)
+}
+
+/// `PRAGMA user_version`-gated, idempotent 10 -> 11 migration for `mach kb
+/// improve`: seeds the `improve_state` singleton row (the table itself is
+/// created by `init_schema`) and adds `ingested_sessions.skill_usage`, the
+/// per-session skill-invocation/correction counts `ingest-sessions` records
+/// so the improve pass can see whether an existing skill is working. A
+/// fresh table already has the column; sessions ingested before this
+/// migration simply have no usage recorded (NULL).
+fn migrate_v10_to_v11(conn: &Connection) -> Result<(), KbError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS improve_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            last_run_at TEXT,
+            last_memory_id INTEGER,
+            last_relation_id INTEGER,
+            last_completed_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS ingested_sessions (
+            session_id TEXT PRIMARY KEY,
+            ingested_at TEXT NOT NULL
+        );",
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO improve_state (id, last_run_at, last_memory_id, last_relation_id) VALUES (1, NULL, NULL, NULL)",
+        [],
+    )?;
+    let cols = existing_ingested_sessions_columns(conn)?;
+    if !cols.iter().any(|c| c == "skill_usage") {
+        conn.execute("ALTER TABLE ingested_sessions ADD COLUMN skill_usage TEXT", [])?;
+    }
+    conn.execute("PRAGMA user_version = 11", [])?;
+    Ok(())
+}
+
 fn migrate_v6_to_v7(conn: &Connection) -> Result<(), KbError> {
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(
@@ -569,6 +632,9 @@ fn migrate(conn: &Connection) -> Result<(), KbError> {
     }
     if version < 10 {
         migrate_v9_to_v10(conn)?;
+    }
+    if version < 11 {
+        migrate_v10_to_v11(conn)?;
     }
     Ok(())
 }
@@ -1637,6 +1703,102 @@ pub fn mark_reflect_completed(conn: &Connection, now: &str) -> Result<(), KbErro
     Ok(())
 }
 
+// --- improve_state: `mach kb improve` watermarks ---
+
+pub fn get_improve_state(conn: &Connection) -> Result<ImproveState, KbError> {
+    let row = conn
+        .query_row(
+            "SELECT last_run_at, last_memory_id, last_relation_id, last_completed_at FROM improve_state WHERE id = 1",
+            [],
+            |r| {
+                Ok(ImproveState {
+                    last_run_at: r.get(0)?,
+                    last_memory_id: r.get(1)?,
+                    last_relation_id: r.get(2)?,
+                    last_completed_at: r.get(3)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row.unwrap_or_default())
+}
+
+/// Advances the improve watermark trio together (see `ImproveState`).
+pub fn update_improve_state(
+    conn: &Connection,
+    last_run_at: &str,
+    last_memory_id: Option<i64>,
+    last_relation_id: Option<i64>,
+) -> Result<(), KbError> {
+    conn.execute(
+        "INSERT INTO improve_state (id, last_run_at, last_memory_id, last_relation_id) VALUES (1, ?1, ?2, ?3)
+         ON CONFLICT(id) DO UPDATE SET last_run_at = excluded.last_run_at,
+             last_memory_id = excluded.last_memory_id, last_relation_id = excluded.last_relation_id",
+        params![last_run_at, last_memory_id, last_relation_id],
+    )?;
+    Ok(())
+}
+
+/// Records that `mach kb improve` reached its own end at `now` -- set on a
+/// below-threshold exit too, never on the offline-defer exit.
+pub fn mark_improve_completed(conn: &Connection, now: &str) -> Result<(), KbError> {
+    conn.execute(
+        "INSERT INTO improve_state (id, last_completed_at) VALUES (1, ?1)
+         ON CONFLICT(id) DO UPDATE SET last_completed_at = excluded.last_completed_at",
+        params![now],
+    )?;
+    Ok(())
+}
+
+/// Active relations with `id > last_id`, oldest first -- the improve pass's
+/// affective-signal input, filtered by predicate on the caller's side.
+pub fn relations_since(conn: &Connection, last_id: i64) -> Result<Vec<Relation>, KbError> {
+    let mut stmt =
+        conn.prepare("SELECT * FROM relations WHERE id > ?1 AND invalidated_at IS NULL ORDER BY id ASC")?;
+    let rows = stmt.query_map(params![last_id], row_to_relation)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Highest memory id present (0 on an empty table) -- what an improve run
+/// advances `last_memory_id` to, so a memory filtered out of the bundle is
+/// still counted as seen.
+pub fn latest_memory_id(conn: &Connection) -> Result<i64, KbError> {
+    Ok(conn.query_row("SELECT COALESCE(MAX(id), 0) FROM memories", [], |r| r.get(0))?)
+}
+
+/// Highest relation id present (0 on an empty table); see `latest_memory_id`.
+pub fn latest_relation_id(conn: &Connection) -> Result<i64, KbError> {
+    Ok(conn.query_row("SELECT COALESCE(MAX(id), 0) FROM relations", [], |r| r.get(0))?)
+}
+
+/// Active memories whose `source` starts with `prefix` OR whose `project`
+/// equals `project`, oldest first -- how the improve pass reads back its own
+/// prior outcomes (`source = "improve <ts> ..."`, `project = "claude-config"`)
+/// regardless of the watermark, so it always sees its full history.
+pub fn memories_by_source_prefix_or_project(
+    conn: &Connection,
+    prefix: &str,
+    project: &str,
+) -> Result<Vec<Memory>, KbError> {
+    let like = format!("{}%", prefix.replace('%', "\\%").replace('_', "\\_"));
+    let mut stmt = conn.prepare(
+        "SELECT * FROM memories
+         WHERE invalidated_at IS NULL AND dormant_at IS NULL
+           AND (source LIKE ?1 ESCAPE '\\' OR project = ?2)
+         ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map(params![like, project], row_to_memory)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
 // --- meta-reflection: level-2 themes ---
 
 /// Count of active (non-invalidated) insights at exactly `level` — the
@@ -2214,11 +2376,39 @@ pub fn is_session_ingested(conn: &Connection, session_id: &str) -> Result<bool, 
 /// fast-trigger racing the opportunistic sweep, say) a harmless no-op rather
 /// than an error.
 pub fn mark_session_ingested(conn: &Connection, session_id: &str, now: &str) -> Result<(), KbError> {
+    mark_session_ingested_with_usage(conn, session_id, now, None)
+}
+
+/// `mark_session_ingested` plus the session's skill-usage JSON (see
+/// `ingest::skill_usage_from_transcript`), `None` when the transcript had
+/// no `Skill` calls at all. Same `INSERT OR IGNORE` race posture.
+pub fn mark_session_ingested_with_usage(
+    conn: &Connection,
+    session_id: &str,
+    now: &str,
+    skill_usage: Option<&str>,
+) -> Result<(), KbError> {
     conn.execute(
-        "INSERT OR IGNORE INTO ingested_sessions (session_id, ingested_at) VALUES (?1, ?2)",
-        params![session_id, now],
+        "INSERT OR IGNORE INTO ingested_sessions (session_id, ingested_at, skill_usage) VALUES (?1, ?2, ?3)",
+        params![session_id, now, skill_usage],
     )?;
     Ok(())
+}
+
+/// `(ingested_at, skill_usage_json)` for every session ingested at or after
+/// `since` that recorded any skill usage, oldest first -- the improve pass
+/// sums these per skill.
+pub fn skill_usage_since(conn: &Connection, since: &str) -> Result<Vec<(String, String)>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT ingested_at, skill_usage FROM ingested_sessions
+         WHERE skill_usage IS NOT NULL AND ingested_at >= ?1 ORDER BY ingested_at ASC",
+    )?;
+    let rows = stmt.query_map(params![since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
 }
 
 
@@ -3222,10 +3412,11 @@ mod tests {
         // tables), v2->v3 (the insights `level` column), v3->v4 (the
         // memories `dormant_at` column), v4->v5 (the `dedupe_seen` table),
         // v5->v6 (`last_verified_at` + `contradiction_seen`), v6->v7 (the
-        // AUTOINCREMENT rebuild), then v7->v8 (`ingested_sessions`),
-        // landing at the current version.
+        // AUTOINCREMENT rebuild), v7->v8 (`ingested_sessions`), ... v10->v11
+        // (`improve_state` + `ingested_sessions.skill_usage`), landing at the
+        // current version.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1);
@@ -3374,7 +3565,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 10,
+            version, 11,
             "v1->v2 (reflection tables), v2->v3 (insights level column), v3->v4 (dormant_at), \
              v4->v5 (dedupe_seen), v5->v6 (last_verified_at + contradiction_seen), \
              v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions), v8->v9 (graph layer), \
@@ -3400,7 +3591,7 @@ mod tests {
     fn fresh_database_lands_at_current_user_version() {
         let conn = mem_conn();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
     }
 
     #[test]
@@ -3629,7 +3820,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 10,
+            version, 11,
             "v2->v3 (level column), v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, \
              v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions), v8->v9, v9->v10 all run"
         );
@@ -3673,7 +3864,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 10,
+            version, 11,
             "v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild), \
              v7->v8 (ingested_sessions), v8->v9, v9->v10 all run"
         );
@@ -3718,7 +3909,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 10,
+            version, 11,
             "v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 \
              (ingested_sessions), v8->v9, v9->v10 all run"
         );
@@ -3766,7 +3957,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 10, "v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) all run");
+        assert_eq!(version, 11, "v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) all run");
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -3826,7 +4017,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 10, "v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) both run");
+        assert_eq!(version, 11, "v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) both run");
 
         // Every row and its data survive the rebuild, ids included.
         let rows = list(&conn, None, false).unwrap();
@@ -3987,7 +4178,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 10, "v7->v8 (ingested_sessions) runs");
+        assert_eq!(version, 11, "v7->v8 (ingested_sessions) runs");
 
         assert_eq!(list(&conn, None, false).unwrap().len(), 1, "existing memory row must survive the migration");
 
@@ -4718,7 +4909,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 10, "v8->v9 (graph layer) runs");
+        assert_eq!(version, 11, "v8->v9 (graph layer) runs");
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -4779,7 +4970,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 10, "v9->v10 (last_completed_at + entity_merge_seen) runs");
+        assert_eq!(version, 11, "v9->v10 (last_completed_at + entity_merge_seen) runs");
 
         // The pre-existing watermark row survives, and last_completed_at
         // backfills to NULL (never completed under the new field yet).
@@ -5160,5 +5351,57 @@ mod tests {
 
         let all = active_relations_all(&conn).unwrap();
         assert_eq!(all.iter().map(|r| r.id).collect::<Vec<_>>(), vec![r1]);
+    }
+
+    #[test]
+    fn migration_v10_to_v11_seeds_improve_state_and_adds_skill_usage() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ingested_sessions (session_id TEXT PRIMARY KEY, ingested_at TEXT NOT NULL);
+             INSERT INTO ingested_sessions VALUES ('s1', '2026-01-01T00:00:00Z');
+             CREATE TABLE improve_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1), last_run_at TEXT, last_memory_id INTEGER,
+                last_relation_id INTEGER, last_completed_at TEXT
+             );
+             PRAGMA user_version = 10;",
+        )
+        .unwrap();
+        migrate_v10_to_v11(&conn).unwrap();
+        // idempotent
+        migrate_v10_to_v11(&conn).unwrap();
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 11);
+        let cols = existing_ingested_sessions_columns(&conn).unwrap();
+        assert!(cols.iter().any(|c| c == "skill_usage"));
+        assert_eq!(get_improve_state(&conn).unwrap(), ImproveState::default());
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM ingested_sessions", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn improve_state_and_skill_usage_round_trip() {
+        let conn = mem_conn();
+        let now = "2026-09-08T10:00:00Z";
+        mark_improve_completed(&conn, now).unwrap();
+        update_improve_state(&conn, now, Some(7), Some(3)).unwrap();
+        let st = get_improve_state(&conn).unwrap();
+        assert_eq!(st.last_memory_id, Some(7));
+        assert_eq!(st.last_relation_id, Some(3));
+        assert_eq!(st.last_completed_at.as_deref(), Some(now));
+
+        mark_session_ingested_with_usage(&conn, "s1", "2026-09-01T00:00:00Z", Some("{\"kb\":{\"invocations\":2,\"corrections\":0}}")).unwrap();
+        mark_session_ingested(&conn, "s2", "2026-09-02T00:00:00Z").unwrap();
+        mark_session_ingested_with_usage(&conn, "s0", "2026-08-01T00:00:00Z", Some("{}")).unwrap();
+        let rows = skill_usage_since(&conn, "2026-08-15T00:00:00Z").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "2026-09-01T00:00:00Z");
+
+        let a = insert(&conn, "outcome", Some("improve 2026-09-08T10:00:00Z abc"), Some("claude-config"), true, None, 6).unwrap();
+        let b = insert(&conn, "other", Some("session-digest"), Some("claude-config"), true, None, 5).unwrap();
+        let _c = insert(&conn, "unrelated", Some("improvement idea"), None, true, None, 5).unwrap();
+        let hits: Vec<i64> = memories_by_source_prefix_or_project(&conn, "improve ", "claude-config").unwrap().iter().map(|m| m.id).collect();
+        assert_eq!(hits, vec![a, b]);
+        assert_eq!(latest_memory_id(&conn).unwrap(), _c);
+        assert_eq!(latest_relation_id(&conn).unwrap(), 0);
     }
 }

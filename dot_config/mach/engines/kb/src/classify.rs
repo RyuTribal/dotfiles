@@ -132,20 +132,32 @@ fn extract_id(rest: &str) -> Option<i64> {
 /// for its own one-shot sonnet call rather than duplicating this function
 /// across crates.
 pub fn run_claude(claude_bin: &str, model: &str, timeout: Duration, prompt: &str) -> Result<String, String> {
-    let mut child = Command::new(claude_bin)
-        .arg("-p")
+    let mut cmd = Command::new(claude_bin);
+    cmd.arg("-p")
         .arg("--model")
         .arg(model)
         .arg("--permission-prompts")
         .arg("none")
         .arg("--disallowedTools")
         .arg("Bash Edit Write NotebookEdit WebFetch WebSearch Agent")
-        .env("MACH_KB_DIGEST", "1")
+        .env("MACH_KB_DIGEST", "1");
+    run_with_stdin(cmd, timeout, prompt)
+}
+
+/// Spawns `cmd` with `prompt` on stdin and polls it to completion (or up to
+/// `timeout`, killing it), returning stdout on a zero exit. The process
+/// mechanics behind `run_claude`, shared with `improve::ProcessImproveLlm`,
+/// whose agentic `claude -p` needs a different flag set (an allowlist of
+/// file-editing tools instead of a denylist) but the same stdin/timeout
+/// discipline.
+pub fn run_with_stdin(mut cmd: Command, timeout: Duration, prompt: &str) -> Result<String, String> {
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("failed to spawn '{}': {}", claude_bin, e))?;
+        .map_err(|e| format!("failed to spawn '{}': {}", program, e))?;
 
     if let Some(mut stdin) = child.stdin.take() {
         // Best-effort: if the child has already exited (or its stdin pipe
@@ -165,18 +177,18 @@ pub fn run_claude(claude_bin: &str, model: &str, timeout: Duration, prompt: &str
                 return if status.success() {
                     Ok(out)
                 } else {
-                    Err(format!("'{}' exited with {:?}", claude_bin, status.code()))
+                    Err(format!("'{}' exited with {:?}", program, status.code()))
                 };
             }
             Ok(None) => {
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!("'{}' timed out after {:?}", claude_bin, timeout));
+                    return Err(format!("'{}' timed out after {:?}", program, timeout));
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            Err(e) => return Err(format!("error waiting on '{}': {}", claude_bin, e)),
+            Err(e) => return Err(format!("error waiting on '{}': {}", program, e)),
         }
     }
 }

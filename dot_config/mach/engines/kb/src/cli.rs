@@ -13,6 +13,7 @@ use crate::classify::{self, Classifier, Verdict};
 use crate::embed::{Embedder, OllamaEmbedder};
 use crate::export;
 use crate::health;
+use crate::improve::{self, ImproveLlm, Vcs};
 use crate::ingest;
 use crate::reflect::{self, ProcessReflectLlm, ReflectLlm, Stage2Result, ThemeResult, TIMEOUT_HAIKU, TIMEOUT_SONNET};
 use crate::store::{self, AddOutcome, Insight, InsightHit, KbError, Memory, RankedHit};
@@ -69,6 +70,13 @@ fn print_help() {
     println!("                          session-digest hook). No args: sweeps every session");
     println!("                          transcript idle >=10min and not yet processed. --session-id:");
     println!("                          processes exactly that session now (the SessionEnd trigger)");
+    println!("  improve [--dry-run] [--force]");
+    println!("                          self-improvement pass: when enough new signal (memories +");
+    println!("                          prefers/rejects/values edges) has accrued since its last run,");
+    println!("                          hands the evidence to one agentic claude call allowed to edit");
+    println!("                          ~/.claude/skills, CLAUDE.md, settings.json and claude-hooks;");
+    println!("                          verifies, commits via chezmoi, records the outcome as a memory.");
+    println!("                          --dry-run prints the prompt; --force ignores the threshold");
     println!("  entity <name>           association graph for one entity — active edges both");
     println!("                          directions, with evidence memory + date (exact name");
     println!("                          match first, else embedding similarity)");
@@ -99,6 +107,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Some("export") => cmd_export(args),
         Some("import") => cmd_import(args),
         Some("ingest-sessions") => cmd_ingest_sessions(args),
+        Some("improve") => cmd_improve(args),
         Some("entity") => cmd_entity(args),
         Some("graph") => cmd_graph(args),
         Some("health") => cmd_health(args),
@@ -3145,13 +3154,17 @@ fn run_ingest_sessions<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>(
             continue; // unreadable this run -- stays unprocessed, retried later
         };
 
+        // No-LLM skill-usage counts for `mach kb improve`, recorded on every
+        // path that marks this session processed.
+        let usage_json = ingest::skill_usage_json(&ingest::skill_usage_from_transcript(&raw));
+
         let recall_log_path = recall_log_root.join(format!("{}.jsonl", session_id));
         let injected_ids: Vec<i64> =
             std::fs::read_to_string(&recall_log_path).map(|c| ingest::parse_recall_log(&c)).unwrap_or_default();
 
         let raw_line_count = raw.lines().count();
         if raw_line_count < INGEST_TRIVIAL_LINE_FLOOR && injected_ids.is_empty() {
-            store::mark_session_ingested(conn, &session_id, now)?;
+            store::mark_session_ingested_with_usage(conn, &session_id, now, usage_json.as_deref())?;
             summary.processed += 1;
             continue;
         }
@@ -3166,7 +3179,7 @@ fn run_ingest_sessions<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>(
                 // no `claude` call was needed, so this is always safe to
                 // mark processed.
                 summary.shown += injected_ids.len();
-                store::mark_session_ingested(conn, &session_id, now)?;
+                store::mark_session_ingested_with_usage(conn, &session_id, now, usage_json.as_deref())?;
                 summary.processed += 1;
                 continue;
             }
@@ -3229,7 +3242,7 @@ fn run_ingest_sessions<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>(
             continue; // leave unprocessed -- retried on a later run
         }
 
-        store::mark_session_ingested(conn, &session_id, now)?;
+        store::mark_session_ingested_with_usage(conn, &session_id, now, usage_json.as_deref())?;
         summary.processed += 1;
     }
 
@@ -3397,6 +3410,40 @@ fn check_reflect_completion(conn_result: &Result<Connection, KbError>) -> health
     health::Check { name, ok, detail }
 }
 
+/// `mach kb improve` liveness: completed within `improve::STALE_WARN_HOURS`
+/// and not `improve::HEALTH_FAIL_STREAK` failures in a row.
+fn check_improve(conn_result: &Result<Connection, KbError>) -> health::Check {
+    let name = "improve".to_string();
+    let conn = match conn_result {
+        Ok(c) => c,
+        Err(_) => return health::Check { name, ok: false, detail: "kb.db unavailable".to_string() },
+    };
+    let state = match store::get_improve_state(conn) {
+        Ok(s) => s,
+        Err(e) => return health::Check { name, ok: false, detail: e.to_string() },
+    };
+    let now = store::now_rfc3339();
+    let hours = state.last_completed_at.as_deref().map(|ts| store::age_days(ts, &now) * 24.0);
+    let outcomes = match store::memories_by_source_prefix_or_project(conn, improve::OUTCOME_SOURCE_PREFIX, improve::OUTCOME_PROJECT) {
+        Ok(v) => v,
+        Err(e) => return health::Check { name, ok: false, detail: e.to_string() },
+    };
+    let recent_failed: Vec<bool> = outcomes
+        .iter()
+        .rev()
+        .filter(|m| m.source.as_deref().map(|s| s.starts_with(improve::OUTCOME_SOURCE_PREFIX)).unwrap_or(false))
+        .take(improve::HEALTH_FAIL_STREAK)
+        .map(improve::is_failed_outcome)
+        .collect();
+    let ok = improve::health_ok(hours, &recent_failed);
+    let streak = recent_failed.iter().filter(|f| **f).count();
+    let detail = match hours {
+        Some(h) => format!("last completed {:.1}h ago, {} recent failures", h, streak),
+        None => "never completed".to_string(),
+    };
+    health::Check { name, ok, detail }
+}
+
 /// Checks that `machd`'s kb socket subsystem (`socket::run`) is up and
 /// actually answers a `search` op — a real one-shot round trip over
 /// `$XDG_RUNTIME_DIR/mach-kb.sock`, not just a file-exists check.
@@ -3546,6 +3593,370 @@ fn maybe_send_health_notification(checks: &[health::Check]) {
     }
 }
 
+// --- improve: the knowledge bank feeding back into Claude's own config ---
+
+/// What one `mach kb improve` invocation came to (before any exit code).
+#[derive(Debug)]
+enum ImproveRun {
+    BelowThreshold { signal: usize, min_signal: usize },
+    DryRun { prompt: String },
+    Done(improve::Outcome),
+}
+
+/// New signal since the improve watermark: `(new_memories, signal_relations)`.
+/// This pass's own outcome memories are never "new" -- they ride along in
+/// the history section instead.
+fn improve_signal(conn: &Connection, state: &store::ImproveState) -> Result<(Vec<Memory>, Vec<store::Relation>), KbError> {
+    let history_ids: HashSet<i64> =
+        store::memories_by_source_prefix_or_project(conn, improve::OUTCOME_SOURCE_PREFIX, improve::OUTCOME_PROJECT)?
+            .iter()
+            .map(|m| m.id)
+            .collect();
+    let new_memories: Vec<Memory> = store::memories_since(conn, state.last_memory_id.unwrap_or(0))?
+        .into_iter()
+        .filter(|m| !history_ids.contains(&m.id))
+        .collect();
+    let relations: Vec<store::Relation> = store::relations_since(conn, state.last_relation_id.unwrap_or(0))?
+        .into_iter()
+        .filter(|r| improve::is_signal_predicate(&r.predicate))
+        .collect();
+    Ok((new_memories, relations))
+}
+
+fn build_improve_bundle(
+    conn: &Connection,
+    targets: &improve::Targets,
+    new_memories: Vec<Memory>,
+    relations: &[store::Relation],
+    now_secs: u64,
+) -> Result<improve::Bundle, KbError> {
+    let model_lines: Vec<String> = store::mental_model(conn)?.iter().map(format_model_row).collect();
+    let history =
+        store::memories_by_source_prefix_or_project(conn, improve::OUTCOME_SOURCE_PREFIX, improve::OUTCOME_PROJECT)?;
+    let mut rel_lines = Vec::new();
+    for r in relations {
+        let name = |id: i64| -> Result<String, KbError> {
+            Ok(store::get_entity(conn, id)?.map(|e| e.name).unwrap_or_else(|| format!("entity#{}", id)))
+        };
+        let evidence = match r.evidence_memory_id {
+            Some(id) => store::get(conn, id)?.map(|m| m.content),
+            None => None,
+        };
+        rel_lines.push(improve::RelationLine {
+            id: r.id,
+            src: name(r.src)?,
+            predicate: r.predicate.clone(),
+            dst: name(r.dst)?,
+            evidence_id: r.evidence_memory_id,
+            evidence,
+        });
+    }
+    let since = store::now_rfc3339_from_secs(now_secs.saturating_sub(improve::SKILL_USAGE_WINDOW_DAYS * 86_400));
+    let blobs = store::skill_usage_since(conn, &since)?;
+    let skill_usage = ingest::merge_skill_usage(blobs.iter().map(|(_, j)| j.as_str()));
+    Ok(improve::Bundle {
+        model_lines,
+        new_memories,
+        history,
+        relations: rel_lines,
+        skill_usage,
+        inventory: improve::inventory(targets),
+    })
+}
+
+fn record_improve_outcome<E: Embedder>(
+    conn: &Connection,
+    embedder: &E,
+    outcome: &improve::Outcome,
+    now: &str,
+) -> Result<(), KbError> {
+    let text = outcome.memory_text();
+    let embedding = embedder.embed(&text).ok();
+    store::insert(
+        conn,
+        &text,
+        Some(&outcome.memory_source(now)),
+        Some(improve::OUTCOME_PROJECT),
+        true,
+        embedding.as_deref(),
+        improve::OUTCOME_IMPORTANCE,
+    )?;
+    Ok(())
+}
+
+/// The whole guarded run after the gate has opened: preflight, snapshot,
+/// the agentic call, verification, commit, outcome memory, watermark.
+/// Network-free except through `llm`/`vcs`, so tests drive it with fakes.
+#[allow(clippy::too_many_arguments)]
+fn run_improve<E: Embedder, L: ImproveLlm, V: Vcs>(
+    conn: &Connection,
+    embedder: &E,
+    llm: &L,
+    vcs: &V,
+    targets: &improve::Targets,
+    snapshot_root: &Path,
+    model: &str,
+    timeout: std::time::Duration,
+    min_signal: usize,
+    force: bool,
+    dry_run: bool,
+    now: &str,
+    now_secs: u64,
+) -> Result<ImproveRun, KbError> {
+    let state = store::get_improve_state(conn)?;
+    let (new_memories, relations) = improve_signal(conn, &state)?;
+    let signal = new_memories.len() + relations.len();
+    if !improve::should_run(signal, min_signal, force) {
+        store::mark_improve_completed(conn, now)?;
+        return Ok(ImproveRun::BelowThreshold { signal, min_signal });
+    }
+
+    let bundle = build_improve_bundle(conn, targets, new_memories, &relations, now_secs)?;
+    let prompt = improve::build_prompt(&bundle, targets);
+    if dry_run {
+        return Ok(ImproveRun::DryRun { prompt });
+    }
+
+    // A failure anywhere below is recorded as an outcome memory and never
+    // advances the watermark, so the same evidence gets another look.
+    let finish = |outcome: improve::Outcome, advance: bool| -> Result<ImproveRun, KbError> {
+        record_improve_outcome(conn, embedder, &outcome, now)?;
+        if advance {
+            // after the insert, so the outcome memory itself is never "new"
+            store::update_improve_state(
+                conn,
+                now,
+                Some(store::latest_memory_id(conn)?),
+                Some(store::latest_relation_id(conn)?),
+            )?;
+        }
+        store::mark_improve_completed(conn, now)?;
+        if let Some(line) = outcome.notification() {
+            improve::notify(&line);
+        }
+        Ok(ImproveRun::Done(outcome))
+    };
+    let fail = |reason: String| finish(improve::Outcome::Failed { reason }, false);
+
+    // --- preflight: every target chezmoi-managed, source repo clean, no human WIP on a target
+    let managed = match vcs.managed() {
+        Ok(m) => m,
+        Err(e) => return fail(format!("chezmoi managed: {}", e)),
+    };
+    let unmanaged = improve::unmanaged_targets(&managed, targets);
+    if !unmanaged.is_empty() {
+        let list: Vec<String> = unmanaged.iter().map(|p| p.display().to_string()).collect();
+        return fail(format!("write targets not chezmoi-managed: {} (run `chezmoi add` on them)", list.join(", ")));
+    }
+    match vcs.source_clean() {
+        Ok(true) => {}
+        Ok(false) => return fail("chezmoi source repo has uncommitted changes".to_string()),
+        Err(e) => return fail(format!("git status: {}", e)),
+    }
+    let pre_status: HashSet<PathBuf> = match vcs.status() {
+        Ok(v) => v.into_iter().collect(),
+        Err(e) => return fail(format!("chezmoi status: {}", e)),
+    };
+    if let Some(p) = pre_status.iter().find(|p| targets.allows(p)) {
+        return fail(format!("{} differs from its chezmoi source before the run (human edit in progress?)", p.display()));
+    }
+
+    // --- snapshot, call, verify
+    let snap = match improve::snapshot(targets, &snapshot_root.join(now.replace(':', "-"))) {
+        Ok(s) => s,
+        Err(e) => return fail(format!("snapshot: {}", e)),
+    };
+    let rollback = |why: String| -> String {
+        match improve::restore(&snap) {
+            Ok(()) => why,
+            Err(e) => format!(
+                "{} (AND restore failed: {} -- targets may be inconsistent, snapshot kept at {})",
+                why,
+                e,
+                snap.dir.display()
+            ),
+        }
+    };
+
+    let output = match llm.run(&prompt, targets, model, timeout) {
+        Ok(o) => o,
+        Err(e) => return fail(rollback(format!("claude: {}", e))),
+    };
+    let Some(result) = improve::parse_result(&output) else {
+        return fail(rollback("claude reply had no valid IMPROVE-RESULT block".to_string()));
+    };
+
+    // anything chezmoi now sees out of sync that it didn't before and that
+    // is outside the targets: put it back from source, then roll back
+    match vcs.status() {
+        Ok(post) => {
+            let strays: Vec<PathBuf> =
+                post.into_iter().filter(|p| !pre_status.contains(p) && !targets.allows(p)).collect();
+            if !strays.is_empty() {
+                for p in &strays {
+                    let _ = vcs.apply_force(p);
+                }
+                let list: Vec<String> = strays.iter().map(|p| p.display().to_string()).collect();
+                return fail(rollback(format!(
+                    "claude changed managed files outside the write targets: {}",
+                    list.join(", ")
+                )));
+            }
+        }
+        Err(e) => return fail(rollback(format!("chezmoi status after run: {}", e))),
+    }
+
+    let changes = match improve::changed_files(&snap) {
+        Ok(c) => c,
+        Err(e) => return fail(rollback(format!("diffing targets against snapshot: {}", e))),
+    };
+    if result.action == improve::Action::None {
+        if !changes.is_empty() {
+            let list: Vec<String> = changes.iter().map(|c| c.path().display().to_string()).collect();
+            return fail(rollback(format!("claude reported no action but changed: {}", list.join(", "))));
+        }
+        let _ = std::fs::remove_dir_all(&snap.dir);
+        return finish(improve::Outcome::Nothing { rationale: result.rationale }, true);
+    }
+    if changes.is_empty() {
+        // claimed an edit, made none -- record as a no-op, evidence still consumed
+        let _ = std::fs::remove_dir_all(&snap.dir);
+        return finish(
+            improve::Outcome::Nothing {
+                rationale: format!(
+                    "(claude reported `{}` but changed no file) {}",
+                    result.action.as_str(),
+                    result.rationale
+                ),
+            },
+            true,
+        );
+    }
+    if let Err(e) = improve::verify_changes(&changes, targets, &snap) {
+        return fail(rollback(format!("verification: {}", e)));
+    }
+
+    // --- commit
+    for c in &changes {
+        let r = match c {
+            improve::Change::Added(p) | improve::Change::Modified(p) => vcs.add(p),
+            improve::Change::Deleted(p) => vcs.forget(p),
+        };
+        if let Err(e) = r {
+            return fail(rollback(format!("chezmoi add/forget {}: {}", c.path().display(), e)));
+        }
+    }
+    let mut result = result;
+    // trust the diff over the reply for the file list
+    result.files = changes.iter().map(|c| c.path().to_path_buf()).collect();
+    let sha = match vcs.commit(&improve::commit_message(&result)) {
+        Ok(s) => s,
+        Err(e) => return fail(rollback(format!("git commit: {}", e))),
+    };
+    let _ = std::fs::remove_dir_all(&snap.dir);
+    finish(improve::Outcome::Applied { result, sha }, true)
+}
+
+fn cmd_improve(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut dry_run = false;
+    let mut force = false;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--dry-run" => dry_run = true,
+            "--force" => force = true,
+            "-h" | "--help" => {
+                println!("usage: mach kb improve [--dry-run] [--force]");
+                println!("       --dry-run: build and print the evidence prompt, spawn nothing, change nothing");
+                println!(
+                    "       --force:   run even when new signal is below MACH_IMPROVE_MIN_SIGNAL ({})",
+                    improve::DEFAULT_MIN_SIGNAL
+                );
+                println!(
+                    "       env: MACH_IMPROVE_MODEL (default {}), MACH_IMPROVE_TIMEOUT_SECS (default {})",
+                    improve::DEFAULT_MODEL,
+                    improve::DEFAULT_TIMEOUT.as_secs()
+                );
+                return Ok(());
+            }
+            other => {
+                eprintln!("mach kb improve: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+    let home = match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => PathBuf::from(h),
+        _ => {
+            eprintln!("mach kb improve: HOME is not set");
+            std::process::exit(1);
+        }
+    };
+    let conn = store::open().map_err(to_io)?;
+    let now = store::now_rfc3339();
+    let now_secs = store::now_secs();
+    let targets = improve::Targets::from_home(&home);
+    let min_signal = improve::min_signal_from_env();
+
+    // Cheap DB-only gate before the connectivity probe, same order as reflect.
+    let state = store::get_improve_state(&conn).map_err(to_io)?;
+    let (new_memories, relations) = improve_signal(&conn, &state).map_err(to_io)?;
+    let signal = new_memories.len() + relations.len();
+    if !improve::should_run(signal, min_signal, force) {
+        store::mark_improve_completed(&conn, &now).map_err(to_io)?;
+        println!("mach kb improve: {} new signal rows since last run (< {}), nothing to do", signal, min_signal);
+        return Ok(());
+    }
+    if !dry_run && !reflect::claude_reachable() {
+        println!("mach kb improve: offline, deferring");
+        return Ok(());
+    }
+
+    let snapshot_root = std::env::var("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("mach-improve");
+    let embedder = OllamaEmbedder::new();
+    let llm = improve::ProcessImproveLlm::new(home.clone());
+    let vcs = improve::ProcessChezmoi;
+    let run = run_improve(
+        &conn,
+        &embedder,
+        &llm,
+        &vcs,
+        &targets,
+        &snapshot_root,
+        &improve::model_from_env(),
+        improve::timeout_from_env(),
+        min_signal,
+        force,
+        dry_run,
+        &now,
+        now_secs,
+    )
+    .map_err(to_io)?;
+    match run {
+        ImproveRun::BelowThreshold { signal, min_signal } => {
+            println!("mach kb improve: {} new signal rows (< {}), nothing to do", signal, min_signal)
+        }
+        ImproveRun::DryRun { prompt } => print!("{}", prompt),
+        ImproveRun::Done(improve::Outcome::Applied { result, sha }) => {
+            println!("mach kb improve: {} -> commit {}", result.action.as_str(), sha);
+            for f in &result.files {
+                println!("  {}", f.display());
+            }
+            println!("  {}", result.rationale);
+        }
+        ImproveRun::Done(improve::Outcome::Nothing { rationale }) => {
+            println!("mach kb improve: no change warranted. {}", rationale)
+        }
+        ImproveRun::Done(improve::Outcome::Failed { reason }) => {
+            eprintln!("mach kb improve: FAILED, rolled back: {}", reason);
+            std::process::exit(2);
+        }
+    }
+    Ok(())
+}
+
 fn cmd_health(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut notify = false;
     while let Some(a) = args.next() {
@@ -3581,6 +3992,7 @@ fn cmd_health(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         check_ollama(),
         check_kb_db(&conn_result),
         check_reflect_completion(&conn_result),
+        check_improve(&conn_result),
         check_kb_socket(),
         check_recall_log_writable(),
         check_disk_headroom(),
@@ -5253,5 +5665,251 @@ mod tests {
         let after_wake = entity_connections_for_query(&conn, "unrelated query text", &q);
         assert_eq!(after_wake.len(), 1);
         assert_eq!(after_wake[0].src_name, "Moses");
+    }
+}
+
+#[cfg(test)]
+mod improve_run_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    struct FakeEmbedder;
+    impl Embedder for FakeEmbedder {
+        fn embed(&self, text: &str) -> Result<Vec<f32>, KbError> {
+            Ok(text.bytes().take(8).map(|b| b as f32).collect())
+        }
+    }
+
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!("mach-kb-improve-run-{}-{}-{}", std::process::id(), tag, n));
+            std::fs::create_dir_all(&p).unwrap();
+            Scratch(p)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write(p: &Path, s: &str) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, s).unwrap();
+    }
+
+    /// A home with every target present and a db holding enough signal to
+    /// open the gate.
+    fn setup(tag: &str) -> (Scratch, improve::Targets, Connection) {
+        let s = Scratch::new(tag);
+        let t = improve::Targets::from_home(&s.0.join("home"));
+        write(&t.skills_dir.join("kb/SKILL.md"), "---\nname: kb\ndescription: memory\n---\nbody\n");
+        write(&t.claude_md, "# Global Rules\n\nrule one\nrule two\n");
+        write(&t.settings_json, "{\"hooks\":{}}");
+        write(&t.hooks_dir.join("kb-model.sh"), "#!/usr/bin/env bash\nexit 0\n");
+        let conn = store::open_with_path(Path::new(":memory:")).unwrap();
+        for i in 0..6 {
+            store::insert(&conn, &format!("user rejects unrequested debug logging {}", i), Some("session-digest"), None, true, None, 5)
+                .unwrap();
+        }
+        (s, t, conn)
+    }
+
+    /// Writes the given files (relative to home) then returns `reply`.
+    struct FakeLlm {
+        writes: Vec<(String, String)>,
+        reply: String,
+    }
+    impl ImproveLlm for FakeLlm {
+        fn run(&self, prompt: &str, targets: &improve::Targets, _m: &str, _t: Duration) -> Result<String, String> {
+            assert!(prompt.contains("IMPROVE-RESULT"));
+            let home = targets.claude_md.parent().unwrap().parent().unwrap();
+            for (rel, content) in &self.writes {
+                write(&home.join(rel), content);
+            }
+            Ok(self.reply.clone())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeVcs {
+        managed: HashSet<PathBuf>,
+        status_after: Vec<PathBuf>,
+        added: RefCell<Vec<PathBuf>>,
+        forgotten: RefCell<Vec<PathBuf>>,
+        forced: RefCell<Vec<PathBuf>>,
+        commits: RefCell<Vec<String>>,
+        calls: RefCell<u32>,
+    }
+    impl FakeVcs {
+        fn managing(t: &improve::Targets) -> Self {
+            FakeVcs { managed: t.roots().iter().map(|p| p.to_path_buf()).collect(), ..Default::default() }
+        }
+    }
+    impl Vcs for FakeVcs {
+        fn managed(&self) -> Result<HashSet<PathBuf>, String> {
+            Ok(self.managed.clone())
+        }
+        fn status(&self) -> Result<Vec<PathBuf>, String> {
+            // first call is the pre-run status (clean), later calls are post-run
+            let mut c = self.calls.borrow_mut();
+            *c += 1;
+            Ok(if *c == 1 { Vec::new() } else { self.status_after.clone() })
+        }
+        fn source_clean(&self) -> Result<bool, String> {
+            Ok(true)
+        }
+        fn add(&self, path: &Path) -> Result<(), String> {
+            self.added.borrow_mut().push(path.to_path_buf());
+            Ok(())
+        }
+        fn forget(&self, path: &Path) -> Result<(), String> {
+            self.forgotten.borrow_mut().push(path.to_path_buf());
+            Ok(())
+        }
+        fn apply_force(&self, path: &Path) -> Result<(), String> {
+            self.forced.borrow_mut().push(path.to_path_buf());
+            Ok(())
+        }
+        fn commit(&self, message: &str) -> Result<String, String> {
+            self.commits.borrow_mut().push(message.to_string());
+            Ok("abc1234".to_string())
+        }
+    }
+
+    fn go(conn: &Connection, llm: &FakeLlm, vcs: &FakeVcs, t: &improve::Targets, snap: &Path, dry: bool) -> ImproveRun {
+        run_improve(conn, &FakeEmbedder, llm, vcs, t, snap, "sonnet", Duration::from_secs(5), 5, false, dry, "2026-09-08T12:00:00Z", 1_800_000_000)
+            .unwrap()
+    }
+
+    fn outcomes(conn: &Connection) -> Vec<Memory> {
+        store::memories_by_source_prefix_or_project(conn, improve::OUTCOME_SOURCE_PREFIX, improve::OUTCOME_PROJECT).unwrap()
+    }
+
+    #[test]
+    fn below_threshold_marks_completed_without_calling_anything() {
+        let (s, t, conn) = setup("gate");
+        let conn2 = store::open_with_path(Path::new(":memory:")).unwrap();
+        let llm = FakeLlm { writes: vec![], reply: String::new() };
+        let vcs = FakeVcs::managing(&t);
+        match go(&conn2, &llm, &vcs, &t, &s.0.join("snap"), false) {
+            ImproveRun::BelowThreshold { signal, min_signal } => {
+                assert_eq!((signal, min_signal), (0, 5));
+            }
+            other => panic!("{:?}", other),
+        }
+        assert!(store::get_improve_state(&conn2).unwrap().last_completed_at.is_some());
+        assert!(vcs.commits.borrow().is_empty());
+        drop(conn);
+    }
+
+    #[test]
+    fn dry_run_returns_prompt_and_touches_nothing() {
+        let (s, t, conn) = setup("dry");
+        let llm = FakeLlm { writes: vec![(".claude/CLAUDE.md".into(), "x".into())], reply: String::new() };
+        let vcs = FakeVcs::managing(&t);
+        match go(&conn, &llm, &vcs, &t, &s.0.join("snap"), true) {
+            ImproveRun::DryRun { prompt } => assert!(prompt.contains("unrequested debug logging")),
+            other => panic!("{:?}", other),
+        }
+        assert_eq!(std::fs::read_to_string(&t.claude_md).unwrap(), "# Global Rules\n\nrule one\nrule two\n");
+        assert!(outcomes(&conn).is_empty());
+    }
+
+    #[test]
+    fn applied_run_commits_records_outcome_and_advances_watermark() {
+        let (s, t, conn) = setup("apply");
+        let llm = FakeLlm {
+            writes: vec![
+                (".claude/skills/no-debug-logging/SKILL.md".into(), "---\nname: no-debug-logging\ndescription: Use when debugging.\n---\nDo not add logging unasked.\n".into()),
+                (".claude/CLAUDE.md".into(), "# Global Rules\n\nrule one\nrule two\nrule three\n".into()),
+            ],
+            reply: "done\n\nIMPROVE-RESULT\naction: create\nfiles: whatever\nrationale: repeated rejections\nevidence: m1, m2\n".into(),
+        };
+        let vcs = FakeVcs::managing(&t);
+        let run = go(&conn, &llm, &vcs, &t, &s.0.join("snap"), false);
+        let ImproveRun::Done(improve::Outcome::Applied { result, sha }) = run else { panic!("{:?}", run) };
+        assert_eq!(sha, "abc1234");
+        assert_eq!(result.files.len(), 2, "file list comes from the diff, not the reply");
+        assert_eq!(vcs.added.borrow().len(), 2);
+        let commits = vcs.commits.borrow();
+        assert!(commits[0].starts_with("improve: create "), "{}", commits[0]);
+        assert!(commits[0].contains("no-debug-logging/SKILL.md"));
+        assert!(commits[0].contains("CLAUDE.md"));
+
+        let o = outcomes(&conn);
+        assert_eq!(o.len(), 1);
+        assert!(o[0].source.as_deref().unwrap().ends_with(" abc1234"));
+        let st = store::get_improve_state(&conn).unwrap();
+        assert_eq!(st.last_memory_id, Some(o[0].id), "watermark sits past the outcome memory");
+        assert!(!s.0.join("snap").join("2026-09-08T12-00-00Z").exists(), "snapshot cleaned up");
+
+        // next run sees nothing new: the outcome memory is history, not signal
+        let (nm, rels) = improve_signal(&conn, &st).unwrap();
+        assert!(nm.is_empty() && rels.is_empty());
+    }
+
+    #[test]
+    fn none_with_changes_rolls_back_and_records_failure() {
+        let (s, t, conn) = setup("none");
+        let llm = FakeLlm {
+            writes: vec![(".claude/CLAUDE.md".into(), "tampered".into())],
+            reply: "IMPROVE-RESULT\naction: none\nfiles: none\nrationale: nothing\nevidence: none\n".into(),
+        };
+        let vcs = FakeVcs::managing(&t);
+        let run = go(&conn, &llm, &vcs, &t, &s.0.join("snap"), false);
+        let ImproveRun::Done(improve::Outcome::Failed { reason }) = run else { panic!("{:?}", run) };
+        assert!(reason.contains("reported no action but changed"), "{}", reason);
+        assert_eq!(std::fs::read_to_string(&t.claude_md).unwrap(), "# Global Rules\n\nrule one\nrule two\n", "restored");
+        assert!(vcs.commits.borrow().is_empty());
+        assert!(improve::is_failed_outcome(&outcomes(&conn)[0]));
+        assert!(store::get_improve_state(&conn).unwrap().last_memory_id.is_none(), "watermark not advanced");
+    }
+
+    #[test]
+    fn stray_managed_change_outside_targets_is_forced_back_and_fails() {
+        let (s, t, conn) = setup("stray");
+        let stray = s.0.join("home/.bashrc");
+        let llm = FakeLlm {
+            writes: vec![(".claude/CLAUDE.md".into(), "# Global Rules\n\nrule one\nrule two\nrule three\n".into())],
+            reply: "IMPROVE-RESULT\naction: edit\nfiles: x\nrationale: r\nevidence: m1\n".into(),
+        };
+        let vcs = FakeVcs { status_after: vec![stray.clone()], ..FakeVcs::managing(&t) };
+        let run = go(&conn, &llm, &vcs, &t, &s.0.join("snap"), false);
+        let ImproveRun::Done(improve::Outcome::Failed { reason }) = run else { panic!("{:?}", run) };
+        assert!(reason.contains("outside the write targets"), "{}", reason);
+        assert_eq!(vcs.forced.borrow().as_slice(), &[stray]);
+        assert_eq!(std::fs::read_to_string(&t.claude_md).unwrap(), "# Global Rules\n\nrule one\nrule two\n");
+    }
+
+    #[test]
+    fn verification_failure_rolls_back() {
+        let (s, t, conn) = setup("verify");
+        let llm = FakeLlm {
+            writes: vec![(".config/claude-hooks/new.sh".into(), "#!/usr/bin/env bash\nset -e\nexit 0\n".into())],
+            reply: "IMPROVE-RESULT\naction: create\nfiles: x\nrationale: r\nevidence: m1\n".into(),
+        };
+        let vcs = FakeVcs::managing(&t);
+        let run = go(&conn, &llm, &vcs, &t, &s.0.join("snap"), false);
+        let ImproveRun::Done(improve::Outcome::Failed { reason }) = run else { panic!("{:?}", run) };
+        assert!(reason.contains("set -e"), "{}", reason);
+        assert!(!t.hooks_dir.join("new.sh").exists());
+    }
+
+    #[test]
+    fn unmanaged_target_fails_before_any_call() {
+        let (s, t, conn) = setup("unmanaged");
+        let llm = FakeLlm { writes: vec![(".claude/CLAUDE.md".into(), "x".into())], reply: String::new() };
+        let mut vcs = FakeVcs::managing(&t);
+        vcs.managed.remove(&t.settings_json);
+        let run = go(&conn, &llm, &vcs, &t, &s.0.join("snap"), false);
+        let ImproveRun::Done(improve::Outcome::Failed { reason }) = run else { panic!("{:?}", run) };
+        assert!(reason.contains("not chezmoi-managed"), "{}", reason);
+        assert_eq!(std::fs::read_to_string(&t.claude_md).unwrap(), "# Global Rules\n\nrule one\nrule two\n", "llm never ran");
     }
 }

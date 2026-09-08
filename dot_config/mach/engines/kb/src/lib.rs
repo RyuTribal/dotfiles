@@ -28,6 +28,7 @@ pub mod cli;
 pub mod embed;
 pub mod export;
 pub mod health;
+pub mod improve;
 pub mod ingest;
 pub mod note;
 pub mod reflect;

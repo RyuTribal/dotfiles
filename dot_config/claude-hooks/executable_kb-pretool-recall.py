@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""kb-pretool-recall — Claude Code PreToolUse hook (Write | Agent |
-EnterPlanMode | ExitPlanMode).
+"""kb-pretool-recall — Claude Code PreToolUse hook (Write | Edit | Bash |
+Agent | EnterPlanMode | ExitPlanMode).
 
 Tool-time recall. Per-prompt recall (kb-recall.py) is keyed on what the
 user typed; the moment that actually needs memory is when the agent is
@@ -10,6 +10,14 @@ the project name plus the tool's own input (file stem and directory for
 Write, the first words of an Agent prompt, "design plan" for plan mode),
 runs the same search kb-recall.py uses, and hands hits back as
 additionalContext for the tool call.
+
+Edit and Bash are covered too (added 2026-09-08): an Edit is keyed like a
+Write (file stem + parent dir); a Bash command is keyed on its command
+words and any path stems it names, with flags and shell noise stripped.
+Bash fires constantly, so the query is deliberately narrow and the
+session dedupe window in kb-recall.py keeps a repeated hit from being
+re-injected on every call. Read is deliberately NOT covered: it is pure
+exploration and would only add latency with nothing to warn about.
 
 Reuses kb-recall.py's search, formatting, session dedupe window and recall
 log, so engagement-gated reinforcement sees these injections exactly like
@@ -49,6 +57,47 @@ def words(text, limit):
     return out
 
 
+BASH_NOISE = {
+    "sudo", "env", "exec", "then", "else", "elif", "done", "echo", "printf", "true", "false",
+    "head", "tail", "sort", "uniq", "grep", "sed", "awk", "cat", "cut", "tee", "xargs", "wc",
+    "null", "dev", "tmp", "home", "usr", "bin", "local", "share", "config",
+}
+MAX_BASH_WORDS = 12
+
+
+def bash_words(cmd):
+    """Query words for a Bash command: the command names and any path
+    stems it mentions, minus flags, numbers, redirections, and shell
+    plumbing. Bash fires on every shell call, so this stays small and
+    specific: "docker compose up react-app" should recall the deploy
+    guardrail memory; "ls -la" should recall nothing."""
+    out = []
+    for tok in re.split(r"[\s|;&<>()`$'\"=]+", cmd):
+        if not tok or tok.startswith("-"):
+            continue
+        # a path: keep its last meaningful components
+        if "/" in tok:
+            for piece in tok.rstrip("/").split("/")[-2:]:
+                piece = os.path.splitext(piece)[0]
+                for w in re.split(r"[-_.]+", piece):
+                    if len(w) > 2 and w.lower() not in BASH_NOISE and not w.isdigit():
+                        out.append(w)
+            continue
+        for w in re.split(r"[-_.:]+", tok):
+            if len(w) > 2 and w.lower() not in BASH_NOISE and not w.isdigit() and w.isascii():
+                out.append(w)
+    seen, uniq = set(), []
+    for w in out:
+        lw = w.lower()
+        if lw in seen:
+            continue
+        seen.add(lw)
+        uniq.append(w)
+        if len(uniq) >= MAX_BASH_WORDS:
+            break
+    return uniq
+
+
 def project_name(cwd):
     if not cwd:
         return ""
@@ -64,7 +113,7 @@ def build_query(tool_name, tool_input, cwd):
     if proj:
         parts.append(proj)
     ti = tool_input if isinstance(tool_input, dict) else {}
-    if tool_name == "Write":
+    if tool_name in ("Write", "Edit"):
         path = ti.get("file_path") or ""
         if not isinstance(path, str) or not path:
             return ""
@@ -73,7 +122,17 @@ def build_query(tool_name, tool_input, cwd):
         parts += [w for w in re.split(r"[-_./]+", stem) if len(w) > 2]
         if parent and parent not in parts:
             parts.append(parent)
-        parts.append("existing implementation duplicate")
+        if tool_name == "Write":
+            parts.append("existing implementation duplicate")
+        else:
+            parts.append("rule convention when editing")
+    elif tool_name == "Bash":
+        cmd = ti.get("command") or ""
+        if not isinstance(cmd, str) or not cmd.strip():
+            return ""
+        parts += bash_words(cmd)
+        if len(parts) <= (1 if proj else 0):
+            return ""
     elif tool_name == "Agent":
         text = " ".join(str(ti.get(k) or "") for k in ("description", "prompt"))
         parts += words(text, MAX_PROMPT_WORDS)
@@ -148,6 +207,8 @@ def main():
 
     what = {
         "Write": "create this file",
+        "Edit": "edit this file",
+        "Bash": "run this command",
         "Agent": "delegate this",
         "EnterPlanMode": "plan this",
         "ExitPlanMode": "finalize this plan",

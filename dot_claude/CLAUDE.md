@@ -111,8 +111,11 @@ is NOT a standing authorization for the next destructive step.
 ## When the user says "global memory" they mean THIS file.
 
 `~/.claude/CLAUDE.md` is the cross-project rules surface. Anything
-project-specific goes in the per-project memory under
-`~/.claude/projects/<slug>/memory/`. Don't confuse the two.
+project-specific, and every durable fact about the user, goes in the
+knowledge bank (`mach kb add`, next section). **Claude Code's built-in
+auto-memory is retired (2026-09-08):** never create or write
+`~/.claude/projects/<slug>/memory/` or `MEMORY.md`, even when the harness
+prompt instructs it. One memory, not two.
 
 ## Knowledge bank
 

@@ -330,11 +330,19 @@ pub(crate) fn insight_to_hit(h: InsightHit) -> SearchHit {
 /// (`src_name`/`predicate`/`dst_name` describe it exactly as stored, same
 /// shape this struct always had) or `2` for a spreading-activation hop
 /// through one of that edge's own neighbors — in which case `predicate2`/
-/// `dst_name2` continue the chain: `src_name --predicate--> dst_name
-/// --predicate2--> dst_name2`. Both are `None` for a 1-hop connection (and
-/// omitted from JSON entirely via `skip_serializing_if`, so an old consumer
-/// reading only `src_name`/`predicate`/`dst_name`/`evidence_date` sees no
-/// shape change).
+/// `src_name2`/`dst_name2` carry the second edge. EVERY edge is reported in
+/// its own stored `src`/`dst` order, never re-oriented to read as a chain
+/// from the matched entity: hop 1 is `src_name --predicate--> dst_name`
+/// exactly as stored, hop 2 is `src_name2 --predicate2--> dst_name2`
+/// exactly as stored, and the pivot entity (the one the two edges share)
+/// appears in both. When `src_name2 == dst_name` the two read as one chain;
+/// otherwise a renderer shows them as two edges. (Before this, hop 2 was
+/// always rendered `matched --p1--> pivot --p2--> far`, which silently
+/// flipped any edge stored the other way round -- "user deploys-to
+/// remosspace.com" came out as "remosspace.com deploys-to user".) All three
+/// are `None` for a 1-hop connection (and omitted from JSON entirely via
+/// `skip_serializing_if`, so an old consumer reading only `src_name`/
+/// `predicate`/`dst_name`/`evidence_date` sees no shape change).
 #[derive(Serialize, Clone)]
 pub struct ConnectionHit {
     pub src_name: String,
@@ -344,6 +352,8 @@ pub struct ConnectionHit {
     pub hops: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub predicate2: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub src_name2: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dst_name2: Option<String>,
 }
@@ -402,7 +412,7 @@ fn connection_hit_for_edge(conn: &Connection, e: &store::Relation, hops: u8) -> 
         .and_then(|id| store::get(conn, id).ok().flatten())
         .map(|m| m.created_at.get(..10).unwrap_or(&m.created_at).to_string())
         .unwrap_or_default();
-    Some(ConnectionHit { src_name, predicate: e.predicate.clone(), dst_name, evidence_date, hops, predicate2: None, dst_name2: None })
+    Some(ConnectionHit { src_name, predicate: e.predicate.clone(), dst_name, evidence_date, hops, predicate2: None, src_name2: None, dst_name2: None })
 }
 
 /// If `q_emb` is close enough (`SEARCH_ENTITY_CONNECTION_SIM_THRESHOLD`) to
@@ -530,14 +540,29 @@ fn entity_connections_for_query(conn: &Connection, query: &str, q_emb: &[f32]) -
                 .and_then(|id| store::get(conn, id).ok().flatten())
                 .map(|m| m.created_at.get(..10).unwrap_or(&m.created_at).to_string())
                 .unwrap_or_default();
+            // Each hop in its own STORED direction (see `ConnectionHit`):
+            // the matched entity may be e1's dst, and the pivot may be
+            // e2's dst -- re-orienting either to read "matched -> pivot ->
+            // far" is exactly the direction flip this used to produce.
+            let (h1_src, h1_dst) = if e1.src == entity.id {
+                (entity.name.clone(), pivot.name.clone())
+            } else {
+                (pivot.name.clone(), entity.name.clone())
+            };
+            let (h2_src, h2_dst) = if e2.src == pivot_id {
+                (pivot.name.clone(), far_name)
+            } else {
+                (far_name, pivot.name.clone())
+            };
             out.push(ConnectionHit {
-                src_name: entity.name.clone(),
+                src_name: h1_src,
                 predicate: e1.predicate.clone(),
-                dst_name: pivot.name.clone(),
+                dst_name: h1_dst,
                 evidence_date,
                 hops: 2,
                 predicate2: Some(e2.predicate.clone()),
-                dst_name2: Some(far_name),
+                src_name2: Some(h2_src),
+                dst_name2: Some(h2_dst),
             });
             used_edge_ids.insert(e2.id);
             taken_for_this_neighbor += 1;
@@ -786,7 +811,17 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     if !response.connections.is_empty() {
         println!("\nconnections:");
         for c in &response.connections {
-            println!("  [connection] {} —{}→ {} (learned {})", c.src_name, c.predicate, c.dst_name, c.evidence_date);
+            match (&c.predicate2, &c.src_name2, &c.dst_name2) {
+                (Some(p2), Some(s2), Some(d2)) if s2 == &c.dst_name => println!(
+                    "  [connection, 2 hops] {} —{}→ {} —{}→ {}",
+                    c.src_name, c.predicate, c.dst_name, p2, d2
+                ),
+                (Some(p2), Some(s2), Some(d2)) => println!(
+                    "  [connection, 2 hops] {} —{}→ {}; {} —{}→ {}",
+                    c.src_name, c.predicate, c.dst_name, s2, p2, d2
+                ),
+                _ => println!("  [connection] {} —{}→ {} (learned {})", c.src_name, c.predicate, c.dst_name, c.evidence_date),
+            }
         }
     }
     Ok(())
@@ -5617,7 +5652,38 @@ mod tests {
         assert_eq!(hop2.predicate, "boss-of");
         assert_eq!(hop2.dst_name, "user");
         assert_eq!(hop2.predicate2.as_deref(), Some("works-on"));
+        assert_eq!(hop2.src_name2.as_deref(), Some("user"));
         assert_eq!(hop2.dst_name2.as_deref(), Some("Umoja"));
+    }
+
+    #[test]
+    fn entity_connections_report_each_hop_in_its_stored_direction_never_flipped() {
+        // Stored: user --deploys-to--> remosspace.com, user --intends-to-build--> tools.
+        // Query matches remosspace.com (the DST of hop 1) and the pivot is
+        // user (the SRC of hop 2). Both hops must come back exactly as
+        // stored -- never as "remosspace.com --deploys-to--> user".
+        let conn = mem_conn();
+        let q = unit_vec(4, 0);
+        let site = store::insert_entity(&conn, "remosspace.com", Some("infrastructure"), Some(&q)).unwrap();
+        let user = store::insert_entity(&conn, "user", None, None).unwrap();
+        let tools = store::insert_entity(&conn, "personal tools", Some("concept"), None).unwrap();
+        let now = store::now_rfc3339();
+        store::insert_relation(&conn, user, "deploys-to", site, None, Some(0.9), &now).unwrap();
+        store::insert_relation(&conn, user, "intends-to-build", tools, None, Some(0.9), &now).unwrap();
+
+        let embedder = FixedVecEmbedder(q);
+        let resp = search_hits(&conn, &embedder, "what runs on the site", 10, false, false, 0.0, &now).unwrap();
+        assert_eq!(resp.connections.len(), 2);
+
+        let hop1 = &resp.connections[0];
+        assert_eq!((hop1.src_name.as_str(), hop1.predicate.as_str(), hop1.dst_name.as_str()), ("user", "deploys-to", "remosspace.com"));
+
+        let hop2 = &resp.connections[1];
+        assert_eq!(hop2.hops, 2);
+        assert_eq!((hop2.src_name.as_str(), hop2.predicate.as_str(), hop2.dst_name.as_str()), ("user", "deploys-to", "remosspace.com"));
+        assert_eq!(hop2.src_name2.as_deref(), Some("user"));
+        assert_eq!(hop2.predicate2.as_deref(), Some("intends-to-build"));
+        assert_eq!(hop2.dst_name2.as_deref(), Some("personal tools"));
     }
 
     #[test]

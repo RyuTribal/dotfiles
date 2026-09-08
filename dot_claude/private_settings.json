@@ -72,7 +72,7 @@
         ]
       },
       {
-        "matcher": "Write|Agent|EnterPlanMode|ExitPlanMode",
+        "matcher": "Write|Edit|Bash|Agent|EnterPlanMode|ExitPlanMode",
         "hooks": [
           {
             "type": "command",

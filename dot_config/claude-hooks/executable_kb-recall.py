@@ -234,8 +234,8 @@ def suppressed_conns(log_path):
 def connection_key(c):
     """Renders one connection (`ConnectionHit`) as its session-dedupe key —
     "src|predicate|dst" for a 1-hop connection, extended with
-    "|predicate2|dst_name2" for a 2-hop one, so two connections that share a
-    first hop but continue differently are never conflated. `None` when the
+    "|src_name2|predicate2|dst_name2" for a 2-hop one, so two connections
+    that share a first hop but continue differently are never conflated. `None` when the
     connection is too malformed to key (mirrors `connection_line`'s own
     validity check) — such a connection is never suppressible and never
     logged, exactly like it's never rendered."""
@@ -247,10 +247,14 @@ def connection_key(c):
     key = "{}|{}|{}".format(src, predicate, dst)
     if c.get("hops") == 2:
         predicate2 = (c.get("predicate2") or "").strip()
+        # src_name2: the second edge's own stored source (newer mach kb);
+        # absent from an older daemon's JSON, where hop 2 always started at
+        # dst_name -- fall back to that so the key stays stable either way.
+        src2 = (c.get("src_name2") or dst).strip()
         dst2 = (c.get("dst_name2") or "").strip()
         if not predicate2 or not dst2:
             return None
-        key += "|{}|{}".format(predicate2, dst2)
+        key += "|{}|{}|{}".format(src2, predicate2, dst2)
     return key
 
 
@@ -272,10 +276,17 @@ def connection_line(c):
         return None
     if c.get("hops") == 2:
         predicate2 = (c.get("predicate2") or "").strip()
+        src2 = (c.get("src_name2") or dst).strip()
         dst2 = (c.get("dst_name2") or "").strip()
         if not predicate2 or not dst2:
             return None
-        return "- [connection, 2 hops] {} —{}→ {} —{}→ {}".format(src, predicate, dst, predicate2, dst2)
+        # Every edge arrives in its STORED direction (mach kb never
+        # re-orients an edge to read as a chain). When the second edge
+        # starts where the first ends, render one chain; otherwise render
+        # the two edges side by side so no arrow is ever shown flipped.
+        if src2 == dst:
+            return "- [connection, 2 hops] {} —{}→ {} —{}→ {}".format(src, predicate, dst, predicate2, dst2)
+        return "- [connection, 2 hops] {} —{}→ {}; {} —{}→ {}".format(src, predicate, dst, src2, predicate2, dst2)
     date = (c.get("evidence_date") or "").strip()
     when = " (learned {})".format(date) if date else ""
     return "- [connection] {} —{}→ {}{}".format(src, predicate, dst, when)

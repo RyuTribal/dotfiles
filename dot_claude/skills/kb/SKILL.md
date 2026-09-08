@@ -43,6 +43,21 @@ add`) rather than silently overriding it — the next `mach kb reflect` /
 re-verification pass reconciles the belief itself; you don't edit insights
 directly.
 
+## Stated vs inferred (basis)
+
+Every memory carries a `basis`: **stated** (the user or a named person said
+it in so many words: `mach kb add`, `mach note`, a decision cue, a digest
+line the model tagged STATED) or **inferred** (deduced from behavior, code,
+or context: a digest line tagged INFERRED). Rows written before 2026-09-08
+and channels that do not classify (meeting facts, consolidation) have no
+basis and render with the older source-only phrase. Recall shows it in the
+provenance tail: "(you said this in a session)" vs "(I inferred this from a
+session)". Weigh them differently: a stated fact is testimony, an inferred
+one is your own earlier deduction and can be wrong the same way any
+inference can. When you correct an inferred memory with something the user
+now says, save the correction with `mach kb add` (stated) and let reflect
+reconcile.
+
 ## Memory-first protocol (every prompt)
 
 The recall hook fires on every prompt. Your job per prompt:

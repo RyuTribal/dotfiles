@@ -91,6 +91,16 @@ pub struct Memory {
     // "never mark seen on failure" house rule as `dedupe_seen`/
     // `contradiction_seen`.
     pub graph_extracted_at: Option<String>,
+    // How this memory came to be known -- Honcho's explicit/deductive split.
+    // `Some("stated")`: the user (or a named person) said it in so many
+    // words: `mach kb add`, `mach note`, a decision cue, a digest line the
+    // model tagged STATED. `Some("inferred")`: deduced from behavior, code,
+    // or context (a digest line tagged INFERRED). `None`: written before the
+    // column existed, or by a channel that does not classify (meeting
+    // facts, consolidation) -- renderers fall back to source-only phrasing.
+    // Never affects ranking; it exists so recall can say "you told me" vs
+    // "I inferred" honestly.
+    pub basis: Option<String>,
 }
 
 impl Memory {
@@ -206,7 +216,8 @@ fn init_schema(conn: &Connection) -> Result<(), KbError> {
             superseded_by INTEGER,
             dormant_at TEXT,
             last_verified_at TEXT,
-            graph_extracted_at TEXT
+            graph_extracted_at TEXT,
+            basis TEXT
         );
         CREATE TABLE IF NOT EXISTS insights (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -580,6 +591,19 @@ fn migrate_v12_to_v13(conn: &Connection) -> Result<(), KbError> {
     Ok(())
 }
 
+/// `PRAGMA user_version`-gated, idempotent 13 -> 14 migration: adds
+/// `memories.basis` (see `Memory::basis`). A fresh table already has it;
+/// every pre-existing row is left NULL -- "basis unknown" -- which is the
+/// honest value for anything written before the split existed.
+fn migrate_v13_to_v14(conn: &Connection) -> Result<(), KbError> {
+    let cols = existing_columns(conn)?;
+    if !cols.iter().any(|c| c == "basis") {
+        conn.execute("ALTER TABLE memories ADD COLUMN basis TEXT", [])?;
+    }
+    conn.execute("PRAGMA user_version = 14", [])?;
+    Ok(())
+}
+
 fn migrate_v6_to_v7(conn: &Connection) -> Result<(), KbError> {
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(
@@ -689,6 +713,9 @@ fn migrate(conn: &Connection) -> Result<(), KbError> {
     }
     if version < 13 {
         migrate_v12_to_v13(conn)?;
+    }
+    if version < 14 {
+        migrate_v13_to_v14(conn)?;
     }
     Ok(())
 }
@@ -897,6 +924,7 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         dormant_at: row.get("dormant_at")?,
         last_verified_at: row.get("last_verified_at")?,
         graph_extracted_at: row.get("graph_extracted_at")?,
+        basis: row.get("basis")?,
         created_at,
     })
 }
@@ -912,16 +940,58 @@ pub fn insert(
     embedding: Option<&[f32]>,
     importance: i64,
 ) -> Result<i64, KbError> {
+    insert_with_basis(conn, content, source, project, reviewed, embedding, importance, None)
+}
+
+/// The two values `Memory::basis` may hold. Anything else is rejected at
+/// the write boundary so the column never accumulates free text.
+pub const BASIS_STATED: &str = "stated";
+pub const BASIS_INFERRED: &str = "inferred";
+
+pub fn is_valid_basis(b: &str) -> bool {
+    b == BASIS_STATED || b == BASIS_INFERRED
+}
+
+/// `insert` plus an explicit `basis` (see `Memory::basis`). `None` leaves
+/// the column NULL. An unknown basis string is an error, not silently
+/// stored.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_with_basis(
+    conn: &Connection,
+    content: &str,
+    source: Option<&str>,
+    project: Option<&str>,
+    reviewed: bool,
+    embedding: Option<&[f32]>,
+    importance: i64,
+    basis: Option<&str>,
+) -> Result<i64, KbError> {
+    if let Some(b) = basis {
+        if !is_valid_basis(b) {
+            return Err(KbError::Other(format!("invalid basis {:?} (expected stated|inferred)", b)));
+        }
+    }
     let created_at = now_rfc3339();
     let stability = importance as f64 * 7.0;
     let blob = embedding.map(encode_embedding);
     conn.execute(
         "INSERT INTO memories
-            (content, source, project, created_at, reviewed, embedding, importance, stability, valid_from)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?4)",
-        params![content, source, project, created_at, reviewed as i64, blob, importance, stability],
+            (content, source, project, created_at, reviewed, embedding, importance, stability, valid_from, basis)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?4, ?9)",
+        params![content, source, project, created_at, reviewed as i64, blob, importance, stability, basis],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Sets `basis` on an existing row (used by `mach kb add`, whose insert
+/// runs inside the classifier's `apply_verdict` and so cannot pass it at
+/// insert time). Same validation as `insert_with_basis`.
+pub fn set_basis(conn: &Connection, id: i64, basis: &str) -> Result<(), KbError> {
+    if !is_valid_basis(basis) {
+        return Err(KbError::Other(format!("invalid basis {:?} (expected stated|inferred)", basis)));
+    }
+    conn.execute("UPDATE memories SET basis = ?1 WHERE id = ?2", params![basis, id])?;
+    Ok(())
 }
 
 /// Most recent memories first, optionally capped to `limit` rows.
@@ -2302,8 +2372,8 @@ pub fn raw_upsert_memory(conn: &Connection, m: &Memory) -> Result<(), KbError> {
         "INSERT INTO memories
             (id, content, source, project, created_at, reviewed, embedding, importance, stability,
              access_count, first_accessed_at, last_accessed_at, valid_from, invalidated_at,
-             superseded_by, dormant_at, last_verified_at, graph_extracted_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+             superseded_by, dormant_at, last_verified_at, graph_extracted_at, basis)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
          ON CONFLICT(id) DO UPDATE SET
             content = excluded.content, source = excluded.source, project = excluded.project,
             created_at = excluded.created_at, reviewed = excluded.reviewed, embedding = excluded.embedding,
@@ -2312,7 +2382,7 @@ pub fn raw_upsert_memory(conn: &Connection, m: &Memory) -> Result<(), KbError> {
             last_accessed_at = excluded.last_accessed_at, valid_from = excluded.valid_from,
             invalidated_at = excluded.invalidated_at, superseded_by = excluded.superseded_by,
             dormant_at = excluded.dormant_at, last_verified_at = excluded.last_verified_at,
-            graph_extracted_at = excluded.graph_extracted_at",
+            graph_extracted_at = excluded.graph_extracted_at, basis = excluded.basis",
         params![
             m.id,
             m.content,
@@ -2332,6 +2402,7 @@ pub fn raw_upsert_memory(conn: &Connection, m: &Memory) -> Result<(), KbError> {
             m.dormant_at,
             m.last_verified_at,
             m.graph_extracted_at,
+            m.basis,
         ],
     )?;
     Ok(())
@@ -3146,6 +3217,44 @@ mod tests {
     }
 
     #[test]
+    fn basis_round_trips_and_rejects_unknown_values() {
+        let conn = mem_conn();
+        let a = insert_with_basis(&conn, "the user said tea", None, None, true, None, 5, Some(BASIS_STATED)).unwrap();
+        let b = insert(&conn, "legacy row", None, None, true, None, 5).unwrap();
+        assert_eq!(get(&conn, a).unwrap().unwrap().basis.as_deref(), Some("stated"));
+        assert_eq!(get(&conn, b).unwrap().unwrap().basis, None);
+        set_basis(&conn, b, BASIS_INFERRED).unwrap();
+        assert_eq!(get(&conn, b).unwrap().unwrap().basis.as_deref(), Some("inferred"));
+        assert!(insert_with_basis(&conn, "x", None, None, true, None, 5, Some("guessed")).is_err());
+        assert!(set_basis(&conn, a, "guessed").is_err());
+        assert_eq!(get(&conn, a).unwrap().unwrap().basis.as_deref(), Some("stated"), "a rejected write must not touch the row");
+    }
+
+    #[test]
+    fn migrate_v13_to_v14_adds_basis_to_a_pre_existing_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, source TEXT, project TEXT,
+                created_at TEXT NOT NULL, reviewed INTEGER NOT NULL DEFAULT 1, embedding BLOB,
+                importance INTEGER NOT NULL DEFAULT 5, stability REAL, access_count INTEGER NOT NULL DEFAULT 0,
+                first_accessed_at TEXT, last_accessed_at TEXT, valid_from TEXT, invalidated_at TEXT,
+                superseded_by INTEGER, dormant_at TEXT, last_verified_at TEXT, graph_extracted_at TEXT);
+             INSERT INTO memories (content, created_at) VALUES ('old', '2026-01-01T00:00:00Z');
+             PRAGMA user_version = 13;",
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 14);
+        let m = get(&conn, 1).unwrap().unwrap();
+        assert_eq!(m.basis, None, "pre-existing rows stay basis-unknown");
+        // idempotent
+        migrate(&conn).unwrap();
+    }
+
+    #[test]
     fn cosine_identical_is_one() {
         let v = vec![1.0f32, 2.0, 3.0];
         assert!((cosine(&v, &v) - 1.0).abs() < 1e-6);
@@ -3590,7 +3699,7 @@ mod tests {
         // (`improve_state` + `ingested_sessions.skill_usage`), landing at the
         // current version.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1);
@@ -3739,7 +3848,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 13,
+            version, 14,
             "v1->v2 (reflection tables), v2->v3 (insights level column), v3->v4 (dormant_at), \
              v4->v5 (dedupe_seen), v5->v6 (last_verified_at + contradiction_seen), \
              v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions), v8->v9 (graph layer), \
@@ -3765,7 +3874,7 @@ mod tests {
     fn fresh_database_lands_at_current_user_version() {
         let conn = mem_conn();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
     }
 
     #[test]
@@ -3994,7 +4103,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 13,
+            version, 14,
             "v2->v3 (level column), v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, \
              v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions), v8->v9, v9->v10 all run"
         );
@@ -4038,7 +4147,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 13,
+            version, 14,
             "v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild), \
              v7->v8 (ingested_sessions), v8->v9, v9->v10 all run"
         );
@@ -4083,7 +4192,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 13,
+            version, 14,
             "v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 \
              (ingested_sessions), v8->v9, v9->v10 all run"
         );
@@ -4131,7 +4240,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 13, "v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) all run");
+        assert_eq!(version, 14, "v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) all run");
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -4191,7 +4300,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 13, "v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) both run");
+        assert_eq!(version, 14, "v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) both run");
 
         // Every row and its data survive the rebuild, ids included.
         let rows = list(&conn, None, false).unwrap();
@@ -4352,7 +4461,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 13, "v7->v8 (ingested_sessions) runs");
+        assert_eq!(version, 14, "v7->v8 (ingested_sessions) runs");
 
         assert_eq!(list(&conn, None, false).unwrap().len(), 1, "existing memory row must survive the migration");
 
@@ -4722,6 +4831,7 @@ mod tests {
             dormant_at: None,
             last_verified_at: None,
             graph_extracted_at: None,
+            basis: None,
         }
     }
 
@@ -5083,7 +5193,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 13, "v8->v9 (graph layer) runs");
+        assert_eq!(version, 14, "v8->v9 (graph layer) runs");
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -5144,7 +5254,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 13, "v9->v10 (last_completed_at + entity_merge_seen) runs");
+        assert_eq!(version, 14, "v9->v10 (last_completed_at + entity_merge_seen) runs");
 
         // The pre-existing watermark row survives, and last_completed_at
         // backfills to NULL (never completed under the new field yet).

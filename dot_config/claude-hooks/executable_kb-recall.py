@@ -169,20 +169,37 @@ def search_via_subprocess(query):
     return _valid_response(data)
 
 
-def source_phrase(source):
+def source_phrase(source, basis=None):
     """Provenance-visible recall: map each source-class to a plain phrase
     saying HOW it was learned, so authority stays legible — something the
     user said directly ("you told me") reads differently from something
     picked up secondhand from a session or meeting transcript. Insights and
     themes never go through this; they keep their own [derived ...] markers,
-    a separate axis (a belief ABOUT the user, not a provenance class)."""
+    a separate axis (a belief ABOUT the user, not a provenance class).
+
+    `basis` is the row's explicit/deductive split (mach kb `memories.basis`,
+    "stated" | "inferred" | None). It refines the phrase, never replaces the
+    source class: an INFERRED digest line reads "I inferred this from a
+    session", a STATED one "you said this in a session". A row with no basis
+    (written before the column existed, or by a channel that does not
+    classify) keeps the source-only phrasing below."""
     s = (source or "").strip()
+    b = (basis or "").strip().lower()
+    where = None
+    if s.startswith("meeting:"):
+        where = "a meeting"
+    elif s == "session-digest" or s.startswith("session-digest:") \
+            or s == "transcript-backfill" or s.startswith("transcript-backfill:"):
+        where = "a session"
+    if b == "inferred":
+        return "I inferred this from {}".format(where or "context")
+    if b == "stated" and where:
+        return "you said this in {}".format(where)
     if s.startswith("meeting:"):
         return "from a meeting"
     if s.startswith("memory-backfill"):
         return "from earlier project memory"
-    if s == "session-digest" or s.startswith("session-digest:") \
-            or s == "transcript-backfill" or s.startswith("transcript-backfill:"):
+    if where == "a session":
         return "picked up from a session"
     # note:/manual/kb design/empty and any unrecognized tag all read as
     # deliberate, reviewed input — an unknown tag can never masquerade as
@@ -350,7 +367,7 @@ def main():
             if isinstance(mem_id, int) and mem_id in suppressed:
                 continue
             via = h.get("via_assoc")
-            how = source_phrase(h.get("source"))
+            how = source_phrase(h.get("source"), h.get("basis"))
             if isinstance(via, int):
                 # spreading activation over Hebbian memory_assoc edges: this
                 # did not match the prompt, it has been useful alongside a

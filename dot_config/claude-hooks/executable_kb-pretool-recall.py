@@ -189,7 +189,7 @@ def main():
             mem_id = h.get("id")
             if isinstance(mem_id, int) and mem_id in suppressed:
                 continue
-            how = kb_recall.source_phrase(h.get("source"))
+            how = kb_recall.source_phrase(h.get("source"), h.get("basis"))
             via = h.get("via_assoc")
             if isinstance(via, int):
                 how += "; recalled by association"

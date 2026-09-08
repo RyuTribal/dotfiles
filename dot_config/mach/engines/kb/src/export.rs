@@ -144,6 +144,8 @@ struct MemoryRow {
     last_verified_at: Option<String>,
     #[serde(default)]
     graph_extracted_at: Option<String>,
+    #[serde(default)]
+    basis: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -189,6 +191,7 @@ fn memory_to_row(m: &Memory) -> MemoryRow {
         dormant_at: m.dormant_at.clone(),
         last_verified_at: m.last_verified_at.clone(),
         graph_extracted_at: m.graph_extracted_at.clone(),
+        basis: m.basis.clone(),
     }
 }
 
@@ -219,6 +222,7 @@ fn row_to_memory(row: MemoryRow) -> Result<Memory, KbError> {
         dormant_at: row.dormant_at,
         last_verified_at: row.last_verified_at,
         graph_extracted_at: row.graph_extracted_at,
+        basis: row.basis,
     })
 }
 
@@ -575,6 +579,7 @@ mod tests {
             dormant_at: None,
             last_verified_at: None,
             graph_extracted_at: None,
+            basis: None,
         };
         let mut buf: Vec<u8> = Vec::new();
         writeln!(

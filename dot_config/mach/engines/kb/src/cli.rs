@@ -234,8 +234,13 @@ fn cmd_add(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     .map_err(to_io)?;
 
     match outcome {
-        AddOutcome::Added { id } => println!("stored memory #{}", id),
+        AddOutcome::Added { id } => {
+            // `mach kb add` is deliberate, human-authored input: basis `stated`.
+            let _ = store::set_basis(&conn, id, store::BASIS_STATED);
+            println!("stored memory #{}", id)
+        }
         AddOutcome::AddedAndTombstoned { new_id, old_id, verb } => {
+            let _ = store::set_basis(&conn, new_id, store::BASIS_STATED);
             println!("stored memory #{} ({} memory #{})", new_id, verb, old_id);
         }
         AddOutcome::Skipped { reason } => println!("mach kb add: skipped — {}", reason),
@@ -277,6 +282,11 @@ pub struct SearchHit {
     // whose id this is (see `spread_assoc`). Omitted from JSON otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub via_assoc: Option<i64>,
+    // `Memory::basis` ("stated" | "inferred") when the row recorded one;
+    // omitted otherwise (legacy rows, insights, channels that don't
+    // classify). Lets kb-recall.py say "you told me" vs "I inferred".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub basis: Option<String>,
 }
 
 pub(crate) fn to_hit(h: RankedHit) -> SearchHit {
@@ -296,6 +306,7 @@ pub(crate) fn to_hit(h: RankedHit) -> SearchHit {
         confidence: None,
         level: None,
         via_assoc: None,
+        basis: h.memory.basis,
     }
 }
 
@@ -317,6 +328,7 @@ pub(crate) fn insight_to_hit(h: InsightHit) -> SearchHit {
         confidence: Some(h.insight.confidence),
         level: Some(h.insight.level),
         via_assoc: None,
+        basis: None,
     }
 }
 
@@ -675,6 +687,7 @@ fn spread_assoc(conn: &Connection, hits: &[SearchHit], now: &str) -> Result<Vec<
                 confidence: None,
                 level: None,
                 via_assoc: Some(h.id),
+                basis: m.basis,
             });
         }
     }
@@ -3321,10 +3334,12 @@ fn ingest_sessions_impl<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>
                 ingest::TIMEOUT_INGEST,
             ) {
                 Ok(out) => {
-                    for fact in ingest::parse_digest_facts(&out) {
-                        let embedding = embedder.embed(&fact).ok();
-                        if store::insert(conn, &fact, Some("session-digest"), None, false, embedding.as_deref(), 5)
-                            .is_ok()
+                    for fact in ingest::parse_digest_facts_with_basis(&out) {
+                        let embedding = embedder.embed(&fact.content).ok();
+                        if store::insert_with_basis(
+                            conn, &fact.content, Some("session-digest"), None, false, embedding.as_deref(), 5, fact.basis,
+                        )
+                        .is_ok()
                         {
                             summary.facts_added += 1;
                         }
@@ -3353,10 +3368,12 @@ fn ingest_sessions_impl<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>
             let window = ingest::tail_lines(dialogue_text, ingest::DIGEST_MAX_DIALOGUE_LINES);
             match llm.call("haiku", &ingest::build_digest_prompt(&window), ingest::TIMEOUT_INGEST) {
                 Ok(out) => {
-                    for fact in ingest::parse_digest_facts(&out) {
-                        let embedding = embedder.embed(&fact).ok();
-                        if store::insert(conn, &fact, Some("session-digest"), None, false, embedding.as_deref(), 5)
-                            .is_ok()
+                    for fact in ingest::parse_digest_facts_with_basis(&out) {
+                        let embedding = embedder.embed(&fact.content).ok();
+                        if store::insert_with_basis(
+                            conn, &fact.content, Some("session-digest"), None, false, embedding.as_deref(), 5, fact.basis,
+                        )
+                        .is_ok()
                         {
                             summary.facts_added += 1;
                         }
@@ -3455,10 +3472,12 @@ fn ingest_sessions_impl<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>
                 let digest_prompt = ingest::build_digest_prompt(&ingest::tail_lines(tail, ingest::DIGEST_MAX_DIALOGUE_LINES));
                 match llm.call("haiku", &digest_prompt, ingest::TIMEOUT_INGEST) {
                     Ok(out) => {
-                        for fact in ingest::parse_digest_facts(&out) {
-                            let embedding = embedder.embed(&fact).ok();
-                            if store::insert(conn, &fact, Some("session-digest"), None, false, embedding.as_deref(), 5)
-                                .is_ok()
+                        for fact in ingest::parse_digest_facts_with_basis(&out) {
+                            let embedding = embedder.embed(&fact.content).ok();
+                            if store::insert_with_basis(
+                                conn, &fact.content, Some("session-digest"), None, false, embedding.as_deref(), 5, fact.basis,
+                            )
+                            .is_ok()
                             {
                                 summary.facts_added += 1;
                             }

@@ -138,7 +138,7 @@ impl<'a> Pipeline<'a> {
             }
             Err(_reason) => {
                 let content = format!("voice note (untranscribed): {}", saved.display());
-                if let Err(e) = store::insert(self.conn, &content, Some("telegram:voice"), None, true, None, note::DEFAULT_IMPORTANCE) {
+                if let Err(e) = store::insert_with_basis(self.conn, &content, Some("telegram:voice"), None, true, None, note::DEFAULT_IMPORTANCE, Some(store::BASIS_STATED)) {
                     return bot::format_note_failure(&e.to_string());
                 }
                 bot::VOICE_TRANSCRIBE_FAILURE_REPLY.to_string()

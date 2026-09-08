@@ -729,7 +729,17 @@ pub fn file_note(
         // from the WORTH mapping above -- durable notes keep the old
         // "reviewed at the caller's importance" behavior; dubious/noise
         // ones go to the unreviewed review queue instead.
-        store::insert(conn, &content, Some(&source), Some(&classification.topic), reviewed, embedding.as_deref(), effective_importance)?;
+        // A note is the user's own words: basis `stated`.
+        store::insert_with_basis(
+            conn,
+            &content,
+            Some(&source),
+            Some(&classification.topic),
+            reviewed,
+            embedding.as_deref(),
+            effective_importance,
+            Some(store::BASIS_STATED),
+        )?;
     }
 
     Ok(FiledNote {

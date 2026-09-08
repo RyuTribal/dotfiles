@@ -272,6 +272,11 @@ pub struct SearchHit {
     // level-2 theme. `None` on plain memory hits — lets `kb-recall.sh`
     // distinguish "[derived belief]" from "[derived theme]".
     pub level: Option<i64>,
+    // Set on a memory hit that did NOT match the query itself but was
+    // pulled in by spreading activation over `memory_assoc` from the hit
+    // whose id this is (see `spread_assoc`). Omitted from JSON otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via_assoc: Option<i64>,
 }
 
 pub(crate) fn to_hit(h: RankedHit) -> SearchHit {
@@ -290,6 +295,7 @@ pub(crate) fn to_hit(h: RankedHit) -> SearchHit {
         derived: false,
         confidence: None,
         level: None,
+        via_assoc: None,
     }
 }
 
@@ -310,6 +316,7 @@ pub(crate) fn insight_to_hit(h: InsightHit) -> SearchHit {
         derived: true,
         confidence: Some(h.insight.confidence),
         level: Some(h.insight.level),
+        via_assoc: None,
     }
 }
 
@@ -575,8 +582,19 @@ pub fn search_hits<E: Embedder>(
     let q_emb = embedder.embed(query)?;
     let mem_hits = store::search_ranked(conn, &q_emb, limit, reviewed_only, include_superseded, 0.0, now)?;
     let insight_hits = store::search_insights_ranked(conn, &q_emb, limit, now)?;
+    let mut mem_hits: Vec<SearchHit> = mem_hits.into_iter().map(to_hit).collect();
+    // Threshold the query matches before spreading: a memory that only
+    // scraped in under the floor by embedding must still be reachable as an
+    // associate of a real hit (and then carries the associate's score).
+    // Equivalent to the post-limit threshold below for the matches
+    // themselves -- both are "top-N among rows clearing the floor".
+    if min_score > 0.0 {
+        mem_hits.retain(|h| h.score >= min_score);
+    }
+    let associates = spread_assoc(conn, &mem_hits, now)?;
+    mem_hits.extend(associates);
     let mut combined: Vec<SearchHit> =
-        mem_hits.into_iter().map(to_hit).chain(insight_hits.into_iter().map(insight_to_hit)).collect();
+        mem_hits.into_iter().chain(insight_hits.into_iter().map(insight_to_hit)).collect();
     combined.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     combined.truncate(limit);
     if min_score > 0.0 {
@@ -584,6 +602,58 @@ pub fn search_hits<E: Embedder>(
     }
     let connections = entity_connections_for_query(conn, query, &q_emb);
     Ok(SearchResponse { hits: combined, connections })
+}
+
+/// Spreading activation over Hebbian `memory_assoc` edges: from each of the
+/// top `ASSOC_SPREAD_SOURCES` memory hits, pull up to `ASSOC_SPREAD_PER_HIT`
+/// associates not already among the hits. An associate's score is the
+/// source hit's score damped by `ASSOC_DAMPING` and by how strong the edge
+/// is (`1 - exp(-weight)`, saturating), so a weak or stale association never
+/// outranks the query match that led to it. Each associate is tagged with
+/// the id it came through (`SearchHit::via_assoc`).
+pub const ASSOC_SPREAD_SOURCES: usize = 3;
+pub const ASSOC_SPREAD_PER_HIT: usize = 2;
+pub const ASSOC_DAMPING: f32 = 0.7;
+
+fn spread_assoc(conn: &Connection, hits: &[SearchHit], now: &str) -> Result<Vec<SearchHit>, KbError> {
+    let mut present: HashSet<i64> = hits.iter().map(|h| h.id).collect();
+    let mut out = Vec::new();
+    for h in hits.iter().filter(|h| !h.superseded).take(ASSOC_SPREAD_SOURCES) {
+        let mut taken = 0;
+        for (other, weight) in store::assoc_neighbors(conn, h.id, now)? {
+            if taken >= ASSOC_SPREAD_PER_HIT {
+                break;
+            }
+            if present.contains(&other) {
+                continue;
+            }
+            let Some(m) = store::get(conn, other)? else { continue };
+            if m.invalidated_at.is_some() || m.dormant_at.is_some() {
+                continue;
+            }
+            let factor = ASSOC_DAMPING * (1.0 - (-weight).exp());
+            present.insert(other);
+            taken += 1;
+            out.push(SearchHit {
+                id: m.id,
+                content: m.content,
+                source: m.source,
+                project: m.project,
+                created_at: m.created_at,
+                score: h.score * factor,
+                sim: 0.0,
+                recency: 0.0,
+                strength: weight,
+                importance: m.importance,
+                superseded: false,
+                derived: false,
+                confidence: None,
+                level: None,
+                via_assoc: Some(h.id),
+            });
+        }
+    }
+    Ok(out)
 }
 
 fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
@@ -1034,6 +1104,12 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     // unprocessed memory must not early-exit before that pass ever gets a
     // look, since (like curation/dormancy) it runs unconditionally below.
     let graph_backlog = store::has_graph_extraction_candidates(&conn).map_err(to_io)?;
+    // Hebbian edges forget on their own curve; dropping the ones that have
+    // faded is DB-only and belongs before every exit, including "nothing new".
+    let pruned_assoc = store::prune_assoc(&conn, &now).map_err(to_io)?;
+    if pruned_assoc > 0 {
+        println!("mach kb reflect: pruned {} faded memory associations", pruned_assoc);
+    }
     if !has_new && !force_meta && verification_queue.is_empty() && !graph_backlog {
         // Still a genuine completion for `mach kb health`'s purposes — the
         // process ran and had nothing to do, which is different from never
@@ -2626,6 +2702,7 @@ fn cmd_graph(args: impl Iterator<Item = String>) -> io::Result<()> {
     let invalidated_edges = store::invalidated_relation_count(&conn).map_err(to_io)?;
 
     println!("entities: {}", total_entities);
+    println!("memory associations (hebbian): {}", store::count_assoc(&conn).map_err(to_io)?);
     for (kind, count) in &by_kind {
         println!("  {}: {}", kind, count);
     }
@@ -3016,6 +3093,8 @@ struct IngestSummary {
     facts_added: usize,
     deferred_offline: usize,
     pruned_recall_logs: usize,
+    /// `--partial` only: sessions whose checkpoint mark advanced this run.
+    checkpointed: usize,
 }
 
 /// Every `.jsonl` transcript under `~/.claude/projects/*/*.jsonl` —
@@ -3113,6 +3192,8 @@ fn find_transcript_by_session(projects_root: &Path, session_id: &str) -> Option<
 /// judgment. A session needing no `claude` call at all (no ids were ever
 /// injected into it, and its transcript is too trivial to digest) is always
 /// safe to mark processed immediately, regardless of connectivity.
+/// Test-facing wrapper: the historical whole-session entry point.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn run_ingest_sessions<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>(
     conn: &Connection,
@@ -3124,7 +3205,34 @@ fn run_ingest_sessions<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>(
     only_session: Option<&str>,
     now: &str,
 ) -> Result<IngestSummary, KbError> {
+    ingest_sessions_impl(conn, embedder, llm, filter, projects_root, recall_log_root, only_session, false, now)
+}
+
+/// `run_ingest_sessions` plus the `--partial` mode behind mid-session
+/// checkpoints (`kb-checkpoint.sh` on Stop/PreCompact): digest only the raw
+/// transcript lines since the session's last checkpoint
+/// (`store::session_progress`), record the new high-water mark, and never
+/// mark the session ingested nor judge engagement -- both belong to the
+/// final pass, which in turn digests only the lines after the last
+/// checkpoint so no passage is ever extracted twice. A partial run needs a
+/// specific session; with `only_session` None it does nothing.
+#[allow(clippy::too_many_arguments)]
+fn ingest_sessions_impl<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>(
+    conn: &Connection,
+    embedder: &E,
+    llm: &L,
+    filter: &F,
+    projects_root: &Path,
+    recall_log_root: &Path,
+    only_session: Option<&str>,
+    partial: bool,
+    now: &str,
+) -> Result<IngestSummary, KbError> {
     let mut summary = IngestSummary::default();
+
+    if partial && only_session.is_none() {
+        return Ok(summary);
+    }
 
     let candidates: Vec<PathBuf> = match only_session {
         Some(sid) => find_transcript_by_session(projects_root, sid).into_iter().collect(),
@@ -3147,12 +3255,86 @@ fn run_ingest_sessions<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>(
         let Some(session_id) = ingest::session_id_from_path(&path) else {
             continue;
         };
-        if store::is_session_ingested(conn, &session_id)? {
-            continue;
-        }
+        // A session the idle sweep already marked finished can still be
+        // alive (a laptop resumed after ten quiet minutes): its engagement
+        // pass is done for good, but anything written after the mark still
+        // deserves a digest -- so "ingested" no longer means "never look
+        // again," only "digest the tail, no engagement, no re-marking."
+        let already_ingested = store::is_session_ingested(conn, &session_id)?;
         let Ok(raw) = std::fs::read_to_string(&path) else {
             continue; // unreadable this run -- stays unprocessed, retried later
         };
+
+        // Lines a previous checkpoint (or the final pass) already digested.
+        // Every path digests only what came after them.
+        let last_line = store::session_progress(conn, &session_id)?.max(0) as usize;
+        let (new_raw, raw_line_count) = ingest::lines_after(&raw, last_line);
+        let new_line_count = raw_line_count.saturating_sub(last_line);
+
+        if already_ingested && !partial {
+            if new_line_count < ingest::PARTIAL_MIN_NEW_LINES {
+                continue;
+            }
+            // finished session that kept growing: tail digest only
+            let Some(tail) = filter.filter(&new_raw).filter(|d| !d.trim().is_empty()) else {
+                store::set_session_progress(conn, &session_id, raw_line_count as i64, now)?;
+                continue;
+            };
+            match llm.call(
+                "haiku",
+                &ingest::build_digest_prompt(&ingest::tail_lines(&tail, ingest::DIGEST_MAX_DIALOGUE_LINES)),
+                ingest::TIMEOUT_INGEST,
+            ) {
+                Ok(out) => {
+                    for fact in ingest::parse_digest_facts(&out) {
+                        let embedding = embedder.embed(&fact).ok();
+                        if store::insert(conn, &fact, Some("session-digest"), None, false, embedding.as_deref(), 5)
+                            .is_ok()
+                        {
+                            summary.facts_added += 1;
+                        }
+                    }
+                    store::set_session_progress(conn, &session_id, raw_line_count as i64, now)?;
+                    summary.checkpointed += 1;
+                }
+                Err(_) => summary.deferred_offline += 1,
+            }
+            continue;
+        }
+
+        // --- checkpoint (partial) ---
+        if partial {
+            if new_line_count < ingest::PARTIAL_MIN_NEW_LINES {
+                continue; // not enough new material yet; the next checkpoint or the final pass gets it
+            }
+            let dialogue = filter.filter(&new_raw);
+            let Some(dialogue_text) = dialogue.as_deref().filter(|d| !d.trim().is_empty()) else {
+                // nothing digestible in this stretch -- move the mark so the
+                // final pass does not re-filter it either
+                store::set_session_progress(conn, &session_id, raw_line_count as i64, now)?;
+                summary.checkpointed += 1;
+                continue;
+            };
+            let window = ingest::tail_lines(dialogue_text, ingest::DIGEST_MAX_DIALOGUE_LINES);
+            match llm.call("haiku", &ingest::build_digest_prompt(&window), ingest::TIMEOUT_INGEST) {
+                Ok(out) => {
+                    for fact in ingest::parse_digest_facts(&out) {
+                        let embedding = embedder.embed(&fact).ok();
+                        if store::insert(conn, &fact, Some("session-digest"), None, false, embedding.as_deref(), 5)
+                            .is_ok()
+                        {
+                            summary.facts_added += 1;
+                        }
+                    }
+                    store::set_session_progress(conn, &session_id, raw_line_count as i64, now)?;
+                    summary.checkpointed += 1;
+                }
+                Err(_) => summary.deferred_offline += 1, // mark unchanged; retried next checkpoint
+            }
+            continue;
+        }
+
+        // --- final pass ---
 
         // No-LLM skill-usage counts for `mach kb improve`, recorded on every
         // path that marks this session processed.
@@ -3162,13 +3344,15 @@ fn run_ingest_sessions<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>(
         let injected_ids: Vec<i64> =
             std::fs::read_to_string(&recall_log_path).map(|c| ingest::parse_recall_log(&c)).unwrap_or_default();
 
-        let raw_line_count = raw.lines().count();
         if raw_line_count < INGEST_TRIVIAL_LINE_FLOOR && injected_ids.is_empty() {
             store::mark_session_ingested_with_usage(conn, &session_id, now, usage_json.as_deref())?;
+            store::set_session_progress(conn, &session_id, raw_line_count as i64, now)?;
             summary.processed += 1;
             continue;
         }
 
+        // Engagement is judged over the whole conversation; the digest only
+        // over what no checkpoint has seen.
         let dialogue = filter.filter(&raw);
         let dialogue_text = match dialogue.as_deref() {
             Some(d) if !d.trim().is_empty() => d,
@@ -3180,6 +3364,7 @@ fn run_ingest_sessions<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>(
                 // mark processed.
                 summary.shown += injected_ids.len();
                 store::mark_session_ingested_with_usage(conn, &session_id, now, usage_json.as_deref())?;
+                store::set_session_progress(conn, &session_id, raw_line_count as i64, now)?;
                 summary.processed += 1;
                 continue;
             }
@@ -3209,6 +3394,10 @@ fn run_ingest_sessions<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>(
                         if !engaged_ids.is_empty() {
                             store::touch(conn, &engaged_ids, now)?;
                         }
+                        // fired together, wire together
+                        if engaged_ids.len() >= 2 {
+                            store::reinforce_assoc(conn, &engaged_ids, now)?;
+                        }
                         summary.engaged += engaged_ids.len();
                         summary.shown += verdicts.len() - engaged_ids.len();
                     }
@@ -3219,21 +3408,29 @@ fn run_ingest_sessions<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>(
             // judge or touch, and no call was needed for it.
         }
 
-        // --- fact digest (absorbed kb-capture.sh) ---
-        if !needs_retry && raw_line_count >= ingest::DIGEST_MIN_TRANSCRIPT_LINES {
-            let digest_prompt = ingest::build_digest_prompt(dialogue_text);
-            match llm.call("haiku", &digest_prompt, ingest::TIMEOUT_INGEST) {
-                Ok(out) => {
-                    for fact in ingest::parse_digest_facts(&out) {
-                        let embedding = embedder.embed(&fact).ok();
-                        if store::insert(conn, &fact, Some("session-digest"), None, false, embedding.as_deref(), 5)
-                            .is_ok()
-                        {
-                            summary.facts_added += 1;
+        // --- fact digest (absorbed kb-capture.sh) over the undigested tail ---
+        // A session with no checkpoints keeps the historical whole-transcript
+        // floor; one that was checkpointed only needs the tail to be worth a
+        // call.
+        let digest_floor =
+            if last_line == 0 { ingest::DIGEST_MIN_TRANSCRIPT_LINES } else { ingest::PARTIAL_MIN_NEW_LINES };
+        if !needs_retry && new_line_count >= digest_floor {
+            let tail_dialogue = if last_line == 0 { Some(dialogue_text.to_string()) } else { filter.filter(&new_raw) };
+            if let Some(tail) = tail_dialogue.as_deref().filter(|d| !d.trim().is_empty()) {
+                let digest_prompt = ingest::build_digest_prompt(&ingest::tail_lines(tail, ingest::DIGEST_MAX_DIALOGUE_LINES));
+                match llm.call("haiku", &digest_prompt, ingest::TIMEOUT_INGEST) {
+                    Ok(out) => {
+                        for fact in ingest::parse_digest_facts(&out) {
+                            let embedding = embedder.embed(&fact).ok();
+                            if store::insert(conn, &fact, Some("session-digest"), None, false, embedding.as_deref(), 5)
+                                .is_ok()
+                            {
+                                summary.facts_added += 1;
+                            }
                         }
                     }
+                    Err(_) => needs_retry = true,
                 }
-                Err(_) => needs_retry = true,
             }
         }
 
@@ -3243,6 +3440,7 @@ fn run_ingest_sessions<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>(
         }
 
         store::mark_session_ingested_with_usage(conn, &session_id, now, usage_json.as_deref())?;
+        store::set_session_progress(conn, &session_id, raw_line_count as i64, now)?;
         summary.processed += 1;
     }
 
@@ -3253,11 +3451,18 @@ fn run_ingest_sessions<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>(
 
 fn cmd_ingest_sessions(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut only_session: Option<String> = None;
+    let mut partial = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--session-id" => only_session = args.next(),
+            "--partial" => partial = true,
             "-h" | "--help" => {
-                println!("usage: mach kb ingest-sessions [--session-id ID]");
+                println!("usage: mach kb ingest-sessions [--session-id ID [--partial]]");
+                println!(
+                    "       --partial (with --session-id): mid-session checkpoint -- digests only the \
+                     transcript lines since the last checkpoint and records the new mark; never \
+                     marks the session finished (kb-checkpoint.sh's Stop/PreCompact trigger)."
+                );
                 println!(
                     "       engagement-gated reinforcement: for each finished session, judges \
                      which memories injected into it (via kb-recall.sh's recall log) were \
@@ -3297,14 +3502,28 @@ fn cmd_ingest_sessions(mut args: impl Iterator<Item = String>) -> io::Result<()>
     let filter = ingest::ProcessTranscriptFilter::new();
     let now = store::now_rfc3339();
 
-    let summary =
-        run_ingest_sessions(&conn, &embedder, &llm, &filter, &projects_root, &recall_log_root, only_session.as_deref(), &now)
-            .map_err(to_io)?;
+    if partial && only_session.is_none() {
+        eprintln!("mach kb ingest-sessions: --partial requires --session-id");
+        std::process::exit(1);
+    }
+    let summary = ingest_sessions_impl(
+        &conn,
+        &embedder,
+        &llm,
+        &filter,
+        &projects_root,
+        &recall_log_root,
+        only_session.as_deref(),
+        partial,
+        &now,
+    )
+    .map_err(to_io)?;
 
     println!(
-        "mach kb ingest-sessions: scanned={} processed={} engaged={} shown={} facts_added={} deferred_offline={} pruned_recall_logs={}",
+        "mach kb ingest-sessions: scanned={} processed={} checkpointed={} engaged={} shown={} facts_added={} deferred_offline={} pruned_recall_logs={}",
         summary.scanned,
         summary.processed,
+        summary.checkpointed,
         summary.engaged,
         summary.shown,
         summary.facts_added,
@@ -5666,6 +5885,174 @@ mod tests {
         assert_eq!(after_wake.len(), 1);
         assert_eq!(after_wake[0].src_name, "Moses");
     }
+    /// Counts digest calls and returns a fixed fact list -- for the
+    /// checkpoint (`--partial`) flow.
+    struct DigestCountingLlm {
+        calls: std::cell::Cell<usize>,
+        facts: &'static str,
+    }
+    impl ReflectLlm for DigestCountingLlm {
+        fn call(&self, _model: &str, _prompt: &str, _timeout: std::time::Duration) -> Result<String, String> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.facts.to_string())
+        }
+    }
+
+    /// Filter that returns the raw text it was given, so a test can see
+    /// which slice reached the digest by inspecting prompt-independent
+    /// side effects (line counts via `seen`).
+    struct EchoFilter {
+        seen: std::cell::RefCell<Vec<usize>>,
+    }
+    impl ingest::TranscriptFilter for EchoFilter {
+        fn filter(&self, raw: &str) -> Option<String> {
+            self.seen.borrow_mut().push(raw.lines().count());
+            if raw.trim().is_empty() {
+                None
+            } else {
+                Some(raw.to_string())
+            }
+        }
+    }
+
+    #[test]
+    fn partial_checkpoints_digest_only_new_lines_and_final_pass_takes_the_tail() {
+        let scratch = ScratchDir::new("partial");
+        let conn = mem_conn();
+        let projects_root = scratch.path.join("projects");
+        let recall_root = scratch.path.join("recall-log");
+        let now = store::now_rfc3339();
+        let llm = DigestCountingLlm { calls: std::cell::Cell::new(0), facts: "fact one\nfact two" };
+        let filter = EchoFilter { seen: std::cell::RefCell::new(Vec::new()) };
+
+        // 100 raw lines, first checkpoint: everything is new
+        write_transcript(&scratch.path, "sess-p", 100, None);
+        let s = ingest_sessions_impl(&conn, &FakeEmbedder, &llm, &filter, &projects_root, &recall_root, Some("sess-p"), true, &now).unwrap();
+        assert_eq!((s.checkpointed, s.facts_added, s.processed), (1, 2, 0));
+        assert_eq!(store::session_progress(&conn, "sess-p").unwrap(), 100);
+        assert!(!store::is_session_ingested(&conn, "sess-p").unwrap());
+        assert_eq!(filter.seen.borrow().last().copied(), Some(100));
+
+        // only 20 new lines: below PARTIAL_MIN_NEW_LINES, nothing happens
+        write_transcript(&scratch.path, "sess-p", 120, None);
+        let s = ingest_sessions_impl(&conn, &FakeEmbedder, &llm, &filter, &projects_root, &recall_root, Some("sess-p"), true, &now).unwrap();
+        assert_eq!(s.checkpointed, 0);
+        assert_eq!(store::session_progress(&conn, "sess-p").unwrap(), 100);
+        assert_eq!(llm.calls.get(), 1);
+
+        // 60 new lines: second checkpoint sees exactly those 60
+        write_transcript(&scratch.path, "sess-p", 160, None);
+        let s = ingest_sessions_impl(&conn, &FakeEmbedder, &llm, &filter, &projects_root, &recall_root, Some("sess-p"), true, &now).unwrap();
+        assert_eq!(s.checkpointed, 1);
+        assert_eq!(filter.seen.borrow().last().copied(), Some(60));
+        assert_eq!(store::session_progress(&conn, "sess-p").unwrap(), 160);
+
+        // final pass: engagement over the whole file (160), digest over the
+        // 45-line tail only, session marked done, progress cleared
+        write_transcript(&scratch.path, "sess-p", 205, None);
+        let calls_before = llm.calls.get();
+        let s = ingest_sessions_impl(&conn, &FakeEmbedder, &llm, &filter, &projects_root, &recall_root, Some("sess-p"), false, &now).unwrap();
+        assert_eq!(s.processed, 1);
+        assert_eq!(s.facts_added, 2);
+        assert_eq!(llm.calls.get() - calls_before, 1, "no injected ids, so exactly one digest call");
+        let seen = filter.seen.borrow();
+        assert_eq!(&seen[seen.len() - 2..], &[205, 45], "whole file for engagement, tail for digest");
+        drop(seen);
+        assert!(store::is_session_ingested(&conn, "sess-p").unwrap());
+        assert_eq!(store::session_progress(&conn, "sess-p").unwrap(), 205, "mark persists past the final pass");
+        assert_eq!(store::list(&conn, None, false).unwrap().iter().filter(|m| m.source.as_deref() == Some("session-digest")).count(), 6);
+
+        // the session keeps growing after being marked finished: a later
+        // sweep digests only the new tail, marks nothing, judges nothing
+        write_transcript(&scratch.path, "sess-p", 260, Some(ingest::SWEEP_MIN_IDLE_SECS + 60));
+        let calls_before = llm.calls.get();
+        let s = ingest_sessions_impl(&conn, &FakeEmbedder, &llm, &filter, &projects_root, &recall_root, None, false, &now).unwrap();
+        assert_eq!((s.checkpointed, s.processed, s.facts_added), (1, 0, 2));
+        assert_eq!(llm.calls.get() - calls_before, 1);
+        assert_eq!(filter.seen.borrow().last().copied(), Some(55));
+        assert_eq!(store::session_progress(&conn, "sess-p").unwrap(), 260);
+        // and a checkpoint on the same finished-but-alive session works too
+        write_transcript(&scratch.path, "sess-p", 310, None);
+        let s = ingest_sessions_impl(&conn, &FakeEmbedder, &llm, &filter, &projects_root, &recall_root, Some("sess-p"), true, &now).unwrap();
+        assert_eq!(s.checkpointed, 1);
+        assert_eq!(store::session_progress(&conn, "sess-p").unwrap(), 310);
+    }
+
+    #[test]
+    fn co_engaged_memories_get_a_hebbian_edge() {
+        let scratch = ScratchDir::new("hebb");
+        let conn = mem_conn();
+        let projects_root = scratch.path.join("projects");
+        let recall_root = scratch.path.join("recall-log");
+        std::fs::create_dir_all(&recall_root).unwrap();
+        let now = store::now_rfc3339();
+        let a = store::insert(&conn, "fact a", None, None, true, None, 5).unwrap();
+        let b = store::insert(&conn, "fact b", None, None, true, None, 5).unwrap();
+        let c = store::insert(&conn, "fact c", None, None, true, None, 5).unwrap();
+        write_transcript(&scratch.path, "sess-h", 10, None);
+        std::fs::write(recall_root.join("sess-h.jsonl"), format!("{{\"ts\":\"t\",\"ids\":[{},{},{}]}}\n", a, b, c)).unwrap();
+        let reply = format!("{} ENGAGED\n{} ENGAGED\n{} SHOWN", a, b, c);
+        let llm = OwnedReplyLlm { reply };
+        let filter = FixedFilter { dialogue: Some("user: talked about a and b") };
+        let s = ingest_sessions_impl(&conn, &FakeEmbedder, &llm, &filter, &projects_root, &recall_root, Some("sess-h"), false, &now).unwrap();
+        assert_eq!((s.engaged, s.shown), (2, 1));
+        assert_eq!(store::count_assoc(&conn).unwrap(), 1);
+        assert_eq!(store::assoc_neighbors(&conn, a, &now).unwrap()[0].0, b);
+    }
+
+    #[test]
+    fn partial_without_session_id_is_a_no_op_and_offline_keeps_the_mark() {
+        let scratch = ScratchDir::new("partial-noop");
+        let conn = mem_conn();
+        let projects_root = scratch.path.join("projects");
+        let recall_root = scratch.path.join("recall-log");
+        let now = store::now_rfc3339();
+        write_transcript(&scratch.path, "sess-q", 100, Some(ingest::SWEEP_MIN_IDLE_SECS + 60));
+        let llm = FixedReflectLlm { reply: Err("offline") };
+        let filter = FixedFilter { dialogue: Some("user: we decided x") };
+        let s = ingest_sessions_impl(&conn, &FakeEmbedder, &llm, &filter, &projects_root, &recall_root, None, true, &now).unwrap();
+        assert_eq!(s.scanned, 0);
+        let s = ingest_sessions_impl(&conn, &FakeEmbedder, &llm, &filter, &projects_root, &recall_root, Some("sess-q"), true, &now).unwrap();
+        assert_eq!((s.checkpointed, s.deferred_offline), (0, 1));
+        assert_eq!(store::session_progress(&conn, "sess-q").unwrap(), 0, "offline: mark not advanced");
+    }
+
+    #[test]
+    fn search_spreads_activation_over_hebbian_edges() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        // One-hot embeddings: each text lives on its own axis, so a query
+        // matches exactly one memory and is orthogonal to the others.
+        struct AxisEmbedder;
+        impl Embedder for AxisEmbedder {
+            fn embed(&self, text: &str) -> Result<Vec<f32>, KbError> {
+                Ok(match text {
+                    t if t.contains("hub") => vec![1.0, 0.0, 0.0],
+                    t if t.contains("strangler") => vec![0.0, 1.0, 0.0],
+                    _ => vec![0.0, 0.0, 1.0],
+                })
+            }
+        }
+        let e = AxisEmbedder;
+        let hub = store::insert(&conn, "audit hub endpoints", None, None, true, Some(&e.embed("hub").unwrap()), 5).unwrap();
+        let strangler = store::insert(&conn, "strangler pattern", None, None, true, Some(&e.embed("strangler").unwrap()), 5).unwrap();
+        let _lonely = store::insert(&conn, "lonely", None, None, true, Some(&e.embed("lonely").unwrap()), 5).unwrap();
+
+        let before = search_hits(&conn, &e, "audit hub endpoints", 5, false, false, 0.5, &now).unwrap();
+        assert!(before.hits.iter().all(|h| h.via_assoc.is_none()));
+        assert!(!before.hits.iter().any(|h| h.id == strangler), "no edge yet: strangler is not near the query");
+
+        store::reinforce_assoc(&conn, &[hub, strangler], &now).unwrap();
+        store::reinforce_assoc(&conn, &[hub, strangler], &now).unwrap();
+        let after = search_hits(&conn, &e, "audit hub endpoints", 5, false, false, 0.3, &now).unwrap();
+        let assoc = after.hits.iter().find(|h| h.id == strangler).expect("strangler pulled in by association");
+        assert_eq!(assoc.via_assoc, Some(hub));
+        let src = after.hits.iter().find(|h| h.id == hub).unwrap();
+        assert!(assoc.score < src.score, "associate never outranks its source");
+        assert!(assoc.score > 0.3);
+        assert!(!after.hits.iter().any(|h| h.content.contains("lonely")));
+    }
+
 }
 
 #[cfg(test)]

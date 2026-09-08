@@ -246,6 +246,19 @@ fn init_schema(conn: &Connection) -> Result<(), KbError> {
             ingested_at TEXT NOT NULL,
             skill_usage TEXT
         );
+        CREATE TABLE IF NOT EXISTS session_progress (
+            session_id TEXT PRIMARY KEY,
+            last_line INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS memory_assoc (
+            a INTEGER NOT NULL,
+            b INTEGER NOT NULL,
+            count INTEGER NOT NULL,
+            first_at TEXT NOT NULL,
+            last_at TEXT NOT NULL,
+            PRIMARY KEY (a, b)
+        );
         CREATE TABLE IF NOT EXISTS improve_state (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             last_run_at TEXT,
@@ -532,6 +545,41 @@ fn migrate_v10_to_v11(conn: &Connection) -> Result<(), KbError> {
     Ok(())
 }
 
+/// `PRAGMA user_version`-gated, idempotent 11 -> 12 migration: the
+/// `session_progress` table behind `mach kb ingest-sessions --partial`
+/// (mid-session checkpoint digests). Pure `CREATE TABLE IF NOT EXISTS`, so
+/// it is safe on both a hand-built old database and a fresh one where
+/// `init_schema` already made it.
+fn migrate_v11_to_v12(conn: &Connection) -> Result<(), KbError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session_progress (
+            session_id TEXT PRIMARY KEY,
+            last_line INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        );",
+    )?;
+    conn.execute("PRAGMA user_version = 12", [])?;
+    Ok(())
+}
+
+/// `PRAGMA user_version`-gated, idempotent 12 -> 13 migration: the
+/// `memory_assoc` table -- Hebbian memory-to-memory association edges
+/// (see `reinforce_assoc`). Pure `CREATE TABLE IF NOT EXISTS`.
+fn migrate_v12_to_v13(conn: &Connection) -> Result<(), KbError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memory_assoc (
+            a INTEGER NOT NULL,
+            b INTEGER NOT NULL,
+            count INTEGER NOT NULL,
+            first_at TEXT NOT NULL,
+            last_at TEXT NOT NULL,
+            PRIMARY KEY (a, b)
+        );",
+    )?;
+    conn.execute("PRAGMA user_version = 13", [])?;
+    Ok(())
+}
+
 fn migrate_v6_to_v7(conn: &Connection) -> Result<(), KbError> {
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(
@@ -635,6 +683,12 @@ fn migrate(conn: &Connection) -> Result<(), KbError> {
     }
     if version < 11 {
         migrate_v10_to_v11(conn)?;
+    }
+    if version < 12 {
+        migrate_v11_to_v12(conn)?;
+    }
+    if version < 13 {
+        migrate_v12_to_v13(conn)?;
     }
     Ok(())
 }
@@ -2412,6 +2466,126 @@ pub fn skill_usage_since(conn: &Connection, since: &str) -> Result<Vec<(String, 
 }
 
 
+// --- session_progress: mid-session checkpoint digests ---
+
+/// Raw transcript line count already digested for a session -- advanced by
+/// every checkpoint (`mach kb ingest-sessions --partial`) and by the final
+/// pass, and kept after the session is marked finished so a session that
+/// keeps growing past its mark still gets its tail digested. 0 when nothing
+/// has been digested yet.
+pub fn session_progress(conn: &Connection, session_id: &str) -> Result<i64, KbError> {
+    let v: Option<i64> = conn
+        .query_row("SELECT last_line FROM session_progress WHERE session_id = ?1", params![session_id], |r| r.get(0))
+        .optional()?;
+    Ok(v.unwrap_or(0))
+}
+
+pub fn set_session_progress(conn: &Connection, session_id: &str, last_line: i64, now: &str) -> Result<(), KbError> {
+    conn.execute(
+        "INSERT INTO session_progress (session_id, last_line, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(session_id) DO UPDATE SET last_line = excluded.last_line, updated_at = excluded.updated_at",
+        params![session_id, last_line, now],
+    )?;
+    Ok(())
+}
+
+// --- memory_assoc: Hebbian co-activation between memories ---
+//
+// Memories injected into the same session and BOTH engaged with there
+// "fired together": each such pair gets an undirected edge whose count
+// grows on every co-engagement and whose effective weight decays with the
+// same forgetting curve as everything else here. Search spreads activation
+// one hop over these edges, so a memory that has repeatedly been useful
+// alongside a hit surfaces even when its embedding is not near the query.
+// Distinct from `relations` (entity graph extracted by an LLM from fact
+// text): this graph is behavioral, learned only from what recall + the
+// conversation actually did, never from what a fact says.
+
+/// Days for an association's effective weight to fall to 1/e without
+/// re-engagement.
+pub const ASSOC_TAU_DAYS: f64 = 60.0;
+/// Below this effective weight an edge is pruned by reflect.
+pub const ASSOC_PRUNE_FLOOR: f32 = 0.15;
+
+fn assoc_pair(a: i64, b: i64) -> (i64, i64) {
+    if a < b { (a, b) } else { (b, a) }
+}
+
+/// Effective weight: `sqrt(count) * exp(-days_since_last / tau)` -- grows
+/// sublinearly with repetition (a pair engaged 9 times is 3x, not 9x, a pair
+/// engaged once), forgets on the ACT-R-shaped curve the rest of the store
+/// uses.
+pub fn assoc_weight(count: i64, last_at: &str, now: &str) -> f32 {
+    let days = age_days(last_at, now).max(0.0);
+    ((count.max(0) as f64).sqrt() * (-days / ASSOC_TAU_DAYS).exp()) as f32
+}
+
+/// Records one co-engagement across every pair in `ids` (order-free,
+/// self-pairs skipped). Called by the ingest engagement pass with the ids
+/// judged ENGAGED in one session.
+pub fn reinforce_assoc(conn: &Connection, ids: &[i64], now: &str) -> Result<usize, KbError> {
+    let mut uniq: Vec<i64> = ids.to_vec();
+    uniq.sort_unstable();
+    uniq.dedup();
+    let mut n = 0;
+    for i in 0..uniq.len() {
+        for j in (i + 1)..uniq.len() {
+            let (a, b) = assoc_pair(uniq[i], uniq[j]);
+            conn.execute(
+                "INSERT INTO memory_assoc (a, b, count, first_at, last_at) VALUES (?1, ?2, 1, ?3, ?3)
+                 ON CONFLICT(a, b) DO UPDATE SET count = count + 1, last_at = excluded.last_at",
+                params![a, b, now],
+            )?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// Active associates of `id` with their effective weight, strongest first.
+/// Only edges whose other end is still an active memory are returned.
+pub fn assoc_neighbors(conn: &Connection, id: i64, now: &str) -> Result<Vec<(i64, f32)>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT CASE WHEN a = ?1 THEN b ELSE a END AS other, count, last_at
+         FROM memory_assoc ma
+         JOIN memories m ON m.id = CASE WHEN ma.a = ?1 THEN ma.b ELSE ma.a END
+         WHERE (a = ?1 OR b = ?1) AND m.invalidated_at IS NULL AND m.dormant_at IS NULL",
+    )?;
+    let rows = stmt.query_map(params![id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)))?;
+    let mut out = Vec::new();
+    for r in rows {
+        let (other, count, last_at) = r?;
+        out.push((other, assoc_weight(count, &last_at, now)));
+    }
+    out.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(out)
+}
+
+/// Deletes edges whose effective weight fell under `ASSOC_PRUNE_FLOOR` or
+/// whose either end no longer exists. Returns how many went.
+pub fn prune_assoc(conn: &Connection, now: &str) -> Result<usize, KbError> {
+    let mut stmt = conn.prepare("SELECT a, b, count, last_at FROM memory_assoc")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))
+    })?;
+    let mut doomed = Vec::new();
+    for r in rows {
+        let (a, b, count, last_at) = r?;
+        let dead_end = get(conn, a)?.is_none() || get(conn, b)?.is_none();
+        if dead_end || assoc_weight(count, &last_at, now) < ASSOC_PRUNE_FLOOR {
+            doomed.push((a, b));
+        }
+    }
+    for (a, b) in &doomed {
+        conn.execute("DELETE FROM memory_assoc WHERE a = ?1 AND b = ?2", params![a, b])?;
+    }
+    Ok(doomed.len())
+}
+
+pub fn count_assoc(conn: &Connection) -> Result<i64, KbError> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM memory_assoc", [], |r| r.get(0))?)
+}
+
 // --- entities/relations: the graph layer ---
 //
 // Entities are not just people: a project, a technology, a game engine, a
@@ -3416,7 +3590,7 @@ mod tests {
         // (`improve_state` + `ingested_sessions.skill_usage`), landing at the
         // current version.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 13);
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1);
@@ -3565,7 +3739,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 11,
+            version, 13,
             "v1->v2 (reflection tables), v2->v3 (insights level column), v3->v4 (dormant_at), \
              v4->v5 (dedupe_seen), v5->v6 (last_verified_at + contradiction_seen), \
              v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions), v8->v9 (graph layer), \
@@ -3591,7 +3765,7 @@ mod tests {
     fn fresh_database_lands_at_current_user_version() {
         let conn = mem_conn();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 13);
     }
 
     #[test]
@@ -3820,7 +3994,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 11,
+            version, 13,
             "v2->v3 (level column), v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, \
              v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions), v8->v9, v9->v10 all run"
         );
@@ -3864,7 +4038,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 11,
+            version, 13,
             "v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild), \
              v7->v8 (ingested_sessions), v8->v9, v9->v10 all run"
         );
@@ -3909,7 +4083,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 11,
+            version, 13,
             "v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 \
              (ingested_sessions), v8->v9, v9->v10 all run"
         );
@@ -3957,7 +4131,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 11, "v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) all run");
+        assert_eq!(version, 13, "v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) all run");
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -4017,7 +4191,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 11, "v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) both run");
+        assert_eq!(version, 13, "v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) both run");
 
         // Every row and its data survive the rebuild, ids included.
         let rows = list(&conn, None, false).unwrap();
@@ -4178,7 +4352,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 11, "v7->v8 (ingested_sessions) runs");
+        assert_eq!(version, 13, "v7->v8 (ingested_sessions) runs");
 
         assert_eq!(list(&conn, None, false).unwrap().len(), 1, "existing memory row must survive the migration");
 
@@ -4909,7 +5083,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 11, "v8->v9 (graph layer) runs");
+        assert_eq!(version, 13, "v8->v9 (graph layer) runs");
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -4970,7 +5144,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 11, "v9->v10 (last_completed_at + entity_merge_seen) runs");
+        assert_eq!(version, 13, "v9->v10 (last_completed_at + entity_merge_seen) runs");
 
         // The pre-existing watermark row survives, and last_completed_at
         // backfills to NULL (never completed under the new field yet).
@@ -5371,6 +5545,15 @@ mod tests {
         migrate_v10_to_v11(&conn).unwrap();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(version, 11);
+        migrate_v11_to_v12(&conn).unwrap();
+        migrate_v11_to_v12(&conn).unwrap();
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 12);
+        migrate_v12_to_v13(&conn).unwrap();
+        migrate_v12_to_v13(&conn).unwrap();
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 13);
+        assert_eq!(count_assoc(&conn).unwrap(), 0);
         let cols = existing_ingested_sessions_columns(&conn).unwrap();
         assert!(cols.iter().any(|c| c == "skill_usage"));
         assert_eq!(get_improve_state(&conn).unwrap(), ImproveState::default());
@@ -5403,5 +5586,43 @@ mod tests {
         assert_eq!(hits, vec![a, b]);
         assert_eq!(latest_memory_id(&conn).unwrap(), _c);
         assert_eq!(latest_relation_id(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn session_progress_round_trip() {
+        let conn = mem_conn();
+        assert_eq!(session_progress(&conn, "s").unwrap(), 0);
+        set_session_progress(&conn, "s", 120, "2026-09-08T10:00:00Z").unwrap();
+        set_session_progress(&conn, "s", 340, "2026-09-08T11:00:00Z").unwrap();
+        assert_eq!(session_progress(&conn, "s").unwrap(), 340);
+        assert_eq!(session_progress(&conn, "other").unwrap(), 0);
+    }
+
+    #[test]
+    fn assoc_reinforces_pairs_decays_and_prunes() {
+        let conn = mem_conn();
+        let a = insert(&conn, "audit hub endpoints first", None, None, true, None, 5).unwrap();
+        let b = insert(&conn, "strangler pattern on overhaul branch", None, None, true, None, 5).unwrap();
+        let c = insert(&conn, "unrelated", None, None, true, None, 5).unwrap();
+        let t0 = "2026-09-01T00:00:00Z";
+        assert_eq!(reinforce_assoc(&conn, &[b, a, a], t0).unwrap(), 1, "dup ids collapse, self-pairs skipped");
+        reinforce_assoc(&conn, &[a, b, c], "2026-09-02T00:00:00Z").unwrap();
+        assert_eq!(count_assoc(&conn).unwrap(), 3);
+
+        let n = assoc_neighbors(&conn, a, "2026-09-02T00:00:00Z").unwrap();
+        assert_eq!(n[0].0, b, "a-b engaged twice ranks above a-c engaged once");
+        assert!((n[0].1 - 2f32.sqrt()).abs() < 1e-3);
+        assert!((n[1].1 - 1.0).abs() < 1e-3);
+
+        // decay: a year later everything is under the prune floor
+        assert!(assoc_weight(2, t0, "2027-09-01T00:00:00Z") < ASSOC_PRUNE_FLOOR);
+        assert!(assoc_weight(2, t0, "2026-09-03T00:00:00Z") > 1.0);
+
+        // a forgotten memory takes its edges with it at prune time
+        delete(&conn, c).unwrap();
+        assert_eq!(prune_assoc(&conn, "2026-09-03T00:00:00Z").unwrap(), 2);
+        assert_eq!(count_assoc(&conn).unwrap(), 1);
+        assert_eq!(prune_assoc(&conn, "2027-09-01T00:00:00Z").unwrap(), 1);
+        assert_eq!(count_assoc(&conn).unwrap(), 0);
     }
 }

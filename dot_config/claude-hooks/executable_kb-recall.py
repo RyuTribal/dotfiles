@@ -42,13 +42,63 @@ def read_input():
     try:
         data = json.load(sys.stdin)
     except Exception:
-        return "", ""
+        return "", "", ""
     prompt = data.get("prompt", "")
     session_id = data.get("session_id", "")
+    cwd = data.get("cwd", "")
     return (
         prompt if isinstance(prompt, str) else "",
         session_id if isinstance(session_id, str) else "",
+        cwd if isinstance(cwd, str) else "",
     )
+
+
+def project_name(cwd):
+    """Basename of the session's working directory, or "" when it is the
+    home directory (no project) or unknown."""
+    if not cwd:
+        return ""
+    base = os.path.basename(os.path.normpath(cwd))
+    if not base or base == os.path.basename(os.path.expanduser("~")):
+        return ""
+    return base
+
+
+def search(query):
+    resp = search_via_socket(query)
+    if resp is None:
+        resp = search_via_subprocess(query)
+    return resp
+
+
+def merge_responses(primary, secondary):
+    """Union of two search responses, primary order first, deduped by memory
+    id (or by content for derived rows, which carry insight ids in the same
+    `id` space). Either side may be None."""
+    if not primary and not secondary:
+        return None
+    out = {"hits": [], "connections": []}
+    seen_ids, seen_text, seen_conn = set(), set(), set()
+    for resp in (primary, secondary):
+        if not resp:
+            continue
+        for h in resp.get("hits") or []:
+            if not isinstance(h, dict):
+                continue
+            key = ("d" if h.get("derived") else "m", h.get("id"))
+            text = (h.get("content") or "").strip()
+            if (isinstance(h.get("id"), int) and key in seen_ids) or (text and text in seen_text):
+                continue
+            seen_ids.add(key)
+            seen_text.add(text)
+            out["hits"].append(h)
+        for c in resp.get("connections") or []:
+            k = connection_key(c) if isinstance(c, dict) else None
+            if k is None or k in seen_conn:
+                continue
+            seen_conn.add(k)
+            out["connections"].append(c)
+    return out
 
 
 def _valid_response(data):
@@ -232,13 +282,17 @@ def connection_line(c):
 
 
 def main():
-    prompt, session_id = read_input()
+    prompt, session_id, cwd = read_input()
     if not prompt or len(prompt) < MIN_PROMPT_LEN or prompt.startswith("/"):
         return
 
-    resp = search_via_socket(prompt)
-    if resp is None:
-        resp = search_via_subprocess(prompt)
+    resp = search(prompt)
+    # Query expansion: the same prompt anchored to the project the session
+    # runs in, so "fix the tutorial drift" inside ~/programming/umoja also
+    # pulls Umoja-specific memories the bare prompt does not embed near.
+    project = project_name(cwd)
+    if project and project.lower() not in prompt.lower():
+        resp = merge_responses(resp, search("{} {}".format(project, prompt)))
     if not resp:
         return
     hits = resp.get("hits") or []
@@ -252,6 +306,11 @@ def main():
 
     lines = []
     ids = []
+    # per-id ranking components [sim, recency, strength, score(, via_assoc)]
+    # -- logged, never shown; the offline data a future ranking-parameter
+    # search (evolutionary or otherwise) will be fitted against, paired with
+    # ingest-sessions' engaged/shown verdicts
+    scores = {}
     for h in hits:
         if not isinstance(h, dict):
             continue
@@ -279,9 +338,22 @@ def main():
             mem_id = h.get("id")
             if isinstance(mem_id, int) and mem_id in suppressed:
                 continue
-            lines.append("- [{}] {} ({})".format(date, content, source_phrase(h.get("source"))))
+            via = h.get("via_assoc")
+            how = source_phrase(h.get("source"))
+            if isinstance(via, int):
+                # spreading activation over Hebbian memory_assoc edges: this
+                # did not match the prompt, it has been useful alongside a
+                # hit that did
+                how = how + "; recalled by association"
+            lines.append("- [{}] {} ({})".format(date, content, how))
             if isinstance(mem_id, int):
                 ids.append(mem_id)
+                scores[str(mem_id)] = [
+                    round(float(h.get("sim") or 0), 3),
+                    round(float(h.get("recency") or 0), 3),
+                    round(float(h.get("strength") or 0), 3),
+                    round(score, 3),
+                ] + ([via] if isinstance(via, int) else [])
 
     # Same sliding-window session dedupe as memory hits (`suppressed`,
     # above), now applied to connections too via their own rendered key —
@@ -328,6 +400,8 @@ def main():
             import datetime
             ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             entry = {"ts": ts, "ids": ids}
+            if scores:
+                entry["scores"] = scores
             if conn_keys:
                 entry["conn"] = conn_keys
             with open(log_path, "a") as f:

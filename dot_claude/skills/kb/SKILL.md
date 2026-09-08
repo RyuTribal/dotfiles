@@ -187,6 +187,42 @@ that's just restating what's already in a CLAUDE.md or the repo.
 or account numbers, ever, regardless of how the user phrases the request.
 If asked to save one, decline and point to a proper secret manager instead.
 
+## Capture that does not depend on you remembering to save
+
+Three hooks make mid-session capture and recall structural rather than a
+matter of discipline; know they exist so you neither duplicate them nor
+assume nothing is being saved:
+
+- **Checkpoint digests** (`kb-checkpoint.sh`, Stop + PreCompact). Every 8
+  assistant turns or 15 minutes, and always right before compaction,
+  `mach kb ingest-sessions --session-id <id> --partial` digests only the
+  transcript lines since the last checkpoint into unreviewed memories. A
+  long session no longer waits for SessionEnd, and nothing about to be
+  compacted away is lost. The final SessionEnd pass digests just the tail.
+- **Decision cues** (`kb-decision.sh`, UserPromptSubmit). A user message
+  that reads like a decision ("decision:", "let's go with", "from now on",
+  "approved", "settled on") is stored verbatim as an unreviewed memory at
+  once, no model call. Reflect's dedupe reconciles it with the digest.
+- **Tool-time recall** (`kb-pretool-recall.py`, PreToolUse on Write, Agent,
+  EnterPlanMode, ExitPlanMode). Before you create a file, delegate, or plan,
+  memories matching the project plus the file or task are injected as
+  additional context. This is where "audit existing X before building"
+  memories are meant to reach you; read them before proceeding.
+
+Prompt-time recall also runs a second query anchored on the project name
+(basename of the working directory), so project-specific memories surface
+even when the prompt itself does not name the project.
+
+A recalled line marked "recalled by association" did not match the prompt.
+It was pulled in over a Hebbian edge: you engaged it together with a hit
+that did match, in an earlier session (`memory_assoc`, reinforced by the
+engagement pass, pruned by reflect as it fades). Treat it as a nudge about
+what usually goes together, weaker than a direct match.
+
+None of this replaces a deliberate `mach kb add` for something the user
+states plainly and you judge durable. It removes the failure mode where a
+decision only survives if you happened to save it.
+
 ## Self-improvement: memory feeding back into your own config
 
 `mach kb improve` runs after every `mach kb reflect` (same

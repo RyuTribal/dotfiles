@@ -44,6 +44,14 @@
             "command": "bash /home/ryutribal/.config/claude-hooks/kb-recall.sh"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /home/ryutribal/.config/claude-hooks/kb-decision.sh"
+          }
+        ]
       }
     ],
     "PreToolUse": [
@@ -60,6 +68,16 @@
           {
             "type": "command",
             "command": "'/usr/bin/caveman' shrink-hook"
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Agent|EnterPlanMode|ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /home/ryutribal/.config/claude-hooks/kb-pretool-recall.py",
+            "timeout": 5
           }
         ]
       }
@@ -90,6 +108,15 @@
           {
             "type": "command",
             "command": "'/home/ryutribal/.caveman/bin/caveman-proxy' native-hook claude --adapter '/usr/lib/node_modules/@caveman-ai/cli/dist/native-hook-fast.js'"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /home/ryutribal/.config/claude-hooks/kb-checkpoint.sh",
+            "timeout": 100
           }
         ]
       }
@@ -130,6 +157,14 @@
           {
             "type": "command",
             "command": "'/home/ryutribal/.caveman/bin/caveman-proxy' native-hook claude --adapter '/usr/lib/node_modules/@caveman-ai/cli/dist/native-hook-fast.js'"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /home/ryutribal/.config/claude-hooks/kb-checkpoint.sh"
           }
         ]
       }

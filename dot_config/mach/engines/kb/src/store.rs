@@ -7,6 +7,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use std::collections::HashMap;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::classify::Verdict;
@@ -297,6 +298,41 @@ fn init_schema(conn: &Connection) -> Result<(), KbError> {
             invalidated_at TEXT,
             superseded_by INTEGER
         );",
+    )?;
+    ensure_fts(conn)?;
+    Ok(())
+}
+
+/// FTS5 external-content index over `memories.content`, kept in step by
+/// triggers. `content='memories'` means the index stores no copy of the
+/// text -- it reads the row back from `memories` by rowid -- so it costs
+/// only the inverted index. Tokenizer `unicode61` folds case and splits on
+/// punctuation: "10.8.0.63" indexes as four numeric tokens, "react-app" as
+/// two words, a NORAD id "43005" as itself -- exactly the exact-token
+/// matches cosine over an embedding blurs. Idempotent (`IF NOT EXISTS`
+/// everywhere); the v14 -> v15 migration additionally issues a 'rebuild'
+/// so rows written before the index existed are indexed.
+///
+/// `memories_fts` is derived state: never exported, never imported, always
+/// rebuildable with `INSERT INTO memories_fts(memories_fts) VALUES('rebuild')`.
+fn ensure_fts(conn: &Connection) -> Result<(), KbError> {
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+            content,
+            content='memories',
+            content_rowid='id',
+            tokenize='unicode61 remove_diacritics 2'
+        );
+        CREATE TRIGGER IF NOT EXISTS memories_fts_ai AFTER INSERT ON memories BEGIN
+            INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memories_fts_ad AFTER DELETE ON memories BEGIN
+            INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.id, old.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE OF content ON memories BEGIN
+            INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.id, old.content);
+            INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+        END;",
     )?;
     Ok(())
 }
@@ -606,6 +642,20 @@ fn migrate_v13_to_v14(conn: &Connection) -> Result<(), KbError> {
     Ok(())
 }
 
+/// `PRAGMA user_version`-gated, idempotent 14 -> 15 migration: the FTS5
+/// lexical index (`ensure_fts`, which `init_schema` already ran before
+/// `migrate` got here) plus a one-off 'rebuild' so every row that predates
+/// the index is indexed. A rebuild on an already-current index is a no-op
+/// apart from the time it takes, so re-running is harmless. `ensure_fts` is
+/// called again here because an earlier migration in the same run
+/// (v6 -> v7's table rebuild) drops `memories` and with it the triggers.
+fn migrate_v14_to_v15(conn: &Connection) -> Result<(), KbError> {
+    ensure_fts(conn)?;
+    conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')", [])?;
+    conn.execute("PRAGMA user_version = 15", [])?;
+    Ok(())
+}
+
 fn migrate_v6_to_v7(conn: &Connection) -> Result<(), KbError> {
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(
@@ -718,6 +768,9 @@ fn migrate(conn: &Connection) -> Result<(), KbError> {
     }
     if version < 14 {
         migrate_v13_to_v14(conn)?;
+    }
+    if version < 15 {
+        migrate_v14_to_v15(conn)?;
     }
     Ok(())
 }
@@ -1364,6 +1417,10 @@ pub struct RankedHit {
     pub recency: f32,
     pub strength: f32,
     pub superseded: bool,
+    // Normalized BM25 from the FTS5 index for the query's exact tokens:
+    // 1.0 for the best lexical match, 0.0 when the row matched no token
+    // (or the search ran without query text). See `search_hybrid`.
+    pub lexical: f32,
 }
 
 /// Confidence penalty applied to an unreviewed (`reviewed = 0`) row's score
@@ -1404,25 +1461,75 @@ pub fn search_ranked(
     min_score: f32,
     now: &str,
 ) -> Result<Vec<RankedHit>, KbError> {
+    rank_with_lexical(conn, query_embedding, &HashMap::new(), limit, reviewed_only, include_superseded, min_score, now)
+}
+
+/// Weight of a perfect lexical match relative to a perfect cosine match.
+/// Below 1.0 on purpose: an exact-token hit is strong evidence but the
+/// embedding still knows about paraphrase; a row that matches both gets
+/// whichever is higher, never the sum (so nothing is double counted).
+pub const LEXICAL_WEIGHT: f32 = 0.9;
+
+/// How many FTS rows to pull per query. Only the top few ever matter for
+/// ranking; this bounds the join work on a large bank.
+pub const LEXICAL_CANDIDATES: usize = 50;
+
+/// `search_ranked` plus the FTS5 lexical channel (Honcho-style hybrid):
+/// the query's exact tokens are looked up in `memories_fts`, BM25 is
+/// normalized to `[0, 1]` against the best lexical hit, and each row's
+/// similarity term becomes `max(cosine, LEXICAL_WEIGHT * lexical)`. The
+/// recency/strength/penalty blend is unchanged, so scores stay on the same
+/// scale the hooks threshold against (`kb-recall.py`'s 0.45). A row with no
+/// embedding can now surface on a lexical hit alone; a row with neither is
+/// still excluded. Any FTS failure (bad syntax that slipped past
+/// `fts_query`, index missing) degrades to plain cosine, never an error.
+pub fn search_hybrid(
+    conn: &Connection,
+    query_text: &str,
+    query_embedding: &[f32],
+    limit: usize,
+    reviewed_only: bool,
+    include_superseded: bool,
+    min_score: f32,
+    now: &str,
+) -> Result<Vec<RankedHit>, KbError> {
+    let lexical = lexical_scores(conn, query_text, LEXICAL_CANDIDATES).unwrap_or_default();
+    rank_with_lexical(conn, query_embedding, &lexical, limit, reviewed_only, include_superseded, min_score, now)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rank_with_lexical(
+    conn: &Connection,
+    query_embedding: &[f32],
+    lexical: &HashMap<i64, f32>,
+    limit: usize,
+    reviewed_only: bool,
+    include_superseded: bool,
+    min_score: f32,
+    now: &str,
+) -> Result<Vec<RankedHit>, KbError> {
     let now_secs = parse_rfc3339(now).unwrap_or(0);
     let mut scored: Vec<RankedHit> = candidates(conn, !reviewed_only, include_superseded)?
         .into_iter()
         .filter_map(|m| {
+            let lex = lexical.get(&m.id).copied().unwrap_or(0.0);
             let sim = match &m.embedding {
                 Some(e) if !e.is_empty() => cosine(query_embedding, e).clamp(0.0, 1.0),
+                _ if lex > 0.0 => 0.0,
                 _ => return None,
             };
+            let sim_eff = sim.max(LEXICAL_WEIGHT * lex);
             let recency = compute_recency(&m, now_secs);
             let strength = compute_strength(&m, now_secs);
             let superseded = m.is_superseded();
-            let mut score = 0.70 * sim + 0.20 * recency + 0.10 * strength;
+            let mut score = 0.70 * sim_eff + 0.20 * recency + 0.10 * strength;
             if superseded {
                 score *= 0.1;
             }
             if !m.reviewed {
                 score *= UNREVIEWED_SEARCH_PENALTY;
             }
-            Some(RankedHit { memory: m, score, sim, recency, strength, superseded })
+            Some(RankedHit { memory: m, score, sim, recency, strength, superseded, lexical: lex })
         })
         .collect();
     scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
@@ -1431,6 +1538,86 @@ pub fn search_ranked(
         scored.retain(|h| h.score >= min_score);
     }
     Ok(scored)
+}
+
+/// Words too common to carry lexical signal; dropped from FTS queries.
+const FTS_STOPWORDS: &[&str] = &[
+    "the", "and", "for", "that", "this", "with", "what", "does", "did", "do", "is", "are", "was", "were", "be",
+    "been", "have", "has", "had", "you", "your", "our", "we", "they", "them", "their", "his", "her", "its", "it",
+    "me", "my", "in", "on", "at", "to", "of", "a", "an", "or", "not", "no", "so", "if", "as", "by", "from", "about",
+    "how", "why", "when", "where", "which", "who", "whom", "can", "could", "would", "should", "will", "just",
+    "into", "than", "then", "there", "here", "also", "any", "all", "some", "more", "most", "want", "wants", "know",
+    "like", "one", "two", "use", "used", "using", "get", "got", "make", "made", "please", "tell", "remember",
+];
+
+/// Turns free text into a safe FTS5 MATCH expression: lowercase alphanumeric
+/// tokens (unicode61's own idea of a word), stopwords and 1-2 letter words
+/// dropped (digits of any length kept -- "Q4", "43005"), deduped, capped at
+/// 12, each double-quoted so no FTS operator syntax (`NEAR`, `*`, `:`, a
+/// stray quote) can leak through, joined with OR. `None` when nothing
+/// survives, in which case the lexical channel is skipped entirely.
+pub fn fts_query(text: &str) -> Option<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for raw in text.split(|c: char| !c.is_alphanumeric()) {
+        if raw.is_empty() {
+            continue;
+        }
+        let tok = raw.to_lowercase();
+        let has_digit = tok.chars().any(|c| c.is_ascii_digit());
+        if !has_digit && tok.chars().count() < 3 {
+            continue;
+        }
+        if FTS_STOPWORDS.contains(&tok.as_str()) {
+            continue;
+        }
+        if seen.contains(&tok) {
+            continue;
+        }
+        seen.push(tok);
+        if seen.len() >= 12 {
+            break;
+        }
+    }
+    if seen.is_empty() {
+        return None;
+    }
+    Some(seen.into_iter().map(|t| format!("\"{}\"", t)).collect::<Vec<_>>().join(" OR "))
+}
+
+/// `memory id -> normalized lexical score` for the query's tokens, from the
+/// FTS5 index: BM25 (negative, more negative is better) divided by the best
+/// row's BM25, so the top lexical hit is exactly 1.0 and the rest fall off
+/// toward 0. Empty when the query has no usable tokens or nothing matches.
+/// Errors (index missing, syntax) propagate; `search_hybrid` treats them as
+/// "no lexical channel".
+pub fn lexical_scores(conn: &Connection, query_text: &str, limit: usize) -> Result<HashMap<i64, f32>, KbError> {
+    let Some(expr) = fts_query(query_text) else {
+        return Ok(HashMap::new());
+    };
+    let mut stmt = conn.prepare(
+        "SELECT rowid, bm25(memories_fts) FROM memories_fts WHERE memories_fts MATCH ?1 ORDER BY bm25(memories_fts) LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![expr, limit as i64], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))?;
+    let mut ranked: Vec<(i64, f64)> = Vec::new();
+    for r in rows {
+        ranked.push(r?);
+    }
+    let mut out = HashMap::new();
+    let Some(&(_, best)) = ranked.first() else {
+        return Ok(out);
+    };
+    if best >= 0.0 {
+        // bm25() is negative for every real match; a non-negative best means
+        // nothing usable came back.
+        return Ok(out);
+    }
+    for (id, bm) in ranked {
+        let lex = if bm < 0.0 { (bm / best).clamp(0.0, 1.0) as f32 } else { 0.0 };
+        if lex > 0.0 {
+            out.insert(id, lex);
+        }
+    }
+    Ok(out)
 }
 
 /// Fallback search when embedding the query failed (e.g. ollama is down):
@@ -3233,6 +3420,101 @@ mod tests {
     }
 
     #[test]
+    fn fts_query_sanitizes_and_keeps_exact_tokens() {
+        assert_eq!(
+            fts_query("What's the NORAD id 43005 for react-app on 10.8.0.63?").as_deref(),
+            Some("\"norad\" OR \"43005\" OR \"react\" OR \"app\" OR \"10\" OR \"8\" OR \"0\" OR \"63\"")
+        );
+        assert_eq!(fts_query("the a to"), None);
+        assert_eq!(fts_query("!!! ---"), None);
+        // operator syntax cannot leak: everything is a quoted bare token
+        let q = fts_query("NEAR(foo bar) \"quoted\" col:val x*").unwrap();
+        assert!(!q.contains("NEAR("));
+        assert!(!q.contains(':'));
+        assert!(!q.contains('*'));
+        assert!(q.split(" OR ").all(|t| t.starts_with('"') && t.ends_with('"')));
+    }
+
+    #[test]
+    fn fts_index_tracks_insert_update_and_delete() {
+        let conn = mem_conn();
+        let id = insert(&conn, "TigriSat beacon NORAD 43005 at 435 MHz", None, None, true, None, 5).unwrap();
+        assert!(lexical_scores(&conn, "43005", 10).unwrap().contains_key(&id));
+        conn.execute("UPDATE memories SET content = 'renamed to OBJECT A, catalog 99999' WHERE id = ?1", [id]).unwrap();
+        assert!(!lexical_scores(&conn, "43005", 10).unwrap().contains_key(&id));
+        assert!(lexical_scores(&conn, "99999", 10).unwrap().contains_key(&id));
+        conn.execute("DELETE FROM memories WHERE id = ?1", [id]).unwrap();
+        assert!(lexical_scores(&conn, "99999", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn hybrid_search_finds_an_exact_token_the_embedding_misses() {
+        let conn = mem_conn();
+        let norad = insert(&conn, "TigriSat beacon uses NORAD 43005", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        insert(&conn, "the user prefers dark mode", None, None, true, Some(&unit_vec(4, 1)), 5).unwrap();
+        let now = now_rfc3339();
+        // A query embedding orthogonal to both rows: cosine alone has nothing.
+        let q = unit_vec(4, 2);
+        let plain = search_ranked(&conn, &q, 5, false, false, 0.0, &now).unwrap();
+        assert!(plain.iter().all(|h| h.sim == 0.0 && h.lexical == 0.0));
+
+        let hybrid = search_hybrid(&conn, "what is 43005", &q, 5, false, false, 0.0, &now).unwrap();
+        assert_eq!(hybrid[0].memory.id, norad, "the exact catalog number must win on the lexical channel");
+        assert!((hybrid[0].lexical - 1.0).abs() < 1e-6);
+        assert_eq!(hybrid[0].sim, 0.0, "raw cosine is reported untouched");
+        assert!(hybrid[0].score >= 0.7 * LEXICAL_WEIGHT, "a perfect lexical hit clears the hooks' 0.45 floor");
+        assert!(hybrid[0].score > hybrid[1].score);
+    }
+
+    #[test]
+    fn hybrid_search_never_exceeds_a_perfect_cosine_and_never_double_counts() {
+        let conn = mem_conn();
+        let both = insert(&conn, "catalog 43005", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        let now = now_rfc3339();
+        let q = unit_vec(4, 0); // cosine 1.0 AND lexical 1.0
+        let hybrid = search_hybrid(&conn, "43005", &q, 5, false, false, 0.0, &now).unwrap();
+        let plain = search_ranked(&conn, &q, 5, false, false, 0.0, &now).unwrap();
+        assert_eq!(hybrid[0].memory.id, both);
+        assert!((hybrid[0].score - plain[0].score).abs() < 1e-6, "max(), not sum: same score as cosine alone");
+    }
+
+    #[test]
+    fn hybrid_search_surfaces_an_embeddingless_row_on_a_lexical_hit_only() {
+        let conn = mem_conn();
+        let id = insert(&conn, "host popobawa is 10.8.0.63", None, None, true, None, 5).unwrap();
+        let now = now_rfc3339();
+        let q = unit_vec(4, 0);
+        assert!(search_ranked(&conn, &q, 5, false, false, 0.0, &now).unwrap().is_empty());
+        let hybrid = search_hybrid(&conn, "popobawa", &q, 5, false, false, 0.0, &now).unwrap();
+        assert_eq!(hybrid.len(), 1);
+        assert_eq!(hybrid[0].memory.id, id);
+        // and with no usable tokens at all it is still excluded
+        assert!(search_hybrid(&conn, "the a", &q, 5, false, false, 0.0, &now).unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrate_v14_to_v15_rebuilds_the_index_over_pre_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, source TEXT, project TEXT,
+                created_at TEXT NOT NULL, reviewed INTEGER NOT NULL DEFAULT 1, embedding BLOB,
+                importance INTEGER NOT NULL DEFAULT 5, stability REAL, access_count INTEGER NOT NULL DEFAULT 0,
+                first_accessed_at TEXT, last_accessed_at TEXT, valid_from TEXT, invalidated_at TEXT,
+                superseded_by INTEGER, dormant_at TEXT, last_verified_at TEXT, graph_extracted_at TEXT, basis TEXT);
+             INSERT INTO memories (content, created_at) VALUES ('legacy row mentions 43005', '2026-01-01T00:00:00Z');
+             PRAGMA user_version = 14;",
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 15);
+        assert!(lexical_scores(&conn, "43005", 10).unwrap().contains_key(&1), "pre-existing rows get indexed by the rebuild");
+        migrate(&conn).unwrap(); // idempotent
+    }
+
+    #[test]
     fn add_column_if_missing_is_idempotent_across_a_lost_race() {
         // Simulates the second of two concurrent migrators: the column
         // already landed (the other process won), and this one's ALTER
@@ -3270,7 +3552,7 @@ mod tests {
         init_schema(&conn).unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 14);
+        assert_eq!(v, 15);
         let m = get(&conn, 1).unwrap().unwrap();
         assert_eq!(m.basis, None, "pre-existing rows stay basis-unknown");
         // idempotent
@@ -3722,7 +4004,7 @@ mod tests {
         // (`improve_state` + `ingested_sessions.skill_usage`), landing at the
         // current version.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1);
@@ -3871,7 +4153,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 14,
+            version, 15,
             "v1->v2 (reflection tables), v2->v3 (insights level column), v3->v4 (dormant_at), \
              v4->v5 (dedupe_seen), v5->v6 (last_verified_at + contradiction_seen), \
              v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions), v8->v9 (graph layer), \
@@ -3897,7 +4179,7 @@ mod tests {
     fn fresh_database_lands_at_current_user_version() {
         let conn = mem_conn();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
     }
 
     #[test]
@@ -4126,7 +4408,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 14,
+            version, 15,
             "v2->v3 (level column), v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, \
              v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions), v8->v9, v9->v10 all run"
         );
@@ -4170,7 +4452,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 14,
+            version, 15,
             "v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild), \
              v7->v8 (ingested_sessions), v8->v9, v9->v10 all run"
         );
@@ -4215,7 +4497,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 14,
+            version, 15,
             "v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 \
              (ingested_sessions), v8->v9, v9->v10 all run"
         );
@@ -4263,7 +4545,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 14, "v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) all run");
+        assert_eq!(version, 15, "v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) all run");
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -4323,7 +4605,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 14, "v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) both run");
+        assert_eq!(version, 15, "v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) both run");
 
         // Every row and its data survive the rebuild, ids included.
         let rows = list(&conn, None, false).unwrap();
@@ -4484,7 +4766,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 14, "v7->v8 (ingested_sessions) runs");
+        assert_eq!(version, 15, "v7->v8 (ingested_sessions) runs");
 
         assert_eq!(list(&conn, None, false).unwrap().len(), 1, "existing memory row must survive the migration");
 
@@ -5216,7 +5498,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 14, "v8->v9 (graph layer) runs");
+        assert_eq!(version, 15, "v8->v9 (graph layer) runs");
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -5277,7 +5559,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 14, "v9->v10 (last_completed_at + entity_merge_seen) runs");
+        assert_eq!(version, 15, "v9->v10 (last_completed_at + entity_merge_seen) runs");
 
         // The pre-existing watermark row survives, and last_completed_at
         // backfills to NULL (never completed under the new field yet).

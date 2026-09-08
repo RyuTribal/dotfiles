@@ -43,6 +43,17 @@ add`) rather than silently overriding it — the next `mach kb reflect` /
 re-verification pass reconciles the belief itself; you don't edit insights
 directly.
 
+## Retrieval is hybrid (since 2026-09-08)
+
+Search and recall rank on `max(cosine, 0.9 * lexical)` blended with recency
+and strength. `lexical` is normalized BM25 from an FTS5 index over memory
+text (`memories_fts`, trigger-maintained, rebuildable): the query's exact
+tokens (a NORAD number, a hostname, a ticket name, a person's name) match
+even when the embedding blurs them. `--json` hits carry `lexical` (omitted
+when 0) next to `sim`; a hit with `sim` near 0 and `lexical` 1.0 was found
+by the exact token alone. Stopwords and 1-2 letter words are dropped from
+the lexical query; digits of any length are kept.
+
 ## Stated vs inferred (basis)
 
 Every memory carries a `basis`: **stated** (the user or a named person said

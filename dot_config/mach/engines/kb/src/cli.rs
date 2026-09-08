@@ -35,7 +35,8 @@ fn print_help() {
     println!("                          memory triggers a classifier verdict unless --no-classify.");
     println!("  search \"<query>\" [--limit N] [--json] [--reviewed-only] [--touch]");
     println!("      [--include-superseded] [--min-score F]");
-    println!("                          ranked top-N search (sim/recency/strength blend);");
+    println!("                          ranked top-N search: hybrid cosine + FTS5 exact-token");
+    println!("                          (max, never sum) blended with recency/strength;");
     println!("                          unreviewed rows are included by default at a small");
     println!("                          confidence penalty — --reviewed-only excludes them;");
     println!("                          --touch reinforces the rows actually returned");
@@ -287,6 +288,17 @@ pub struct SearchHit {
     // classify). Lets kb-recall.py say "you told me" vs "I inferred".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub basis: Option<String>,
+    // Normalized BM25 from the FTS5 lexical channel (`store::search_hybrid`):
+    // 1.0 for the query's best exact-token match, omitted when 0 (no token
+    // matched, or the hit came from insights/association where the channel
+    // does not apply). `sim` stays the raw cosine; the blended `score`
+    // already reflects whichever of the two was higher.
+    #[serde(skip_serializing_if = "f32_is_zero")]
+    pub lexical: f32,
+}
+
+fn f32_is_zero(v: &f32) -> bool {
+    *v == 0.0
 }
 
 pub(crate) fn to_hit(h: RankedHit) -> SearchHit {
@@ -307,6 +319,7 @@ pub(crate) fn to_hit(h: RankedHit) -> SearchHit {
         level: None,
         via_assoc: None,
         basis: h.memory.basis,
+        lexical: h.lexical,
     }
 }
 
@@ -329,6 +342,7 @@ pub(crate) fn insight_to_hit(h: InsightHit) -> SearchHit {
         level: Some(h.insight.level),
         via_assoc: None,
         basis: None,
+        lexical: 0.0,
     }
 }
 
@@ -617,7 +631,10 @@ pub fn search_hits<E: Embedder>(
     now: &str,
 ) -> Result<SearchResponse, KbError> {
     let q_emb = embedder.embed(query)?;
-    let mem_hits = store::search_ranked(conn, &q_emb, limit, reviewed_only, include_superseded, 0.0, now)?;
+    // Hybrid: cosine over embeddings plus the FTS5 exact-token channel
+    // (`store::search_hybrid`), so a NORAD number, hostname, or ticket name
+    // the embedding blurs still ranks.
+    let mem_hits = store::search_hybrid(conn, query, &q_emb, limit, reviewed_only, include_superseded, 0.0, now)?;
     let insight_hits = store::search_insights_ranked(conn, &q_emb, limit, now)?;
     let mut mem_hits: Vec<SearchHit> = mem_hits.into_iter().map(to_hit).collect();
     // Threshold the query matches before spreading: a memory that only
@@ -688,6 +705,7 @@ fn spread_assoc(conn: &Connection, hits: &[SearchHit], now: &str) -> Result<Vec<
                 level: None,
                 via_assoc: Some(h.id),
                 basis: m.basis,
+                lexical: 0.0,
             });
         }
     }
@@ -773,7 +791,7 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
                 .into_iter()
                 .map(|(m, score)| {
                     let superseded = m.is_superseded();
-                    to_hit(RankedHit { memory: m, score, sim: score, recency: 0.0, strength: 0.0, superseded })
+                    to_hit(RankedHit { memory: m, score, sim: score, recency: 0.0, strength: 0.0, superseded, lexical: 0.0 })
                 })
                 .collect();
             SearchResponse { hits, connections: Vec::new() }
@@ -821,7 +839,10 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
             println!("(! = superseded — scored ×0.1, shown via --include-superseded)");
         }
     }
-    if !response.connections.is_empty() {
+    // Human-readable only: with --json the connections are already inside
+    // the JSON object above, and trailing text would break every consumer
+    // that json-parses stdout (kb-recall.py's subprocess fallback did).
+    if !json && !response.connections.is_empty() {
         println!("\nconnections:");
         for c in &response.connections {
             match (&c.predicate2, &c.src_name2, &c.dst_name2) {

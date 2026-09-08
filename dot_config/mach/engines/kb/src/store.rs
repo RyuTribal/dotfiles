@@ -155,6 +155,15 @@ impl Insight {
 pub struct ReflectState {
     pub last_run_at: Option<String>,
     pub last_memory_id: Option<i64>,
+    // Set by every `mach kb reflect` invocation that actually completes
+    // (including a cheap "nothing new" early exit) -- but NOT by the
+    // offline-defer early exit, which means reflection genuinely didn't
+    // happen this time. Distinct from `last_run_at`, which only advances
+    // when there was new material AND nothing failed (see
+    // `should_advance_watermark`): this field exists purely so `mach kb
+    // health` can answer "is the reflect pass still running periodically at
+    // all," independent of whether it's had anything to do lately.
+    pub last_completed_at: Option<String>,
 }
 
 /// `~/.local/share/mach/kb.db`, the default store location.
@@ -200,7 +209,8 @@ fn init_schema(conn: &Connection) -> Result<(), KbError> {
         CREATE TABLE IF NOT EXISTS reflect_state (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             last_run_at TEXT,
-            last_memory_id INTEGER
+            last_memory_id INTEGER,
+            last_completed_at TEXT
         );
         CREATE TABLE IF NOT EXISTS dedupe_seen (
             id_a INTEGER NOT NULL,
@@ -208,6 +218,11 @@ fn init_schema(conn: &Connection) -> Result<(), KbError> {
             PRIMARY KEY (id_a, id_b)
         );
         CREATE TABLE IF NOT EXISTS contradiction_seen (
+            id_a INTEGER NOT NULL,
+            id_b INTEGER NOT NULL,
+            PRIMARY KEY (id_a, id_b)
+        );
+        CREATE TABLE IF NOT EXISTS entity_merge_seen (
             id_a INTEGER NOT NULL,
             id_b INTEGER NOT NULL,
             PRIMARY KEY (id_a, id_b)
@@ -428,6 +443,32 @@ fn migrate_v8_to_v9(conn: &Connection) -> Result<(), KbError> {
     Ok(())
 }
 
+fn existing_reflect_state_columns(conn: &Connection) -> Result<Vec<String>, KbError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(reflect_state)")?;
+    let cols = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(cols)
+}
+
+/// `PRAGMA user_version`-gated, idempotent 9 -> 10 migration: the graph
+/// hygiene pass's `entity_merge_seen` table (`init_schema`'s `CREATE TABLE
+/// IF NOT EXISTS` already creates it on any database, fresh or pre-existing,
+/// before `migrate` ever runs) and `reflect_state.last_completed_at` (for
+/// `mach kb health`'s "is reflect still running" check) — a fresh
+/// `reflect_state` table already has the column, so the only real work here
+/// is adding it to a pre-existing one that predates it; every existing row
+/// simply has never recorded a completion yet, exactly the column's
+/// implicit default (NULL).
+fn migrate_v9_to_v10(conn: &Connection) -> Result<(), KbError> {
+    let cols = existing_reflect_state_columns(conn)?;
+    if !cols.iter().any(|c| c == "last_completed_at") {
+        conn.execute("ALTER TABLE reflect_state ADD COLUMN last_completed_at TEXT", [])?;
+    }
+    conn.execute("PRAGMA user_version = 10", [])?;
+    Ok(())
+}
+
 fn migrate_v6_to_v7(conn: &Connection) -> Result<(), KbError> {
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(
@@ -525,6 +566,9 @@ fn migrate(conn: &Connection) -> Result<(), KbError> {
     }
     if version < 9 {
         migrate_v8_to_v9(conn)?;
+    }
+    if version < 10 {
+        migrate_v9_to_v10(conn)?;
     }
     Ok(())
 }
@@ -1555,9 +1599,11 @@ pub fn memories_since(conn: &Connection, last_id: i64) -> Result<Vec<Memory>, Kb
 
 pub fn get_reflect_state(conn: &Connection) -> Result<ReflectState, KbError> {
     let row = conn
-        .query_row("SELECT last_run_at, last_memory_id FROM reflect_state WHERE id = 1", [], |r| {
-            Ok(ReflectState { last_run_at: r.get(0)?, last_memory_id: r.get(1)? })
-        })
+        .query_row(
+            "SELECT last_run_at, last_memory_id, last_completed_at FROM reflect_state WHERE id = 1",
+            [],
+            |r| Ok(ReflectState { last_run_at: r.get(0)?, last_memory_id: r.get(1)?, last_completed_at: r.get(2)? }),
+        )
         .optional()?;
     Ok(row.unwrap_or_default())
 }
@@ -1570,6 +1616,23 @@ pub fn update_reflect_state(conn: &Connection, last_run_at: &str, last_memory_id
         "INSERT INTO reflect_state (id, last_run_at, last_memory_id) VALUES (1, ?1, ?2)
          ON CONFLICT(id) DO UPDATE SET last_run_at = excluded.last_run_at, last_memory_id = excluded.last_memory_id",
         params![last_run_at, last_memory_id],
+    )?;
+    Ok(())
+}
+
+/// Records that `mach kb reflect` completed a run at `now` — set
+/// unconditionally by every invocation that reaches its own end (including
+/// a cheap "nothing new" early exit), but deliberately NOT by the
+/// offline-defer early exit (see `ReflectState::last_completed_at`'s own
+/// doc comment for why the two watermarks track different things). Only
+/// ever touches this one column, via `ON CONFLICT` against the singleton
+/// row the v1->v2 migration seeds — `update_reflect_state`'s own
+/// `last_run_at`/`last_memory_id` are left exactly as they are.
+pub fn mark_reflect_completed(conn: &Connection, now: &str) -> Result<(), KbError> {
+    conn.execute(
+        "INSERT INTO reflect_state (id, last_completed_at) VALUES (1, ?1)
+         ON CONFLICT(id) DO UPDATE SET last_completed_at = excluded.last_completed_at",
+        params![now],
     )?;
     Ok(())
 }
@@ -2457,6 +2520,219 @@ pub fn mark_graph_extracted(conn: &Connection, id: i64, now: &str) -> Result<boo
     Ok(n > 0)
 }
 
+// --- graph hygiene pass (mach kb reflect, after edge extraction, before
+// dormancy): evidence-death propagation + entity merge ---
+
+/// Invalidates a relation on its own, `superseded_by` left NULL -- for a
+/// death this graph never lost a competition over: either its own evidence
+/// memory died (evidence-death propagation, below) or a one-time audit
+/// judged it poisoned/generic (`mach kb graph audit`). Contrast
+/// `supersede_relation`, which always names a winner. Never deletes; the
+/// row stays as an audit trail like every other tombstone in this store.
+/// Returns `false` (no-op) if `id` doesn't exist or is already invalidated.
+pub fn invalidate_relation(conn: &Connection, id: i64, now: &str) -> Result<bool, KbError> {
+    let n = conn.execute(
+        "UPDATE relations SET invalidated_at = ?1 WHERE id = ?2 AND invalidated_at IS NULL",
+        params![now, id],
+    )?;
+    Ok(n > 0)
+}
+
+/// ACTIVE edges whose evidence memory has died -- invalidated (superseded,
+/// contradicted, deduped away) or hard-deleted (`mach kb forget`) -- the
+/// graph hygiene pass's deterministic, no-LLM "evidence-death propagation"
+/// candidate pool. Deliberately excludes an edge whose evidence is merely
+/// *dormant*: a dormant fact can wake (`mach kb wake`), so its edges must
+/// not die with it -- see `relation_evidence_is_dormant` for how that case
+/// is instead respected only at query time.
+pub fn relations_with_dead_evidence(conn: &Connection) -> Result<Vec<Relation>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT r.* FROM relations r
+         LEFT JOIN memories m ON m.id = r.evidence_memory_id
+         WHERE r.invalidated_at IS NULL
+           AND r.evidence_memory_id IS NOT NULL
+           AND (m.id IS NULL OR m.invalidated_at IS NOT NULL)
+         ORDER BY r.id ASC",
+    )?;
+    let rows = stmt.query_map([], row_to_relation)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Whether a relation's own evidence memory is currently dormant -- `true`
+/// only when `evidence_memory_id` is `Some` and that memory still exists and
+/// is dormant (a memory that's simply gone is `relations_with_dead_evidence`'s
+/// concern, not this one; a relation with no evidence at all is never
+/// dormant by definition). Called at query time (never inside the reflect
+/// pass, which must never tombstone an edge merely because its evidence
+/// napped) by every path that surfaces "connections" for recall, so a
+/// dormant-but-wakeable fact's edge is excluded from that view without ever
+/// being invalidated.
+pub fn relation_evidence_is_dormant(conn: &Connection, r: &Relation) -> Result<bool, KbError> {
+    match r.evidence_memory_id {
+        Some(mid) => Ok(matches!(get(conn, mid)?, Some(m) if m.is_dormant())),
+        None => Ok(false),
+    }
+}
+
+/// Normalizes an entity name for merge-candidate matching: lowercased,
+/// stripped of everything but letters/digits -- so "C++", "c++", and "C ++"
+/// collapse to the same key, as do "Umoja" and "umoja." — a
+/// case/punctuation-insensitive match the embedding-similarity path (below)
+/// might otherwise miss on a very short name.
+fn normalize_entity_name(name: &str) -> String {
+    name.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+}
+
+/// Candidate entity-merge pairs for the graph hygiene pass: active entity
+/// pairs `(a, b)` with `a < b` where EITHER their name embeddings clear
+/// `min_sim` cosine similarity OR their normalized (case/punctuation-
+/// insensitive) names are identical, excluding any pair already in `seen`
+/// (`entity_merge_seen_pairs`). Personal-scale linear scan, same rationale
+/// as `find_entity_by_similarity`. Deduped and capped at `cap`, ascending by
+/// the pair's own `(a, b)` ordering so a backlog drains in a stable order
+/// across runs, same as `dedupe_candidate_pairs`.
+pub fn entity_merge_candidate_pairs(
+    conn: &Connection,
+    min_sim: f32,
+    seen: &std::collections::HashSet<(i64, i64)>,
+    cap: usize,
+) -> Result<Vec<(i64, i64)>, KbError> {
+    let entities = all_entities(conn)?;
+    let mut out: Vec<(i64, i64)> = Vec::new();
+    for i in 0..entities.len() {
+        for j in (i + 1)..entities.len() {
+            let (a, b) = (&entities[i], &entities[j]);
+            let (id_a, id_b) = if a.id < b.id { (a.id, b.id) } else { (b.id, a.id) };
+            if seen.contains(&(id_a, id_b)) {
+                continue;
+            }
+            let name_match = normalize_entity_name(&a.name) == normalize_entity_name(&b.name);
+            let sim_match = match (&a.embedding, &b.embedding) {
+                (Some(ea), Some(eb)) if !ea.is_empty() && !eb.is_empty() => cosine(ea, eb) >= min_sim,
+                _ => false,
+            };
+            if name_match || sim_match {
+                out.push((id_a, id_b));
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out.truncate(cap);
+    Ok(out)
+}
+
+/// Up to `n` active edges touching `entity_id`, rendered as plain
+/// `"src --predicate--> dst"` strings by entity NAME (never an id) -- the
+/// entity-merge judge prompt's "2 sample edges" description, id-free per
+/// this feature's own house rule.
+pub fn sample_relation_descriptions(conn: &Connection, entity_id: i64, n: usize) -> Result<Vec<String>, KbError> {
+    let edges = active_relations_for_entity(conn, entity_id)?;
+    let mut out = Vec::new();
+    for r in edges.iter().take(n) {
+        let src = get_entity(conn, r.src)?;
+        let dst = get_entity(conn, r.dst)?;
+        if let (Some(s), Some(d)) = (src, dst) {
+            out.push(format!("{} --{}--> {}", s.name, r.predicate, d.name));
+        }
+    }
+    Ok(out)
+}
+
+/// Records that an entity-merge candidate pair was judged genuinely
+/// `DIFFERENT` -- never asked about again on a future reflect run. Same
+/// "never watermark a failed or malformed judgment" contract as
+/// `mark_dedupe_seen`: a `SAME` verdict needs no entry here either, since
+/// the merged (newer) entity is deleted outright and can never resurface as
+/// a candidate.
+pub fn mark_entity_merge_seen(conn: &Connection, id_a: i64, id_b: i64) -> Result<(), KbError> {
+    let (a, b) = normalize_pair(id_a, id_b);
+    conn.execute("INSERT OR IGNORE INTO entity_merge_seen (id_a, id_b) VALUES (?1, ?2)", params![a, b])?;
+    Ok(())
+}
+
+/// Every pair ever recorded by `mark_entity_merge_seen`, as normalized
+/// `(min, max)` tuples -- loaded once per reflect run, same shape as
+/// `dedupe_seen_pairs`.
+pub fn entity_merge_seen_pairs(conn: &Connection) -> Result<std::collections::HashSet<(i64, i64)>, KbError> {
+    let mut stmt = conn.prepare("SELECT id_a, id_b FROM entity_merge_seen")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let mut out = std::collections::HashSet::new();
+    for r in rows {
+        out.insert(r?);
+    }
+    Ok(out)
+}
+
+/// Repoints every relation's `src`/`dst` reference from `old_id` to
+/// `new_id` (both directions, across every relation regardless of active/
+/// invalidated status -- a provenance fix, not a currency judgment, mirrors
+/// `repoint_insight_citations`' own scope), then deduplicates: when the
+/// repoint makes two ACTIVE relations identical (`src`, `predicate`
+/// case-insensitive, `dst`), only the oldest (lowest id) survives active --
+/// any newer duplicate is invalidated via `invalidate_relation`-shaped
+/// mechanics, with `superseded_by` pointing at the survivor (an ordinary
+/// supersession outcome, not an evidence-death or audit one). Returns the
+/// number of relation rows whose `src`/`dst` was actually repointed.
+pub fn repoint_entity_relations(conn: &Connection, old_id: i64, new_id: i64, now: &str) -> Result<usize, KbError> {
+    let mut count_stmt = conn.prepare("SELECT COUNT(*) FROM relations WHERE src = ?1 OR dst = ?1")?;
+    let touched: i64 = count_stmt.query_row(params![old_id], |r| r.get(0))?;
+
+    conn.execute("UPDATE relations SET src = ?1 WHERE src = ?2", params![new_id, old_id])?;
+    conn.execute("UPDATE relations SET dst = ?1 WHERE dst = ?2", params![new_id, old_id])?;
+
+    let mut stmt = conn.prepare(
+        "SELECT id, src, predicate, dst FROM relations
+         WHERE invalidated_at IS NULL AND (src = ?1 OR dst = ?1) ORDER BY id ASC",
+    )?;
+    let rows: Vec<(i64, i64, String, i64)> =
+        stmt.query_map(params![new_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?;
+    let mut seen_keys: std::collections::HashMap<(i64, String, i64), i64> = std::collections::HashMap::new();
+    for (id, src, predicate, dst) in rows {
+        let key = (src, predicate.to_lowercase(), dst);
+        match seen_keys.get(&key) {
+            Some(&survivor) => {
+                conn.execute(
+                    "UPDATE relations SET invalidated_at = ?1, superseded_by = ?2 WHERE id = ?3 AND invalidated_at IS NULL",
+                    params![now, survivor, id],
+                )?;
+            }
+            None => {
+                seen_keys.insert(key, id);
+            }
+        }
+    }
+    Ok(touched as usize)
+}
+
+/// Hard-deletes an entity row -- used only by the merge pass, and only
+/// right after `repoint_entity_relations` has unconditionally moved every
+/// relation off it, so by the time this runs the row has zero remaining
+/// references. Returns whether a row existed.
+pub fn delete_entity(conn: &Connection, id: i64) -> Result<bool, KbError> {
+    let n = conn.execute("DELETE FROM entities WHERE id = ?1", params![id])?;
+    Ok(n > 0)
+}
+
+/// All ACTIVE relations, any entity, ascending by id -- the pool `mach kb
+/// graph audit` re-examines every time it's run (not a drained backlog with
+/// its own watermark, unlike `graph_extraction_candidates`: an edge this
+/// audit invalidates simply drops out of this pool on the next run, and a
+/// clean bill of health costs nothing to re-check).
+pub fn active_relations_all(conn: &Connection) -> Result<Vec<Relation>, KbError> {
+    let mut stmt = conn.prepare("SELECT * FROM relations WHERE invalidated_at IS NULL ORDER BY id ASC")?;
+    let rows = stmt.query_map([], row_to_relation)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2949,7 +3225,7 @@ mod tests {
         // AUTOINCREMENT rebuild), then v7->v8 (`ingested_sessions`),
         // landing at the current version.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1);
@@ -3098,10 +3374,11 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 9,
+            version, 10,
             "v1->v2 (reflection tables), v2->v3 (insights level column), v3->v4 (dormant_at), \
              v4->v5 (dedupe_seen), v5->v6 (last_verified_at + contradiction_seen), \
-             v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions) all run"
+             v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions), v8->v9 (graph layer), \
+             v9->v10 (last_completed_at + entity_merge_seen) all run"
         );
 
         let rows = list(&conn, None, false).unwrap();
@@ -3123,7 +3400,7 @@ mod tests {
     fn fresh_database_lands_at_current_user_version() {
         let conn = mem_conn();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
     }
 
     #[test]
@@ -3202,6 +3479,27 @@ mod tests {
         let advanced = get_reflect_state(&conn).unwrap();
         assert_eq!(advanced.last_run_at.as_deref(), Some("2026-01-02T00:00:00Z"));
         assert_eq!(advanced.last_memory_id, Some(11), "watermark must advance, not reset");
+        assert!(advanced.last_completed_at.is_none(), "update_reflect_state must never touch last_completed_at");
+    }
+
+    #[test]
+    fn mark_reflect_completed_touches_only_that_column() {
+        let conn = mem_conn();
+        // A --meta-only run with nothing new must never clobber the
+        // watermark -- setting last_completed_at first, before the
+        // watermark is ever advanced, must leave it untouched.
+        mark_reflect_completed(&conn, "2026-01-01T00:00:00Z").unwrap();
+        let state = get_reflect_state(&conn).unwrap();
+        assert_eq!(state.last_completed_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert!(state.last_run_at.is_none());
+        assert!(state.last_memory_id.is_none());
+
+        update_reflect_state(&conn, "2026-01-02T00:00:00Z", Some(9)).unwrap();
+        mark_reflect_completed(&conn, "2026-01-02T00:05:00Z").unwrap();
+        let after = get_reflect_state(&conn).unwrap();
+        assert_eq!(after.last_completed_at.as_deref(), Some("2026-01-02T00:05:00Z"));
+        assert_eq!(after.last_run_at.as_deref(), Some("2026-01-02T00:00:00Z"), "must never touch last_run_at");
+        assert_eq!(after.last_memory_id, Some(9), "must never touch last_memory_id");
     }
 
     #[test]
@@ -3331,9 +3629,9 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 9,
+            version, 10,
             "v2->v3 (level column), v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, \
-             v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions) all run"
+             v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions), v8->v9, v9->v10 all run"
         );
 
         let rows = list_insights(&conn, false).unwrap();
@@ -3375,9 +3673,9 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 9,
+            version, 10,
             "v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild), \
-             v7->v8 (ingested_sessions) all run"
+             v7->v8 (ingested_sessions), v8->v9, v9->v10 all run"
         );
 
         let rows = list(&conn, None, false).unwrap();
@@ -3420,9 +3718,9 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 9,
+            version, 10,
             "v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 \
-             (ingested_sessions) all run"
+             (ingested_sessions), v8->v9, v9->v10 all run"
         );
 
         // The table exists and behaves — round-trips through the store
@@ -3468,7 +3766,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 9, "v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) all run");
+        assert_eq!(version, 10, "v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) all run");
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -3528,7 +3826,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 9, "v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) both run");
+        assert_eq!(version, 10, "v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) both run");
 
         // Every row and its data survive the rebuild, ids included.
         let rows = list(&conn, None, false).unwrap();
@@ -3689,7 +3987,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 9, "v7->v8 (ingested_sessions) runs");
+        assert_eq!(version, 10, "v7->v8 (ingested_sessions) runs");
 
         assert_eq!(list(&conn, None, false).unwrap().len(), 1, "existing memory row must survive the migration");
 
@@ -4420,7 +4718,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 9, "v8->v9 (graph layer) runs");
+        assert_eq!(version, 10, "v8->v9 (graph layer) runs");
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -4436,6 +4734,70 @@ mod tests {
         // idempotent on repeat
         migrate(&conn).unwrap();
         assert_eq!(list(&conn, None, false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migration_v9_to_v10_adds_last_completed_at_and_creates_entity_merge_seen() {
+        // Build a v9-era database by hand: every table exactly as
+        // `migrate_v8_to_v9` leaves it -- `reflect_state` with no
+        // `last_completed_at` column, no `entity_merge_seen` table.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, source TEXT, project TEXT,
+                created_at TEXT NOT NULL, reviewed INTEGER NOT NULL DEFAULT 1, embedding BLOB,
+                importance INTEGER NOT NULL DEFAULT 5, stability REAL, access_count INTEGER NOT NULL DEFAULT 0,
+                first_accessed_at TEXT, last_accessed_at TEXT, valid_from TEXT, invalidated_at TEXT,
+                superseded_by INTEGER, dormant_at TEXT, last_verified_at TEXT, graph_extracted_at TEXT
+            );
+            CREATE TABLE insights (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, created_at TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.5, source_ids TEXT NOT NULL, embedding BLOB,
+                invalidated_at TEXT, flagged_at TEXT, last_verified_at TEXT, level INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE reflect_state (id INTEGER PRIMARY KEY CHECK (id = 1), last_run_at TEXT, last_memory_id INTEGER);
+            INSERT INTO reflect_state (id, last_run_at, last_memory_id) VALUES (1, '2026-01-01T00:00:00Z', 5);
+            CREATE TABLE dedupe_seen (id_a INTEGER NOT NULL, id_b INTEGER NOT NULL, PRIMARY KEY (id_a, id_b));
+            CREATE TABLE contradiction_seen (id_a INTEGER NOT NULL, id_b INTEGER NOT NULL, PRIMARY KEY (id_a, id_b));
+            CREATE TABLE ingested_sessions (session_id TEXT PRIMARY KEY, ingested_at TEXT NOT NULL);
+            CREATE TABLE entities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, kind TEXT, embedding BLOB,
+                created_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX idx_entities_name_nocase ON entities (name COLLATE NOCASE);
+            CREATE TABLE relations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, src INTEGER NOT NULL REFERENCES entities(id),
+                predicate TEXT NOT NULL, dst INTEGER NOT NULL REFERENCES entities(id),
+                evidence_memory_id INTEGER REFERENCES memories(id), confidence REAL, created_at TEXT NOT NULL,
+                valid_from TEXT, invalidated_at TEXT, superseded_by INTEGER
+            );
+            PRAGMA user_version = 9;",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 10, "v9->v10 (last_completed_at + entity_merge_seen) runs");
+
+        // The pre-existing watermark row survives, and last_completed_at
+        // backfills to NULL (never completed under the new field yet).
+        let state = get_reflect_state(&conn).unwrap();
+        assert_eq!(state.last_run_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(state.last_memory_id, Some(5));
+        assert!(state.last_completed_at.is_none());
+
+        // The new field and table both behave via the store functions that
+        // use them.
+        mark_reflect_completed(&conn, "2026-01-02T00:00:00Z").unwrap();
+        assert_eq!(get_reflect_state(&conn).unwrap().last_completed_at.as_deref(), Some("2026-01-02T00:00:00Z"));
+        mark_entity_merge_seen(&conn, 3, 1).unwrap();
+        assert_eq!(entity_merge_seen_pairs(&conn).unwrap(), [(1, 3)].into_iter().collect());
+
+        // idempotent on repeat
+        migrate(&conn).unwrap();
+        assert_eq!(get_reflect_state(&conn).unwrap().last_run_at.as_deref(), Some("2026-01-01T00:00:00Z"));
     }
 
     #[test]
@@ -4601,5 +4963,202 @@ mod tests {
         supersede(&conn, old, new, &now_rfc3339()).unwrap();
         assert!(!multiply_stability(&conn, old, 1.5).unwrap(), "a superseded row must not be boosted");
         assert!(!multiply_stability(&conn, 999_999, 1.5).unwrap());
+    }
+
+    // --- graph hygiene: evidence-death propagation ---
+
+    #[test]
+    fn relations_with_dead_evidence_finds_invalidated_evidence_only() {
+        // The "hard-deleted evidence" leg of this query's own LEFT JOIN
+        // (`m.id IS NULL`) is defensive rather than reachable through this
+        // store's own API today: `relations.evidence_memory_id REFERENCES
+        // memories(id)` with this build's foreign_keys=ON means a memory
+        // cited as evidence can never actually be hard-deleted (`delete`
+        // itself would fail the FK constraint first) — so this test covers
+        // the one path that's actually reachable: invalidation.
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let moses = insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let umoja = insert_entity(&conn, "Umoja", Some("project"), None).unwrap();
+
+        let alive_mem = insert(&conn, "Moses proposes a feature for Umoja", None, None, true, None, 5).unwrap();
+        let dying_mem = insert(&conn, "a memory about to be superseded", None, None, true, None, 5).unwrap();
+
+        let r_alive = insert_relation(&conn, moses, "proposes-feature-for", umoja, Some(alive_mem), Some(0.9), &now).unwrap();
+        let r_dead_invalidated =
+            insert_relation(&conn, moses, "used-to-lead", umoja, Some(dying_mem), Some(0.7), &now).unwrap();
+        let r_no_evidence = insert_relation(&conn, moses, "no-evidence-edge", umoja, None, Some(0.5), &now).unwrap();
+
+        let replacement = insert(&conn, "replacement fact", None, None, true, None, 5).unwrap();
+        supersede(&conn, dying_mem, replacement, &now).unwrap();
+
+        let dying = relations_with_dead_evidence(&conn).unwrap();
+        let dying_ids: Vec<i64> = dying.iter().map(|r| r.id).collect();
+        assert_eq!(dying_ids, vec![r_dead_invalidated]);
+        assert!(!dying_ids.contains(&r_alive), "an edge with live evidence must never be a candidate");
+        assert!(!dying_ids.contains(&r_no_evidence), "an edge with no evidence at all has nothing to die");
+    }
+
+    #[test]
+    fn invalidate_relation_never_sets_superseded_by() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let a = insert_entity(&conn, "A", None, None).unwrap();
+        let b = insert_entity(&conn, "B", None, None).unwrap();
+        let r = insert_relation(&conn, a, "rel", b, None, Some(0.9), &now).unwrap();
+
+        assert!(invalidate_relation(&conn, r, &now).unwrap());
+        let row = get_relation(&conn, r).unwrap().unwrap();
+        assert!(!row.is_active());
+        assert_eq!(row.superseded_by, None, "died with its evidence -- never beaten by a rival edge");
+
+        assert!(!invalidate_relation(&conn, r, &now).unwrap(), "already invalidated -- no-op");
+        assert!(!invalidate_relation(&conn, 999_999, &now).unwrap());
+    }
+
+    #[test]
+    fn evidence_death_propagation_leaves_dormant_evidence_alone() {
+        // A dormant (not invalidated, not deleted) evidence memory must
+        // never appear as a dead-evidence candidate -- it can still wake.
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let a = insert_entity(&conn, "A", None, None).unwrap();
+        let b = insert_entity(&conn, "B", None, None).unwrap();
+        let dormant_mem = insert(&conn, "a fact that will nap", None, None, true, None, 5).unwrap();
+        let r = insert_relation(&conn, a, "rel", b, Some(dormant_mem), Some(0.9), &now).unwrap();
+
+        set_dormant(&conn, dormant_mem, &now).unwrap();
+        assert!(relations_with_dead_evidence(&conn).unwrap().is_empty());
+        assert!(relation_evidence_is_dormant(&conn, &get_relation(&conn, r).unwrap().unwrap()).unwrap());
+    }
+
+    #[test]
+    fn relation_evidence_is_dormant_false_for_live_or_absent_evidence() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let a = insert_entity(&conn, "A", None, None).unwrap();
+        let b = insert_entity(&conn, "B", None, None).unwrap();
+        let live_mem = insert(&conn, "a lively fact", None, None, true, None, 5).unwrap();
+        let r_live = insert_relation(&conn, a, "rel", b, Some(live_mem), Some(0.9), &now).unwrap();
+        let r_none = insert_relation(&conn, a, "rel2", b, None, Some(0.9), &now).unwrap();
+
+        assert!(!relation_evidence_is_dormant(&conn, &get_relation(&conn, r_live).unwrap().unwrap()).unwrap());
+        assert!(!relation_evidence_is_dormant(&conn, &get_relation(&conn, r_none).unwrap().unwrap()).unwrap());
+    }
+
+    // --- graph hygiene: entity merge ---
+
+    #[test]
+    fn entity_merge_candidate_pairs_matches_by_similarity_or_normalized_name() {
+        let conn = mem_conn();
+        let umoja = insert_entity(&conn, "Umoja", Some("project"), Some(&unit_vec(4, 0))).unwrap();
+        let umoja_near = insert_entity(&conn, "umoja project", Some("project"), Some(&unit_vec(4, 0))).unwrap();
+        let cplusplus = insert_entity(&conn, "C++", Some("technology"), None).unwrap();
+        let cplusplus_punct = insert_entity(&conn, "c ++", Some("technology"), None).unwrap();
+        let unrelated = insert_entity(&conn, "Moses", Some("person"), Some(&unit_vec(4, 2))).unwrap();
+
+        let seen = std::collections::HashSet::new();
+        let pairs = entity_merge_candidate_pairs(&conn, 0.9, &seen, 10).unwrap();
+
+        let (a, b) = normalize_pair(umoja, umoja_near);
+        assert!(pairs.contains(&(a, b)), "identical embeddings above the similarity floor must be a candidate");
+        let (a, b) = normalize_pair(cplusplus, cplusplus_punct);
+        assert!(pairs.contains(&(a, b)), "case/punctuation-insensitive name match must be a candidate with no embedding at all");
+        assert!(!pairs.iter().any(|&(x, y)| x == unrelated || y == unrelated), "an unrelated entity must never be a candidate");
+    }
+
+    #[test]
+    fn entity_merge_candidate_pairs_excludes_seen_pairs() {
+        let conn = mem_conn();
+        // "Umoja" / "umoja project" differ under the case-insensitive exact
+        // name index (so both can coexist) but share a name-embedding, which
+        // is what makes them a merge candidate at all.
+        let a = insert_entity(&conn, "Umoja", None, Some(&unit_vec(4, 0))).unwrap();
+        let b = insert_entity(&conn, "umoja project", None, Some(&unit_vec(4, 0))).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(normalize_pair(a, b));
+        assert!(entity_merge_candidate_pairs(&conn, 0.9, &seen, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mark_entity_merge_seen_roundtrips_normalized() {
+        let conn = mem_conn();
+        mark_entity_merge_seen(&conn, 5, 2).unwrap();
+        let seen = entity_merge_seen_pairs(&conn).unwrap();
+        assert!(seen.contains(&(2, 5)));
+        // Idempotent -- asking again (either order) never errors or duplicates.
+        mark_entity_merge_seen(&conn, 2, 5).unwrap();
+        assert_eq!(entity_merge_seen_pairs(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sample_relation_descriptions_renders_up_to_n_edges_by_name() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let moses = insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let umoja = insert_entity(&conn, "Umoja", Some("project"), None).unwrap();
+        let user = insert_entity(&conn, "user", None, None).unwrap();
+        insert_relation(&conn, moses, "proposes-feature-for", umoja, None, Some(0.9), &now).unwrap();
+        insert_relation(&conn, moses, "boss-of", user, None, Some(0.9), &now).unwrap();
+
+        let samples = sample_relation_descriptions(&conn, moses, 2).unwrap();
+        assert_eq!(samples.len(), 2);
+        assert!(samples.iter().any(|s| s.contains("Moses") && s.contains("Umoja")));
+        assert!(samples.iter().any(|s| s.contains("Moses") && s.contains("user")));
+    }
+
+    #[test]
+    fn repoint_entity_relations_moves_edges_and_dedupes_resulting_identicals() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let older = insert_entity(&conn, "Umoja", Some("project"), None).unwrap();
+        let newer = insert_entity(&conn, "umoja project", Some("project"), None).unwrap();
+        let moses = insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let ivar = insert_entity(&conn, "Ivar", Some("person"), None).unwrap();
+
+        // An edge already shared between the two names (will become
+        // identical once repointed -- one must survive, the other must be
+        // invalidated as a dedup, never both left active).
+        let r_older = insert_relation(&conn, moses, "proposes-feature-for", older, None, Some(0.9), &now).unwrap();
+        let r_newer_dup = insert_relation(&conn, moses, "proposes-feature-for", newer, None, Some(0.8), &now).unwrap();
+        // An edge unique to the newer entity -- must simply move over, not collide.
+        let r_newer_unique = insert_relation(&conn, ivar, "boss-of", newer, None, Some(0.9), &now).unwrap();
+
+        let touched = repoint_entity_relations(&conn, newer, older, &now).unwrap();
+        assert_eq!(touched, 2, "both edges touching the newer entity must be repointed");
+
+        let unique_row = get_relation(&conn, r_newer_unique).unwrap().unwrap();
+        assert_eq!(unique_row.dst, older, "repointed to the surviving (older) entity");
+        assert!(unique_row.is_active());
+
+        // Exactly one of the two now-identical edges survives active.
+        let older_row = get_relation(&conn, r_older).unwrap().unwrap();
+        let dup_row = get_relation(&conn, r_newer_dup).unwrap().unwrap();
+        assert!(older_row.is_active(), "the older (lower-id) duplicate survives");
+        assert!(!dup_row.is_active(), "the newer duplicate must be invalidated, not left active alongside an identical edge");
+        assert_eq!(dup_row.superseded_by, Some(r_older));
+    }
+
+    #[test]
+    fn delete_entity_removes_the_row() {
+        let conn = mem_conn();
+        let id = insert_entity(&conn, "throwaway", None, None).unwrap();
+        assert!(delete_entity(&conn, id).unwrap());
+        assert!(get_entity(&conn, id).unwrap().is_none());
+        assert!(!delete_entity(&conn, id).unwrap(), "already gone -- no-op");
+    }
+
+    #[test]
+    fn active_relations_all_excludes_invalidated() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let a = insert_entity(&conn, "A", None, None).unwrap();
+        let b = insert_entity(&conn, "B", None, None).unwrap();
+        let r1 = insert_relation(&conn, a, "rel", b, None, Some(0.9), &now).unwrap();
+        let r2 = insert_relation(&conn, a, "rel2", b, None, Some(0.9), &now).unwrap();
+        invalidate_relation(&conn, r2, &now).unwrap();
+
+        let all = active_relations_all(&conn).unwrap();
+        assert_eq!(all.iter().map(|r| r.id).collect::<Vec<_>>(), vec![r1]);
     }
 }

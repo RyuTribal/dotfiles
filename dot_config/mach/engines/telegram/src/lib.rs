@@ -91,25 +91,31 @@ pub fn run(cfg: config::Config, shutdown: &AtomicBool) -> Result<(), String> {
         match api.get_updates(st.offset, POLL_TIMEOUT_SECS) {
             Ok(updates) => {
                 backoff = BACKOFF_MIN;
-                if updates.is_empty() {
-                    continue;
+                if !updates.is_empty() {
+                    let pipeline = Pipeline {
+                        api: &api,
+                        allowed_user_id: cfg.allowed_user_id,
+                        drop_counter: &drop_counter,
+                        conn: &conn,
+                        llm: &llm,
+                        embedder: &embedder,
+                        transcriber: transcriber.as_deref(),
+                        converter: &converter,
+                        claude_bin: claude_bin.clone(),
+                        started_at,
+                    };
+                    for u in &updates {
+                        pipeline.handle_update(u);
+                        st.offset = u.update_id + 1;
+                    }
                 }
-                let pipeline = Pipeline {
-                    api: &api,
-                    allowed_user_id: cfg.allowed_user_id,
-                    drop_counter: &drop_counter,
-                    conn: &conn,
-                    llm: &llm,
-                    embedder: &embedder,
-                    transcriber: transcriber.as_deref(),
-                    converter: &converter,
-                    claude_bin: claude_bin.clone(),
-                    started_at,
-                };
-                for u in &updates {
-                    pipeline.handle_update(u);
-                    st.offset = u.update_id + 1;
-                }
+                // Persisted on every successful poll, even an empty one --
+                // not just when the offset actually advances. `mach kb
+                // health`'s own telegram-state staleness check depends on
+                // this file's mtime meaning "the long-poll loop is alive",
+                // not merely "a message arrived recently" (a quiet personal
+                // bot can otherwise go hours between real updates without
+                // that meaning the bridge itself is stuck or dead).
                 if let Err(e) = state::save(&state_path, st) {
                     eprintln!("mach-telegramd: warning: could not persist getUpdates offset: {}", e);
                 }

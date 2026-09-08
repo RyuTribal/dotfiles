@@ -129,6 +129,33 @@ install_kb_backup_timer() {
 }
 install_kb_backup_timer
 
+# mach kb health --notify (persistent-degradation notification) — same
+# soft-install treatment as the reflect/backup timers: a non-systemd
+# environment must not fail the whole install, `mach kb health` still works
+# run by hand or from cron in that case.
+install_health_timer() {
+  local unit_dir="$HOME/.config/systemd/user"
+  install -Dm644 "$HERE/systemd/mach-health.service" "$unit_dir/mach-health.service"
+  install -Dm644 "$HERE/systemd/mach-health.timer"   "$unit_dir/mach-health.timer"
+  echo "installed: $unit_dir/mach-health.{service,timer}"
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "NOTE: systemctl not found — units installed but not enabled. Run 'mach kb health' via cron or by hand instead."
+    return
+  fi
+  if ! systemctl --user list-units >/dev/null 2>&1; then
+    echo "NOTE: no systemd --user session available here — units installed but not enabled."
+    return
+  fi
+  systemctl --user daemon-reload
+  if systemctl --user enable --now mach-health.timer >/dev/null 2>&1; then
+    echo "enabled: mach-health.timer (twice daily 06:47/18:47, +20min after boot, +/-20min jitter)"
+  else
+    echo "WARNING: 'systemctl --user enable --now mach-health.timer' failed — enable it by hand once mach is on PATH."
+  fi
+}
+install_health_timer
+
 # whisper.cpp (telegram voice-note transcription) — pacman first, per the
 # user's package install discipline: this script never pip/npm/cargo-installs
 # a transcription tool itself, only checks for one and reports how to get it.

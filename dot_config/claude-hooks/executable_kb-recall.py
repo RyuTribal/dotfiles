@@ -140,13 +140,12 @@ def source_phrase(source):
     return "you told me"
 
 
-def suppressed_ids(log_path):
-    """Session-deduped injection: an id already injected within the LAST
-    DEDUPE_WINDOW recall-log entries is suppressed this time — re-showing
-    the same top memories every prompt is pure token waste. The window
-    slides; once a memory has been out of it, it may surface again. Read
-    BEFORE this prompt's entry is appended, so "last N" means prior prompts.
-    Any read/parse failure just means an empty suppression set."""
+def _suppressed_field(log_path, field):
+    """Shared sliding-window read for the last DEDUPE_WINDOW recall-log
+    entries' `field` array (a list of ints for "ids", a list of strings for
+    "conn"). Read BEFORE this prompt's entry is appended, so "last N" means
+    prior prompts. Any read/parse failure just means an empty suppression
+    set — same silence-on-error contract for both fields."""
     out = set()
     if not log_path:
         return out
@@ -160,10 +159,49 @@ def suppressed_ids(log_path):
             entry = json.loads(ln)
         except Exception:
             continue
-        for n in entry.get("ids") or []:
-            if isinstance(n, int):
-                out.add(n)
+        for v in entry.get(field) or []:
+            out.add(v)
     return out
+
+
+def suppressed_ids(log_path):
+    """Session-deduped injection: an id already injected within the LAST
+    DEDUPE_WINDOW recall-log entries is suppressed this time — re-showing
+    the same top memories every prompt is pure token waste. The window
+    slides; once a memory has been out of it, it may surface again."""
+    return {n for n in _suppressed_field(log_path, "ids") if isinstance(n, int)}
+
+
+def suppressed_conns(log_path):
+    """Same sliding-window session dedupe as `suppressed_ids`, but for
+    association-graph connections (see `connection_key`) rather than memory
+    ids — a connection whose key appeared in the last DEDUPE_WINDOW
+    recall-log entries is suppressed this time. Same silence-on-error
+    contract."""
+    return {k for k in _suppressed_field(log_path, "conn") if isinstance(k, str)}
+
+
+def connection_key(c):
+    """Renders one connection (`ConnectionHit`) as its session-dedupe key —
+    "src|predicate|dst" for a 1-hop connection, extended with
+    "|predicate2|dst_name2" for a 2-hop one, so two connections that share a
+    first hop but continue differently are never conflated. `None` when the
+    connection is too malformed to key (mirrors `connection_line`'s own
+    validity check) — such a connection is never suppressible and never
+    logged, exactly like it's never rendered."""
+    src = (c.get("src_name") or "").strip()
+    predicate = (c.get("predicate") or "").strip()
+    dst = (c.get("dst_name") or "").strip()
+    if not src or not predicate or not dst:
+        return None
+    key = "{}|{}|{}".format(src, predicate, dst)
+    if c.get("hops") == 2:
+        predicate2 = (c.get("predicate2") or "").strip()
+        dst2 = (c.get("dst_name2") or "").strip()
+        if not predicate2 or not dst2:
+            return None
+        key += "|{}|{}".format(predicate2, dst2)
+    return key
 
 
 def connection_line(c):
@@ -172,10 +210,11 @@ def connection_line(c):
     —boss-of→ user (learned 2026-09-07)" — or, for a 2-hop spreading-
     activation connection (`hops == 2`), a two-edge chain continuing
     through `predicate2`/`dst_name2` — "- [connection, 2 hops] Moses
-    —boss-of→ user —works-on→ Umoja". Never logged/shown as ids —
+    —boss-of→ user —works-on→ Umoja". Never logged/shown as memory ids —
     connections carry no reinforcement semantics in this first version,
-    unlike a memory hit's own id (see `suppressed_ids`/the recall log
-    below)."""
+    unlike a memory hit's own id (see `suppressed_ids`) — but a connection's
+    own rendered key IS now session-deduped the same way, via
+    `connection_key`/`suppressed_conns` below."""
     src = (c.get("src_name") or "").strip()
     predicate = (c.get("predicate") or "").strip()
     dst = (c.get("dst_name") or "").strip()
@@ -209,6 +248,7 @@ def main():
 
     log_path = os.path.join(RECALL_LOG_DIR, session_id + ".jsonl") if session_id else ""
     suppressed = suppressed_ids(log_path)
+    suppressed_conn_keys = suppressed_conns(log_path)
 
     lines = []
     ids = []
@@ -243,7 +283,23 @@ def main():
             if isinstance(mem_id, int):
                 ids.append(mem_id)
 
-    connection_lines = [ln for ln in (connection_line(c) for c in connections) if ln]
+    # Same sliding-window session dedupe as memory hits (`suppressed`,
+    # above), now applied to connections too via their own rendered key —
+    # a connection re-shown every prompt is the same token waste a repeated
+    # memory hit is. Only connections actually kept are rendered/logged.
+    conn_keys = []
+    connection_lines = []
+    for c in connections:
+        if not isinstance(c, dict):
+            continue
+        key = connection_key(c)
+        if key is None or key in suppressed_conn_keys:
+            continue
+        line = connection_line(c)
+        if not line:
+            continue
+        connection_lines.append(line)
+        conn_keys.append(key)
 
     if lines or connection_lines:
         print("You remember (your memory of this user from past sessions — "
@@ -251,24 +307,31 @@ def main():
               "it was learned):")
         for l in lines:
             print(l)
-        # Connections render after memory lines, never logged/suppressed by
-        # id (see connection_line's own doc comment) — a plain association
-        # the graph layer (`mach kb reflect`'s extraction pass) has derived
-        # alongside whatever verbatim memories matched.
+        # Connections render after memory lines — a plain association the
+        # graph layer (`mach kb reflect`'s extraction pass) has derived
+        # alongside whatever verbatim memories matched. Never logged/
+        # suppressed by memory id (a connection has none), but its own
+        # rendered key IS now session-deduped the same way ids are — see
+        # `conn_keys` above.
         for l in connection_lines:
             print(l)
 
-    # Only ids actually rendered above are logged — the engagement sweep
-    # (`mach kb ingest-sessions`) depends on this log meaning "shown", not
-    # "considered". Best-effort: any failure means no log line, never a
-    # failed hook.
-    if session_id and ids:
+    # Only ids/connection keys actually rendered above are logged — the
+    # engagement sweep (`mach kb ingest-sessions`) depends on the "ids"
+    # field meaning "shown", not "considered"; "conn" exists purely for this
+    # hook's own session dedupe and carries no reinforcement semantics, so
+    # ingest.rs's own parsing must (and does) simply ignore it. Best-effort:
+    # any failure means no log line, never a failed hook.
+    if session_id and (ids or conn_keys):
         try:
             os.makedirs(RECALL_LOG_DIR, exist_ok=True)
             import datetime
             ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            entry = {"ts": ts, "ids": ids}
+            if conn_keys:
+                entry["conn"] = conn_keys
             with open(log_path, "a") as f:
-                f.write(json.dumps({"ts": ts, "ids": ids}) + "\n")
+                f.write(json.dumps(entry) + "\n")
         except Exception:
             pass
 

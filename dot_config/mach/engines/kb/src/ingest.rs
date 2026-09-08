@@ -325,6 +325,28 @@ mod tests {
         assert_eq!(parse_recall_log("\n\n"), Vec::<i64>::new());
     }
 
+    #[test]
+    fn parse_recall_log_tolerates_the_conn_field_kb_recall_py_now_writes() {
+        // kb-recall.py's own session dedupe for association-graph
+        // connections adds a "conn" array (rendered connection keys) to
+        // each log line alongside "ids" -- this parser reads "ids" only
+        // and must keep working unchanged: an unrecognized extra field is
+        // simply ignored, never treated as malformed.
+        let content = "{\"ts\":\"2026-01-01T00:00:00Z\",\"ids\":[1,2],\"conn\":[\"Moses|boss-of|user\"]}\n\
+                        {\"ts\":\"2026-01-01T00:05:00Z\",\"ids\":[3],\"conn\":[]}\n";
+        assert_eq!(parse_recall_log(content), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn parse_recall_log_tolerates_a_conn_only_line_with_no_ids() {
+        // A prompt whose only surviving injection was a connection (every
+        // memory hit suppressed) still logs a valid line -- "ids" absent
+        // entirely, not just empty -- and must not break the ids union for
+        // surrounding lines.
+        let content = "{\"ts\":\"a\",\"ids\":[7]}\n{\"ts\":\"b\",\"conn\":[\"x|y|z\"]}\n{\"ts\":\"c\",\"ids\":[8]}\n";
+        assert_eq!(parse_recall_log(content), vec![7, 8]);
+    }
+
     // --- session id / staleness ---
 
     #[test]

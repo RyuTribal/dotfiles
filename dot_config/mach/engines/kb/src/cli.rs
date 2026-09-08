@@ -12,6 +12,7 @@ use serde::Serialize;
 use crate::classify::{self, Classifier, Verdict};
 use crate::embed::{Embedder, OllamaEmbedder};
 use crate::export;
+use crate::health;
 use crate::ingest;
 use crate::reflect::{self, ProcessReflectLlm, ReflectLlm, Stage2Result, ThemeResult, TIMEOUT_HAIKU, TIMEOUT_SONNET};
 use crate::store::{self, AddOutcome, Insight, InsightHit, KbError, Memory, RankedHit};
@@ -73,6 +74,11 @@ fn print_help() {
     println!("                          match first, else embedding similarity)");
     println!("  graph --stats           entity/edge counts by kind — a compact view of the");
     println!("                          association graph `mach kb reflect` has derived so far");
+    println!("  graph audit             batched KEEP/POISONED/GENERIC judgment over every active");
+    println!("                          edge; POISONED/GENERIC edges are invalidated (never deleted)");
+    println!("  health [--notify]       operational self-check (ollama, kb.db, kb socket, reflect");
+    println!("                          cadence, disk headroom, recall-log dir, telegram-state");
+    println!("                          staleness); --notify sends one desktop alert on failure");
 }
 
 /// Runs the kb CLI given the arguments following `kb` in `mach kb ...`.
@@ -95,6 +101,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Some("ingest-sessions") => cmd_ingest_sessions(args),
         Some("entity") => cmd_entity(args),
         Some("graph") => cmd_graph(args),
+        Some("health") => cmd_health(args),
         Some("-h") | Some("--help") => {
             print_help();
             Ok(())
@@ -400,12 +407,27 @@ fn connection_hit_for_edge(conn: &Connection, e: &store::Relation, hops: u8) -> 
 /// failure along the way (no match, a vanished entity/memory row) simply
 /// yields fewer or zero connections, never an error — this is enrichment,
 /// not a required part of a search response.
+/// `store::active_relations_for_entity`, filtered to exclude any edge whose
+/// evidence memory is currently dormant — the graph hygiene pass's "respect
+/// at query time" half of evidence-death propagation: a dormant fact can
+/// wake (`mach kb wake`), so its edge must not be tombstoned, only left out
+/// of *this* recall-connections view until it does. Used only here (search
+/// enrichment); `mach kb entity <name>` (an audit view, not recall) keeps
+/// showing these edges via the unfiltered `active_relations_for_entity`.
+fn active_relations_for_recall(conn: &Connection, entity_id: i64) -> Vec<store::Relation> {
+    store::active_relations_for_entity(conn, entity_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| !store::relation_evidence_is_dormant(conn, r).unwrap_or(false))
+        .collect()
+}
+
 fn entity_connections_for_query(conn: &Connection, q_emb: &[f32]) -> Vec<ConnectionHit> {
     let entity = match store::find_entity_by_similarity(conn, q_emb, SEARCH_ENTITY_CONNECTION_SIM_THRESHOLD) {
         Ok(Some((e, _sim))) => e,
         _ => return Vec::new(),
     };
-    let hop1_edges = store::active_relations_for_entity(conn, entity.id).unwrap_or_default();
+    let hop1_edges = active_relations_for_recall(conn, entity.id);
     let mut out: Vec<ConnectionHit> = Vec::new();
     let mut used_edge_ids: HashSet<i64> = HashSet::new();
 
@@ -431,7 +453,7 @@ fn entity_connections_for_query(conn: &Connection, q_emb: &[f32]) -> Vec<Connect
             Ok(Some(p)) => p,
             _ => continue,
         };
-        let hop2_edges = store::active_relations_for_entity(conn, pivot_id).unwrap_or_default();
+        let hop2_edges = active_relations_for_recall(conn, pivot_id);
         let mut taken_for_this_neighbor = 0usize;
         for e2 in &hop2_edges {
             if out.len() >= SEARCH_MAX_CONNECTIONS || taken_for_this_neighbor >= SEARCH_HOP2_MAX_PER_NEIGHBOR {
@@ -965,6 +987,12 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     // look, since (like curation/dormancy) it runs unconditionally below.
     let graph_backlog = store::has_graph_extraction_candidates(&conn).map_err(to_io)?;
     if !has_new && !force_meta && verification_queue.is_empty() && !graph_backlog {
+        // Still a genuine completion for `mach kb health`'s purposes — the
+        // process ran and had nothing to do, which is different from never
+        // running at all (see `store::ReflectState::last_completed_at`'s
+        // own doc comment). The offline-defer exit just below this one is
+        // the one case that deliberately does NOT call this.
+        store::mark_reflect_completed(&conn, &now).map_err(to_io)?;
         println!("mach kb reflect: nothing new");
         return Ok(());
     }
@@ -1275,6 +1303,24 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         run_graph_extraction_pass(&conn, &embedder, &llm, &now).map_err(to_io)?;
     llm_failed = llm_failed || graph_llm_failed;
 
+    // Step 4.64: graph hygiene — runs right after edge extraction and before
+    // dormancy: (a) evidence-death propagation (deterministic, no LLM) —
+    // an active edge whose evidence memory has since died (invalidated or
+    // hard-deleted) is invalidated too, `superseded_by` left NULL (it died
+    // with its evidence, it wasn't beaten by a rival edge); a dormant
+    // evidence memory is deliberately left alone here (it can wake) and is
+    // instead excluded only at recall-query time (see
+    // `active_relations_for_recall`). (b) entity merge (batched LLM
+    // confirm) — candidate pairs found by name-embedding similarity or a
+    // case/punctuation-insensitive exact match are batch-judged SAME/
+    // DIFFERENT; a SAME verdict keeps the older entity, repoints every edge
+    // off the newer one (deduping any resulting identical edges), and
+    // deletes the newer entity row. Runs every invocation regardless of
+    // has_new, same as curation/dormancy/graph-extraction — both halves are
+    // sweeps over the whole graph, not gated on this run's new material.
+    let (evidence_dead, entities_merged, hygiene_llm_failed) = run_graph_hygiene_pass(&conn, &llm, &now).map_err(to_io)?;
+    llm_failed = llm_failed || hygiene_llm_failed;
+
     // Step 4.65: dormancy — put stale, low-importance, uncited memories to
     // sleep (reviewed and unreviewed alike, on the exact same criteria —
     // see store::memory_qualifies_for_dormancy's own doc comment; there is
@@ -1319,11 +1365,18 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         store::update_reflect_state(&conn, &now, new_watermark).map_err(to_io)?;
     }
 
+    // Records this run's completion for `mach kb health`'s own "is reflect
+    // still running" check — unconditional (see
+    // `store::ReflectState::last_completed_at`'s own doc comment for why
+    // this is deliberately separate from the has_new/llm_failed-gated
+    // watermark above).
+    store::mark_reflect_completed(&conn, &now).map_err(to_io)?;
+
     println!(
         "mach kb reflect: examined={} questions={} insights_added={} reinforced={} \
          themes_added={} flagged={} verified={} curated={} promoted={} demoted={} dormant={} \
          consolidated={} deduped={} contradictions={} mem_verified={} mem_stale={} mem_routed={} \
-         graph_examined={} graph_edges={} graph_entities={}{}",
+         graph_examined={} graph_edges={} graph_entities={} evidence_dead={} entities_merged={}{}",
         examined,
         questions_count,
         insights_added,
@@ -1344,6 +1397,8 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         graph_examined,
         graph_edges,
         graph_entities,
+        evidence_dead,
+        entities_merged,
         if llm_failed { " (degraded: some claude calls failed — watermark not advanced)" } else { "" }
     );
     Ok(())
@@ -2185,6 +2240,125 @@ fn run_graph_extraction_pass<E: Embedder, L: ReflectLlm>(
     Ok((examined, edges_created, entities_created, llm_failed))
 }
 
+/// The graph hygiene pass (runs inside `mach kb reflect`, right after graph
+/// extraction and before dormancy): evidence-death propagation (below,
+/// deterministic, no LLM) followed by batched entity-merge judging (below).
+/// Returns `(evidence_dead, entities_merged, any_llm_call_failed)`.
+fn run_graph_hygiene_pass<L: ReflectLlm>(conn: &Connection, llm: &L, now: &str) -> Result<(usize, usize, bool), KbError> {
+    let evidence_dead = run_evidence_death_propagation(conn, now)?;
+    let (entities_merged, llm_failed) = run_entity_merge_pass(conn, llm, now)?;
+    Ok((evidence_dead, entities_merged, llm_failed))
+}
+
+/// Evidence-death propagation: every ACTIVE edge whose evidence memory has
+/// since died (invalidated/superseded, or hard-deleted via `mach kb
+/// forget`) is invalidated too, via `store::invalidate_relation` —
+/// `superseded_by` stays NULL (the edge died with its evidence, it wasn't
+/// beaten by a rival edge). Purely deterministic, no LLM involved; an edge
+/// whose evidence is merely dormant is deliberately left alone here — see
+/// `store::relation_evidence_is_dormant`'s own doc comment for why that
+/// case is instead respected only at recall-query time
+/// (`active_relations_for_recall`), never by tombstoning the edge outright.
+/// Returns the number of edges invalidated.
+fn run_evidence_death_propagation(conn: &Connection, now: &str) -> Result<usize, KbError> {
+    let dying = store::relations_with_dead_evidence(conn)?;
+    let mut count = 0usize;
+    for r in &dying {
+        if store::invalidate_relation(conn, r.id, now)? {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Batched entity-merge judging: candidate pairs
+/// (`store::entity_merge_candidate_pairs`, name-embedding similarity or a
+/// case/punctuation-insensitive exact name match, capped at
+/// `reflect::ENTITY_MERGE_MAX_PAIRS_PER_RUN`) are described by kind + up to
+/// 2 sample edges each (id-free, `store::sample_relation_descriptions`) and
+/// batch-judged SAME/DIFFERENT, `reflect::ENTITY_MERGE_BATCH_SIZE` pairs per
+/// call — same batching philosophy `run_graph_extraction_pass`'s own
+/// `resolve_pending_conflicts` already established for edge conflicts.
+///
+/// `Same` keeps the older (lower-id) entity, repoints every edge off the
+/// newer one (`store::repoint_entity_relations`, which also dedupes any
+/// resulting identical edges), and deletes the newer entity row
+/// (`store::delete_entity`) — never watermarked in `entity_merge_seen`
+/// (the merged entity is gone, so it can never resurface as a candidate,
+/// mirroring the dedupe pass's own treatment of a merged memory).
+/// `Different` is recorded in `entity_merge_seen` so the pair is never
+/// re-asked. A pair a batch reply never addressed, or a whole batch call
+/// that failed outright, is left exactly as it is — never watermarked,
+/// never merged — so it gets a fresh chance on a later run (the "failed LLM
+/// judgments never marked seen" house rule, same as every other batched
+/// pass in this module).
+///
+/// Returns `(entities_merged, any_llm_call_failed)`.
+fn run_entity_merge_pass<L: ReflectLlm>(conn: &Connection, llm: &L, now: &str) -> Result<(usize, bool), KbError> {
+    let seen = store::entity_merge_seen_pairs(conn)?;
+    let pairs = store::entity_merge_candidate_pairs(
+        conn,
+        reflect::ENTITY_MERGE_MIN_SIM,
+        &seen,
+        reflect::ENTITY_MERGE_MAX_PAIRS_PER_RUN,
+    )?;
+
+    let mut merged = 0usize;
+    let mut llm_failed = false;
+
+    for chunk in pairs.chunks(reflect::ENTITY_MERGE_BATCH_SIZE) {
+        // Re-fetch descriptions fresh per batch: an earlier chunk in this
+        // same run may already have merged (deleted) an entity this
+        // chunk's own candidates reference.
+        let mut resolved: Vec<(i64, i64, (String, String, Vec<String>), (String, String, Vec<String>))> = Vec::new();
+        for &(id_a, id_b) in chunk {
+            let (ea, eb) = match (store::get_entity(conn, id_a)?, store::get_entity(conn, id_b)?) {
+                (Some(a), Some(b)) => (a, b),
+                _ => continue, // one side already merged away earlier this run
+            };
+            let kind_a = ea.kind.clone().unwrap_or_else(|| "unspecified".to_string());
+            let kind_b = eb.kind.clone().unwrap_or_else(|| "unspecified".to_string());
+            let samples_a = store::sample_relation_descriptions(conn, id_a, 2)?;
+            let samples_b = store::sample_relation_descriptions(conn, id_b, 2)?;
+            resolved.push((id_a, id_b, (ea.name, kind_a, samples_a), (eb.name, kind_b, samples_b)));
+        }
+        if resolved.is_empty() {
+            continue;
+        }
+
+        let prompt_pairs: Vec<((&str, &str, &[String]), (&str, &str, &[String]))> = resolved
+            .iter()
+            .map(|(_, _, a, b)| ((a.0.as_str(), a.1.as_str(), a.2.as_slice()), (b.0.as_str(), b.1.as_str(), b.2.as_slice())))
+            .collect();
+        let prompt = reflect::build_batch_entity_merge_prompt(&prompt_pairs);
+        let raw = match llm.call("haiku", &prompt, reflect::TIMEOUT_HAIKU_BATCH) {
+            Ok(out) => out,
+            Err(_) => {
+                llm_failed = true;
+                continue;
+            }
+        };
+        let verdicts = reflect::parse_batch_entity_merge_verdicts(&raw, resolved.len());
+
+        for (i, (id_a, id_b, _, _)) in resolved.iter().enumerate() {
+            match verdicts.get(&(i + 1)) {
+                Some(reflect::EntityMergeVerdict::Same) => {
+                    let (keep_id, drop_id) = if *id_a < *id_b { (*id_a, *id_b) } else { (*id_b, *id_a) };
+                    store::repoint_entity_relations(conn, drop_id, keep_id, now)?;
+                    store::delete_entity(conn, drop_id)?;
+                    merged += 1;
+                }
+                Some(reflect::EntityMergeVerdict::Different) => {
+                    store::mark_entity_merge_seen(conn, *id_a, *id_b)?;
+                }
+                None => {} // unaddressed -- left exactly as it is, retried next run
+            }
+        }
+    }
+
+    Ok((merged, llm_failed))
+}
+
 fn cmd_insights(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut flagged_only = false;
     while let Some(a) = args.next() {
@@ -2367,14 +2541,23 @@ fn cmd_entity(mut args: impl Iterator<Item = String>) -> io::Result<()> {
 
 /// `mach kb graph --stats` — a compact view of the association graph `mach
 /// kb reflect`'s extraction pass has derived so far: total entities (broken
-/// down by `kind`) and edge counts (active vs. invalidated).
-fn cmd_graph(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+/// down by `kind`) and edge counts (active vs. invalidated). `mach kb graph
+/// audit` is a separate subcommand (see `cmd_graph_audit`) — dispatched on
+/// here since both live under the same `graph` subcommand name.
+fn cmd_graph(args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut args = args.peekable();
+    if args.peek().map(|s| s.as_str()) == Some("audit") {
+        args.next();
+        return cmd_graph_audit(args);
+    }
+
     let mut stats = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--stats" => stats = true,
             "-h" | "--help" => {
                 println!("usage: mach kb graph --stats");
+                println!("       mach kb graph audit");
                 return Ok(());
             }
             other => {
@@ -2400,6 +2583,121 @@ fn cmd_graph(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     }
     println!("edges: {} active, {} invalidated", active_edges, invalidated_edges);
     Ok(())
+}
+
+/// `mach kb graph audit` — a one-time-or-repeatable batched pass over every
+/// ACTIVE edge (`store::active_relations_all`), judging each KEEP / POISONED
+/// / GENERIC (`reflect::GraphAuditVerdict`) and invalidating (never
+/// deleting) anything POISONED or GENERIC. Reusable: unlike `mach kb
+/// reflect`'s own drained-backlog passes, this re-examines the whole active
+/// edge set every run, so running it again after a clean pass costs one
+/// batch of already-KEEP verdicts, never a stale watermark.
+fn cmd_graph_audit(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "-h" | "--help" => {
+                println!("usage: mach kb graph audit");
+                println!("       batched KEEP/POISONED/GENERIC judgment over every active edge;");
+                println!("       POISONED/GENERIC edges are invalidated (never deleted).");
+                return Ok(());
+            }
+            other => {
+                eprintln!("mach kb graph audit: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let conn = store::open().map_err(to_io)?;
+    let now = store::now_rfc3339();
+    let llm = ProcessReflectLlm::new();
+    let (kept, invalidated, invalidated_descs, llm_failed) = run_graph_audit(&conn, &llm, &now).map_err(to_io)?;
+
+    for desc in &invalidated_descs {
+        println!("invalidated: {}", desc);
+    }
+    println!(
+        "mach kb graph audit: kept={} invalidated={}{}",
+        kept,
+        invalidated,
+        if llm_failed { " (degraded: some claude calls failed — re-run to cover the rest)" } else { "" }
+    );
+    Ok(())
+}
+
+/// The audit pass itself: batches `store::active_relations_all` at
+/// `reflect::GRAPH_AUDIT_BATCH_SIZE` edges per call, describing each edge by
+/// its endpoint names/kinds, predicate, and an evidence snippet (id-free,
+/// per this feature's own house rule). An edge whose batch reply never
+/// addressed it, or whose whole batch call failed, is left exactly as it is
+/// (treated like an explicit KEEP for this run's counts) — never
+/// destructive on doubt, and simply re-examined on the next `mach kb graph
+/// audit` invocation. Returns `(kept, invalidated, invalidated_descriptions,
+/// any_llm_call_failed)`. Generic over `ReflectLlm` so it's exercised in
+/// tests against a fake that can fail on demand.
+fn run_graph_audit<L: ReflectLlm>(conn: &Connection, llm: &L, now: &str) -> Result<(usize, usize, Vec<String>, bool), KbError> {
+    let edges = store::active_relations_all(conn)?;
+    let mut kept = 0usize;
+    let mut invalidated = 0usize;
+    let mut invalidated_descs: Vec<String> = Vec::new();
+    let mut llm_failed = false;
+
+    for chunk in edges.chunks(reflect::GRAPH_AUDIT_BATCH_SIZE) {
+        let mut descs: Vec<(String, String, String, String, String, String)> = Vec::new();
+        for r in chunk {
+            let src = store::get_entity(conn, r.src)?;
+            let dst = store::get_entity(conn, r.dst)?;
+            let (src_name, src_kind) = match src {
+                Some(e) => (e.name, e.kind.unwrap_or_else(|| "unspecified".to_string())),
+                None => ("?".to_string(), "unspecified".to_string()),
+            };
+            let (dst_name, dst_kind) = match dst {
+                Some(e) => (e.name, e.kind.unwrap_or_else(|| "unspecified".to_string())),
+                None => ("?".to_string(), "unspecified".to_string()),
+            };
+            let evidence = r
+                .evidence_memory_id
+                .and_then(|id| store::get(conn, id).ok().flatten())
+                .map(|m| truncate(&m.content, 100))
+                .unwrap_or_else(|| "(no evidence recorded)".to_string());
+            descs.push((src_name, src_kind, r.predicate.clone(), dst_name, dst_kind, evidence));
+        }
+        let prompt_rows: Vec<(&str, &str, &str, &str, &str, &str)> = descs
+            .iter()
+            .map(|(a, b, c, d, e, f)| (a.as_str(), b.as_str(), c.as_str(), d.as_str(), e.as_str(), f.as_str()))
+            .collect();
+        let prompt = reflect::build_batch_graph_audit_prompt(&prompt_rows);
+        let raw = match llm.call("haiku", &prompt, reflect::TIMEOUT_HAIKU_BATCH) {
+            Ok(out) => out,
+            Err(_) => {
+                llm_failed = true;
+                kept += chunk.len(); // left untouched -- counted as kept for this run's report
+                continue;
+            }
+        };
+        let verdicts = reflect::parse_batch_graph_audit_verdicts(&raw, chunk.len());
+        for (i, r) in chunk.iter().enumerate() {
+            match verdicts.get(&(i + 1)) {
+                Some(reflect::GraphAuditVerdict::Poisoned) | Some(reflect::GraphAuditVerdict::Generic) => {
+                    let verdict_label = if verdicts.get(&(i + 1)) == Some(&reflect::GraphAuditVerdict::Poisoned) {
+                        "POISONED"
+                    } else {
+                        "GENERIC"
+                    };
+                    if store::invalidate_relation(conn, r.id, now)? {
+                        invalidated += 1;
+                        let (src_name, src_kind, predicate, dst_name, dst_kind, _) = &descs[i];
+                        invalidated_descs.push(format!(
+                            "#{} {} ({}) --{}--> {} ({}) [{}]",
+                            r.id, src_name, src_kind, predicate, dst_name, dst_kind, verdict_label
+                        ));
+                    }
+                }
+                _ => kept += 1, // explicit KEEP, or unaddressed -- never destructive on doubt
+            }
+        }
+    }
+    Ok((kept, invalidated, invalidated_descs, llm_failed))
 }
 
 fn cmd_tree(mut args: impl Iterator<Item = String>) -> io::Result<()> {
@@ -2961,6 +3259,307 @@ fn cmd_ingest_sessions(mut args: impl Iterator<Item = String>) -> io::Result<()>
         summary.deferred_offline,
         summary.pruned_recall_logs
     );
+    Ok(())
+}
+
+// --- health: operational self-check + persistent-degradation notification ---
+
+/// `~/.local/share/mach/health-notify-streak.json` — the last failing-set
+/// `mach kb health --notify` actually notified about, and when (see
+/// `health::should_notify`).
+fn health_streak_path() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+    Ok(PathBuf::from(home).join(".local/share/mach/health-notify-streak.json"))
+}
+
+fn load_streak(path: &Path) -> Option<health::NotifyStreak> {
+    std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok())
+}
+
+fn save_streak(path: &Path, streak: &health::NotifyStreak) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string(streak) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// Bytes free on the filesystem containing `path`, via `df -B1
+/// --output=avail` -- same subprocess-over-a-syscall-binding approach
+/// `engines/meet/src/disk.rs::free_bytes` already uses for the same reason
+/// (a one-off syscall wrapper isn't worth an extra crate dependency);
+/// duplicated in miniature here rather than taking a cross-crate dependency
+/// on `meet` for one function.
+fn free_bytes(path: &Path) -> io::Result<u64> {
+    let out = std::process::Command::new("df").arg("-B1").arg("--output=avail").arg(path).output()?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!("df failed: {}", String::from_utf8_lossy(&out.stderr).trim())));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .nth(1) // line 0 is the "avail" header
+        .and_then(|l| l.trim().parse::<u64>().ok())
+        .ok_or_else(|| io::Error::other(format!("could not parse `df` output: {:?}", text)))
+}
+
+/// Checks that `mach kb`'s ollama embed model actually responds — a tiny
+/// real embed call, not just a TCP connect (mirrors why `note`/`add`/
+/// `search` all treat a failed embed as the definitive "ollama unreachable"
+/// signal rather than pinging the port).
+fn check_ollama() -> health::Check {
+    let name = "ollama".to_string();
+    let embedder = OllamaEmbedder::new();
+    match embedder.embed("mach kb health check") {
+        Ok(_) => health::Check { name, ok: true, detail: "embed model responded".to_string() },
+        Err(e) => health::Check { name, ok: false, detail: e.to_string() },
+    }
+}
+
+/// Checks that `kb.db` opens, passes `PRAGMA integrity_check`, and reports
+/// its `user_version` (informational — confirms migrations have actually
+/// run, not a pass/fail condition on its own).
+fn check_kb_db(conn_result: &Result<Connection, KbError>) -> health::Check {
+    let name = "kb.db".to_string();
+    match conn_result {
+        Ok(conn) => {
+            let integrity: String =
+                conn.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap_or_else(|_| "error".to_string());
+            let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(-1);
+            health::Check {
+                name,
+                ok: integrity == "ok",
+                detail: format!("integrity_check={} user_version={}", integrity, version),
+            }
+        }
+        Err(e) => health::Check { name, ok: false, detail: e.to_string() },
+    }
+}
+
+/// Checks the reflect-completion age (`store::ReflectState::last_completed_at`)
+/// against `health::REFLECT_STALE_WARN_HOURS`.
+fn check_reflect_completion(conn_result: &Result<Connection, KbError>) -> health::Check {
+    let name = "reflect".to_string();
+    let conn = match conn_result {
+        Ok(c) => c,
+        Err(_) => return health::Check { name, ok: false, detail: "kb.db unavailable".to_string() },
+    };
+    let state = match store::get_reflect_state(conn) {
+        Ok(s) => s,
+        Err(e) => return health::Check { name, ok: false, detail: e.to_string() },
+    };
+    let now = store::now_rfc3339();
+    let hours = state.last_completed_at.as_deref().map(|ts| store::age_days(ts, &now) * 24.0);
+    let ok = health::reflect_completion_ok(hours);
+    let detail = match hours {
+        Some(h) => format!("last completed {:.1}h ago", h),
+        None => "never completed".to_string(),
+    };
+    health::Check { name, ok, detail }
+}
+
+/// Checks that `machd`'s kb socket subsystem (`socket::run`) is up and
+/// actually answers a `search` op — a real one-shot round trip over
+/// `$XDG_RUNTIME_DIR/mach-kb.sock`, not just a file-exists check.
+fn check_kb_socket() -> health::Check {
+    let name = "kb-socket".to_string();
+    let path = crate::socket::socket_path();
+    if !path.exists() {
+        return health::Check { name, ok: false, detail: format!("socket not found at {}", path.display()) };
+    }
+    let result: Result<(), String> = (|| {
+        use std::os::unix::net::UnixStream;
+        let mut stream = UnixStream::connect(&path).map_err(|e| e.to_string())?;
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+        let req = serde_json::json!({"op": "search", "query": "mach kb health check", "limit": 1}).to_string() + "\n";
+        stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.contains(&b'\n') {
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&buf);
+        let line = text.lines().next().unwrap_or("");
+        let v: serde_json::Value = serde_json::from_str(line).map_err(|e| format!("bad response: {}", e))?;
+        if v.get("hits").is_some() {
+            Ok(())
+        } else if let Some(err) = v.get("error") {
+            Err(format!("socket returned an error: {}", err))
+        } else {
+            Err("unexpected response shape".to_string())
+        }
+    })();
+    match result {
+        Ok(()) => health::Check { name, ok: true, detail: "search responded".to_string() },
+        Err(e) => health::Check { name, ok: false, detail: e },
+    }
+}
+
+/// Checks that `~/.local/share/mach/recall-log` exists (creating it if
+/// needed) and is actually writable — a real write-then-remove probe file,
+/// not just a permissions read.
+fn check_recall_log_writable() -> health::Check {
+    let name = "recall-log-dir".to_string();
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return health::Check { name, ok: false, detail: "HOME is not set".to_string() },
+    };
+    let dir = PathBuf::from(home).join(".local/share/mach/recall-log");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return health::Check { name, ok: false, detail: format!("cannot create {}: {}", dir.display(), e) };
+    }
+    let probe = dir.join(format!(".health-write-probe-{}", std::process::id()));
+    match std::fs::write(&probe, b"ok") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            health::Check { name, ok: true, detail: format!("{} writable", dir.display()) }
+        }
+        Err(e) => health::Check { name, ok: false, detail: format!("cannot write to {}: {}", dir.display(), e) },
+    }
+}
+
+/// Checks free disk space at the filesystem holding `kb.db` against
+/// `health::DISK_HEADROOM_WARN_BYTES`.
+fn check_disk_headroom() -> health::Check {
+    let name = "disk-headroom".to_string();
+    let path = match store::db_path() {
+        Ok(p) => p,
+        Err(e) => return health::Check { name, ok: false, detail: e.to_string() },
+    };
+    let dir = path.parent().unwrap_or(Path::new("/"));
+    match free_bytes(dir) {
+        Ok(free) => health::Check {
+            name,
+            ok: health::disk_headroom_ok(free),
+            detail: format!("{:.2} GB free at {}", free as f64 / 1e9, dir.display()),
+        },
+        Err(e) => health::Check { name, ok: false, detail: e.to_string() },
+    }
+}
+
+/// Checks `telegram-state.json`'s own staleness (its file mtime — the only
+/// timestamp it records, see `engines/telegram/src/state.rs::State`) against
+/// `health::TELEGRAM_STATE_STALE_WARN_HOURS` — but ONLY when `telegram.toml`
+/// exists at all; an unconfigured bridge has nothing to be stale about, so
+/// this returns `None` (no check row at all) rather than a synthetic
+/// failure. The bridge's own long-poll loop (`telegram::run`) persists this
+/// file on every successful poll, even an empty one — not just when a real
+/// update arrives — precisely so its mtime means "the poll loop is alive,"
+/// not merely "a message showed up recently."
+fn check_telegram_state() -> Option<health::Check> {
+    let home = std::env::var("HOME").ok()?;
+    let toml_path = PathBuf::from(&home).join(".local/share/mach/telegram.toml");
+    if !toml_path.exists() {
+        return None;
+    }
+    let name = "telegram-state".to_string();
+    let state_path = PathBuf::from(&home).join(".local/share/mach/telegram-state.json");
+    let hours = std::fs::metadata(&state_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|d| d.as_secs_f64() / 3600.0);
+    let ok = health::telegram_state_ok(hours);
+    let detail = match hours {
+        Some(h) => format!("last update poll {:.1}h ago", h),
+        None => format!("no {} yet", state_path.display()),
+    };
+    Some(health::Check { name, ok, detail })
+}
+
+/// `--notify`'s side effect: fires at most one `notify-send -u critical`
+/// summarizing every failing check, suppressed for
+/// `health::NOTIFY_SUPPRESS_WINDOW_SECS` when the exact same failing set was
+/// already notified about — see `health::should_notify`. Clears the streak
+/// file entirely once everything passes, so a *future* failure (even an
+/// identical one) notifies immediately rather than staying suppressed by a
+/// stale streak from a resolved incident.
+fn maybe_send_health_notification(checks: &[health::Check]) {
+    let failing = health::failing_names(checks);
+    let path = match health_streak_path() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    if failing.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let last = load_streak(&path);
+    if health::should_notify(&failing, last.as_ref(), now_secs) {
+        let summary = format!("mach kb health: {} check(s) failing: {}", failing.len(), failing.join(", "));
+        let _ = std::process::Command::new("notify-send")
+            .arg("-u")
+            .arg("critical")
+            .arg("-a")
+            .arg("mach kb health")
+            .arg(&summary)
+            .spawn();
+        save_streak(&path, &health::NotifyStreak { key: health::streak_key(&failing), last_notified_secs: now_secs });
+    }
+}
+
+fn cmd_health(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut notify = false;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--notify" => notify = true,
+            "-h" | "--help" => {
+                println!("usage: mach kb health [--notify]");
+                println!(
+                    "       plain-text operational self-check (ollama, kb.db, kb socket, reflect"
+                );
+                println!(
+                    "       cadence, disk headroom, recall-log dir, telegram-state staleness);"
+                );
+                println!("       exits nonzero if any check fails.");
+                println!(
+                    "       --notify: also sends one notify-send -u critical summarizing failing"
+                );
+                println!(
+                    "       checks, suppressed for 24h once the same failing set has been notified."
+                );
+                return Ok(());
+            }
+            other => {
+                eprintln!("mach kb health: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let conn_result = store::open();
+
+    let mut checks: Vec<health::Check> = vec![
+        check_ollama(),
+        check_kb_db(&conn_result),
+        check_reflect_completion(&conn_result),
+        check_kb_socket(),
+        check_recall_log_writable(),
+        check_disk_headroom(),
+    ];
+    if let Some(c) = check_telegram_state() {
+        checks.push(c);
+    }
+
+    print!("{}", health::format_report(&checks));
+    let failed = health::any_failed(&checks);
+
+    if notify {
+        maybe_send_health_notification(&checks);
+    }
+
+    if failed {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -4427,5 +5026,193 @@ mod tests {
         let resp = search_hits(&conn, &embedder, "who does Moses know", 10, false, false, 0.0, &now).unwrap();
         assert_eq!(resp.connections.len(), 5, "6 direct edges must still cap at the overall limit");
         assert!(resp.connections.iter().all(|c| c.hops == 1), "hop-1 edges fill the cap before any hop-2 walk runs");
+    }
+
+    // --- graph hygiene pass: evidence-death propagation + entity merge ---
+
+    #[test]
+    fn run_evidence_death_propagation_invalidates_edges_with_dead_evidence_only() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let moses = store::insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let umoja = store::insert_entity(&conn, "Umoja", Some("project"), None).unwrap();
+        let alive = store::insert(&conn, "Moses proposes a feature for Umoja", None, None, true, None, 5).unwrap();
+        let dying = store::insert(&conn, "a fact about to be superseded", None, None, true, None, 5).unwrap();
+        let r_alive = store::insert_relation(&conn, moses, "proposes-feature-for", umoja, Some(alive), Some(0.9), &now).unwrap();
+        let r_dying = store::insert_relation(&conn, moses, "used-to-lead", umoja, Some(dying), Some(0.7), &now).unwrap();
+
+        let replacement = store::insert(&conn, "replacement fact", None, None, true, None, 5).unwrap();
+        store::supersede(&conn, dying, replacement, &now).unwrap();
+
+        let count = run_evidence_death_propagation(&conn, &now).unwrap();
+        assert_eq!(count, 1);
+        assert!(!store::get_relation(&conn, r_dying).unwrap().unwrap().is_active());
+        assert_eq!(store::get_relation(&conn, r_dying).unwrap().unwrap().superseded_by, None);
+        assert!(store::get_relation(&conn, r_alive).unwrap().unwrap().is_active());
+    }
+
+    #[test]
+    fn run_entity_merge_pass_same_verdict_repoints_and_deletes_the_newer_entity() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let older = store::insert_entity(&conn, "Umoja", Some("project"), Some(&unit_vec(4, 0))).unwrap();
+        let newer = store::insert_entity(&conn, "umoja project", Some("project"), Some(&unit_vec(4, 0))).unwrap();
+        let moses = store::insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let edge = store::insert_relation(&conn, moses, "proposes-feature-for", newer, None, Some(0.9), &now).unwrap();
+
+        let llm = FixedReflectLlm { reply: Ok("1: SAME") };
+        let (merged, failed) = run_entity_merge_pass(&conn, &llm, &now).unwrap();
+        assert_eq!(merged, 1);
+        assert!(!failed);
+        assert!(store::get_entity(&conn, newer).unwrap().is_none(), "the newer entity row must be deleted");
+        assert!(store::get_entity(&conn, older).unwrap().is_some(), "the older entity survives");
+        assert_eq!(store::get_relation(&conn, edge).unwrap().unwrap().dst, older, "its edge must be repointed to the survivor");
+    }
+
+    #[test]
+    fn run_entity_merge_pass_different_verdict_marks_seen_and_touches_nothing() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let a = store::insert_entity(&conn, "Umoja", Some("project"), Some(&unit_vec(4, 0))).unwrap();
+        let b = store::insert_entity(&conn, "umoja project", Some("project"), Some(&unit_vec(4, 0))).unwrap();
+
+        let llm = FixedReflectLlm { reply: Ok("1: DIFFERENT") };
+        let (merged, failed) = run_entity_merge_pass(&conn, &llm, &now).unwrap();
+        assert_eq!(merged, 0);
+        assert!(!failed);
+        assert!(store::get_entity(&conn, a).unwrap().is_some());
+        assert!(store::get_entity(&conn, b).unwrap().is_some());
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        assert_eq!(store::entity_merge_seen_pairs(&conn).unwrap(), [(lo, hi)].into_iter().collect());
+    }
+
+    #[test]
+    fn run_entity_merge_pass_failed_call_never_marks_seen_or_merges() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        store::insert_entity(&conn, "Umoja", Some("project"), Some(&unit_vec(4, 0))).unwrap();
+        store::insert_entity(&conn, "umoja project", Some("project"), Some(&unit_vec(4, 0))).unwrap();
+
+        let llm = FixedReflectLlm { reply: Err("offline") };
+        let (merged, failed) = run_entity_merge_pass(&conn, &llm, &now).unwrap();
+        assert_eq!(merged, 0);
+        assert!(failed);
+        assert!(store::entity_merge_seen_pairs(&conn).unwrap().is_empty(), "a transport failure must not be recorded as seen");
+    }
+
+    #[test]
+    fn run_entity_merge_pass_no_candidates_below_similarity_never_calls_the_judge() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        store::insert_entity(&conn, "Moses", Some("person"), Some(&unit_vec(4, 0))).unwrap();
+        store::insert_entity(&conn, "Ivar", Some("person"), Some(&unit_vec(4, 1))).unwrap();
+
+        struct PanicLlm;
+        impl ReflectLlm for PanicLlm {
+            fn call(&self, _model: &str, _prompt: &str, _timeout: std::time::Duration) -> Result<String, String> {
+                panic!("must never be called when there are no candidates");
+            }
+        }
+        let (merged, failed) = run_entity_merge_pass(&conn, &PanicLlm, &now).unwrap();
+        assert_eq!(merged, 0);
+        assert!(!failed);
+    }
+
+    // --- mach kb graph audit ---
+
+    #[test]
+    fn run_graph_audit_invalidates_poisoned_and_generic_keeps_the_rest() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let moses = store::insert_entity(&conn, "Moses", Some("person"), None).unwrap();
+        let umoja = store::insert_entity(&conn, "Umoja", Some("project"), None).unwrap();
+        let boss = store::insert_entity(&conn, "boss", None, None).unwrap();
+        let user = store::insert_entity(&conn, "user", None, None).unwrap();
+
+        // Known-good edge that must survive.
+        let r_good = store::insert_relation(&conn, moses, "proposes-feature-for", umoja, None, Some(0.9), &now).unwrap();
+        // A test-describing edge -- poisoned.
+        let r_poisoned =
+            store::insert_relation(&conn, moses, "supersedes-as-boss", umoja, None, Some(0.5), &now).unwrap();
+        // The dead generic-role pattern this guard exists for.
+        let r_generic = store::insert_relation(&conn, user, "has-boss", boss, None, Some(0.5), &now).unwrap();
+
+        let llm = OwnedReplyLlm { reply: "1: KEEP\n2: POISONED\n3: GENERIC\n".to_string() };
+        let (kept, invalidated, descs, failed) = run_graph_audit(&conn, &llm, &now).unwrap();
+        assert_eq!(kept, 1);
+        assert_eq!(invalidated, 2);
+        assert!(!failed);
+        assert_eq!(descs.len(), 2);
+
+        assert!(store::get_relation(&conn, r_good).unwrap().unwrap().is_active());
+        assert!(!store::get_relation(&conn, r_poisoned).unwrap().unwrap().is_active());
+        assert!(!store::get_relation(&conn, r_generic).unwrap().unwrap().is_active());
+        // Invalidation only, never deleted -- the row is still readable.
+        assert!(store::get_relation(&conn, r_poisoned).unwrap().is_some());
+    }
+
+    #[test]
+    fn run_graph_audit_unaddressed_edge_is_treated_as_kept_not_invalidated() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let a = store::insert_entity(&conn, "A", None, None).unwrap();
+        let b = store::insert_entity(&conn, "B", None, None).unwrap();
+        let edge = store::insert_relation(&conn, a, "rel", b, None, Some(0.9), &now).unwrap();
+
+        // The reply never addresses edge number 1 at all.
+        let llm = FixedReflectLlm { reply: Ok("garbled reply with no verdict lines") };
+        let (kept, invalidated, descs, failed) = run_graph_audit(&conn, &llm, &now).unwrap();
+        assert_eq!(kept, 1);
+        assert_eq!(invalidated, 0);
+        assert!(descs.is_empty());
+        assert!(!failed, "the call itself succeeded -- only its content was unaddressed");
+        assert!(store::get_relation(&conn, edge).unwrap().unwrap().is_active());
+    }
+
+    #[test]
+    fn run_graph_audit_failed_batch_call_counts_as_kept_and_marks_the_run_degraded() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let a = store::insert_entity(&conn, "A", None, None).unwrap();
+        let b = store::insert_entity(&conn, "B", None, None).unwrap();
+        let edge = store::insert_relation(&conn, a, "rel", b, None, Some(0.9), &now).unwrap();
+
+        let llm = FixedReflectLlm { reply: Err("offline") };
+        let (kept, invalidated, descs, failed) = run_graph_audit(&conn, &llm, &now).unwrap();
+        assert_eq!(kept, 1);
+        assert_eq!(invalidated, 0);
+        assert!(descs.is_empty());
+        assert!(failed);
+        assert!(store::get_relation(&conn, edge).unwrap().unwrap().is_active(), "never destructive on a failed call");
+    }
+
+    // --- recall enrichment: dormant evidence excluded, never tombstoned ---
+
+    #[test]
+    fn entity_connections_for_query_excludes_edges_with_dormant_evidence() {
+        let conn = mem_conn();
+        let q = unit_vec(4, 0);
+        let now = store::now_rfc3339();
+        let moses = store::insert_entity(&conn, "Moses", Some("person"), Some(&q)).unwrap();
+        let user = store::insert_entity(&conn, "user", None, None).unwrap();
+        let evidence_mem = store::insert(&conn, "Moses is the user's boss", None, None, true, None, 5).unwrap();
+        let edge = store::insert_relation(&conn, moses, "boss-of", user, Some(evidence_mem), Some(0.9), &now).unwrap();
+
+        // Still active/live: the connection surfaces.
+        let before = entity_connections_for_query(&conn, &q);
+        assert_eq!(before.len(), 1);
+
+        // Evidence naps -- must be excluded from recall connections, but the
+        // edge itself must remain untouched (never invalidated).
+        store::set_dormant(&conn, evidence_mem, &now).unwrap();
+        let during_nap = entity_connections_for_query(&conn, &q);
+        assert!(during_nap.is_empty(), "a dormant-evidence edge must not surface in recall connections");
+        assert!(store::get_relation(&conn, edge).unwrap().unwrap().is_active(), "must never be tombstoned for napping");
+
+        // Evidence wakes -- the connection surfaces again, same edge row.
+        store::wake(&conn, evidence_mem, &now).unwrap();
+        let after_wake = entity_connections_for_query(&conn, &q);
+        assert_eq!(after_wake.len(), 1);
+        assert_eq!(after_wake[0].src_name, "Moses");
     }
 }

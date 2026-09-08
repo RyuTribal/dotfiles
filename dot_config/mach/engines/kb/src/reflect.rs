@@ -1632,6 +1632,213 @@ pub const CURATION_SCHEMA_STABILITY_MULTIPLIER: f64 = 1.5;
 /// two insights "genuinely share" a theme).
 pub const CURATION_SCHEMA_COHERENCE_MIN_SIM: f32 = META_CLUSTER_MIN_SIM;
 
+// --- graph hygiene pass: batched entity-merge judging ---
+//
+// Runs inside `mach kb reflect`, right after edge extraction and before
+// dormancy. Candidate pairs (`store::entity_merge_candidate_pairs`) are
+// deterministic (name-embedding similarity or a case/punctuation-
+// insensitive exact match); only the SAME/DIFFERENT call itself needs a
+// judge, and every candidate pair collected in one run is batched into as
+// few calls as `ENTITY_MERGE_BATCH_SIZE` allows -- the same batching
+// philosophy `build_batch_edge_contradiction_prompt` already established
+// for edge conflicts, reused here rather than one call per pair.
+
+/// Minimum name-embedding cosine similarity for two active entities to be a
+/// merge candidate -- deliberately higher than
+/// `ENTITY_RESOLUTION_SIM_THRESHOLD` (0.85, extraction's own "reuse this
+/// entity" floor): a *pre-existing* pair of entities clearing this bar is
+/// stronger evidence of an actual duplicate than a single fresh name being
+/// matched against the store, so this pass can afford to be pickier before
+/// spending a judge call on it.
+pub const ENTITY_MERGE_MIN_SIM: f32 = 0.9;
+/// This many candidate entity pairs are offered to one batched haiku call --
+/// same bucket size as `GRAPH_EXTRACTION_BATCH_SIZE`, picked for the same
+/// "several judgments per spawn" reason.
+pub const ENTITY_MERGE_BATCH_SIZE: usize = 12;
+/// At most this many candidate pairs are judged per `mach kb reflect` run --
+/// same bounded-cost rationale as `DEDUPE_MAX_PAIRS_PER_RUN`.
+pub const ENTITY_MERGE_MAX_PAIRS_PER_RUN: usize = 20;
+
+/// Outcome of the id-free entity-merge judge for one candidate pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityMergeVerdict {
+    /// The two entities are the same real-world thing under two names/
+    /// spellings -- the caller keeps the older (lower-id) entity, repoints
+    /// every edge off the newer one, and deletes the newer entity row.
+    Same,
+    /// Genuinely different things that merely look similar -- recorded in
+    /// `entity_merge_seen` so the pair is never re-asked.
+    Different,
+}
+
+/// Builds the entity-merge judge's one-call prompt for a whole batch of
+/// candidate pairs at once: each pair described by name, kind, and up to 2
+/// sample edges per entity (`store::sample_relation_descriptions`) --
+/// deliberately id-free, same rationale as every other batched judge prompt
+/// in this module. `pairs` are `((name, kind, sample_edges), (name, kind,
+/// sample_edges))` per candidate.
+pub fn build_batch_entity_merge_prompt(pairs: &[((&str, &str, &[String]), (&str, &str, &[String]))]) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "You are checking a personal knowledge graph for duplicate entities -- the same real-world \
+         person, project, or thing recorded twice under two different names or spellings. Each \
+         numbered pair below was flagged as a candidate by name similarity -- decide, for EACH pair, \
+         whether the two entities are the SAME thing or DIFFERENT things.\n\n",
+    );
+    for (i, (a, b)) in pairs.iter().enumerate() {
+        s.push_str(&format!("Pair {}:\n  Entity A: \"{}\" (kind: {})\n", i + 1, a.0, a.1));
+        for edge in a.2 {
+            s.push_str(&format!("    - {}\n", edge));
+        }
+        s.push_str(&format!("  Entity B: \"{}\" (kind: {})\n", b.0, b.1));
+        for edge in b.2 {
+            s.push_str(&format!("    - {}\n", edge));
+        }
+        s.push('\n');
+    }
+    s.push_str(&format!(
+        "For EACH pair number above (1 to {}), reply with exactly one line in the form `N: VERDICT`, \
+         where VERDICT is SAME or DIFFERENT. Every pair number from 1 to {} MUST appear exactly once.\n\
+         SAME -- the same real-world thing under two names/spellings (e.g. \"Umoja\" and \"umoja \
+         project\", or \"C++\" and \"c ++\").\n\
+         DIFFERENT -- genuinely different things that merely look similar.\n",
+        pairs.len(),
+        pairs.len()
+    ));
+    s
+}
+
+/// Parses a batch entity-merge reply into a map from pair number (1-based,
+/// matching `build_batch_entity_merge_prompt`'s own numbering) to its
+/// verdict -- same tolerant `N: VERDICT` line scan as
+/// `parse_batch_edge_contradiction_verdicts`. A pair number absent from the
+/// reply is simply absent from the map; the caller leaves an unaddressed
+/// pair untouched (neither merged nor marked seen), same "never watermark a
+/// judgment that never actually happened" rule the other batched passes
+/// follow.
+pub fn parse_batch_entity_merge_verdicts(output: &str, num_pairs: usize) -> HashMap<usize, EntityMergeVerdict> {
+    let mut out = HashMap::new();
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (num_str, rest) = match line.split_once(':') {
+            Some(v) => v,
+            None => continue,
+        };
+        let num: usize = match num_str.trim().parse() {
+            Ok(n) if n >= 1 && n <= num_pairs => n,
+            _ => continue,
+        };
+        let verdict = match rest.trim().to_uppercase().as_str() {
+            "SAME" => EntityMergeVerdict::Same,
+            "DIFFERENT" => EntityMergeVerdict::Different,
+            _ => continue,
+        };
+        out.entry(num).or_insert(verdict);
+    }
+    out
+}
+
+// --- one-time (or repeatable) edge audit: `mach kb graph audit` ---
+//
+// Ships as its own reusable subcommand rather than folded into `mach kb
+// reflect`'s own passes: it re-examines every ACTIVE edge each time it's
+// run (no backlog watermark, since a clean edge costs nothing to re-check),
+// which is a different shape from reflect's drained-backlog passes above.
+
+/// This many active edges are offered to one batched haiku call at a time.
+pub const GRAPH_AUDIT_BATCH_SIZE: usize = 20;
+
+/// Outcome of the audit judge's verdict for one edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphAuditVerdict {
+    /// A genuine, correctly-derived relation between two real named things.
+    Keep,
+    /// Derived from a fact that was merely describing a test, hypothetical,
+    /// example, or the memory system's own mechanics -- not a real fact
+    /// about the people/things it happens to mention (the same poisoning
+    /// this pattern already guards extraction against going forward -- see
+    /// `extraction_quality_guard` -- this is the backfill's one-time
+    /// catch-up audit over edges that predate that guard).
+    Poisoned,
+    /// One endpoint is a generic-role placeholder (e.g. "boss", "the
+    /// project") rather than an actual named thing.
+    Generic,
+}
+
+/// Builds the audit judge's one-call prompt for a whole batch of active
+/// edges at once: each edge described by its endpoint names/kinds,
+/// predicate, and an evidence snippet -- id-free, same rationale as every
+/// other batched judge prompt in this module. `edges` are `(src_name,
+/// src_kind, predicate, dst_name, dst_kind, evidence_snippet)`.
+pub fn build_batch_graph_audit_prompt(edges: &[(&str, &str, &str, &str, &str, &str)]) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "You are auditing a personal knowledge graph's existing edges, some of which predate a \
+         quality guard added after two real poisoning incidents. Decide, for EACH numbered edge \
+         below, whether it should be KEPT, or whether it's POISONED or GENERIC.\n\n",
+    );
+    s.push_str(extraction_quality_guard());
+    for (i, (src_name, src_kind, predicate, dst_name, dst_kind, evidence)) in edges.iter().enumerate() {
+        s.push_str(&format!(
+            "Edge {}: {} ({}) --{}--> {} ({})\n  evidence: {}\n\n",
+            i + 1,
+            src_name,
+            src_kind,
+            predicate,
+            dst_name,
+            dst_kind,
+            evidence
+        ));
+    }
+    s.push_str(&format!(
+        "For EACH edge number above (1 to {}), reply with exactly one line in the form `N: VERDICT`, \
+         where VERDICT is KEEP, POISONED, or GENERIC. Every edge number from 1 to {} MUST appear \
+         exactly once.\n\
+         KEEP -- a genuine, correctly-derived relation between two real named things.\n\
+         POISONED -- derived from a fact merely describing a test, hypothetical, example, or the \
+         memory system's own mechanics.\n\
+         GENERIC -- one endpoint is a generic-role placeholder, not an actual named thing.\n",
+        edges.len(),
+        edges.len()
+    ));
+    s
+}
+
+/// Parses a batch graph-audit reply into a map from edge number (1-based,
+/// matching `build_batch_graph_audit_prompt`'s own numbering) to its
+/// verdict -- same tolerant `N: VERDICT` line scan as the other batched
+/// judges in this module. An edge number absent from the reply is simply
+/// absent from the map; the caller treats that identically to an explicit
+/// `KEEP` (never destructive on doubt).
+pub fn parse_batch_graph_audit_verdicts(output: &str, num_edges: usize) -> HashMap<usize, GraphAuditVerdict> {
+    let mut out = HashMap::new();
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (num_str, rest) = match line.split_once(':') {
+            Some(v) => v,
+            None => continue,
+        };
+        let num: usize = match num_str.trim().parse() {
+            Ok(n) if n >= 1 && n <= num_edges => n,
+            _ => continue,
+        };
+        let verdict = match rest.trim().to_uppercase().as_str() {
+            "KEEP" => GraphAuditVerdict::Keep,
+            "POISONED" => GraphAuditVerdict::Poisoned,
+            "GENERIC" => GraphAuditVerdict::Generic,
+            _ => continue,
+        };
+        out.entry(num).or_insert(verdict);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2717,5 +2924,89 @@ mod tests {
         let verdicts = parse_batch_edge_contradiction_verdicts(out, 1);
         assert_eq!(verdicts.len(), 1);
         assert_eq!(verdicts[&1], EdgeContradictionVerdict::Conflict);
+    }
+
+    // --- graph hygiene: batched entity-merge judging ---
+
+    #[test]
+    fn build_batch_entity_merge_prompt_numbers_every_pair_and_is_id_free() {
+        let samples_a = vec!["Moses --proposes-feature-for--> Umoja".to_string()];
+        let samples_b: Vec<String> = vec![];
+        let pairs = [(("Umoja", "project", samples_a.as_slice()), ("umoja project", "project", samples_b.as_slice()))];
+        let p = build_batch_entity_merge_prompt(&pairs);
+        assert!(p.contains("Pair 1:"));
+        assert!(p.contains("Entity A: \"Umoja\" (kind: project)"));
+        assert!(p.contains("Entity B: \"umoja project\" (kind: project)"));
+        assert!(p.contains("Moses --proposes-feature-for--> Umoja"));
+        assert!(p.contains("1 to 1"));
+        assert!(p.contains("SAME"));
+        assert!(p.contains("DIFFERENT"));
+    }
+
+    #[test]
+    fn parse_batch_entity_merge_verdicts_attributes_per_pair() {
+        let out = "1: SAME\n2: DIFFERENT";
+        let verdicts = parse_batch_entity_merge_verdicts(out, 2);
+        assert_eq!(verdicts[&1], EntityMergeVerdict::Same);
+        assert_eq!(verdicts[&2], EntityMergeVerdict::Different);
+    }
+
+    #[test]
+    fn parse_batch_entity_merge_verdicts_missing_pair_is_absent() {
+        let out = "1: SAME";
+        let verdicts = parse_batch_entity_merge_verdicts(out, 2);
+        assert!(verdicts.contains_key(&1));
+        assert!(!verdicts.contains_key(&2), "an unaddressed pair has no verdict -- left exactly as it is");
+    }
+
+    #[test]
+    fn parse_batch_entity_merge_verdicts_scans_past_chatter_and_ignores_bad_numbers() {
+        let out = "Sure, here goes:\n1: SAME\n99: DIFFERENT\nbanana: SAME";
+        let verdicts = parse_batch_entity_merge_verdicts(out, 1);
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[&1], EntityMergeVerdict::Same);
+    }
+
+    // --- one-time (or repeatable) edge audit: mach kb graph audit ---
+
+    #[test]
+    fn build_batch_graph_audit_prompt_numbers_every_edge_and_is_id_free() {
+        let edges = [
+            ("Moses", "person", "proposes-feature-for", "Umoja", "project", "Moses proposed a feature for Umoja"),
+            ("user", "unspecified", "has-boss", "boss", "unspecified", "the user's chain of command"),
+        ];
+        let p = build_batch_graph_audit_prompt(&edges);
+        assert!(p.contains("Edge 1: Moses (person) --proposes-feature-for--> Umoja (project)"));
+        assert!(p.contains("Edge 2: user (unspecified) --has-boss--> boss (unspecified)"));
+        assert!(p.contains("1 to 2"));
+        assert!(p.contains("KEEP"));
+        assert!(p.contains("POISONED"));
+        assert!(p.contains("GENERIC"));
+        assert!(!p.contains('#'));
+    }
+
+    #[test]
+    fn parse_batch_graph_audit_verdicts_attributes_per_edge() {
+        let out = "1: KEEP\n2: POISONED\n3: GENERIC";
+        let verdicts = parse_batch_graph_audit_verdicts(out, 3);
+        assert_eq!(verdicts[&1], GraphAuditVerdict::Keep);
+        assert_eq!(verdicts[&2], GraphAuditVerdict::Poisoned);
+        assert_eq!(verdicts[&3], GraphAuditVerdict::Generic);
+    }
+
+    #[test]
+    fn parse_batch_graph_audit_verdicts_missing_edge_is_absent() {
+        let out = "1: KEEP";
+        let verdicts = parse_batch_graph_audit_verdicts(out, 2);
+        assert!(verdicts.contains_key(&1));
+        assert!(!verdicts.contains_key(&2), "an unaddressed edge has no verdict -- caller treats it like KEEP");
+    }
+
+    #[test]
+    fn parse_batch_graph_audit_verdicts_scans_past_chatter_and_ignores_bad_numbers() {
+        let out = "Sure, here goes:\n1: POISONED\n99: GENERIC\nbanana: KEEP";
+        let verdicts = parse_batch_graph_audit_verdicts(out, 1);
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[&1], GraphAuditVerdict::Poisoned);
     }
 }

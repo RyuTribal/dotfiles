@@ -138,7 +138,10 @@ mach kb entity "<name>"
 
 This prints every active connection for that entity, in either direction,
 with the evidence memory's snippet and date. `mach kb graph --stats` gives
-a compact entity/edge count breakdown by kind. You don't need to run
+a compact entity/edge count breakdown by kind; `mach kb graph audit` is a
+one-off (or occasionally re-run) batched quality sweep over every active
+edge, invalidating anything poisoned by a test/hypothetical fact or naming
+a generic-role placeholder instead of a real thing. You don't need to run
 either proactively — a query close enough to a known entity already
 surfaces up to 5 of its connections inline in ordinary recall/search (the
 `connections` field above), including a bounded 2-hop spreading-activation
@@ -183,3 +186,11 @@ that's just restating what's already in a CLAUDE.md or the repo.
 **Never store secrets or credentials** — no passwords, API keys, tokens,
 or account numbers, ever, regardless of how the user phrases the request.
 If asked to save one, decline and point to a proper secret manager instead.
+
+## If the user asks whether memory itself is healthy
+
+`mach kb health` (also run twice daily by `mach-health.timer`, notifying on
+failure) is the operational self-check — ollama, kb.db, the kb socket,
+reflect cadence, disk headroom, and more. Reach for it, not exploration,
+when asked something like "is the knowledge bank working" or "why hasn't
+reflect run."

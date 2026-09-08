@@ -1,0 +1,17 @@
+[Unit]
+Description=Run mach kb health --notify twice a day
+
+# ~2x/day, off-peak minutes (not on the hour) per fleet etiquette — avoids
+# piling onto whatever else on this machine (or a shared network path, e.g.
+# ollama/machd) wakes up at a round hour. Persistent=true gives the same
+# catch-up-after-sleep guarantee mach-reflect.timer/mach-kb-backup.timer
+# already rely on; RandomizedDelaySec spreads it further still.
+[Timer]
+OnBootSec=20min
+OnCalendar=*-*-* 06:47:00
+OnCalendar=*-*-* 18:47:00
+Persistent=true
+RandomizedDelaySec=20min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=mach kb health — operational self-check + failure notification
+# Best-effort like mach-reflect.service/mach-kb-backup.service: a failing
+# check here is exactly the point (that's what --notify surfaces), not a
+# reason to fail this unit hard or block anything else.
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/mach kb health --notify

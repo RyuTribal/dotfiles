@@ -13,6 +13,8 @@ Singleton {
 
     property alias inhibit: idleInhibitor.enabled
 
+    function load() {} // Dummy to force init
+
     function toggleInhibit() {
         Persistent.states.idle.inhibit = !Persistent.states.idle.inhibit
     }

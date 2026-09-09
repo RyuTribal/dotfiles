@@ -7,3 +7,13 @@
 # suspenders guard, not something normally reachable.
 .local/share/mach/telegram.toml
 .local/share/mach/telegram-state.json
+
+# fcitx5 rewrites these on every input-method switch, so they can never
+# stay in sync: DefaultIM and the per-item Layout= lines churn whenever the
+# keyboard group changes. Managing them guaranteed a permanently non-empty
+# `chezmoi diff`, which in turn kept `mach kb improve` failing on
+# "chezmoi source repo has uncommitted changes". Ignored rather than
+# forgotten, so the seeded us/se/ru/jp group list stays in the repo for a
+# fresh machine while the live file is left alone.
+.config/fcitx5/profile
+.config/fcitx5/conf/notifications.conf

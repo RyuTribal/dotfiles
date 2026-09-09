@@ -521,6 +521,87 @@ pub fn parse_consolidation(output: &str) -> Option<String> {
     }
 }
 
+// --- insight dedupe ---
+
+/// Cosine at or above which two same-level insights are worth asking about.
+///
+/// Measured, not assumed. This was 0.90 -- set higher than memories'
+/// `DEDUPE_MIN_SIM` (0.85) on the reasoning that insights are written to be
+/// distinct -- and at that value the pass was dead code: across all 497
+/// same-level pairs in the live bank the highest cosine was 0.8767, so not
+/// one pair was ever judged and the bank grew to 34 insights with visible
+/// duplicates still in it.
+///
+/// Insights are long multi-clause sentences, and a long text's embedding
+/// sits nearer the centre of the space than a short one's, so pairs that
+/// say the same thing still score well below what two duplicate one-line
+/// memories would. 0.80 is a candidate gate, not a verdict: everything it
+/// admits goes to a haiku same-or-different judge, and a pair judged
+/// different is recorded in `insight_dedupe_seen` and never re-judged. The
+/// cost of admitting a wrong candidate is therefore one cheap call, once,
+/// while the cost of a threshold nothing reaches is the whole pass.
+pub const INSIGHT_DEDUPE_MIN_SIM: f32 = 0.80;
+pub const INSIGHT_DEDUPE_MAX_PAIRS_PER_RUN: usize = 12;
+pub const INSIGHT_DEDUPE_BATCH_SIZE: usize = 6;
+
+/// Batched same-or-different judgement over candidate insight pairs. One
+/// call for several pairs, same shape as the entity-merge judge.
+pub fn build_batch_insight_dedupe_prompt(pairs: &[(&str, &str)]) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "Each numbered item below is a PAIR of beliefs derived from a personal knowledge bank. For \
+         each pair, decide whether the two state the SAME underlying belief in different words, or \
+         whether they are genuinely DIFFERENT beliefs.\n\n\
+         SAME means one of them could be deleted without losing anything: the same claim, the same \
+         scope, merely rephrased or at a different level of detail.\n\
+         DIFFERENT means each says something the other does not -- a different domain, a different \
+         claim, or one adds a real qualification. Two beliefs that merely SHARE A TOPIC are \
+         DIFFERENT.\n\n",
+    );
+    for (i, (a, b)) in pairs.iter().enumerate() {
+        s.push_str(&format!("{}:\n  A: {}\n  B: {}\n\n", i + 1, a, b));
+    }
+    s.push_str(&format!(
+        "Reply with exactly {} lines and nothing else, in order:\n\
+         <number>: SAME\n\
+         or\n\
+         <number>: DIFFERENT\n",
+        pairs.len()
+    ));
+    s
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsightDedupeVerdict {
+    Same,
+    Different,
+}
+
+/// Parses the batched reply into `number -> verdict`. Unaddressed or
+/// unparseable numbers are simply absent, and the caller leaves those pairs
+/// untouched (never marked seen), so they are retried.
+pub fn parse_batch_insight_dedupe_verdicts(
+    output: &str,
+    expected: usize,
+) -> std::collections::BTreeMap<usize, InsightDedupeVerdict> {
+    let mut out = std::collections::BTreeMap::new();
+    for line in output.lines() {
+        let line = line.trim();
+        let Some((num, rest)) = line.split_once(':') else { continue };
+        let Ok(n) = num.trim().trim_start_matches('#').parse::<usize>() else { continue };
+        if n == 0 || n > expected {
+            continue;
+        }
+        let verdict = match rest.trim().to_uppercase().as_str() {
+            "SAME" => InsightDedupeVerdict::Same,
+            "DIFFERENT" => InsightDedupeVerdict::Different,
+            _ => continue,
+        };
+        out.insert(n, verdict);
+    }
+    out
+}
+
 // --- entity cards: one consolidated profile per entity, any kind ---
 
 /// Lines a card may hold. Enough to characterize a person or a project,
@@ -678,7 +759,23 @@ pub fn should_advance_watermark(has_new: bool, llm_failed: bool) -> bool {
 
 /// Minimum cosine similarity for two active memories to be considered a
 /// candidate near-duplicate pair by the nightly dedupe pass.
-pub const DEDUPE_MIN_SIM: f32 = 0.85;
+/// Measured against the live bank: at 0.85 exactly ONE pair of 314 active
+/// memories qualifies, so the dedupe pass runs every three hours to judge
+/// almost nothing (`deduped=0` in run after run). The embedding space here
+/// tops out at 0.8661 for any pair; 0.85 was set as though near-identical
+/// text would score 0.95+, which it does not for prose of this length.
+///
+/// 0.80 admits 47 pairs. Same trade as `INSIGHT_DEDUPE_MIN_SIM` and
+/// `ENTITY_MERGE_MIN_SIM`: recall gate here, precision in the judge, and
+/// `dedupe_seen` means a pair judged distinct is never re-judged.
+///
+/// Note what is deliberately NOT lowered alongside these:
+/// `ENTITY_RESOLUTION_SIM_THRESHOLD`. Resolution decides at extraction time
+/// whether a name IS an existing entity, and it has no judge -- dropping it
+/// would silently fuse "GitHub" into "GitHub Actions" with nothing to catch
+/// it. Creating liberally and consolidating under judgement is the safer
+/// direction for an irreversible operation.
+pub const DEDUPE_MIN_SIM: f32 = 0.80;
 /// At most this many candidate pairs are sent to the dedupe judge per
 /// `mach kb reflect` run — keeps a single run's LLM cost bounded even if a
 /// large backlog of near-duplicates has accumulated (fast capture paths
@@ -1030,12 +1127,16 @@ pub fn build_contradiction_pass_prompt(a: (i64, &str, &str), b: (i64, &str, &str
          they disagree, AND the more recently recorded memory is describing the CURRENT state (the \
          ordinary case: a change happened and was written down close to when it happened). You don't \
          need to say which one wins; the more recently recorded memory will automatically be treated as \
-         current.\n\
+         current. Do NOT use CONFLICT when each memory explicitly scopes itself to a DIFFERENT date or \
+         period (\"As of 2026-09-07, X was 150\" against \"As of 2026-09-09, X is 739\") -- those are two \
+         readings of a changing quantity, both accurate for their own date, and the older one is the only \
+         record of what was true then. That is BOTH_HOLD.\n\
          CONFLICT_RETRO -- same disagreement, but the more recently recorded memory is itself describing \
          a PAST state retrospectively (reminiscing, or giving historical context), while the OLDER-recorded \
          memory is the one that actually describes what's true now. Use this when the newer note reads as \
          being about the past, not as an update to the present.\n\
-         BOTH_HOLD -- these are genuinely different subjects, or both are still true at once; keep both.\n\
+         BOTH_HOLD -- these are genuinely different subjects, both are still true at once, or each is a \
+         dated snapshot of the same changing thing at a different point in time; keep both.\n\
          UNCLEAR -- you cannot tell from what's shown.\n",
     );
     s
@@ -1261,6 +1362,56 @@ pub fn build_strength_review_prompt(claim: &str, claim_date: &str, neighbors: &[
 
 
 // --- graph extraction: entities/relations from truth-maintained memories ---
+/// Bottom of the band where a name's identity is asked about rather than
+/// assumed.
+///
+/// Above `ENTITY_RESOLUTION_SIM_THRESHOLD` a match is taken silently; below
+/// this, a new entity is minted. Between the two, one haiku call decides
+/// and the verdict is stored in `entity_alias_seen`, so the question is
+/// asked once per (name, entity) pair for the life of the bank.
+///
+/// 0.78 because the real duplicates sat at 0.83-0.845 ("Remos Space"/
+/// "Remos", "staging environment"/"staging", "Expedite Nano"/"Expedite Nano
+/// modem") while the real distinctions sat in the same range ("GitHub"/
+/// "GitHub Actions", "FastAPI"/"fastapi-hub"). Similarity cannot separate
+/// those two groups at any threshold, which is exactly why this band needs
+/// a judge instead of a number.
+pub const ENTITY_RESOLUTION_JUDGE_MIN: f32 = 0.78;
+
+/// Asks whether a newly extracted name refers to an entity already in the
+/// bank. Deliberately biased toward DIFFERENT: minting a duplicate is
+/// cheap and the merge pass can fold it later, while a wrong SAME silently
+/// merges two real things and there is nothing downstream to catch it.
+pub fn build_entity_alias_prompt(new_name: &str, existing_name: &str, existing_kind: Option<&str>) -> String {
+    format!(
+        "A personal knowledge graph already contains an entity. A newly extracted fact mentions a \
+name that is similar to it. Decide whether they are THE SAME real thing.\n\n\
+Existing entity: {} ({})\n\
+Newly mentioned name: {}\n\n\
+Answer SAME only if they denote the same thing and one is merely another spelling, \
+abbreviation, or wording of the other -- \"Remos\" and \"Remos Space\", or \"staging\" and \
+\"staging environment\".\n\
+Answer DIFFERENT whenever they are related but distinct: a tool and a service built on it, a \
+product and one of its components, a company and one of its projects -- \"GitHub\" and \
+\"GitHub Actions\" are DIFFERENT, \"FastAPI\" and \"fastapi-hub\" are DIFFERENT.\n\n\
+If you are unsure, answer DIFFERENT. Reply with exactly one word: SAME or DIFFERENT.\n",
+        existing_name,
+        existing_kind.unwrap_or("kind unspecified"),
+        new_name
+    )
+}
+
+/// Reads the alias judge's verdict. Anything that is not an unambiguous
+/// SAME counts as DIFFERENT, for the same reason the prompt says so.
+pub fn parse_entity_alias_verdict(output: &str) -> bool {
+    output
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .map(|l| l.trim_end_matches('.').eq_ignore_ascii_case("SAME"))
+        .unwrap_or(false)
+}
+
 
 /// Reuse threshold for entity resolution during graph extraction: an
 /// embedding match at or above this cosine similarity to an existing
@@ -1458,6 +1609,23 @@ pub const TIMEOUT_HAIKU_BATCH: Duration = Duration::from_secs(60);
 /// touched this fact at all" (absent from the reply entirely, a parse
 /// failure worth retrying) -- see `parse_batch_extraction`'s own doc
 /// comment for how that distinction is used.
+/// The only causal predicates extraction is allowed to emit.
+///
+/// The bank had `caused-by`, `leads`, `triggers`, `drives` and `prevents`
+/// as one edge each, plus `wants-root-cause-debugging` -- a whole clause
+/// squeezed into a predicate. Four spellings of one idea are worse than
+/// none, because nothing downstream can recognise a causal edge to treat it
+/// differently. Fixing the vocabulary is the precondition for ever
+/// traversing these edges: spreading activation currently hops only via
+/// shared entities and Hebbian association, and a causal traversal channel
+/// built today would have eight edges to walk.
+pub const CAUSAL_PREDICATES: [&str; 3] = ["causes", "enables", "prevents"];
+
+/// Whether a predicate is one of the canonical causal three.
+pub fn is_causal_predicate(p: &str) -> bool {
+    CAUSAL_PREDICATES.contains(&p.trim().to_lowercase().as_str())
+}
+
 pub fn build_batch_extraction_prompt(facts: &[&str]) -> String {
     let mut s = String::new();
     s.push_str(
@@ -1468,7 +1636,13 @@ pub fn build_batch_extraction_prompt(facts: &[&str]) -> String {
          \"boss-of\", \"works-on\", \"built-with\", \"part-of\") -- these are explicitly allowed and \
          wanted, not just factual/organizational links.\n\n\
          The special entity name \"user\" is reserved for the user themself -- use it whenever a \
-         fact is about the user directly, rather than inventing a name.\n\n",
+         fact is about the user directly, rather than inventing a name.\n\n\
+         When a fact states a CAUSAL link, use exactly one of these three predicates, spelled \
+         exactly like this: \"causes\", \"enables\", \"prevents\". Do not invent variants \
+         (\"caused-by\", \"leads\", \"triggers\", \"drives\" and the like) and do not fold a \
+         whole clause into the predicate -- a predicate is a short verb phrase, never a \
+         sentence. Causal links are the most useful edges in the graph and the easiest to miss, \
+         so state one whenever the fact really asserts it, and none when it does not.\n\n",
     );
     s.push_str(extraction_quality_guard());
     s.push_str("Here are several facts, numbered:\n\n");
@@ -1746,15 +1920,24 @@ pub const CURATION_SCHEMA_COHERENCE_MIN_SIM: f32 = META_CLUSTER_MIN_SIM;
 // few calls as `ENTITY_MERGE_BATCH_SIZE` allows -- the same batching
 // philosophy `build_batch_edge_contradiction_prompt` already established
 // for edge conflicts, reused here rather than one call per pair.
-
-/// Minimum name-embedding cosine similarity for two active entities to be a
-/// merge candidate -- deliberately higher than
-/// `ENTITY_RESOLUTION_SIM_THRESHOLD` (0.85, extraction's own "reuse this
-/// entity" floor): a *pre-existing* pair of entities clearing this bar is
-/// stronger evidence of an actual duplicate than a single fresh name being
-/// matched against the store, so this pass can afford to be pickier before
-/// spending a judge call on it.
-pub const ENTITY_MERGE_MIN_SIM: f32 = 0.9;
+/// Cosine at or above which two entities are worth asking a judge about.
+///
+/// Measured, not assumed. This was 0.9 and the pass had never once had a
+/// candidate: across all 420 entities with embeddings the highest pair
+/// similarity in the live bank is 0.8453, and nothing at all reaches 0.85.
+/// Third instance of the same mistake in this file's history -- a threshold
+/// picked by intuition, sitting above what the embedding space actually
+/// produces, turning a whole pass into dead code that looks healthy because
+/// it reports zero work and no errors.
+///
+/// 0.80 admits 36 pairs here, and deliberately mixes real duplicates
+/// ("Remos Space"/"Remos", "staging environment"/"staging", "Expedite
+/// Nano"/"Expedite Nano modem") with real distinctions ("GitHub"/"GitHub
+/// Actions", "FastAPI"/"fastapi-hub"). That is the right trade: the haiku
+/// judge is the precision filter, this is only the recall gate, and every
+/// verdict lands in `entity_merge_seen` so a rejected pair costs one cheap
+/// call once and is never asked again.
+pub const ENTITY_MERGE_MIN_SIM: f32 = 0.80;
 /// This many candidate entity pairs are offered to one batched haiku call --
 /// same bucket size as `GRAPH_EXTRACTION_BATCH_SIZE`, picked for the same
 /// "several judgments per spawn" reason.
@@ -2745,6 +2928,12 @@ mod tests {
         assert!(p.contains("Memory #1 (recorded 2026-03-01T00:00:00Z):\nMoses is the user's boss"));
         assert!(p.contains("Memory #2 (recorded 2026-09-01T00:00:00Z):\nthe user's boss Ivar approved the RHI redesign"));
         assert!(p.contains("Note: memory #2 was recorded more recently than memory #1"));
+        assert!(
+            p.contains("dated snapshot of the same changing thing at a different point in time"),
+            "two snapshots of a changing quantity, each scoped to its own date, must be BOTH_HOLD: \
+             tombstoning the older one destroys the only record of what was true then, which is \
+             exactly what temporal recall asks for"
+        );
         assert!(p.contains("CONFLICT"));
         assert!(p.contains("CONFLICT_RETRO"));
         assert!(p.contains("BOTH_HOLD"));
@@ -2809,6 +2998,32 @@ mod tests {
         assert!(p.contains("SRC_NAME | SRC_KIND | PREDICATE | DST_NAME | DST_KIND | CONFIDENCE"));
         assert!(p.contains("NONE"));
         assert!(p.contains("frustrated-by"), "affective/behavioral predicates must be explicitly invited");
+    }
+
+    #[test]
+    fn insight_dedupe_prompt_and_parser_round_trip() {
+        let p = build_batch_insight_dedupe_prompt(&[("audits before building", "checks state first"), ("x", "y")]);
+        assert!(p.contains("1:
+  A: audits before building
+  B: checks state first"));
+        assert!(p.contains("SHARE A TOPIC are \\
+         DIFFERENT") || p.contains("SHARE A TOPIC"));
+        assert!(p.contains("exactly 2 lines"));
+
+        let v = parse_batch_insight_dedupe_verdicts("1: SAME
+2: different
+", 2);
+        assert_eq!(v[&1], InsightDedupeVerdict::Same);
+        assert_eq!(v[&2], InsightDedupeVerdict::Different);
+        // out-of-range, malformed and missing entries are simply absent
+        let v = parse_batch_insight_dedupe_verdicts("Sure:
+1: SAME
+9: SAME
+banana: SAME
+2: maybe
+", 2);
+        assert_eq!(v.len(), 1);
+        assert!(v.contains_key(&1));
     }
 
     #[test]
@@ -3170,4 +3385,23 @@ mod tests {
         assert_eq!(verdicts.len(), 1);
         assert_eq!(verdicts[&1], GraphAuditVerdict::Poisoned);
     }
+    #[test]
+    fn the_extraction_prompt_pins_the_causal_vocabulary() {
+        let p = build_batch_extraction_prompt(&["a fact"]);
+        for pred in CAUSAL_PREDICATES {
+            assert!(p.contains(pred), "prompt must name {}", pred);
+        }
+        assert!(p.contains("Do not invent variants"), "the variants are the bug this prevents");
+    }
+
+    #[test]
+    fn is_causal_predicate_accepts_only_the_canonical_three() {
+        for ok in ["causes", "Enables", " prevents "] {
+            assert!(is_causal_predicate(ok), "{} should count", ok);
+        }
+        for no in ["caused-by", "leads", "triggers", "drives", "works-on", "wants-root-cause-debugging"] {
+            assert!(!is_causal_predicate(no), "{} must not count as canonical", no);
+        }
+    }
+
 }

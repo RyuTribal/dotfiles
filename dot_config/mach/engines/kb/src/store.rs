@@ -289,6 +289,18 @@ fn init_schema(conn: &Connection) -> Result<(), KbError> {
             last_relation_id INTEGER,
             last_completed_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS relation_evidence (
+            relation_id INTEGER NOT NULL,
+            memory_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (relation_id, memory_id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_relation_evidence_memory ON relation_evidence (memory_id);
+        CREATE TABLE IF NOT EXISTS insight_dedupe_seen (
+            id_a INTEGER NOT NULL,
+            id_b INTEGER NOT NULL,
+            PRIMARY KEY (id_a, id_b)
+        );
         CREATE TABLE IF NOT EXISTS entity_cards (
             entity_id INTEGER PRIMARY KEY,
             text TEXT NOT NULL,
@@ -716,6 +728,652 @@ fn migrate_v15_to_v16(conn: &Connection) -> Result<(), KbError> {
 /// what makes a temporal question answerable: "what shipped on 2026-08-31"
 /// is about an event, and every memory in the bank was written down on a
 /// handful of ingest days.
+/// `PRAGMA user_version`-gated, idempotent 19 -> 20 migration: the
+/// `insight_dedupe_seen` table (created by `init_schema`), which records
+/// insight pairs already judged so a DIFFERENT verdict is never re-paid for.
+/// `PRAGMA user_version`-gated, idempotent 20 -> 21 migration: the
+/// `relation_evidence` table, plus a fold of duplicate claim rows.
+///
+/// One relation row carried one evidence memory, so the same claim
+/// extracted from two memories became two active rows. The bank held five
+/// rows for "user works-on Helios". Now a claim is one row with N evidence
+/// links (the same shape as `memory_entities`). The migration backfills
+/// each existing row's own `evidence_memory_id` as its first link, then
+/// folds duplicates: for each `(src, predicate, dst)` group the oldest row
+/// survives, absorbs the others' evidence, and the rest are invalidated
+/// with `superseded_by` pointing at the survivor -- never deleted, so the
+/// audit trail holds.
+fn migrate_v20_to_v21(conn: &Connection) -> Result<(), KbError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS relation_evidence (
+            relation_id INTEGER NOT NULL,
+            memory_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (relation_id, memory_id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_relation_evidence_memory ON relation_evidence (memory_id);",
+    )?;
+    if !table_exists(conn, "relations")? {
+        conn.execute("PRAGMA user_version = 21", [])?;
+        return Ok(());
+    }
+    let now = now_rfc3339();
+    conn.execute(
+        "INSERT OR IGNORE INTO relation_evidence (relation_id, memory_id, created_at)
+         SELECT id, evidence_memory_id, ?1 FROM relations WHERE evidence_memory_id IS NOT NULL",
+        params![now],
+    )?;
+    fold_duplicate_relations(conn, &now)?;
+    conn.execute("PRAGMA user_version = 21", [])?;
+    Ok(())
+}
+
+/// Schema 22: the raw-transcript index (see `crate::transcripts`).
+///
+/// Separate tables rather than more `memories`: a chunk is not a fact. It
+/// has no basis, no strength, no decay and no provenance chain, it must
+/// never reach the recall hook, and it is derived state -- droppable and
+/// rebuildable from the transcripts on disk at any time.
+fn migrate_v21_to_v22(conn: &Connection) -> Result<(), KbError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS transcript_files (
+            path TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            project TEXT NOT NULL,
+            mtime INTEGER NOT NULL,
+            size INTEGER NOT NULL,
+            chunks INTEGER NOT NULL,
+            indexed_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS transcript_chunks (
+            id INTEGER PRIMARY KEY,
+            path TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            project TEXT NOT NULL,
+            ts TEXT,
+            text TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ix_transcript_chunks_path ON transcript_chunks (path);
+        CREATE VIRTUAL TABLE IF NOT EXISTS transcript_chunks_fts USING fts5(
+            text,
+            content='transcript_chunks',
+            content_rowid='id',
+            tokenize='porter unicode61 remove_diacritics 2'
+        );",
+    )?;
+    conn.execute("PRAGMA user_version = 22", [])?;
+    Ok(())
+}
+
+/// Schema 23: embeddings on transcript passages, making transcript search
+/// hybrid instead of lexical-only.
+///
+/// BM25 alone cannot answer a paraphrase. "Which clip space depth
+/// convention was confirmed by hand" shares no token with the passage that
+/// answers it (`GLM_FORCE_DEPTH_ZERO_TO_ONE`, `OriginIsTopLeft`), so the
+/// eval-ask question for it failed even with the judge searching
+/// transcripts twice. Memories have had both channels since the hybrid
+/// work; passages were left on one.
+fn migrate_v22_to_v23(conn: &Connection) -> Result<(), KbError> {
+    add_column_if_missing(conn, "transcript_chunks", "embedding", "BLOB")?;
+    conn.execute("PRAGMA user_version = 23", [])?;
+    Ok(())
+}
+
+/// One indexed transcript passage.
+#[derive(Debug, Clone)]
+pub struct TranscriptHit {
+    pub id: i64,
+    pub session_id: String,
+    pub project: String,
+    pub ts: Option<String>,
+    pub text: String,
+    /// BM25 relevance, higher is better (SQLite returns it negated).
+    pub score: f32,
+}
+
+/// Whether this file is already indexed at exactly this mtime and size.
+/// Cheap enough to call per file across a 3274-file sweep; it is what makes
+/// a re-index cost only what changed.
+pub fn transcript_file_current(conn: &Connection, path: &str, mtime: i64, size: i64) -> Result<bool, KbError> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM transcript_files WHERE path = ?1 AND mtime = ?2 AND size = ?3",
+            params![path, mtime, size],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
+/// Replaces every chunk of one transcript, and records the file as indexed.
+///
+/// Delete-then-insert rather than an append: a session file grows as the
+/// conversation continues, so re-indexing one must not leave the previous
+/// pass's chunks behind as duplicates.
+pub fn replace_transcript_chunks(
+    conn: &Connection,
+    path: &str,
+    session_id: &str,
+    project: &str,
+    mtime: i64,
+    size: i64,
+    chunks: &[crate::transcripts::Chunk],
+    embeddings: &[Option<Vec<f32>>],
+    now: &str,
+) -> Result<usize, KbError> {
+    conn.execute(
+        "INSERT INTO transcript_chunks_fts(transcript_chunks_fts, rowid, text)
+         SELECT 'delete', id, text FROM transcript_chunks WHERE path = ?1",
+        params![path],
+    )?;
+    conn.execute("DELETE FROM transcript_chunks WHERE path = ?1", params![path])?;
+    {
+        let mut stmt = conn.prepare(
+            "INSERT INTO transcript_chunks (path, session_id, project, ts, text, embedding) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        let mut fts = conn.prepare("INSERT INTO transcript_chunks_fts(rowid, text) VALUES (?1, ?2)")?;
+        for (i, c) in chunks.iter().enumerate() {
+            let emb = embeddings.get(i).and_then(|e| e.as_ref()).map(|v| encode_embedding(v));
+            stmt.execute(params![path, session_id, project, c.ts, c.text, emb])?;
+            fts.execute(params![conn.last_insert_rowid(), c.text])?;
+        }
+    }
+    conn.execute(
+        "INSERT INTO transcript_files (path, session_id, project, mtime, size, chunks, indexed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime, size=excluded.size,
+             chunks=excluded.chunks, indexed_at=excluded.indexed_at",
+        params![path, session_id, project, mtime, size, chunks.len() as i64, now],
+    )?;
+    Ok(chunks.len())
+}
+
+/// BM25 search over indexed transcript passages.
+///
+/// Lexical only, deliberately: these are verbatim words, and the questions
+/// that reach here are the ones the embedding layer already failed on.
+pub fn search_transcripts(
+    conn: &Connection,
+    query: &str,
+    q_emb: Option<&[f32]>,
+    limit: usize,
+) -> Result<Vec<TranscriptHit>, KbError> {
+    // `fts_query` returns None when the query holds nothing an FTS5 MATCH
+    // can use (all punctuation, all stopwords) -- no query, no hits.
+    // Lexical channel: BM25 over the FTS index, normalized against this
+    // result set's own best match so it shares a scale with cosine.
+    let mut scored: HashMap<i64, (TranscriptHit, f32, f32)> = HashMap::new();
+    if let Some(cleaned) = fts_query(query) {
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.session_id, c.project, c.ts, c.text, bm25(transcript_chunks_fts)
+             FROM transcript_chunks_fts f JOIN transcript_chunks c ON c.id = f.rowid
+             WHERE transcript_chunks_fts MATCH ?1 ORDER BY bm25(transcript_chunks_fts) LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![cleaned, (limit * 4) as i64], |r| {
+            Ok((
+                TranscriptHit {
+                    id: r.get(0)?,
+                    session_id: r.get(1)?,
+                    project: r.get(2)?,
+                    ts: r.get(3)?,
+                    text: r.get(4)?,
+                    score: 0.0,
+                },
+                -r.get::<_, f64>(5)? as f32,
+            ))
+        })?;
+        let mut raw = Vec::new();
+        for r in rows {
+            raw.push(r?);
+        }
+        let best = raw.iter().map(|(_, b)| *b).fold(0.0f32, f32::max);
+        for (hit, bm) in raw {
+            let lex = if best > 0.0 { bm / best } else { 0.0 };
+            scored.insert(hit.id, (hit, lex, 0.0));
+        }
+    }
+
+    // Semantic channel: cosine over passage embeddings. A linear scan, same
+    // rationale as `search_ranked` -- at personal scale this is a few
+    // milliseconds and needs no index to maintain.
+    if let Some(q) = q_emb {
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, project, ts, text, embedding FROM transcript_chunks WHERE embedding IS NOT NULL",
+        )?;
+        let mut sims: Vec<(f32, TranscriptHit)> = Vec::new();
+        let rows = stmt.query_map([], |r| {
+            let blob: Vec<u8> = r.get(5)?;
+            Ok((
+                TranscriptHit {
+                    id: r.get(0)?,
+                    session_id: r.get(1)?,
+                    project: r.get(2)?,
+                    ts: r.get(3)?,
+                    text: r.get(4)?,
+                    score: 0.0,
+                },
+                blob,
+            ))
+        })?;
+        for r in rows {
+            let (hit, blob) = r?;
+            let v = decode_embedding(&blob);
+            let sim = cosine(q, &v);
+            if sim > SIM_NOISE_FLOOR {
+                sims.push((sim, hit));
+            }
+        }
+        sims.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        for (sim, hit) in sims.into_iter().take(limit * 4) {
+            scored.entry(hit.id).and_modify(|e| e.2 = sim).or_insert((hit, 0.0, sim));
+        }
+    }
+
+    // Same fusion as memories: the stronger channel wins, lexical held at
+    // LEXICAL_WEIGHT so an exact-token hit outranks a merely similar one.
+    let mut out: Vec<TranscriptHit> = scored
+        .into_values()
+        .map(|(mut hit, lex, sim)| {
+            hit.score = sim.max(LEXICAL_WEIGHT * lex);
+            hit
+        })
+        .collect();
+    out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    out.truncate(limit);
+    Ok(out)
+}
+
+/// Schema 24: judged name-to-entity verdicts, which are both a cache and
+/// an alias table.
+///
+/// `ENTITY_RESOLUTION_SIM_THRESHOLD` is 0.85 and the highest real entity
+/// pair similarity in this bank is 0.8453, so resolution never once matched
+/// an existing entity by embedding: every extraction minted a new row.
+/// 442 entities for 326 memories, 60% of them with a single mention,
+/// `Remos` beside `Remos Space`, `zenithd` beside `Zenith daemon`. An
+/// entity graph that exists to connect memories was mostly dead ends.
+///
+/// Lowering the threshold outright was the wrong fix -- resolution has no
+/// judge, so it would silently fuse "GitHub" into "GitHub Actions" with
+/// nothing to catch it. Instead the near-miss band gets judged once and the
+/// answer is remembered, so a SAME verdict makes that name resolve
+/// instantly forever after and a DIFFERENT verdict is never re-asked.
+fn migrate_v23_to_v24(conn: &Connection) -> Result<(), KbError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS entity_alias_seen (
+            name TEXT NOT NULL,
+            entity_id INTEGER NOT NULL,
+            same INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (name, entity_id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_entity_alias_same ON entity_alias_seen (name, same);",
+    )?;
+    conn.execute("PRAGMA user_version = 24", [])?;
+    Ok(())
+}
+
+/// The entity a name has already been judged to BE, if any.
+///
+/// Checked before embedding, so a name resolved once costs no call and no
+/// embed on every later extraction that mentions it.
+pub fn alias_target(conn: &Connection, name: &str) -> Result<Option<i64>, KbError> {
+    Ok(conn
+        .query_row(
+            "SELECT a.entity_id FROM entity_alias_seen a JOIN entities e ON e.id = a.entity_id
+             WHERE a.name = ?1 AND a.same = 1 LIMIT 1",
+            params![name.trim().to_lowercase()],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// A previously judged verdict for this exact (name, entity) pair.
+pub fn alias_verdict(conn: &Connection, name: &str, entity_id: i64) -> Result<Option<bool>, KbError> {
+    let v: Option<i64> = conn
+        .query_row(
+            "SELECT same FROM entity_alias_seen WHERE name = ?1 AND entity_id = ?2",
+            params![name.trim().to_lowercase(), entity_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(v.map(|n| n == 1))
+}
+
+/// Records one judged (name, entity) verdict.
+pub fn mark_alias_verdict(conn: &Connection, name: &str, entity_id: i64, same: bool, now: &str) -> Result<(), KbError> {
+    conn.execute(
+        "INSERT OR REPLACE INTO entity_alias_seen (name, entity_id, same, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![name.trim().to_lowercase(), entity_id, same as i64, now],
+    )?;
+    Ok(())
+}
+
+/// Schema 25: the project registry.
+///
+/// Identity was `basename(cwd)`, so a rename orphaned every
+/// `project-index:<old>` memory and letter case alone already orphaned
+/// three projects on the live bank. A fingerprint makes rename detection an
+/// exact lookup instead of a guess, and the normalized name is what
+/// memories are tagged with.
+fn migrate_v24_to_v25(conn: &Connection) -> Result<(), KbError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS projects (
+            id              INTEGER PRIMARY KEY,
+            fingerprint     TEXT NOT NULL UNIQUE,
+            name            TEXT NOT NULL,
+            root_path       TEXT NOT NULL,
+            indexed_head    TEXT,
+            indexed_commits INTEGER,
+            indexed_at      TEXT,
+            card            TEXT,
+            card_built_at   TEXT,
+            created_at      TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ix_projects_name ON projects (name);",
+    )?;
+    conn.execute("PRAGMA user_version = 25", [])?;
+    Ok(())
+}
+
+/// One registered project.
+#[derive(Debug, Clone)]
+pub struct ProjectRow {
+    pub id: i64,
+    pub fingerprint: String,
+    pub name: String,
+    pub root_path: String,
+    pub indexed_head: Option<String>,
+    pub indexed_commits: Option<i64>,
+    pub indexed_at: Option<String>,
+    pub card: Option<String>,
+    pub card_built_at: Option<String>,
+}
+
+fn row_to_project(r: &rusqlite::Row) -> rusqlite::Result<ProjectRow> {
+    Ok(ProjectRow {
+        id: r.get("id")?,
+        fingerprint: r.get("fingerprint")?,
+        name: r.get("name")?,
+        root_path: r.get("root_path")?,
+        indexed_head: r.get("indexed_head")?,
+        indexed_commits: r.get("indexed_commits")?,
+        indexed_at: r.get("indexed_at")?,
+        card: r.get("card")?,
+        card_built_at: r.get("card_built_at")?,
+    })
+}
+
+pub fn get_project_by_fingerprint(conn: &Connection, fingerprint: &str) -> Result<Option<ProjectRow>, KbError> {
+    let mut stmt = conn.prepare("SELECT * FROM projects WHERE fingerprint = ?1")?;
+    let mut rows = stmt.query_map(params![fingerprint], |r| row_to_project(r))?;
+    match rows.next() {
+        Some(r) => Ok(Some(r?)),
+        None => Ok(None),
+    }
+}
+
+/// Memories that belong to a project, either by the `project` column or by
+/// the `project-index:<name>` source string. Returns a real error rather
+/// than silently defaulting to 0 on a query failure -- `mach kb projects
+/// refresh` used to treat any SQL error here as "no memories", silently
+/// skipping the project instead of registering it.
+pub fn count_project_memories(conn: &Connection, name: &str) -> Result<i64, KbError> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM memories WHERE project = ?1 OR source = ?2",
+        params![name, format!("project-index:{}", name)],
+        |r| r.get(0),
+    )?)
+}
+
+/// Looks a project up by its normalized name, using `ix_projects_name`
+/// instead of pulling every row and scanning linearly -- the pattern four
+/// call sites used before this existed.
+pub fn get_project_by_name(conn: &Connection, name: &str) -> Result<Option<ProjectRow>, KbError> {
+    let mut stmt = conn.prepare("SELECT * FROM projects WHERE name = ?1 LIMIT 1")?;
+    let mut rows = stmt.query_map(params![name], |r| row_to_project(r))?;
+    match rows.next() {
+        Some(r) => Ok(Some(r?)),
+        None => Ok(None),
+    }
+}
+
+pub fn list_projects(conn: &Connection) -> Result<Vec<ProjectRow>, KbError> {
+    let mut stmt = conn.prepare("SELECT * FROM projects ORDER BY name ASC")?;
+    let rows = stmt.query_map([], |r| row_to_project(r))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Registers or updates a project. Returns its id and, when the same
+/// fingerprint was already registered under a different name, that previous
+/// name — which is exactly a rename (or a case change) and the caller's
+/// signal to re-tag.
+pub fn upsert_project(
+    conn: &Connection,
+    fingerprint: &str,
+    name: &str,
+    root_path: &str,
+    now: &str,
+) -> Result<(i64, Option<String>), KbError> {
+    if let Some(existing) = get_project_by_fingerprint(conn, fingerprint)? {
+        let renamed = if existing.name != name { Some(existing.name.clone()) } else { None };
+        conn.execute(
+            "UPDATE projects SET name = ?1, root_path = ?2 WHERE id = ?3",
+            params![name, root_path, existing.id],
+        )?;
+        return Ok((existing.id, renamed));
+    }
+    conn.execute(
+        "INSERT INTO projects (fingerprint, name, root_path, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![fingerprint, name, root_path, now],
+    )?;
+    Ok((conn.last_insert_rowid(), None))
+}
+
+/// Moves every reference to a project from `old` to `new`.
+///
+/// Both writes are required: `project` drives recall's project-anchored
+/// expansion, and the `project-index:<name>` source string is what the
+/// index-project skill filters on to pull the current index. Leaving either
+/// stale orphans the index in a different way. Returns rows changed.
+pub fn retag_project(conn: &Connection, old: &str, new: &str) -> Result<usize, KbError> {
+    let mut moved = conn.execute(
+        "UPDATE memories SET project = ?1 WHERE project = ?2",
+        params![new, old],
+    )?;
+    moved += conn.execute(
+        "UPDATE memories SET source = ?1 WHERE source = ?2",
+        params![format!("project-index:{}", new), format!("project-index:{}", old)],
+    )?;
+    Ok(moved)
+}
+
+/// Replaces a project's derivable card. Rebuilding a card is not indexing,
+/// so this deliberately does not touch the interpretive watermark.
+///
+/// Does not touch `card_built_at`: confirmed dead in the final review
+/// (written, never read anywhere) and deliberately left unwritten rather
+/// than populated -- the column stays in the schema (migrations here are
+/// additive only) but nothing sets it any more.
+pub fn set_project_card(conn: &Connection, id: i64, card: &str) -> Result<(), KbError> {
+    conn.execute("UPDATE projects SET card = ?1 WHERE id = ?2", params![card, id])?;
+    Ok(())
+}
+
+/// Deletes a project's registry row -- the tracking entry only. Memories
+/// tagged `project = <name>` or `source = project-index:<name>` are
+/// knowledge, not registry state, and are left exactly as they are; the
+/// caller is expected to report how many of them remain so a `forget` reads
+/// as "the drift tracker stopped watching this directory", not "the index
+/// is gone". Returns whether a row was actually removed.
+pub fn forget_project(conn: &Connection, id: i64) -> Result<bool, KbError> {
+    let n = conn.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+    Ok(n > 0)
+}
+
+/// Records that the interpretive index ran, resetting the drift watermark.
+///
+/// Does not touch `indexed_head`: confirmed dead in the final review
+/// (written, never read anywhere) and deliberately left unwritten rather
+/// than populated -- same treatment as `card_built_at` in
+/// `set_project_card`, for the same reason.
+pub fn mark_project_indexed(conn: &Connection, id: i64, commits: Option<i64>, now: &str) -> Result<(), KbError> {
+    conn.execute(
+        "UPDATE projects SET indexed_commits = ?1, indexed_at = ?2 WHERE id = ?3",
+        params![commits, now, id],
+    )?;
+    Ok(())
+}
+
+/// Same as `mark_project_indexed`, but refuses when the project is
+/// git-backed and its current commit count could not be determined (root
+/// moved, deleted, or otherwise unreadable). Writing a NULL commit count in
+/// that case would permanently disable commit-based drift for the project
+/// while leaving no visible sign anything went wrong -- `projects list`
+/// would report it freshly indexed. Returns whether the watermark was
+/// actually written; on `false`, the row (including `indexed_at`) is left
+/// exactly as it was.
+pub fn mark_project_indexed_if_readable(
+    conn: &Connection,
+    id: i64,
+    is_git: bool,
+    commits: Option<i64>,
+    now: &str,
+) -> Result<bool, KbError> {
+    if is_git && commits.is_none() {
+        return Ok(false);
+    }
+    mark_project_indexed(conn, id, commits, now)?;
+    Ok(true)
+}
+
+/// Passages still missing an embedding, oldest first.
+///
+/// Needed because embeddings arrived after the index did (schema 23). A
+/// plain re-index cannot fix those rows: `transcript_file_current` skips a
+/// file whose mtime and size are unchanged, so every already-indexed file
+/// would be passed over and its NULL embeddings would persist forever.
+/// `--all` would work but re-reads 962MB to recompute what is already
+/// correct. This targets exactly the gap.
+pub fn transcript_chunks_missing_embedding(conn: &Connection, cap: usize) -> Result<Vec<(i64, String)>, KbError> {
+    let mut stmt =
+        conn.prepare("SELECT id, text FROM transcript_chunks WHERE embedding IS NULL ORDER BY id ASC LIMIT ?1")?;
+    let rows = stmt.query_map(params![cap as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Attaches an embedding to one already-indexed passage.
+pub fn set_transcript_chunk_embedding(conn: &Connection, id: i64, embedding: &[f32]) -> Result<(), KbError> {
+    conn.execute(
+        "UPDATE transcript_chunks SET embedding = ?1 WHERE id = ?2",
+        params![encode_embedding(embedding), id],
+    )?;
+    Ok(())
+}
+
+/// Counts of what the transcript index currently holds.
+pub fn transcript_index_stats(conn: &Connection) -> Result<(i64, i64), KbError> {
+    let files: i64 = conn.query_row("SELECT COUNT(*) FROM transcript_files", [], |r| r.get(0))?;
+    let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM transcript_chunks", [], |r| r.get(0))?;
+    Ok((files, chunks))
+}
+
+/// Folds active relation rows that state the same claim into one, moving
+/// their evidence onto the survivor. Returns how many rows were folded
+/// away. Deterministic, no LLM; safe to re-run.
+pub fn fold_duplicate_relations(conn: &Connection, now: &str) -> Result<usize, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, src, predicate, dst FROM relations WHERE invalidated_at IS NULL ORDER BY id ASC",
+    )?;
+    let rows: Vec<(i64, i64, String, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut survivor: HashMap<(i64, String, i64), i64> = HashMap::new();
+    let mut folded = 0usize;
+    for (id, src, predicate, dst) in rows {
+        let key = (src, predicate.to_lowercase(), dst);
+        match survivor.get(&key) {
+            Some(&keep) => {
+                conn.execute(
+                    "INSERT OR IGNORE INTO relation_evidence (relation_id, memory_id, created_at)
+                     SELECT ?1, memory_id, created_at FROM relation_evidence WHERE relation_id = ?2",
+                    params![keep, id],
+                )?;
+                conn.execute("DELETE FROM relation_evidence WHERE relation_id = ?1", params![id])?;
+                conn.execute(
+                    "UPDATE relations SET invalidated_at = ?1, superseded_by = ?2 WHERE id = ?3",
+                    params![now, keep, id],
+                )?;
+                folded += 1;
+            }
+            None => {
+                survivor.insert(key, id);
+            }
+        }
+    }
+    Ok(folded)
+}
+
+/// Records that memory `memory_id` is evidence for relation `relation_id`.
+pub fn add_relation_evidence(conn: &Connection, relation_id: i64, memory_id: i64, now: &str) -> Result<bool, KbError> {
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO relation_evidence (relation_id, memory_id, created_at) VALUES (?1, ?2, ?3)",
+        params![relation_id, memory_id, now],
+    )?;
+    Ok(n > 0)
+}
+
+/// Every memory backing a relation, oldest link first.
+pub fn relation_evidence(conn: &Connection, relation_id: i64) -> Result<Vec<i64>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT memory_id FROM relation_evidence WHERE relation_id = ?1 ORDER BY created_at ASC, memory_id ASC",
+    )?;
+    let rows = stmt.query_map(params![relation_id], |r| r.get::<_, i64>(0))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// The ACTIVE relation stating exactly this claim, if one exists. Lets
+/// extraction attach evidence to a known claim instead of inserting a
+/// second row for it.
+pub fn active_relation_for_claim(
+    conn: &Connection,
+    src: i64,
+    predicate: &str,
+    dst: i64,
+) -> Result<Option<i64>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM relations
+         WHERE invalidated_at IS NULL AND src = ?1 AND dst = ?3 AND predicate = ?2 COLLATE NOCASE
+         ORDER BY id ASC LIMIT 1",
+    )?;
+    Ok(stmt.query_row(params![src, predicate, dst], |r| r.get(0)).optional()?)
+}
+
+fn migrate_v19_to_v20(conn: &Connection) -> Result<(), KbError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS insight_dedupe_seen (
+            id_a INTEGER NOT NULL,
+            id_b INTEGER NOT NULL,
+            PRIMARY KEY (id_a, id_b)
+        );",
+    )?;
+    conn.execute("PRAGMA user_version = 20", [])?;
+    Ok(())
+}
+
 fn migrate_v18_to_v19(conn: &Connection) -> Result<(), KbError> {
     add_column_if_missing(conn, "memories", "occurred_from", "TEXT")?;
     add_column_if_missing(conn, "memories", "occurred_to", "TEXT")?;
@@ -958,6 +1616,12 @@ const MEMORY_COLUMNS: &[(&str, &str)] = &[
     ("occurred_to", "TEXT"),
 ];
 
+/// The schema version a fully migrated database lands on. Tests assert
+/// against this rather than a literal: every schema addition used to
+/// require hunting down a dozen hard-coded version numbers across the
+/// migration tests, which is busywork that also invites getting one wrong.
+pub const SCHEMA_VERSION: i64 = 25;
+
 fn ensure_memory_columns(conn: &Connection) -> Result<(), KbError> {
     if !table_exists(conn, "memories")? {
         return Ok(());
@@ -1029,6 +1693,24 @@ fn migrate(conn: &Connection) -> Result<(), KbError> {
     }
     if version < 19 {
         migrate_v18_to_v19(conn)?;
+    }
+    if version < 20 {
+        migrate_v19_to_v20(conn)?;
+    }
+    if version < 21 {
+        migrate_v20_to_v21(conn)?;
+    }
+    if version < 22 {
+        migrate_v21_to_v22(conn)?;
+    }
+    if version < 23 {
+        migrate_v22_to_v23(conn)?;
+    }
+    if version < 24 {
+        migrate_v23_to_v24(conn)?;
+    }
+    if version < 25 {
+        migrate_v24_to_v25(conn)?;
     }
     Ok(())
 }
@@ -1155,7 +1837,7 @@ pub fn now_rfc3339() -> String {
 
 /// Parses a `YYYY-MM-DDTHH:MM:SSZ` timestamp (the only format this store
 /// writes) into Unix seconds. Returns `None` on anything that doesn't match.
-fn parse_rfc3339(s: &str) -> Option<i64> {
+pub fn parse_rfc3339(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() < 20 {
         return None;
@@ -1176,7 +1858,7 @@ fn parse_rfc3339(s: &str) -> Option<i64> {
 /// Whole (fractional) days between two Unix-second instants, floored at 0
 /// so clock skew or a "now" earlier than the stored instant never produces
 /// a negative age.
-fn days_between(now: i64, then: i64) -> f64 {
+pub fn days_between(now: i64, then: i64) -> f64 {
     let diff = (now - then) as f64 / 86400.0;
     if diff < 0.0 {
         0.0
@@ -1550,6 +2232,29 @@ pub fn supersede(conn: &Connection, old_id: i64, new_id: i64, now: &str) -> Resu
     Ok(n > 0)
 }
 
+/// Undoes a supersession: clears `invalidated_at` and `superseded_by` so
+/// the row is active again. Returns `false` (no-op) if `id` doesn't exist
+/// or is not tombstoned.
+///
+/// This exists because the contradiction judge can be wrong in a way that
+/// destroys information rather than tidying it. Two memories that each
+/// scope themselves to a different date ("As of 2026-09-07, the bank held
+/// 150 memories" against "As of 2026-09-09, it holds 739") are not a stale
+/// claim and its correction — they are two readings of a changing
+/// quantity, and the older row is the only record of what was true then.
+/// Tombstoning it makes the bank unable to answer the temporal questions
+/// it exists to answer. `build_contradiction_pass_prompt` now tells the
+/// judge to return BOTH_HOLD for that shape, but judgments already applied
+/// need a way back, and `forget` is the wrong tool: it deletes.
+pub fn restore(conn: &Connection, id: i64) -> Result<bool, KbError> {
+    let n = conn.execute(
+        "UPDATE memories SET invalidated_at = NULL, superseded_by = NULL
+         WHERE id = ?1 AND invalidated_at IS NOT NULL",
+        params![id],
+    )?;
+    Ok(n > 0)
+}
+
 /// Reinforcement (`mach kb search --touch`): for each id, bumps
 /// `access_count`, resets `last_accessed_at` to `now`, sets
 /// `first_accessed_at` if this is the first touch, and grows `stability`
@@ -1818,7 +2523,22 @@ pub fn rrf_contrib(rank: usize) -> f32 {
 /// cosine match. Below the lexical weight: a date is strong evidence of
 /// relevance but a weaker one than the query's own words, since many
 /// unrelated things happen on the same day.
-pub const TEMPORAL_WEIGHT: f32 = 0.75;
+pub const TEMPORAL_FLOOR: f32 = 0.5;
+
+/// How much a query-range overlap lifts a candidate's topical score under
+/// `Fusion::Max`. A fraction, not a channel score: see the fusion site for
+/// why the date multiplies relevance rather than competing with it.
+pub const TEMPORAL_BONUS: f32 = 0.35;
+
+/// Relevance a date-only question gets from occurrence alone.
+///
+/// Measured against the 33-question harness: at 0.75 (the old
+/// `TEMPORAL_WEIGHT`) the floor beats most topical scores and the 27-way
+/// "yesterday" tie comes straight back, costing temporal_relative 5/5 ->
+/// 4/5 and 300 extra chars per injection. At 0.5 it stays below anything
+/// topically relevant while still clearing the hooks' 0.45 threshold, so
+/// "what happened on 2026-08-31" is answerable and "what did I decide about
+/// umoja admin access yesterday" is still ordered by the umoja part.
 
 /// A calendar date range, both ends inclusive, as `YYYY-MM-DD`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2052,7 +2772,29 @@ fn rank_with_lexical(
         Fusion::Max => cands
             .iter()
             .map(|c| {
-                (c.memory.id, c.sim.max(LEXICAL_WEIGHT * c.lex).max(TEMPORAL_WEIGHT * c.temporal))
+                // Topical channels compete on max; the temporal channel
+                // MULTIPLIES the winner instead of joining the contest.
+                //
+                // It used to be a third max() term at weight 0.75, and that
+                // is wrong in a way the harness caught: a date is a
+                // constraint, not a relevance signal. Asking about
+                // "yesterday" overlaps 27 rows here, every one of them
+                // scoring exactly 0.75, so the topical ordering inside the
+                // day was erased and the tie broke on recency. The question
+                // "what did I decide about umoja admin access yesterday"
+                // returned four arbitrary rows from yesterday.
+                //
+                // As a multiplier the date lifts dated rows above undated
+                // ones while preserving how well each one answers the rest
+                // of the query.
+                let base = c.sim.max(LEXICAL_WEIGHT * c.lex);
+                // The floor keeps a date-only question answerable. "What
+                // happened on 2026-08-31" carries no topical signal at all,
+                // so the multiplicative term has nothing to multiply; the
+                // floor lets occurrence alone clear the injection
+                // threshold. Where topical signal DOES exist it exceeds the
+                // floor and the multiplier orders the results.
+                (c.memory.id, (base * (1.0 + TEMPORAL_BONUS * c.temporal)).max(TEMPORAL_FLOOR * c.temporal))
             })
             .collect(),
         Fusion::Rrf => {
@@ -3136,11 +3878,117 @@ pub fn merge_and_supersede(conn: &Connection, loser_id: i64, winner_id: i64, now
 /// occurrence's position; an untouched row's relative citation order is
 /// otherwise left exactly as it was). Returns the number of insight rows
 /// actually updated.
-pub fn repoint_insight_citations(conn: &Connection, old_id: i64, new_id: i64) -> Result<usize, KbError> {
+// --- insight dedupe: one belief, one row ---
+
+/// Insight pairs already judged by the dedupe pass. Same "never re-pay for
+/// a verdict" rule as `dedupe_seen` for memories; a failed judge call is
+/// never recorded, so it is retried.
+pub fn mark_insight_dedupe_seen(conn: &Connection, id_a: i64, id_b: i64) -> Result<(), KbError> {
+    let (a, b) = if id_a <= id_b { (id_a, id_b) } else { (id_b, id_a) };
+    conn.execute("INSERT OR IGNORE INTO insight_dedupe_seen (id_a, id_b) VALUES (?1, ?2)", params![a, b])?;
+    Ok(())
+}
+
+pub fn insight_dedupe_seen_pairs(conn: &Connection) -> Result<std::collections::HashSet<(i64, i64)>, KbError> {
+    let mut stmt = conn.prepare("SELECT id_a, id_b FROM insight_dedupe_seen")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+    let mut out = std::collections::HashSet::new();
+    for r in rows {
+        out.insert(r?);
+    }
+    Ok(out)
+}
+
+/// Merges insight `drop_id` into `keep_id`: the union of their source ids
+/// (deduped), the HIGHER of their confidences, and any theme citing the
+/// loser repointed to the keeper. The loser is invalidated, never deleted.
+///
+/// Confidence takes the max rather than an average because both rows
+/// describe one belief: the evidence that earned the higher number is still
+/// evidence after the merge, and averaging would silently punish a belief
+/// for having been written down twice.
+pub fn merge_insights(conn: &Connection, keep_id: i64, drop_id: i64, now: &str) -> Result<bool, KbError> {
+    let (Some(keep), Some(drop)) = (get_insight(conn, keep_id)?, get_insight(conn, drop_id)?) else {
+        return Ok(false);
+    };
+    let mut ids = keep.source_ids.clone();
+    for id in drop.source_ids {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    let json = serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string());
+    let confidence = keep.confidence.max(drop.confidence);
+    conn.execute(
+        "UPDATE insights SET source_ids = ?1, confidence = ?2, last_verified_at = ?3 WHERE id = ?4",
+        params![json, confidence, now, keep_id],
+    )?;
+    repoint_insight_citations(conn, drop_id, keep_id, 2)?;
+    conn.execute("UPDATE insights SET invalidated_at = ?1 WHERE id = ?2", params![now, drop_id])?;
+    Ok(true)
+}
+
+/// Active insight pairs of the SAME level whose embeddings sit at or above
+/// `min_sim`, excluding pairs already judged. Oldest-first within a pair so
+/// the keeper is deterministic. Capped per run.
+pub fn insight_dedupe_candidate_pairs(
+    conn: &Connection,
+    min_sim: f32,
+    seen: &std::collections::HashSet<(i64, i64)>,
+    cap: usize,
+) -> Result<Vec<(i64, i64)>, KbError> {
+    let all = active_insights(conn)?;
+    let mut out: Vec<(f32, i64, i64)> = Vec::new();
+    for i in 0..all.len() {
+        for j in (i + 1)..all.len() {
+            let (a, b) = (&all[i], &all[j]);
+            if a.level != b.level {
+                continue; // a theme and the insight under it are not duplicates
+            }
+            let (Some(ea), Some(eb)) = (a.embedding.as_deref(), b.embedding.as_deref()) else {
+                continue;
+            };
+            if ea.is_empty() || eb.is_empty() {
+                continue;
+            }
+            let sim = cosine(ea, eb);
+            if sim < min_sim {
+                continue;
+            }
+            let (lo, hi) = if a.id <= b.id { (a.id, b.id) } else { (b.id, a.id) };
+            if seen.contains(&(lo, hi)) {
+                continue;
+            }
+            out.push((sim, lo, hi));
+        }
+    }
+    out.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
+    out.truncate(cap);
+    Ok(out.into_iter().map(|(_, a, b)| (a, b)).collect())
+}
+
+/// Rewrites `old_id` to `new_id` inside the `source_ids` of insights AT
+/// `cites_level`, deduping the result.
+///
+/// The level argument is not optional decoration. `source_ids` holds MEMORY
+/// ids on a level-1 insight and INSIGHT ids on a level-2 theme, and the
+/// column cannot tell you which -- so a scan of every row conflates the two
+/// id spaces the moment the numbers collide. That is not hypothetical: when
+/// insight #1 absorbed insight #2, this function rewrote the literal "2" in
+/// insight #1's own evidence list (memory #2) into "1", silently swapping
+/// one fact's evidence for another's. Callers must say which id space they
+/// are repointing: 1 when merging memories, 2 when merging insights.
+pub fn repoint_insight_citations(
+    conn: &Connection,
+    old_id: i64,
+    new_id: i64,
+    cites_level: i64,
+) -> Result<usize, KbError> {
     let old_s = old_id.to_string();
     let new_s = new_id.to_string();
-    let mut stmt = conn.prepare("SELECT id, source_ids FROM insights")?;
-    let rows: Vec<(i64, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    let mut stmt = conn.prepare("SELECT id, source_ids FROM insights WHERE level = ?1")?;
+    let rows: Vec<(i64, String)> =
+        stmt.query_map(params![cites_level], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
     let mut updated = 0usize;
     for (id, json) in rows {
         let ids: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
@@ -3203,17 +4051,55 @@ pub fn contradiction_seen_pairs(conn: &Connection) -> Result<std::collections::H
 /// it, not a silent citation swap to the winner. Returns the number of
 /// insight rows actually flagged.
 pub fn flag_insights_citing_memory(conn: &Connection, memory_id: i64, now: &str) -> Result<usize, KbError> {
-    let needle = memory_id.to_string();
-    let mut stmt = conn.prepare("SELECT id, source_ids FROM insights WHERE invalidated_at IS NULL AND flagged_at IS NULL")?;
-    let rows: Vec<(i64, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
     let mut flagged = 0usize;
-    for (id, json) in rows {
-        let ids: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
-        if ids.contains(&needle) && flag_insight(conn, id, now)? {
+    for id in downstream_of_memory(conn, memory_id)? {
+        // Already-flagged rows are skipped so a repeat pass does not keep
+        // subtracting confidence for the same dead fact.
+        let already = get_insight(conn, id)?.map(|i| i.is_flagged()).unwrap_or(true);
+        if !already && flag_insight(conn, id, now)? {
             flagged += 1;
         }
     }
     Ok(flagged)
+}
+
+/// Every ACTIVE insight and theme that rests on memory `memory_id`, however
+/// many derivation steps away: the insights citing it, the themes citing
+/// those insights, and so on.
+///
+/// One level was not enough. A memory feeds an insight, that insight feeds a
+/// theme, and the theme is what the session-start mental model actually
+/// shows -- so killing a fact used to leave the belief the user reads
+/// untouched. Breadth-first with a visited set, so a citation cycle
+/// terminates instead of spinning.
+pub fn downstream_of_memory(conn: &Connection, memory_id: i64) -> Result<Vec<i64>, KbError> {
+    let mut stmt = conn.prepare("SELECT id, source_ids FROM insights WHERE invalidated_at IS NULL")?;
+    let rows: Vec<(i64, Vec<String>)> = stmt
+        .query_map([], |r| {
+            let json: String = r.get(1)?;
+            Ok((r.get::<_, i64>(0)?, serde_json::from_str(&json).unwrap_or_default()))
+        })?
+        .collect::<Result<_, _>>()?;
+
+    let mut out: Vec<i64> = Vec::new();
+    let mut visited: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut frontier: Vec<String> = vec![memory_id.to_string()];
+    while !frontier.is_empty() {
+        let mut next: Vec<String> = Vec::new();
+        for (id, ids) in &rows {
+            if visited.contains(id) {
+                continue;
+            }
+            if ids.iter().any(|s| frontier.contains(s)) {
+                visited.insert(*id);
+                out.push(*id);
+                next.push(id.to_string()); // this insight's own id may be cited by a theme
+            }
+        }
+        frontier = next;
+    }
+    out.sort_unstable();
+    Ok(out)
 }
 
 // --- strength review sampler ---
@@ -4651,6 +5537,10 @@ pub fn repoint_entity_relations(conn: &Connection, old_id: i64, new_id: i64, now
 /// relation off it, so by the time this runs the row has zero remaining
 /// references. Returns whether a row existed.
 pub fn delete_entity(conn: &Connection, id: i64) -> Result<bool, KbError> {
+    conn.execute(
+        "DELETE FROM relation_evidence WHERE relation_id IN (SELECT id FROM relations WHERE src = ?1 OR dst = ?1)",
+        params![id],
+    )?;
     conn.execute("DELETE FROM memory_entities WHERE entity_id = ?1", params![id])?;
     conn.execute("DELETE FROM entity_cards WHERE entity_id = ?1", params![id])?;
     let n = conn.execute("DELETE FROM entities WHERE id = ?1", params![id])?;
@@ -4939,7 +5829,7 @@ mod tests {
         init_schema(&conn).unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 19);
+        assert_eq!(v, SCHEMA_VERSION);
         let ents = entities_of_memory(&conn, 1).unwrap();
         assert_eq!(ents.len(), 2, "Ivar by name scan AND relation evidence, RHI redesign by relation evidence only");
         assert!(entities_of_memory(&conn, 2).unwrap().is_empty());
@@ -5096,7 +5986,7 @@ mod tests {
         init_schema(&conn).unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 19);
+        assert_eq!(v, SCHEMA_VERSION);
         assert!(lexical_scores(&conn, "43005", 10).unwrap().contains_key(&1), "pre-existing rows get indexed by the rebuild");
         migrate(&conn).unwrap(); // idempotent
     }
@@ -5139,11 +6029,18 @@ mod tests {
         init_schema(&conn).unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 19);
+        assert_eq!(v, SCHEMA_VERSION);
         let m = get(&conn, 1).unwrap().unwrap();
         assert_eq!(m.basis, None, "pre-existing rows stay basis-unknown");
         // idempotent
         migrate(&conn).unwrap();
+    }
+
+    #[test]
+    fn schema_version_constant_matches_what_migrate_actually_reaches() {
+        let conn = mem_conn();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION, "bump SCHEMA_VERSION when adding a migration");
     }
 
     #[test]
@@ -5170,6 +6067,117 @@ mod tests {
         }
         // and the v19 backfill still ran over it
         assert_eq!(get(&conn, 1).unwrap().unwrap().occurred_from.as_deref(), Some("2026-09-07"));
+    }
+
+    #[test]
+    fn one_claim_is_one_row_with_many_evidence_links() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let user = insert_entity(&conn, "user", None, None).unwrap();
+        let helios = insert_entity(&conn, "Helios", Some("project"), None).unwrap();
+        let other = insert_entity(&conn, "Umoja", Some("project"), None).unwrap();
+        let m1 = insert(&conn, "first mention", None, None, true, None, 5).unwrap();
+        let m2 = insert(&conn, "second mention", None, None, true, None, 5).unwrap();
+
+        let r1 = insert_relation(&conn, user, "works-on", helios, Some(m1), Some(0.9), &now).unwrap();
+        // The same claim again from another memory, and once with different case.
+        let r2 = insert_relation(&conn, user, "works-on", helios, Some(m2), Some(0.9), &now).unwrap();
+        let r3 = insert_relation(&conn, user, "Works-On", helios, None, Some(0.9), &now).unwrap();
+        // A genuinely different claim survives untouched.
+        let r4 = insert_relation(&conn, user, "works-on", other, None, Some(0.9), &now).unwrap();
+
+        // v21 style: seed the links the migration would have, then fold.
+        add_relation_evidence(&conn, r1, m1, &now).unwrap();
+        add_relation_evidence(&conn, r2, m2, &now).unwrap();
+        assert_eq!(fold_duplicate_relations(&conn, &now).unwrap(), 2);
+
+        assert!(get_relation(&conn, r1).unwrap().unwrap().is_active(), "the oldest row survives");
+        assert!(!get_relation(&conn, r2).unwrap().unwrap().is_active());
+        assert_eq!(get_relation(&conn, r2).unwrap().unwrap().superseded_by, Some(r1));
+        assert!(!get_relation(&conn, r3).unwrap().unwrap().is_active(), "case does not make a new claim");
+        assert!(get_relation(&conn, r4).unwrap().unwrap().is_active());
+
+        // the survivor now carries both memories as evidence
+        assert_eq!(relation_evidence(&conn, r1).unwrap(), vec![m1, m2]);
+        assert!(relation_evidence(&conn, r2).unwrap().is_empty());
+
+        // and extraction can find the claim to attach to instead of re-inserting
+        assert_eq!(active_relation_for_claim(&conn, user, "WORKS-ON", helios).unwrap(), Some(r1));
+        assert_eq!(active_relation_for_claim(&conn, user, "works-on", 999).unwrap(), None);
+        assert_eq!(fold_duplicate_relations(&conn, &now).unwrap(), 0, "idempotent");
+    }
+
+    #[test]
+    fn downstream_of_memory_walks_past_the_first_level() {
+        let conn = mem_conn();
+        let m = insert(&conn, "a fact", None, None, true, None, 5).unwrap();
+        let i1 = insert_insight(&conn, "an insight on it", 0.8, &[m.to_string()], None).unwrap();
+        let t1 = insert_theme(&conn, "a theme on the insight", 0.7, &[i1.to_string()], None).unwrap();
+        let unrelated = insert_insight(&conn, "unrelated", 0.5, &["999".to_string()], None).unwrap();
+
+        let down = downstream_of_memory(&conn, m).unwrap();
+        assert!(down.contains(&i1) && down.contains(&t1), "the theme rests on the fact too: {:?}", down);
+        assert!(!down.contains(&unrelated));
+
+        // and flagging propagates the whole way, which is what the mental
+        // model the user reads is actually built from
+        let now = now_rfc3339();
+        assert_eq!(flag_insights_citing_memory(&conn, m, &now).unwrap(), 2);
+        assert!(get_insight(&conn, t1).unwrap().unwrap().is_flagged());
+        // idempotent: a second pass does not re-subtract confidence
+        let c = get_insight(&conn, t1).unwrap().unwrap().confidence;
+        assert_eq!(flag_insights_citing_memory(&conn, m, &now).unwrap(), 0);
+        assert_eq!(get_insight(&conn, t1).unwrap().unwrap().confidence, c);
+    }
+
+    #[test]
+    fn repointing_never_crosses_the_two_id_spaces() {
+        // A level-1 insight's source_ids are MEMORY ids; a theme's are
+        // INSIGHT ids. Repointing insight 2 -> 1 must not touch memory "2"
+        // inside a level-1 row, which is what corrupted evidence before the
+        // level argument existed.
+        let conn = mem_conn();
+        let l1 = insert_insight(&conn, "cites memories 1 and 2", 0.7, &["1".to_string(), "2".to_string()], None).unwrap();
+        let theme = insert_theme(&conn, "cites insight 2", 0.7, &["2".to_string()], None).unwrap();
+
+        assert_eq!(repoint_insight_citations(&conn, 2, 1, 2).unwrap(), 1, "only the theme is rewritten");
+        assert_eq!(get_insight(&conn, l1).unwrap().unwrap().source_ids, vec!["1".to_string(), "2".to_string()]);
+        assert_eq!(get_insight(&conn, theme).unwrap().unwrap().source_ids, vec!["1".to_string()]);
+    }
+
+    #[test]
+    fn merge_insights_unions_evidence_keeps_the_higher_confidence_and_repoints_themes() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let keep = insert_insight(&conn, "the user audits before building", 0.6, &["1".to_string(), "2".to_string()], None).unwrap();
+        let drop_ = insert_insight(&conn, "the user checks existing state first", 0.9, &["2".to_string(), "3".to_string()], None).unwrap();
+        let theme = insert_theme(&conn, "engineering discipline", 0.7, &[drop_.to_string()], None).unwrap();
+
+        assert!(merge_insights(&conn, keep, drop_, &now).unwrap());
+        let merged = get_insight(&conn, keep).unwrap().unwrap();
+        assert_eq!(merged.source_ids, vec!["1".to_string(), "2".to_string(), "3".to_string()]);
+        assert!((merged.confidence - 0.9).abs() < 1e-9, "keeps the higher: {}", merged.confidence);
+        assert!(!get_insight(&conn, drop_).unwrap().unwrap().is_active(), "the loser is invalidated, not deleted");
+        assert_eq!(get_insight(&conn, theme).unwrap().unwrap().source_ids, vec![keep.to_string()]);
+    }
+
+    #[test]
+    fn insight_dedupe_candidates_pair_only_same_level_unseen_and_similar() {
+        let conn = mem_conn();
+        let a = insert_insight(&conn, "one phrasing", 0.7, &["1".to_string()], Some(&[1.0, 0.0])).unwrap();
+        let b = insert_insight(&conn, "another phrasing", 0.7, &["2".to_string()], Some(&[0.99, 0.14])).unwrap();
+        let far = insert_insight(&conn, "unrelated", 0.7, &["3".to_string()], Some(&[0.0, 1.0])).unwrap();
+        let theme = insert_theme(&conn, "a theme", 0.7, &[a.to_string()], Some(&[1.0, 0.0])).unwrap();
+
+        let seen = std::collections::HashSet::new();
+        let pairs = insight_dedupe_candidate_pairs(&conn, 0.9, &seen, 10).unwrap();
+        assert_eq!(pairs, vec![(a, b)], "same level, similar, oldest first");
+        assert!(!pairs.iter().any(|(x, y)| *x == far || *y == far));
+        assert!(!pairs.iter().any(|(x, y)| *x == theme || *y == theme), "a theme is never merged with an insight");
+
+        mark_insight_dedupe_seen(&conn, b, a).unwrap();
+        let seen = insight_dedupe_seen_pairs(&conn).unwrap();
+        assert!(insight_dedupe_candidate_pairs(&conn, 0.9, &seen, 10).unwrap().is_empty(), "a judged pair is never re-judged");
     }
 
     #[test]
@@ -5326,13 +6334,19 @@ mod tests {
         let q: Vec<f32> = vec![1.0, 0.0]; // orthogonal: no semantic signal at all
         let hits = search_hybrid(&conn, "what shipped on 2026-08-31", &q, 5, false, false, 0.0, &now).unwrap();
         assert_eq!(hits[0].memory.id, dated, "the dated match must outrank the undated row");
-        assert!(hits[0].score > 0.6, "a temporal match alone clears the injection floor: {}", hits[0].score);
+        // 0.45 is the real threshold -- `socket::DEFAULT_MIN_SCORE`, and
+        // `mach kb eval`'s default, both mirroring kb-recall's. The old
+        // assertion here was 0.6, a number that came from the previous
+        // TEMPORAL_WEIGHT of 0.75 rather than from anything the system
+        // actually enforces, so it broke when the weight became a floor at
+        // 0.5 even though a 0.525 row is still injected.
+        assert!(hits[0].score > 0.45, "a temporal match alone clears the injection floor: {}", hits[0].score);
         let undated_hit = hits.iter().find(|h| h.memory.id == undated).unwrap();
         assert!(hits[0].score > undated_hit.score);
 
         // The same query without a date gives the temporal channel nothing.
         let plain = search_hybrid(&conn, "what shipped", &q, 5, false, false, 0.0, &now).unwrap();
-        assert!(plain.iter().all(|h| h.score < 0.6));
+        assert!(plain.iter().all(|h| h.score < 0.45), "no date in the query, no temporal lift");
     }
 
     #[test]
@@ -5616,6 +6630,27 @@ mod tests {
     }
 
     #[test]
+    fn restore_undoes_a_supersession_and_is_a_no_op_on_a_live_row() {
+        let conn = mem_conn();
+        let dated_2026_09_07 = insert5(&conn, "As of 2026-09-07 the bank held 150 memories", None);
+        let dated_2026_09_09 = insert5(&conn, "As of 2026-09-09 the bank holds 739 memories", None);
+        let now = now_rfc3339();
+        // the contradiction judge read two dated snapshots as a stale claim
+        // and its correction, so the older reading was tombstoned
+        assert!(supersede(&conn, dated_2026_09_07, dated_2026_09_09, &now).unwrap());
+
+        assert!(restore(&conn, dated_2026_09_07).unwrap());
+        let back = get(&conn, dated_2026_09_07).unwrap().unwrap();
+        assert!(
+            back.invalidated_at.is_none() && back.superseded_by.is_none(),
+            "a restored row must be fully active again, not merely un-dated: a lingering \
+             superseded_by would still point at a survivor that never replaced it"
+        );
+        // nothing to undo on a live row
+        assert!(!restore(&conn, dated_2026_09_07).unwrap());
+    }
+
+    #[test]
     fn search_substring_fallback_matches_case_insensitively() {
         let conn = mem_conn();
         insert5(&conn, "The Boss wants retention metrics", None);
@@ -5838,7 +6873,7 @@ mod tests {
         // (`improve_state` + `ingested_sessions.skill_usage`), landing at the
         // current version.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 19);
+        assert_eq!(version, SCHEMA_VERSION);
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1);
@@ -5987,7 +7022,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 19,
+            version, SCHEMA_VERSION,
             "v1->v2 (reflection tables), v2->v3 (insights level column), v3->v4 (dormant_at), \
              v4->v5 (dedupe_seen), v5->v6 (last_verified_at + contradiction_seen), \
              v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions), v8->v9 (graph layer), \
@@ -6013,7 +7048,7 @@ mod tests {
     fn fresh_database_lands_at_current_user_version() {
         let conn = mem_conn();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 19);
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]
@@ -6242,7 +7277,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 19,
+            version, SCHEMA_VERSION,
             "v2->v3 (level column), v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, \
              v6->v7 (AUTOINCREMENT rebuild), v7->v8 (ingested_sessions), v8->v9, v9->v10 all run"
         );
@@ -6286,7 +7321,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 19,
+            version, SCHEMA_VERSION,
             "v3->v4 (dormant_at), v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild), \
              v7->v8 (ingested_sessions), v8->v9, v9->v10 all run"
         );
@@ -6331,7 +7366,7 @@ mod tests {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            version, 19,
+            version, SCHEMA_VERSION,
             "v4->v5 (dedupe_seen), v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 \
              (ingested_sessions), v8->v9, v9->v10 all run"
         );
@@ -6379,7 +7414,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 19, "v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) all run");
+        assert_eq!(version, SCHEMA_VERSION, "v5->v6, v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) all run");
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -6439,7 +7474,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 19, "v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) both run");
+        assert_eq!(version, SCHEMA_VERSION, "v6->v7 (AUTOINCREMENT rebuild), then v7->v8 (ingested_sessions) both run");
 
         // Every row and its data survive the rebuild, ids included.
         let rows = list(&conn, None, false).unwrap();
@@ -6600,7 +7635,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 19, "v7->v8 (ingested_sessions) runs");
+        assert_eq!(version, SCHEMA_VERSION, "v7->v8 (ingested_sessions) runs");
 
         assert_eq!(list(&conn, None, false).unwrap().len(), 1, "existing memory row must survive the migration");
 
@@ -6907,7 +7942,7 @@ mod tests {
     fn repoint_insight_citations_rewrites_matching_raw_ids_only() {
         let conn = mem_conn();
         let id = insert_insight(&conn, "an insight", 0.6, &["3".into(), "12".into(), "i2".into()], None).unwrap();
-        let updated = repoint_insight_citations(&conn, 12, 40).unwrap();
+        let updated = repoint_insight_citations(&conn, 12, 40, 1).unwrap();
         assert_eq!(updated, 1);
         let ins = get_insight(&conn, id).unwrap().unwrap();
         assert_eq!(ins.source_ids, vec!["3", "40", "i2"], "only the raw id 12 is rewritten, i2 left alone");
@@ -6917,7 +7952,7 @@ mod tests {
     fn repoint_insight_citations_dedupes_when_winner_already_cited() {
         let conn = mem_conn();
         let id = insert_insight(&conn, "an insight", 0.6, &["12".into(), "40".into()], None).unwrap();
-        let updated = repoint_insight_citations(&conn, 12, 40).unwrap();
+        let updated = repoint_insight_citations(&conn, 12, 40, 1).unwrap();
         assert_eq!(updated, 1);
         let ins = get_insight(&conn, id).unwrap().unwrap();
         assert_eq!(ins.source_ids, vec!["40"], "12 rewritten to 40 collapses with the already-cited 40");
@@ -6927,7 +7962,7 @@ mod tests {
     fn repoint_insight_citations_leaves_non_citing_insights_untouched() {
         let conn = mem_conn();
         let id = insert_insight(&conn, "unrelated insight", 0.6, &["7".into(), "8".into()], None).unwrap();
-        let updated = repoint_insight_citations(&conn, 12, 40).unwrap();
+        let updated = repoint_insight_citations(&conn, 12, 40, 1).unwrap();
         assert_eq!(updated, 0);
         let ins = get_insight(&conn, id).unwrap().unwrap();
         assert_eq!(ins.source_ids, vec!["7", "8"]);
@@ -7334,7 +8369,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 19, "v8->v9 (graph layer) runs");
+        assert_eq!(version, SCHEMA_VERSION, "v8->v9 (graph layer) runs");
 
         let rows = list(&conn, None, false).unwrap();
         assert_eq!(rows.len(), 1, "existing memory row must survive the migration");
@@ -7395,7 +8430,7 @@ mod tests {
         migrate(&conn).unwrap();
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 19, "v9->v10 (last_completed_at + entity_merge_seen) runs");
+        assert_eq!(version, SCHEMA_VERSION, "v9->v10 (last_completed_at + entity_merge_seen) runs");
 
         // The pre-existing watermark row survives, and last_completed_at
         // backfills to NULL (never completed under the new field yet).
@@ -7875,5 +8910,170 @@ mod tests {
         assert_eq!(count_assoc(&conn).unwrap(), 1);
         assert_eq!(prune_assoc(&conn, "2027-09-01T00:00:00Z").unwrap(), 1);
         assert_eq!(count_assoc(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_fresh_database_lands_on_schema_25() {
+        let conn = mem_conn();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert!(table_exists(&conn, "projects").unwrap());
+    }
+
+    #[test]
+    fn count_project_memories_counts_both_the_project_column_and_the_index_source_string() {
+        let conn = mem_conn();
+        insert(&conn, "umoja fact tagged by project column", None, Some("umoja"), true, None, 5).unwrap();
+        insert(&conn, "umoja index row tagged by source only", Some("project-index:umoja"), None, true, None, 5).unwrap();
+        insert(&conn, "an unrelated project", None, Some("helios"), true, None, 5).unwrap();
+        assert_eq!(count_project_memories(&conn, "umoja").unwrap(), 2);
+        assert_eq!(count_project_memories(&conn, "nonexistent").unwrap(), 0);
+    }
+
+    #[test]
+    fn count_project_memories_surfaces_a_real_sql_error_instead_of_silently_returning_zero() {
+        // The bug this guards: `.unwrap_or(0)` on this same query used to
+        // make a genuine SQL failure indistinguishable from "no memories",
+        // silently skipping the project in `mach kb projects refresh`.
+        let conn = mem_conn();
+        conn.execute("DROP TABLE memories", []).unwrap();
+        assert!(count_project_memories(&conn, "umoja").is_err(), "a broken query must surface as an error, not a silent 0");
+    }
+
+    #[test]
+    fn get_project_by_name_finds_the_row_or_reports_absence() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        upsert_project(&conn, "git:umoja", "umoja", "/home/x/programming/umoja", &now).unwrap();
+        upsert_project(&conn, "git:helios", "helios", "/home/x/programming/helios", &now).unwrap();
+        let found = get_project_by_name(&conn, "helios").unwrap().unwrap();
+        assert_eq!(found.fingerprint, "git:helios");
+        assert!(get_project_by_name(&conn, "nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn list_projects_orders_by_name_ascending() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        // Registered in reverse alphabetical order, so a missing or wrong
+        // ORDER BY fails the assertion instead of passing by insertion luck.
+        upsert_project(&conn, "git:umoja", "umoja", "/home/x/programming/umoja", &now).unwrap();
+        upsert_project(&conn, "git:helios", "helios", "/home/x/programming/helios", &now).unwrap();
+        let names: Vec<String> = list_projects(&conn).unwrap().into_iter().map(|p| p.name).collect();
+        assert_eq!(names, vec!["helios".to_string(), "umoja".to_string()]);
+    }
+
+    #[test]
+    fn upsert_project_reports_a_rename_and_retag_moves_every_reference() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        // Indexed once under the old name, with both the project column and
+        // the source string carrying it -- the two places a rename must reach.
+        let id = insert(&conn, "umoja uses a ModemDriver trait", Some("project-index:umoja"), Some("umoja"), true, None, 5).unwrap();
+
+        let (_pid, prev) = upsert_project(&conn, "git:abc123", "umoja", "/home/x/programming/umoja", &now).unwrap();
+        assert_eq!(prev, None, "first registration is not a rename");
+
+        let (_pid, prev) = upsert_project(&conn, "git:abc123", "umoja-v2", "/home/x/programming/umoja-v2", &now).unwrap();
+        assert_eq!(prev.as_deref(), Some("umoja"), "same fingerprint, new name = rename");
+
+        let moved = retag_project(&conn, "umoja", "umoja-v2").unwrap();
+        assert_eq!(moved, 2, "one project column and one source string");
+        let m = get(&conn, id).unwrap().unwrap();
+        assert_eq!(m.project.as_deref(), Some("umoja-v2"));
+        assert_eq!(m.source.as_deref(), Some("project-index:umoja-v2"));
+    }
+
+    #[test]
+    fn retagging_is_idempotent_and_leaves_other_projects_alone() {
+        let conn = mem_conn();
+        let other = insert(&conn, "helios renders with OpenGL", Some("project-index:helios"), Some("helios"), true, None, 5).unwrap();
+        insert(&conn, "umoja fact", Some("project-index:umoja"), Some("umoja"), true, None, 5).unwrap();
+        retag_project(&conn, "umoja", "umoja-v2").unwrap();
+        assert_eq!(retag_project(&conn, "umoja", "umoja-v2").unwrap(), 0, "nothing left to move");
+        let h = get(&conn, other).unwrap().unwrap();
+        assert_eq!(h.project.as_deref(), Some("helios"), "an unrelated project is untouched");
+    }
+
+    #[test]
+    fn forgetting_a_project_deletes_its_registry_row_but_leaves_its_memories() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let mem_id = insert(&conn, "umoja uses a ModemDriver trait", Some("project-index:umoja"), Some("umoja"), true, None, 5).unwrap();
+        let (pid, _) = upsert_project(&conn, "git:abc123", "umoja", "/home/x/programming/umoja", &now).unwrap();
+
+        let removed = forget_project(&conn, pid).unwrap();
+        assert!(removed, "the row should report as removed");
+        assert!(get_project_by_fingerprint(&conn, "git:abc123").unwrap().is_none(), "the registry row must be gone");
+
+        // Only the registry entry goes -- the knowledge stays.
+        let m = get(&conn, mem_id).unwrap().unwrap();
+        assert_eq!(m.project.as_deref(), Some("umoja"), "project-index memories tagged to the project must remain untouched");
+        assert_eq!(m.source.as_deref(), Some("project-index:umoja"));
+
+        assert!(!forget_project(&conn, pid).unwrap(), "forgetting an already-gone project id reports nothing removed");
+    }
+
+    #[test]
+    fn mark_indexed_refuses_a_git_projects_unreadable_commit_count_and_leaves_the_watermark_untouched() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let (pid, _) = upsert_project(&conn, "git:abc123", "umoja", "/home/x/programming/umoja", &now).unwrap();
+
+        // The root is unreadable (deleted, moved, whatever) -- commit_count
+        // came back None for a git-fingerprinted project.
+        let wrote = mark_project_indexed_if_readable(&conn, pid, true, None, &now).unwrap();
+        assert!(!wrote, "an unreadable git root must refuse the write");
+        let row = get_project_by_fingerprint(&conn, "git:abc123").unwrap().unwrap();
+        assert_eq!(row.indexed_at, None, "the watermark must be left exactly as it was");
+        assert_eq!(row.indexed_commits, None);
+
+        // A readable root proceeds normally.
+        let wrote = mark_project_indexed_if_readable(&conn, pid, true, Some(7), &now).unwrap();
+        assert!(wrote);
+        let row = get_project_by_fingerprint(&conn, "git:abc123").unwrap().unwrap();
+        assert_eq!(row.indexed_commits, Some(7));
+        assert!(row.indexed_at.is_some());
+
+        // A non-git project has no commit concept at all -- None there is
+        // normal, not a failure, and must not be refused.
+        let (pid2, _) = upsert_project(&conn, "path:/home/x/scratch", "scratch", "/home/x/scratch", &now).unwrap();
+        let wrote = mark_project_indexed_if_readable(&conn, pid2, false, None, &now).unwrap();
+        assert!(wrote, "a non-git project's absent commit count is expected, not a refusal reason");
+    }
+
+    #[test]
+    fn the_registry_never_populates_the_dead_indexed_head_or_card_built_at_columns() {
+        // indexed_head and card_built_at are written-never-read columns
+        // (confirmed dead in the final review). The schema keeps them --
+        // migrations here are additive only -- but nothing writes into them
+        // any more, so they stay NULL forever going forward.
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let (pid, _) = upsert_project(&conn, "git:dead", "deadcols", "/home/x/programming/deadcols", &now).unwrap();
+        set_project_card(&conn, pid, "layout: src/").unwrap();
+        mark_project_indexed(&conn, pid, Some(3), &now).unwrap();
+        let row = get_project_by_fingerprint(&conn, "git:dead").unwrap().unwrap();
+        assert_eq!(row.card.as_deref(), Some("layout: src/"), "the card itself is still written");
+        assert_eq!(row.indexed_commits, Some(3), "the commit watermark is still written");
+        assert_eq!(row.indexed_head, None, "indexed_head is dead -- never populated");
+        assert_eq!(row.card_built_at, None, "card_built_at is dead -- never populated");
+    }
+
+    #[test]
+    fn a_project_card_is_replaced_wholesale_and_the_watermark_is_separate() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let (pid, _) = upsert_project(&conn, "git:def", "helios", "/home/x/programming/helios", &now).unwrap();
+        set_project_card(&conn, pid, "layout: src/, tests/").unwrap();
+        set_project_card(&conn, pid, "layout: src/, tests/, docs/").unwrap();
+        let row = get_project_by_fingerprint(&conn, "git:def").unwrap().unwrap();
+        assert_eq!(row.card.as_deref(), Some("layout: src/, tests/, docs/"), "regenerated, not appended");
+        assert_eq!(row.indexed_at, None, "rebuilding a card is not indexing");
+
+        mark_project_indexed(&conn, pid, Some(42), &now).unwrap();
+        let row = get_project_by_fingerprint(&conn, "git:def").unwrap().unwrap();
+        assert_eq!(row.indexed_commits, Some(42));
+        assert!(row.indexed_at.is_some());
     }
 }

@@ -16,6 +16,9 @@ use crate::export;
 use crate::health;
 use crate::improve::{self, ImproveLlm, Vcs};
 use crate::ingest;
+use crate::ask;
+use crate::projects;
+use crate::transcripts;
 use crate::reflect::{self, ProcessReflectLlm, ReflectLlm, Stage2Result, ThemeResult, TIMEOUT_HAIKU, TIMEOUT_SONNET};
 use crate::store::{self, AddOutcome, Insight, InsightHit, KbError, Memory, RankedHit};
 
@@ -49,6 +52,7 @@ fn print_help() {
     println!("  list [--limit N] [--superseded] [--dormant]");
     println!("                          most recent memories (--superseded/--dormant: audit views)");
     println!("  forget <id>             permanently delete a memory");
+    println!("  restore <id>            undo a supersession: make a tombstoned memory active again");
     println!("  wake <id>               clear a memory's dormant status (mach kb list --dormant)");
     println!("  reflect [--meta]        examine new memories, derive/reinforce durable");
     println!("                          insights, re-verify a sample of existing ones, curate");
@@ -90,6 +94,20 @@ fn print_help() {
     println!("                          session/meeting transcript, insights that cite it,");
     println!("                          graph edges it evidences, Hebbian associates,");
     println!("                          engagement + how often recall has shown it. Read-only.");
+    println!("  eval-ask [--file F] [--json]");
+    println!("                          score `ask` against questions whose answers live in transcripts");
+    println!("  transcripts \"<query>\" [--limit N]");
+    println!("                          search raw session passages directly (what ask's TRANSCRIPT: step sees)");
+    println!("  index-transcripts [--all]");
+    println!("                          index raw session transcripts for `ask` (incremental by mtime)");
+    println!("  projects [list|refresh|mark-indexed <name>|forget <name>]");
+    println!("                          project registry: rename detection, cards, index drift");
+    println!("  ask \"<question>\" [--rounds N] [--json]");
+    println!("                          iterative recall: search, judge, reword or hop, then answer");
+    println!("  cards [--all] [--limit N]");
+    println!("                          build the entity cards that are due right now, without");
+    println!("                          running the rest of reflect. --all keeps going until none");
+    println!("                          are due (one haiku call per entity)");
     println!("  eval [--file F] [--json] [--verbose]");
     println!("                          score retrieval against a fixed question set: did recall");
     println!("                          surface the memory that answers each question? Reports");
@@ -114,6 +132,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Some("review") => cmd_review(args),
         Some("list") => cmd_list(args),
         Some("forget") => cmd_forget(args),
+        Some("restore") => cmd_restore(args),
         Some("wake") => cmd_wake(args),
         Some("reflect") => cmd_reflect(args),
         Some("insights") => cmd_insights(args),
@@ -127,6 +146,12 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Some("entity") => cmd_entity(args),
         Some("why") => cmd_why(args),
         Some("eval") => cmd_eval(args),
+        Some("cards") => cmd_cards(args),
+        Some("ask") => cmd_ask(args),
+        Some("eval-ask") => cmd_eval_ask(args),
+        Some("index-transcripts") => cmd_index_transcripts(args),
+        Some("projects") => cmd_projects(args),
+        Some("transcripts") => cmd_transcripts(args),
         Some("graph") => cmd_graph(args),
         Some("health") => cmd_health(args),
         Some("-h") | Some("--help") => {
@@ -425,6 +450,10 @@ pub struct SearchResponse {
     /// `SEARCH_MAX_CARDS`; empty (and omitted from JSON) otherwise.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub cards: Vec<CardHit>,
+    /// Derivable structure for the session's project (see `projects`).
+    /// Absent when the session is not in a registered project.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_card: Option<String>,
 }
 
 /// One entity card surfaced alongside a search's hits.
@@ -668,6 +697,19 @@ fn entity_connections_for_query(conn: &Connection, query: &str, q_emb: &[f32]) -
     out
 }
 
+/// The derivable card for the session's project, if it has one.
+///
+/// Looked up by name rather than retrieved by similarity: when the session
+/// is in a project, that project's card is the right one by construction,
+/// and a similarity search could return a different project's card.
+pub fn project_card_for(conn: &Connection, project: Option<&str>) -> Result<Option<String>, KbError> {
+    let Some(project) = project else {
+        return Ok(None);
+    };
+    let name = project.to_lowercase();
+    Ok(store::get_project_by_name(conn, &name)?.and_then(|p| p.card))
+}
+
 /// Ranked top-N search + insight blend, embedding `query` itself — the same
 /// merge `cmd_search` performs for `mach kb search --json` (mem hits and
 /// insight hits fetched independently, combined, sorted by score, truncated
@@ -702,6 +744,7 @@ pub fn search_hits<E: Embedder>(
     include_superseded: bool,
     min_score: f32,
     now: &str,
+    project: Option<&str>,
 ) -> Result<SearchResponse, KbError> {
     let q_emb = embedder.embed(query)?;
     // Hybrid: cosine over embeddings plus the FTS5 exact-token channel
@@ -740,7 +783,8 @@ pub fn search_hits<E: Embedder>(
     combined.extend(hops);
     let connections = entity_connections_for_query(conn, query, &q_emb);
     let cards = cards_for_query(conn, query, &q_emb);
-    Ok(SearchResponse { hits: combined, connections, cards })
+    let project_card = project_card_for(conn, project)?;
+    Ok(SearchResponse { hits: combined, connections, cards, project_card })
 }
 
 /// Spreading activation over the memory graph (`store::spread_activation`):
@@ -798,6 +842,7 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut touch = false;
     let mut min_score: f32 = 0.0;
     let mut budget: Option<usize> = None;
+    let mut project: Option<String> = None;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -808,10 +853,16 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
             "--touch" => touch = true,
             "--min-score" => min_score = args.next().and_then(|v| v.parse().ok()).unwrap_or(0.0),
             "--budget" => budget = args.next().and_then(|v| v.parse().ok()),
+            // The kb socket has carried `project` since the project card
+            // shipped; this subprocess path is the recall hook's fallback
+            // for when machd is down, and without the flag that fallback
+            // exits 1 and the hook injects NOTHING -- strictly worse than
+            // the missing card the flag was added to fix.
+            "--project" => project = args.next(),
             "-h" | "--help" => {
                 println!(
                     "usage: mach kb search \"<query>\" [--limit N] [--budget N] [--json] [--reviewed-only] [--touch] \
-                     [--include-superseded] [--min-score F]"
+                     [--include-superseded] [--min-score F] [--project NAME]"
                 );
                 return Ok(());
             }
@@ -842,7 +893,7 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     // the kb socket daemon uses for `kb-recall.sh`'s fast path — only the
     // substring-fallback branch below is unique to this subprocess entry
     // point.
-    let mut response = match search_hits(&conn, &embedder, &query, limit, reviewed_only, include_superseded, 0.0, &now) {
+    let mut response = match search_hits(&conn, &embedder, &query, limit, reviewed_only, include_superseded, 0.0, &now, project.as_deref()) {
         Ok(r) => {
             if touch {
                 let ids: Vec<i64> = r.hits.iter().filter(|h| !h.derived).map(|h| h.id).collect();
@@ -873,7 +924,7 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
                     to_hit(RankedHit { memory: m, score, sim: score, recency: 0.0, strength: 0.0, superseded, lexical: 0.0 })
                 })
                 .collect();
-            SearchResponse { hits, connections: Vec::new(), cards: Vec::new() }
+            SearchResponse { hits, connections: Vec::new(), cards: Vec::new(), project_card: None }
         }
     };
 
@@ -1176,6 +1227,34 @@ fn cmd_forget(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Ok(())
     } else {
         eprintln!("mach kb forget: no memory with id {}", id);
+        std::process::exit(1);
+    }
+}
+
+fn cmd_restore(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let id_str = match args.next() {
+        Some(s) => s,
+        None => {
+            eprintln!("mach kb restore: missing <id> argument");
+            std::process::exit(1);
+        }
+    };
+    let id: i64 = match id_str.parse() {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("mach kb restore: '{}' is not a valid id", id_str);
+            std::process::exit(1);
+        }
+    };
+    let conn = store::open().map_err(to_io)?;
+    if store::restore(&conn, id).map_err(to_io)? {
+        println!("restored memory #{} (supersession undone)", id);
+        Ok(())
+    } else {
+        eprintln!(
+            "mach kb restore: memory {} is not superseded (see `mach kb list --superseded`)",
+            id
+        );
         std::process::exit(1);
     }
 }
@@ -1635,15 +1714,25 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let (dormant, consolidated, dormancy_llm_failed) = run_dormancy_pass(&conn, &embedder, &llm, &now).map_err(to_io)?;
     llm_failed = llm_failed || dormancy_llm_failed;
 
+    // Step 4.655: insight dedupe — fold beliefs that say the same thing into
+    // one row before the card and theme passes read them, so a theme is
+    // never derived from four rephrasings of one insight.
+    let (insight_pairs_judged, insights_merged, insight_dedupe_failed) =
+        run_insight_dedupe_pass(&conn, &llm, &now).map_err(to_io)?;
+    llm_failed = llm_failed || insight_dedupe_failed;
+
     // Step 4.66: entity cards — rebuild the consolidated profile of every
     // entity whose evidence has moved since its card was written. Runs after
     // merges (so a card is never built for an entity about to be merged
     // away) and after dormancy (so it reflects what actually survived), and
     // like those, every invocation regardless of has_new: staleness is
     // measured against the mention watermark, not this run's new material.
-    let (cards_examined, cards_built, cards_llm_failed) =
+    let (cards_examined, cards_built, cards_error) =
         run_entity_card_pass(&conn, &embedder, &llm, &now).map_err(to_io)?;
-    llm_failed = llm_failed || cards_llm_failed;
+    if let Some(e) = &cards_error {
+        eprintln!("mach kb reflect: entity card call failed: {}", e);
+    }
+    llm_failed = llm_failed || cards_error.is_some();
 
     // Step 5: meta-reflection (theme) pass — only when triggered, or
     // forced via --meta for manual runs.
@@ -1686,7 +1775,7 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
          themes_added={} flagged={} weakened={} verified={} curated={} promoted={} demoted={} dormant={} \
          consolidated={} deduped={} contradictions={} mem_verified={} mem_stale={} mem_routed={} \
          graph_examined={} graph_edges={} graph_entities={} evidence_dead={} entities_merged={} \
-         cards_examined={} cards_built={}{}",
+         cards_examined={} cards_built={} insight_pairs={} insights_merged={}{}",
         examined,
         questions_count,
         insights_added,
@@ -1712,6 +1801,8 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         entities_merged,
         cards_examined,
         cards_built,
+        insight_pairs_judged,
+        insights_merged,
         if llm_failed { " (degraded: some claude calls failed — watermark not advanced)" } else { "" }
     );
     Ok(())
@@ -1938,7 +2029,7 @@ fn run_dedupe_pass<L: ReflectLlm>(
             reflect::DedupeVerdict::Keep { keep_id } => {
                 let (winner_id, loser_id) = if keep_id == id_a { (id_a, id_b) } else { (id_b, id_a) };
                 if store::merge_and_supersede(conn, loser_id, winner_id, now)? {
-                    store::repoint_insight_citations(conn, loser_id, winner_id)?;
+                    store::repoint_insight_citations(conn, loser_id, winner_id, 1)?;
                     deduped += 1;
                 }
                 // Never recorded in dedupe_seen either way: a successful
@@ -2338,22 +2429,56 @@ fn run_strength_review_pass<L: ReflectLlm>(conn: &Connection, llm: &L, now: &str
 /// similarity). Returns `(id, true)` when a new entity was actually
 /// created, `(id, false)` when an existing one was reused, so callers can
 /// report how many genuinely new entities a pass added.
-fn resolve_or_create_entity<E: Embedder>(
+fn resolve_or_create_entity<E: Embedder, L: ReflectLlm>(
     conn: &Connection,
     embedder: &E,
+    llm: &L,
     name: &str,
     kind: Option<&str>,
+    now: &str,
 ) -> Result<(i64, bool), KbError> {
     let name = name.trim();
     if let Some(existing) = store::find_entity_by_name(conn, name)? {
         return Ok((existing.id, false));
     }
+    // A name already judged to BE an entity resolves with no embed and no
+    // call, so the judgement is paid for once and reused forever.
+    if let Some(id) = store::alias_target(conn, name)? {
+        return Ok((id, false));
+    }
     let embedding = embedder.embed(name).ok();
     if let Some(emb) = &embedding {
-        if let Some((existing, _)) =
-            store::find_entity_by_similarity(conn, emb, reflect::ENTITY_RESOLUTION_SIM_THRESHOLD)?
+        // Search from the bottom of the judged band, then decide what the
+        // score entitles us to do.
+        if let Some((existing, sim)) =
+            store::find_entity_by_similarity(conn, emb, reflect::ENTITY_RESOLUTION_JUDGE_MIN)?
         {
-            return Ok((existing.id, false));
+            if sim >= reflect::ENTITY_RESOLUTION_SIM_THRESHOLD {
+                return Ok((existing.id, false));
+            }
+            // The band where similarity cannot decide: "Remos"/"Remos
+            // Space" and "GitHub"/"GitHub Actions" score alike, so ask.
+            let verdict = match store::alias_verdict(conn, name, existing.id)? {
+                Some(v) => v,
+                None => match llm.call(
+                    "haiku",
+                    &reflect::build_entity_alias_prompt(name, &existing.name, existing.kind.as_deref()),
+                    reflect::TIMEOUT_HAIKU,
+                ) {
+                    Ok(out) => {
+                        let same = reflect::parse_entity_alias_verdict(&out);
+                        store::mark_alias_verdict(conn, name, existing.id, same, now)?;
+                        same
+                    }
+                    // A failed judge must not be recorded as DIFFERENT --
+                    // that would poison the cache with an answer nobody
+                    // gave. Mint the entity and let a later run decide.
+                    Err(_) => false,
+                },
+            };
+            if verdict {
+                return Ok((existing.id, false));
+            }
         }
     }
     let id = store::insert_entity(conn, name, kind, embedding.as_deref())?;
@@ -2518,12 +2643,35 @@ fn run_graph_extraction_pass<E: Embedder, L: ReflectLlm>(
             }
         };
         let parsed = reflect::parse_batch_extraction(&raw, chunk.len());
+        // Was the reply COMPLETE? Truncation always loses the tail, so a
+        // reply that addressed the batch's last fact cannot have been cut
+        // short -- and then a fact it skipped in the middle was skipped on
+        // purpose, meaning no extractable relation.
+        //
+        // This distinction is the whole fix for a starvation bug. The old
+        // rule left every unaddressed fact unmarked so it would be retried,
+        // which is right for truncation and wrong for omission: 79 rows the
+        // model silently declined to mention came back every run, held the
+        // entire GRAPH_EXTRACTION_MAX_PER_RUN budget, and starved newly
+        // added memories of extraction. The backlog sat at exactly 79
+        // across repeated reflect runs while 25% of the bank had no entity
+        // links at all.
+        let reply_complete = parsed.contains_key(&chunk.len());
 
         for (i, m) in chunk.iter().enumerate() {
             let fact_num = i + 1;
             let triples = match parsed.get(&fact_num) {
                 Some(t) => t,
-                None => continue, // unaddressed -- not marked extracted, retried next run
+                None => {
+                    // Omitted from a complete reply: no extractable
+                    // relation here, which is a stable answer. Mark it so
+                    // it stops competing for next run's budget.
+                    if reply_complete {
+                        store::mark_graph_extracted(conn, m.id, now)?;
+                        examined += 1;
+                    }
+                    continue;
+                }
             };
             examined += 1;
 
@@ -2533,8 +2681,10 @@ fn run_graph_extraction_pass<E: Embedder, L: ReflectLlm>(
             let source_penalty = if m.reviewed { 1.0 } else { reflect::GRAPH_EXTRACTION_UNREVIEWED_PENALTY };
 
             for t in triples {
-                let (src_id, src_new) = resolve_or_create_entity(conn, embedder, &t.src_name, t.src_kind.as_deref())?;
-                let (dst_id, dst_new) = resolve_or_create_entity(conn, embedder, &t.dst_name, t.dst_kind.as_deref())?;
+                let (src_id, src_new) =
+                    resolve_or_create_entity(conn, embedder, llm, &t.src_name, t.src_kind.as_deref(), now)?;
+                let (dst_id, dst_new) =
+                    resolve_or_create_entity(conn, embedder, llm, &t.dst_name, t.dst_kind.as_deref(), now)?;
                 entities_created += src_new as usize + dst_new as usize;
                 // The memory mentions both endpoints (the substrate graph
                 // recall and entity cards walk); a freshly minted entity also
@@ -2549,9 +2699,30 @@ fn run_graph_extraction_pass<E: Embedder, L: ReflectLlm>(
                 }
 
                 let confidence = t.confidence * source_penalty;
-                let new_edge_id =
-                    store::insert_relation(conn, src_id, &t.predicate, dst_id, Some(m.id), Some(confidence), now)?;
-                edges_created += 1;
+                // If this exact claim is already an active edge, this memory
+                // is one more piece of evidence for it -- not a second copy
+                // of the claim. Re-inserting was how the graph came to hold
+                // five rows for "user works-on Helios".
+                let new_edge_id = match store::active_relation_for_claim(conn, src_id, &t.predicate, dst_id)? {
+                    Some(existing) => {
+                        store::add_relation_evidence(conn, existing, m.id, now)?;
+                        existing
+                    }
+                    None => {
+                        let id = store::insert_relation(
+                            conn,
+                            src_id,
+                            &t.predicate,
+                            dst_id,
+                            Some(m.id),
+                            Some(confidence),
+                            now,
+                        )?;
+                        store::add_relation_evidence(conn, id, m.id, now)?;
+                        edges_created += 1;
+                        id
+                    }
+                };
 
                 for old in store::relations_conflicting_with(conn, src_id, &t.predicate, dst_id)? {
                     if old.id == new_edge_id {
@@ -2568,6 +2739,88 @@ fn run_graph_extraction_pass<E: Embedder, L: ReflectLlm>(
     llm_failed = llm_failed || conflict_llm_failed;
 
     Ok((examined, edges_created, entities_created, llm_failed))
+}
+
+/// The insight-dedupe pass (inside `mach kb reflect`, before the card and
+/// theme passes): candidate same-level insight pairs above
+/// `reflect::INSIGHT_DEDUPE_MIN_SIM` are batch-judged SAME/DIFFERENT, and a
+/// SAME verdict merges the newer into the older
+/// (`store::merge_insights`: union of evidence, higher confidence, themes
+/// repointed, loser invalidated).
+///
+/// Why this pass exists: memories have had dedupe from the start, insights
+/// never did, so reflection kept deriving the same belief from new evidence
+/// and storing it again. The bank reached 28 active level-1 insights with
+/// several near-identical ("audit before build" appeared as four separately
+/// worded beliefs), and insights feed the session-start mental model
+/// directly -- duplication there is not just waste, it reads as four
+/// independent confirmations of one idea.
+///
+/// Returns `(examined, merged, any_llm_call_failed)`. A pair whose verdict
+/// never arrives is left unmarked and retried next run.
+fn run_insight_dedupe_pass<L: ReflectLlm>(
+    conn: &Connection,
+    llm: &L,
+    now: &str,
+) -> Result<(usize, usize, bool), KbError> {
+    let seen = store::insight_dedupe_seen_pairs(conn)?;
+    let pairs = store::insight_dedupe_candidate_pairs(
+        conn,
+        reflect::INSIGHT_DEDUPE_MIN_SIM,
+        &seen,
+        reflect::INSIGHT_DEDUPE_MAX_PAIRS_PER_RUN,
+    )?;
+    let mut examined = 0usize;
+    let mut merged = 0usize;
+    let mut llm_failed = false;
+
+    for chunk in pairs.chunks(reflect::INSIGHT_DEDUPE_BATCH_SIZE) {
+        // Re-read inside the loop: an earlier chunk this same run may have
+        // merged one side away.
+        let mut resolved: Vec<(i64, i64, String, String)> = Vec::new();
+        for &(a, b) in chunk {
+            match (store::get_insight(conn, a)?, store::get_insight(conn, b)?) {
+                (Some(ia), Some(ib)) if ia.is_active() && ib.is_active() => {
+                    resolved.push((a, b, ia.text, ib.text))
+                }
+                _ => continue,
+            }
+        }
+        if resolved.is_empty() {
+            continue;
+        }
+        let prompt_pairs: Vec<(&str, &str)> =
+            resolved.iter().map(|(_, _, ta, tb)| (ta.as_str(), tb.as_str())).collect();
+        let prompt = reflect::build_batch_insight_dedupe_prompt(&prompt_pairs);
+        let raw = match llm.call("haiku", &prompt, reflect::TIMEOUT_HAIKU_BATCH) {
+            Ok(out) => out,
+            Err(_) => {
+                llm_failed = true;
+                continue;
+            }
+        };
+        let verdicts = reflect::parse_batch_insight_dedupe_verdicts(&raw, resolved.len());
+
+        for (i, (a, b, _, _)) in resolved.iter().enumerate() {
+            match verdicts.get(&(i + 1)) {
+                Some(reflect::InsightDedupeVerdict::Same) => {
+                    examined += 1;
+                    // Keep the older row: its id is what any theme already cites.
+                    let (keep, drop_) = if a <= b { (*a, *b) } else { (*b, *a) };
+                    if store::merge_insights(conn, keep, drop_, now)? {
+                        merged += 1;
+                    }
+                }
+                Some(reflect::InsightDedupeVerdict::Different) => {
+                    examined += 1;
+                    store::mark_insight_dedupe_seen(conn, *a, *b)?;
+                }
+                None => {} // unaddressed: retried next run
+            }
+        }
+    }
+
+    Ok((examined, merged, llm_failed))
 }
 
 /// The entity-card pass (inside `mach kb reflect`, after graph hygiene and
@@ -2587,11 +2840,14 @@ fn run_entity_card_pass<E: Embedder, L: ReflectLlm>(
     embedder: &E,
     llm: &L,
     now: &str,
-) -> Result<(usize, usize, bool), KbError> {
+) -> Result<(usize, usize, Option<String>), KbError> {
     let candidates = store::entity_card_candidates(conn, store::CARD_MAX_PER_RUN)?;
     let mut examined = 0usize;
     let mut built = 0usize;
-    let mut llm_failed = false;
+    // The first failure's message, not just a flag: `classify` now puts the
+    // subprocess stderr tail in there, and a bool threw exactly that away --
+    // an unattended run reported "some calls failed" and nothing else.
+    let mut first_error: Option<String> = None;
 
     for entity in candidates {
         let mems = store::memories_mentioning(conn, entity.id, Some(store::CARD_EVIDENCE_LIMIT))?;
@@ -2607,10 +2863,18 @@ fn run_entity_card_pass<E: Embedder, L: ReflectLlm>(
             &evidence,
             existing.as_ref().map(|c| c.text.as_str()),
         );
-        let raw = match llm.call("haiku", &prompt, reflect::TIMEOUT_HAIKU) {
+        // The batch headroom, not the single-fact one: a card prompt carries
+        // up to `CARD_EVIDENCE_LIMIT` (14) memories plus the existing card and
+        // asks for a whole synthesized profile back, which is the same shape
+        // `TIMEOUT_HAIKU_BATCH` was raised for. At 30s the tail of this pass
+        // was timing out rather than failing -- three of six entities per run
+        // stayed due with "'claude' timed out after 30s".
+        let raw = match llm.call("haiku", &prompt, reflect::TIMEOUT_HAIKU_BATCH) {
             Ok(out) => out,
-            Err(_) => {
-                llm_failed = true;
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
                 continue;
             }
         };
@@ -2641,7 +2905,7 @@ fn run_entity_card_pass<E: Embedder, L: ReflectLlm>(
         built += 1;
     }
 
-    Ok((examined, built, llm_failed))
+    Ok((examined, built, first_error))
 }
 
 /// The graph hygiene pass (runs inside `mach kb reflect`, right after graph
@@ -3090,17 +3354,23 @@ pub fn why_report(
                 out.push_str(&format!("  origin: {}\n", src));
             }
             // downstream
-            let cites = store::insights_citing(conn, id)?;
+            // The full downstream cone, not just direct citers: a memory
+            // feeds an insight, that insight feeds a theme, and the theme is
+            // what the session-start mental model shows.
+            let cites = store::downstream_of_memory(conn, id)?;
             if !cites.is_empty() {
-                out.push_str("  cited by:\n");
-                for i in &cites {
+                let direct: HashSet<i64> = store::insights_citing(conn, id)?.iter().map(|i| i.id).collect();
+                out.push_str("  everything resting on it:\n");
+                for iid in &cites {
+                    let Some(i) = store::get_insight(conn, *iid)? else { continue };
                     out.push_str(&format!(
-                        "    {} #{} (confidence {:.2}{}) {}\n",
+                        "    {} {} #{} (confidence {:.2}{}) {}\n",
+                        if direct.contains(iid) { "directly:" } else { "indirectly:" },
                         if i.level >= 2 { "theme" } else { "insight" },
                         i.id,
                         i.confidence,
                         if i.is_flagged() { ", DOUBTED" } else { "" },
-                        truncate(&i.text, 90)
+                        truncate(&i.text, 80)
                     ));
                 }
             }
@@ -3128,7 +3398,9 @@ pub fn why_report(
                 out.push_str("  evidence for graph edges:\n");
                 for e in &edges {
                     let name = |eid: i64| store::get_entity(conn, eid).ok().flatten().map(|x| x.name).unwrap_or_else(|| format!("#{}", eid));
-                    out.push_str(&format!("    {} —{}→ {}\n", name(e.src), e.predicate, name(e.dst)));
+                    let shared = store::relation_evidence(conn, e.id)?.len();
+                    let also = if shared > 1 { format!(" (with {} other memories)", shared - 1) } else { String::new() };
+                    out.push_str(&format!("    {} —{}→ {}{}\n", name(e.src), e.predicate, name(e.dst), also));
                 }
             }
             let now = store::now_rfc3339();
@@ -3186,9 +3458,886 @@ pub fn why_report(
             for t in cites.iter().filter(|t| t.level >= 2) {
                 out.push_str(&format!("  cited by theme #{} (confidence {:.2}) {}\n", t.id, t.confidence, truncate(&t.text, 90)));
             }
+            // What dies with it: every memory whose death would flag this
+            // insight, read in the other direction.
+            let evidence_alive = i
+                .source_ids
+                .iter()
+                .filter_map(|s| s.parse::<i64>().ok())
+                .filter(|mid| {
+                    if i.level >= 2 {
+                        store::get_insight(conn, *mid).ok().flatten().map(|x| x.is_active()).unwrap_or(false)
+                    } else {
+                        store::get(conn, *mid).ok().flatten().map(|m| m.invalidated_at.is_none()).unwrap_or(false)
+                    }
+                })
+                .count();
+            if evidence_alive < i.source_ids.len() {
+                out.push_str(&format!(
+                    "  WARNING: {} of {} cited sources are gone\n",
+                    i.source_ids.len() - evidence_alive,
+                    i.source_ids.len()
+                ));
+            }
         }
     }
     Ok(out)
+}
+
+/// `mach kb cards` — run ONLY the entity-card pass.
+///
+/// The card pass inside `mach kb reflect` is capped per run so a nightly
+/// reflection stays bounded, which means a bank that has just gained the
+/// feature (or just had 50 entities go stale at once) takes days of timer
+/// runs to catch up. This drains the queue on demand.
+/// What one `ask` run gathered and concluded.
+pub struct AskOutcome {
+    pub evidence: Vec<(i64, String)>,
+    pub passages: Vec<String>,
+    pub trail: Vec<String>,
+}
+
+/// The gather loop, shared by `mach kb ask` and `mach kb eval-ask`.
+///
+/// Extracted so the evaluator measures the real thing rather than a
+/// reimplementation of it: a harness that drifts from the command it grades
+/// is worse than no harness.
+pub fn run_ask_gather<E: Embedder, L: ReflectLlm>(
+    conn: &Connection,
+    embedder: &E,
+    llm: &L,
+    question: &str,
+    rounds: usize,
+    now: &str,
+    verbose: bool,
+) -> io::Result<AskOutcome> {
+    let question = question.to_string();
+    // Insertion-ordered so the prompt reads in the order the loop found
+    // things, with the first round's best matches at the top.
+    let mut evidence: Vec<(i64, String)> = Vec::new();
+    // Raw transcript passages ride alongside, never merged into `evidence`:
+    // they carry no memory id, so nothing may cite them as a bank row.
+    let mut passages: Vec<String> = Vec::new();
+    let mut seen: HashSet<i64> = HashSet::new();
+    let mut trail: Vec<String> = Vec::new();
+    // Every gather already performed, so a judge that asks twice for the
+    // same thing ends the loop instead of spending a round re-finding rows
+    // that are already in the pool.
+    let mut done: HashSet<String> = HashSet::new();
+
+    let mut push = |evidence: &mut Vec<(i64, String)>, id: i64, content: String| -> bool {
+        if seen.insert(id) && evidence.len() < ask::EVIDENCE_CAP {
+            evidence.push((id, content));
+            return true;
+        }
+        false
+    };
+
+    // A round gathers, then judges. The first gather is always the question
+    // as asked; after that the judge chooses, and its choice IS the gather —
+    // a hop is not followed by a repeat of the search that preceded it.
+    let mut next = Some(ask::Step::Search(question.clone()));
+
+    for round in 1..=rounds {
+        let step = match next.take() {
+            Some(s) => s,
+            None => break,
+        };
+        match step {
+            ask::Step::Enough => break,
+            ask::Step::Search(q) => {
+                if !done.insert(format!("search:{}", q.to_lowercase())) {
+                    trail.push(format!("round {}: search {:?} -> already run, stopping", round, q));
+                    break;
+                }
+                // Round 1 searches transcripts too, without being asked.
+                //
+                // Measured: with `TRANSCRIPT:` available only as a judge
+                // verb, three of five eval-ask failures never invoked it --
+                // the judge saw topically plausible memories and said
+                // ENOUGH, never learning that the literal it needed was one
+                // BM25 query away. A judge is the wrong gate for "is the
+                // distilled layer missing something", because the evidence
+                // it reads cannot show what is absent from it. The channel
+                // costs no LLM call, so run it and let the pool speak.
+                if round == 1 {
+                    // Embed the query for the semantic channel; if ollama
+                    // is unreachable the search degrades to lexical rather
+                    // than failing the round.
+                    let qe = embedder.embed(&q).ok();
+                    let hits =
+                        store::search_transcripts(conn, &q, qe.as_deref(), ask::TRANSCRIPT_LIMIT).map_err(to_io)?;
+                    let n = hits.len();
+                    for h in hits {
+                        let when = h.ts.as_deref().unwrap_or("undated");
+                        passages.push(format!("[{} session {}, {}]\n{}", h.project, h.session_id, when, h.text));
+                    }
+                    done.insert(format!("transcript:{}", q.to_lowercase()));
+                    trail.push(format!("round 1: transcript {:?} -> {} passages (automatic)", q, n));
+                    if verbose {
+                        eprintln!("{}", trail.last().unwrap());
+                    }
+                }
+                let resp =
+                    search_hits(conn, embedder, &q, ask::ROUND_LIMIT, false, false, ask::ROUND_MIN_SCORE, now, None)
+                        .map_err(to_io)?;
+                let found = resp.hits.len();
+                let mut added = 0usize;
+                for h in resp.hits {
+                    // Insights share the numeric id space with memories and
+                    // cannot be cited as a source row, so only memories
+                    // enter the pool.
+                    if !h.derived && push(&mut evidence, h.id, h.content) {
+                        added += 1;
+                    }
+                }
+                trail.push(format!("round {}: search {:?} -> {} hits, {} new, {} total", round, q, found, added, evidence.len()));
+            }
+            ask::Step::Transcript(q) => {
+                if !done.insert(format!("transcript:{}", q.to_lowercase())) {
+                    trail.push(format!("round {}: transcript {:?} -> already searched, stopping", round, q));
+                    break;
+                }
+                let qe = embedder.embed(&q).ok();
+                let hits = store::search_transcripts(conn, &q, qe.as_deref(), ask::TRANSCRIPT_LIMIT).map_err(to_io)?;
+                let found = hits.len();
+                for h in hits {
+                    let when = h.ts.as_deref().unwrap_or("undated");
+                    passages.push(format!("[{} session {}, {}]\n{}", h.project, h.session_id, when, h.text));
+                }
+                trail.push(format!("round {}: transcript {:?} -> {} passages", round, q, found));
+            }
+            ask::Step::Hop(name) => {
+                if !done.insert(format!("hop:{}", name.to_lowercase())) {
+                    trail.push(format!("round {}: hop {:?} -> already taken, stopping", round, name));
+                    break;
+                }
+                let Some(entity) = store::find_entity_by_name(conn, &name).map_err(to_io)? else {
+                    trail.push(format!("round {}: hop {:?} -> no such entity, stopping", round, name));
+                    break;
+                };
+                let mems = store::memories_mentioning(conn, entity.id, Some(ask::HOP_LIMIT)).map_err(to_io)?;
+                let mut added = 0usize;
+                for m in mems {
+                    if push(&mut evidence, m.id, m.content) {
+                        added += 1;
+                    }
+                }
+                trail.push(format!("round {}: hop {:?} -> {} new, {} total", round, name, added, evidence.len()));
+            }
+        }
+        if verbose {
+            eprintln!("{}", trail.last().unwrap());
+        }
+        if round == rounds {
+            break;
+        }
+
+        let probe = ask::build_probe_prompt(&question, &evidence, &passages, round);
+        next = Some(match llm.call("haiku", &probe, reflect::TIMEOUT_HAIKU_BATCH) {
+            Ok(out) => ask::parse_step(&out),
+            // A failed judge is not a failed answer: synthesize over what
+            // the rounds so far already gathered.
+            Err(e) => {
+                if verbose {
+                    eprintln!("round {}: judge failed ({}), answering with what we have", round, e);
+                }
+                ask::Step::Enough
+            }
+        });
+    }
+
+    Ok(AskOutcome { evidence, passages, trail })
+}
+
+/// `mach kb ask` — iterative agentic recall (see `ask` for the shape and
+/// why it is a command rather than part of the hook).
+///
+/// One round is: search, then ask haiku whether what came back answers the
+/// question. If not, haiku picks the next move — a rewording, or a hop to
+/// an entity it saw named in the evidence — and the round runs again with
+/// that. After `ask::MAX_ROUNDS`, or as soon as haiku says ENOUGH, one
+/// sonnet call answers over everything gathered.
+///
+/// Evidence accumulates across rounds and is deduplicated by memory id, so
+/// a reworded query that re-finds the same rows costs nothing and a hop
+/// only ever adds. Every id sent is remembered so `ask::cited_ids` can
+/// reject a citation to anything that was not.
+/// Every `.jsonl` under `dir`, at any depth. Symlinks are not followed --
+/// a loop through one would walk forever.
+fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            collect_jsonl(&p, out);
+        } else if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
+            out.push(p);
+        }
+    }
+}
+
+/// `mach kb eval-ask` — score iterative recall the way `mach kb eval`
+/// scores the hook.
+///
+/// Same discipline: deterministic, no LLM judge, run through the real code
+/// path (`run_ask_gather`), read-only against the bank. Different unit,
+/// though — an ask question is graded on substrings, not memory ids,
+/// because most of what it should reach is a transcript passage and those
+/// carry no id on purpose.
+///
+/// Reports retrieval and answering separately. A run that gathers the right
+/// passage and then writes around it is a synthesis problem; one that never
+/// gathers it is a retrieval problem, and conflating them would send the
+/// next fix to the wrong layer.
+fn cmd_eval_ask(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut file: Option<String> = None;
+    let mut json = false;
+    let mut verbose = false;
+    let mut rounds = ask::MAX_ROUNDS;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--file" => file = args.next(),
+            "--rounds" => rounds = args.next().and_then(|v| v.parse().ok()).unwrap_or(rounds),
+            "--json" => json = true,
+            "--verbose" | "-v" => verbose = true,
+            "-h" | "--help" => {
+                println!("usage: mach kb eval-ask [--file F] [--rounds N] [--json] [--verbose]");
+                println!("       Scores `mach kb ask` on questions whose answers live in raw");
+                println!("       transcripts. Default set: ~/{}", eval::DEFAULT_ASK_QUESTIONS_PATH);
+                return Ok(());
+            }
+            other => {
+                eprintln!("mach kb eval-ask: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let path = match file {
+        Some(f) => PathBuf::from(f),
+        None => {
+            let home = std::env::var("HOME").unwrap_or_default();
+            Path::new(&home).join(eval::DEFAULT_ASK_QUESTIONS_PATH)
+        }
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("mach kb eval-ask: cannot read {}: {}", path.display(), e);
+            std::process::exit(1);
+        }
+    };
+    let questions = eval::parse_ask_questions(&content).map_err(to_io)?;
+
+    let conn = store::open().map_err(to_io)?;
+    let embedder = OllamaEmbedder::new();
+    let llm = ProcessReflectLlm::new();
+    let now = store::now_rfc3339();
+
+    let mut results = Vec::new();
+    for q in &questions {
+        let out = run_ask_gather(&conn, &embedder, &llm, &q.query, rounds, &now, verbose)?;
+        let used_transcript = !out.passages.is_empty();
+        let mut pool = String::new();
+        for (id, c) in &out.evidence {
+            pool.push_str(&format!("[{}] {}\n", id, c));
+        }
+        for p in &out.passages {
+            pool.push_str(p);
+            pool.push('\n');
+        }
+        let answer = if out.evidence.is_empty() && out.passages.is_empty() {
+            String::new()
+        } else {
+            let prompt = ask::build_answer_prompt(&q.query, &out.evidence, &out.passages);
+            llm.call("sonnet", &prompt, reflect::TIMEOUT_SONNET).unwrap_or_default()
+        };
+        let r = eval::score_ask(q, &pool, &answer, out.trail.len(), used_transcript);
+        if verbose {
+            eprintln!("{}: retrieved={} answered={} transcript={}", r.id, r.retrieved, r.answered, r.used_transcript);
+        }
+        results.push(r);
+    }
+
+    let total = results.len();
+    let passed = results.iter().filter(|r| r.passed).count();
+    let retrieved = results.iter().filter(|r| r.retrieved).count();
+    let with_transcript = results.iter().filter(|r| r.used_transcript).count();
+
+    if json {
+        println!("{}", serde_json::json!({"total": total, "passed": passed, "retrieved": retrieved,
+            "used_transcript": with_transcript, "results": results}));
+    } else {
+        println!("mach kb eval-ask: {} questions, rounds<={}", total, rounds);
+        let mut cats: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for r in &results {
+            let e = cats.entry(r.category.clone()).or_insert((0, 0));
+            e.1 += 1;
+            if r.passed {
+                e.0 += 1;
+            }
+        }
+        for (cat, (p, n)) in &cats {
+            println!("  {:<18} {}/{} ({}%)", cat, p, n, if *n > 0 { p * 100 / n } else { 0 });
+        }
+        println!(
+            "  OVERALL            {}/{} ({}%)  retrieved {}/{}  used transcript {}/{}",
+            passed,
+            total,
+            if total > 0 { passed * 100 / total } else { 0 },
+            retrieved,
+            total,
+            with_transcript,
+            total
+        );
+    }
+    Ok(())
+}
+
+/// `mach kb index-transcripts` — build/refresh the raw-transcript index
+/// that `mach kb ask` searches with its `TRANSCRIPT:` step.
+///
+/// Walks `~/.claude/projects/<project>/<session>.jsonl`, extracting only
+/// user and assistant prose (see `transcripts::extract_turn`) and storing
+/// it in `CHUNK_CHARS`-sized passages. Incremental by (mtime, size): an
+/// unchanged file is skipped without being read, which is what keeps a
+/// 962MB / 3274-file corpus a routine command rather than an event.
+///
+/// Streams line by line and commits per file, so a 194MB transcript costs
+/// one line of memory at a time and an interrupted run keeps what it
+/// finished.
+/// `mach kb transcripts` — search the raw passage index directly.
+///
+/// Exists as a diagnostic first: `ask`'s `TRANSCRIPT:` step is two LLM
+/// calls deep, so asking "did retrieval find the passage, or did the judge
+/// word the query badly" used to mean a five-minute eval run per guess.
+/// Also useful on its own — it is the closest thing to grepping your own
+/// conversation history with meaning rather than regex.
+fn cmd_transcripts(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut query: Option<String> = None;
+    let mut limit = 8usize;
+    let mut json = false;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--limit" => limit = args.next().and_then(|v| v.parse().ok()).unwrap_or(limit),
+            "--json" => json = true,
+            "-h" | "--help" => {
+                println!("usage: mach kb transcripts \"<query>\" [--limit N] [--json]");
+                println!("       Hybrid search (cosine + BM25) over indexed session passages.");
+                return Ok(());
+            }
+            other if query.is_none() => query = Some(other.to_string()),
+            other => {
+                eprintln!("mach kb transcripts: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+    let Some(query) = query else {
+        eprintln!("mach kb transcripts: need a query");
+        std::process::exit(1);
+    };
+    let conn = store::open().map_err(to_io)?;
+    let embedder = OllamaEmbedder::new();
+    let qe = embedder.embed(&query).ok();
+    let hits = store::search_transcripts(&conn, &query, qe.as_deref(), limit).map_err(to_io)?;
+    if json {
+        println!("{}", serde_json::to_string(&hits.iter().map(|h| serde_json::json!({
+            "id": h.id, "project": h.project, "session": h.session_id, "ts": h.ts, "score": h.score,
+            "text": h.text })).collect::<Vec<_>>()).unwrap_or_default());
+    } else {
+        if hits.is_empty() {
+            println!("mach kb transcripts: nothing matched");
+        }
+        for h in &hits {
+            let when = h.ts.as_deref().unwrap_or("undated");
+            println!("[{:.3}] {} {} {}", h.score, h.project, when, h.session_id);
+            for line in h.text.lines().take(4) {
+                println!("    {}", line.chars().take(160).collect::<String>());
+            }
+            println!();
+        }
+    }
+    Ok(())
+}
+
+fn cmd_index_transcripts(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut reindex_all = false;
+    let mut embed_missing = false;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--all" => reindex_all = true,
+            "--embed-missing" => embed_missing = true,
+            "-h" | "--help" => {
+                println!("usage: mach kb index-transcripts [--all] [--embed-missing]");
+                println!("       --embed-missing only fills in absent passage embeddings, without");
+                println!("       re-reading any transcript; use it when the index predates embeddings.");
+                println!("       Indexes session transcripts for `mach kb ask`. Unchanged files are");
+                println!("       skipped; --all re-reads every file even when mtime and size match.");
+                return Ok(());
+            }
+            other => {
+                eprintln!("mach kb index-transcripts: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    let root = Path::new(&home).join(".claude/projects");
+    if !root.is_dir() {
+        eprintln!("mach kb index-transcripts: no {}", root.display());
+        return Ok(());
+    }
+
+    let conn = store::open().map_err(to_io)?;
+    let embedder = OllamaEmbedder::new();
+    let now = store::now_rfc3339();
+
+    if embed_missing {
+        let pending = store::transcript_chunks_missing_embedding(&conn, usize::MAX).map_err(to_io)?;
+        let total = pending.len();
+        let (mut done, mut failed) = (0usize, 0usize);
+        for (id, text) in pending {
+            match embedder.embed(&text) {
+                Ok(v) => {
+                    store::set_transcript_chunk_embedding(&conn, id, &v).map_err(to_io)?;
+                    done += 1;
+                }
+                // Leave it NULL and carry on: the passage stays lexically
+                // searchable and the next run picks it up.
+                Err(_) => failed += 1,
+            }
+            if done > 0 && done % 500 == 0 {
+                eprintln!("mach kb index-transcripts: embedded {}/{}", done, total);
+            }
+        }
+        println!("mach kb index-transcripts: embedded {} of {} missing ({} failed)", done, total, failed);
+        return Ok(());
+    }
+    let (mut scanned, mut indexed, mut skipped, mut chunks_total) = (0usize, 0usize, 0usize, 0usize);
+    let mut machine = 0usize;
+
+    let projects = std::fs::read_dir(&root)?;
+    for pdir in projects.flatten() {
+        if !pdir.path().is_dir() {
+            continue;
+        }
+        let dir_name = pdir.file_name().to_string_lossy().to_string();
+        let project = transcripts::project_from_dir(&dir_name);
+        // Recursive: subagent transcripts live one level deeper
+        // (<session>/subagents/agent-*.jsonl) and are 652 of this corpus's
+        // 3274 files. A subagent's findings are part of what was said.
+        let mut files: Vec<PathBuf> = Vec::new();
+        collect_jsonl(&pdir.path(), &mut files);
+        for path in files {
+            scanned += 1;
+            let Ok(meta) = std::fs::metadata(&path) else { continue };
+            let size = meta.len() as i64;
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let path_s = path.to_string_lossy().to_string();
+            if !reindex_all && store::transcript_file_current(&conn, &path_s, mtime, size).map_err(to_io)? {
+                skipped += 1;
+                continue;
+            }
+            let session_id = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let Ok(file) = std::fs::File::open(&path) else { continue };
+            let mut turns = Vec::new();
+            for line in io::BufRead::lines(io::BufReader::new(file)).map_while(Result::ok) {
+                if let Some(t) = transcripts::extract_turn(&line) {
+                    turns.push(t);
+                }
+            }
+            // mach's own chore transcripts are machinery, not conversation.
+            // Indexed anyway (rather than `continue`d before this point) so
+            // that a file which WAS indexed before this filter existed gets
+            // its chunks cleared by the empty replace below.
+            let chunks =
+                if transcripts::is_machine_session(&turns) { Vec::new() } else { transcripts::chunk_turns(&turns) };
+            if chunks.is_empty() {
+                machine += 1;
+            }
+            // One embedding per passage, so transcript search has a
+            // semantic channel and not only BM25. A failure here stores
+            // NULL and the passage stays lexically searchable.
+            let embeddings: Vec<Option<Vec<f32>>> =
+                chunks.iter().map(|c| embedder.embed(&c.text).ok()).collect();
+            let n = store::replace_transcript_chunks(
+                &conn,
+                &path_s,
+                &session_id,
+                &project,
+                mtime,
+                size,
+                &chunks,
+                &embeddings,
+                &now,
+            )
+            .map_err(to_io)?;
+            indexed += 1;
+            chunks_total += n;
+        }
+    }
+
+    let (files, total_chunks) = store::transcript_index_stats(&conn).map_err(to_io)?;
+    println!(
+        "mach kb index-transcripts: scanned={} indexed={} skipped={} machine={} new_chunks={} (index now {} files, {} chunks)",
+        scanned, indexed, skipped, machine, chunks_total, files, total_chunks
+    );
+    Ok(())
+}
+
+/// Registers one project, re-tagging its memories when the fingerprint was
+/// already known under a different name. Returns rows re-tagged.
+///
+/// Split out from `cmd_projects` so the rename path is testable without a
+/// filesystem or a git repo.
+/// Returns `(renamed, retagged)` as the two distinct numbers they are: a
+/// rename either happened or it didn't (`previous.is_some()`), independent
+/// of how many rows `retag_project` found to move. A project with zero
+/// memories yet still counts as renamed even though nothing was retagged --
+/// conflating the two used to print a rename event as "0 renamed".
+fn refresh_one_project(
+    conn: &Connection,
+    fingerprint: &str,
+    name: &str,
+    root_path: &str,
+    card: Option<&str>,
+    now: &str,
+) -> Result<(bool, usize), KbError> {
+    let (id, previous) = store::upsert_project(conn, fingerprint, name, root_path, now)?;
+    let mut retagged = 0;
+    let renamed = previous.is_some();
+    if let Some(old) = previous {
+        // A rename or a case change. Automatic because the alternative is
+        // an index that stays orphaned until someone notices, and because
+        // it is semantically safe: same repo, same facts, new label.
+        retagged = store::retag_project(conn, &old, name)?;
+        eprintln!("mach kb projects: {} -> {} ({} references re-tagged)", old, name, retagged);
+    }
+    if let Some(card) = card {
+        store::set_project_card(conn, id, card)?;
+    }
+    Ok((renamed, retagged))
+}
+
+/// `mach kb projects` — the registry: rename detection, card rebuilds and
+/// index-drift reporting. No LLM call anywhere in here, so it is safe on
+/// the reflect timer.
+fn cmd_projects(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let sub = args.next().unwrap_or_else(|| "list".to_string());
+    let conn = store::open().map_err(to_io)?;
+    let now = store::now_rfc3339();
+
+    match sub.as_str() {
+        "-h" | "--help" => {
+            println!("usage: mach kb projects [list|refresh|mark-indexed <name>|forget <name>]");
+            println!("       list          registered projects, their cards and drift");
+            println!("       refresh       detect renames, rebuild cards, recompute drift (no LLM)");
+            println!("       mark-indexed  reset a project's drift watermark after re-indexing");
+            println!("       forget        drop a project's registry row (its project-index memories stay)");
+            Ok(())
+        }
+        "list" => {
+            for p in store::list_projects(&conn).map_err(to_io)? {
+                let root = Path::new(&p.root_path);
+                let drift = projects::drift_state(
+                    p.indexed_commits,
+                    projects::commit_count(root),
+                    p.indexed_at.as_deref(),
+                    &now,
+                );
+                let state = match drift {
+                    projects::DriftState::NeverIndexed => "never indexed".to_string(),
+                    projects::DriftState::Fresh => "fresh".to_string(),
+                    projects::DriftState::Drifted { commits, days } => {
+                        format!("DRIFTED {} commits / {:.0} days", commits, days)
+                    }
+                };
+                let present = if root.is_dir() { "" } else { " [MISSING ON DISK]" };
+                println!("{:<20} {:<28} {}{}", p.name, state, p.fingerprint, present);
+            }
+            Ok(())
+        }
+        "refresh" => {
+            let home = std::env::var("HOME").unwrap_or_default();
+            // Registered projects first, then discover anything under
+            // ~/programming that already has index memories.
+            let mut roots: Vec<PathBuf> =
+                store::list_projects(&conn).map_err(to_io)?.into_iter().map(|p| PathBuf::from(p.root_path)).collect();
+            let prog = Path::new(&home).join("programming");
+            if let Ok(entries) = std::fs::read_dir(&prog) {
+                for e in entries.flatten() {
+                    if e.path().is_dir() && !roots.contains(&e.path()) {
+                        roots.push(e.path());
+                    }
+                }
+            }
+            // mach is indexed but lives outside ~/programming.
+            let mach = Path::new(&home).join(".config/mach");
+            if mach.is_dir() && !roots.contains(&mach) {
+                roots.push(mach);
+            }
+
+            let (mut seen, mut renamed, mut retagged_total, mut cards) = (0usize, 0usize, 0usize, 0usize);
+            for root in roots {
+                if !root.is_dir() {
+                    continue;
+                }
+                let name = projects::normalize_name(&root);
+                // Only track projects the bank actually knows something
+                // about; registering every directory would fill this with
+                // scratch dirs. A real query failure is surfaced loudly and
+                // this project is skipped rather than silently treated as
+                // having zero memories.
+                let known: i64 = match store::count_project_memories(&conn, &name) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("mach kb projects: skipping '{}' at {} — could not count its memories: {}", name, root.display(), e);
+                        continue;
+                    }
+                };
+                let fingerprint = projects::fingerprint_for(&root).key();
+                let registered = store::get_project_by_fingerprint(&conn, &fingerprint).map_err(to_io)?.is_some();
+                if known == 0 && !registered {
+                    continue;
+                }
+                // `name` is not a unique key in the schema: two different
+                // fingerprints could otherwise both register under it, and
+                // their memories would then share one ambiguous project
+                // tag with no automatic way back apart. If some other
+                // fingerprint already holds this name, skip rather than
+                // silently create a second, colliding row.
+                if let Some(existing) =
+                    store::get_project_by_name(&conn, &name).map_err(to_io)?.filter(|p| p.fingerprint != fingerprint)
+                {
+                    eprintln!(
+                        "mach kb projects: skipping '{}' at {} — name already registered for {} ({})",
+                        name,
+                        root.display(),
+                        existing.root_path,
+                        existing.fingerprint
+                    );
+                    continue;
+                }
+                seen += 1;
+                // `build_card` cannot fail — an unreadable directory just
+                // yields a card with no layout or manifest lines. Writing
+                // that over a good card would silently lose the map, so a
+                // degenerate card is skipped and the previous one stands.
+                let built = projects::build_card(&root);
+                let card = if built.lines().count() > 1 { Some(built) } else { None };
+                let (did_rename, rows_retagged) = refresh_one_project(
+                    &conn,
+                    &fingerprint,
+                    &name,
+                    &root.to_string_lossy(),
+                    card.as_deref(),
+                    &now,
+                )
+                .map_err(to_io)?;
+                if did_rename {
+                    renamed += 1;
+                }
+                retagged_total += rows_retagged;
+                if card.is_some() {
+                    cards += 1;
+                }
+            }
+            println!(
+                "mach kb projects: {} tracked, {} renamed ({} references re-tagged), {} cards rebuilt",
+                seen, renamed, retagged_total, cards
+            );
+            Ok(())
+        }
+        "mark-indexed" => {
+            let Some(name) = args.next() else {
+                eprintln!("mach kb projects mark-indexed: need a project name");
+                std::process::exit(1);
+            };
+            let name = name.to_lowercase();
+            let Some(p) = store::get_project_by_name(&conn, &name).map_err(to_io)? else {
+                eprintln!("mach kb projects mark-indexed: '{}' is not registered", name);
+                std::process::exit(1);
+            };
+            let root = PathBuf::from(&p.root_path);
+            let is_git = p.fingerprint.starts_with("git:");
+            let commits = projects::commit_count(&root);
+            let wrote = store::mark_project_indexed_if_readable(&conn, p.id, is_git, commits, &now).map_err(to_io)?;
+            if !wrote {
+                eprintln!(
+                    "mach kb projects mark-indexed: cannot read commit count for '{}' at {} — refusing to touch the watermark",
+                    name,
+                    root.display()
+                );
+                std::process::exit(1);
+            }
+            println!("mach kb projects: {} watermark reset", name);
+            Ok(())
+        }
+        "forget" => {
+            let Some(name) = args.next() else {
+                eprintln!("mach kb projects forget: need a project name");
+                std::process::exit(1);
+            };
+            let name = name.to_lowercase();
+            let Some(p) = store::get_project_by_name(&conn, &name).map_err(to_io)? else {
+                eprintln!("mach kb projects forget: '{}' is not registered", name);
+                std::process::exit(1);
+            };
+            // The remaining-memory count is informational only: forgetting
+            // never touches memories, so this is safe to compute either
+            // before or after the delete.
+            let remaining: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE project = ?1 OR source = ?2",
+                    rusqlite::params![name, format!("project-index:{}", name)],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            store::forget_project(&conn, p.id).map_err(to_io)?;
+            println!(
+                "mach kb projects: {} forgotten (registry row only — {} project-index memories untouched)",
+                name, remaining
+            );
+            Ok(())
+        }
+        other => {
+            eprintln!("mach kb projects: unknown subcommand '{}'", other);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_ask(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut question: Option<String> = None;
+    let mut rounds = ask::MAX_ROUNDS;
+    let mut json = false;
+    let mut verbose = false;
+
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--rounds" => rounds = args.next().and_then(|v| v.parse().ok()).unwrap_or(rounds),
+            "--json" => json = true,
+            "--verbose" | "-v" => verbose = true,
+            "-h" | "--help" => {
+                println!("usage: mach kb ask \"<question>\" [--rounds N] [--json] [--verbose]");
+                println!("       Searches, judges whether the result answers the question, and if not");
+                println!("       rewords the query or hops to an entity — up to {} rounds — then answers", ask::MAX_ROUNDS);
+                println!("       with citations. Spends LLM calls: this is the deliberate path, not the hook.");
+                return Ok(());
+            }
+            other if question.is_none() => question = Some(other.to_string()),
+            other => {
+                eprintln!("mach kb ask: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let Some(question) = question else {
+        eprintln!("mach kb ask: need a question");
+        std::process::exit(1);
+    };
+    let rounds = rounds.clamp(1, ask::MAX_ROUNDS);
+
+    let conn = store::open().map_err(to_io)?;
+    let embedder = OllamaEmbedder::new();
+    let llm = ProcessReflectLlm::new();
+    let now = store::now_rfc3339();
+    let out = run_ask_gather(&conn, &embedder, &llm, &question, rounds, &now, verbose)?;
+    let (evidence, passages, trail) = (out.evidence, out.passages, out.trail);
+
+    if evidence.is_empty() && passages.is_empty() {
+        if json {
+            println!("{}", serde_json::json!({"question": question, "answer": null, "sources": [], "trail": trail}));
+        } else {
+            println!("mach kb ask: nothing in the bank clears the floor for that question");
+        }
+        return Ok(());
+    }
+
+    let prompt = ask::build_answer_prompt(&question, &evidence, &passages);
+    let answer = match llm.call("sonnet", &prompt, reflect::TIMEOUT_SONNET) {
+        Ok(a) => a.trim().to_string(),
+        Err(e) => {
+            eprintln!("mach kb ask: answer call failed: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let allowed: Vec<i64> = evidence.iter().map(|(id, _)| *id).collect();
+    let sources = ask::cited_ids(&answer, &allowed);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"question": question, "answer": answer, "sources": sources, "trail": trail})
+        );
+    } else {
+        println!("{}", answer);
+        if !sources.is_empty() {
+            let list: Vec<String> = sources.iter().map(|id| id.to_string()).collect();
+            println!("\nsources: {}", list.join(", "));
+        }
+    }
+    Ok(())
+}
+
+fn cmd_cards(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut all = false;
+    let mut limit: Option<usize> = None;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--all" => all = true,
+            "--limit" => limit = args.next().and_then(|v| v.parse().ok()),
+            "-h" | "--help" => {
+                println!("usage: mach kb cards [--all] [--limit N]");
+                println!("       Builds the entity cards currently due. Without --all it does one");
+                println!("       pass ({} entities); with --all it repeats until none are due.", store::CARD_MAX_PER_RUN);
+                return Ok(());
+            }
+            other => {
+                eprintln!("mach kb cards: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let conn = store::open().map_err(to_io)?;
+    let embedder = OllamaEmbedder::new();
+    let llm = ProcessReflectLlm::new();
+    let mut total_examined = 0usize;
+    let mut total_built = 0usize;
+
+    loop {
+        let now = store::now_rfc3339();
+        let (examined, built, error) = run_entity_card_pass(&conn, &embedder, &llm, &now).map_err(to_io)?;
+        total_examined += examined;
+        total_built += built;
+        if let Some(e) = &error {
+            eprintln!("mach kb cards: a claude call failed — those entities stay due: {}", e);
+        }
+        let due = store::entity_card_candidates(&conn, 1000).map_err(to_io)?.len();
+        println!("mach kb cards: examined={} built={} still_due={}", total_examined, total_built, due);
+        // Stop when asked to, when nothing is due, or when a pass achieved
+        // nothing (a persistent failure or a NONE-verdict entity would
+        // otherwise loop forever).
+        let hit_limit = limit.map(|n| total_built >= n).unwrap_or(false);
+        if !all || due == 0 || examined == 0 || hit_limit {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Rough token estimate: English prose runs about four characters per
@@ -3198,17 +4347,76 @@ pub fn est_tokens(text: &str) -> usize {
     text.chars().count().div_ceil(4)
 }
 
+/// Reservation cap on how much of the budget the project card may claim in
+/// `pack_to_budget`, expressed as numerator/denominator rather than a float
+/// so the comparison stays in integer token counts.
+///
+/// The card is allowed to cost about what one ranked hit costs, and no
+/// more. Before this cap it was charged FIRST against the whole budget, so
+/// a long card could evict three hits — measured live, `project="umoja"`
+/// turned hits `[206, 81, 207]` into `[206, 81]`. Displacing roughly one
+/// hit is the intended trade, not a defect: the card exists precisely to
+/// replace the derivable-structure memories that used to occupy those
+/// slots, and it is re-derivable from the repo at any time while a ranked
+/// memory is not.
+///
+/// The fraction is a third rather than a quarter because of arithmetic,
+/// not taste. Real cards measure 306-469 chars, and `est_tokens` is
+/// `chars/4`, so they cost 77-118 tokens against a 400-token budget. A
+/// quarter (100) cut straight through that range: zenith kept its card and
+/// umoja and helios silently lost theirs. A third (133) clears every card
+/// `build_card` can emit, because `projects::CARD_MAX_CHARS` is capped so
+/// that `CARD_MAX_CHARS / 4` stays under it — the two constants are
+/// consistent by construction, not by luck. Change one and the
+/// `the_card_cap_and_the_budget_reservation_stay_consistent` test fails.
+pub const PROJECT_CARD_BUDGET_NUMERATOR: usize = 1;
+pub const PROJECT_CARD_BUDGET_DENOMINATOR: usize = 3;
+
+#[cfg(test)]
+mod project_card_budget_tests {
+    use super::*;
+
+    /// The two constants are only safe together. `build_card` truncates to
+    /// `CARD_MAX_CHARS`, and `pack_to_budget` drops — never truncates — a
+    /// card that exceeds its reservation, so a cap above the reservation
+    /// means the longest cards vanish entirely instead of being shortened,
+    /// silently and only for the projects with the most to say.
+    #[test]
+    fn the_card_cap_and_the_budget_reservation_stay_consistent() {
+        const RECALL_BUDGET: usize = 400; // claude-hooks/kb-recall.py TOKEN_BUDGET
+        let reservation =
+            RECALL_BUDGET * PROJECT_CARD_BUDGET_NUMERATOR / PROJECT_CARD_BUDGET_DENOMINATOR;
+        let longest_card = "x".repeat(crate::projects::CARD_MAX_CHARS);
+        assert!(
+            est_tokens(&longest_card) <= reservation,
+            "a maximum-length card costs {} tokens but the reservation is {}: the longest \
+             cards would be dropped whole rather than truncated",
+            est_tokens(&longest_card),
+            reservation
+        );
+    }
+}
+
 /// Greedy token-budget packing (Hindsight's final recall stage): keep
 /// results in rank order until the budget is spent, instead of keeping a
 /// fixed COUNT. A count is the wrong unit for injection -- four one-line
 /// preferences and four paragraph-long project-index facts cost the same
 /// four slots and wildly different context.
 ///
-/// The entity card is packed first: it is the consolidation of many
-/// memories, so per token it says the most. Connections are left alone
-/// (they are one short line each and never the bulk of an injection).
+/// Packed in this order: the project card first (a guaranteed same-project
+/// match by construction, not a similarity guess), then entity cards (each
+/// a consolidation of many memories, so per token they say the most among
+/// what's left), then hits. Connections are left alone (they are one short
+/// line each and never the bulk of an injection).
 pub fn pack_to_budget(resp: SearchResponse, budget: usize) -> SearchResponse {
     let mut spent = 0usize;
+    let project_card = match resp.project_card {
+        Some(c) if est_tokens(&c) <= budget * PROJECT_CARD_BUDGET_NUMERATOR / PROJECT_CARD_BUDGET_DENOMINATOR => {
+            spent += est_tokens(&c);
+            Some(c)
+        }
+        _ => None,
+    };
     let mut cards = Vec::new();
     for c in resp.cards {
         let cost = est_tokens(&c.text);
@@ -3226,7 +4434,7 @@ pub fn pack_to_budget(resp: SearchResponse, budget: usize) -> SearchResponse {
         spent += cost;
         hits.push(h);
     }
-    SearchResponse { hits, connections: resp.connections, cards }
+    SearchResponse { hits, connections: resp.connections, cards, project_card }
 }
 
 /// `mach kb eval` — score retrieval against a fixed question set.
@@ -3293,7 +4501,7 @@ fn cmd_eval(mut args: impl Iterator<Item = String>) -> io::Result<()> {
 
     let mut results = Vec::new();
     for q in &questions {
-        let resp = match search_hits(&conn, &embedder, &q.query, limit, false, false, min_score, &now) {
+        let resp = match search_hits(&conn, &embedder, &q.query, limit, false, false, min_score, &now, q.project.as_deref()) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("mach kb eval: {} — search failed: {}", q.id, e);
@@ -4500,9 +5708,19 @@ fn check_improve(conn_result: &Result<Connection, KbError>) -> health::Check {
         .map(improve::is_failed_outcome)
         .collect();
     let ok = improve::health_ok(hours, &recent_failed);
-    let streak = recent_failed.iter().filter(|f| **f).count();
+    let streak = improve::failure_streak(&recent_failed);
+    // Name the threshold in the line. "[OK] ... 2 recent failures" reads as
+    // a contradiction; the check is a three-strikes rule, so say so rather
+    // than leaving the reader to guess whether OK meant the failures were
+    // counted.
     let detail = match hours {
-        Some(h) => format!("last completed {:.1}h ago, {} recent failures", h, streak),
+        Some(h) if streak == 0 => format!("last completed {:.1}h ago", h),
+        Some(h) => format!(
+            "last completed {:.1}h ago, {} consecutive failures since (alerts at {})",
+            h,
+            streak,
+            improve::HEALTH_FAIL_STREAK
+        ),
         None => "never completed".to_string(),
     };
     health::Check { name, ok, detail }
@@ -4511,6 +5729,100 @@ fn check_improve(conn_result: &Result<Connection, KbError>) -> health::Check {
 /// Checks that `machd`'s kb socket subsystem (`socket::run`) is up and
 /// actually answers a `search` op — a real one-shot round trip over
 /// `$XDG_RUNTIME_DIR/mach-kb.sock`, not just a file-exists check.
+/// Checks that every judged consolidation pass can actually reach work.
+///
+/// This exists because the same mistake happened three times in one day.
+/// `INSIGHT_DEDUPE_MIN_SIM`, `ENTITY_MERGE_MIN_SIM` and `DEDUPE_MIN_SIM`
+/// were each set above what this embedding space produces for real prose,
+/// so three passes ran every three hours, judged nothing, reported zero
+/// work and no errors, and looked perfectly healthy. Insight duplicates
+/// accumulated to 34 rows and entity duplicates to 420 while the machinery
+/// meant to fold them was unreachable by construction.
+///
+/// The signature of a dead threshold is exact and cheap to test: no
+/// candidates available AND nothing ever recorded in that pass's seen
+/// table, while the source table holds enough rows to form pairs at all.
+/// "No candidates but plenty judged" is the healthy steady state and must
+/// not alarm; "nothing judged, ever, and nothing to judge" is a threshold
+/// that cannot be met.
+fn check_thresholds(conn_result: &Result<Connection, KbError>) -> health::Check {
+    let name = "thresholds".to_string();
+    let conn = match conn_result {
+        Ok(c) => c,
+        Err(e) => return health::Check { name, ok: false, detail: e.to_string() },
+    };
+    // (label, rows available to pair, pairs judged so far, candidates now)
+    let probes: [(&str, &str, &str); 3] = [
+        ("memory dedupe", "SELECT COUNT(*) FROM memories WHERE invalidated_at IS NULL AND embedding IS NOT NULL", "SELECT COUNT(*) FROM dedupe_seen"),
+        ("insight dedupe", "SELECT COUNT(*) FROM insights WHERE invalidated_at IS NULL AND embedding IS NOT NULL", "SELECT COUNT(*) FROM insight_dedupe_seen"),
+        ("entity merge", "SELECT COUNT(*) FROM entities WHERE embedding IS NOT NULL", "SELECT COUNT(*) FROM entity_merge_seen"),
+    ];
+    let mut dead = Vec::new();
+    let mut detail = Vec::new();
+    for (label, rows_sql, seen_sql) in probes {
+        let rows: i64 = conn.query_row(rows_sql, [], |r| r.get(0)).unwrap_or(0);
+        let judged: i64 = conn.query_row(seen_sql, [], |r| r.get(0)).unwrap_or(0);
+        // Fewer than two rows cannot form a pair, so silence proves nothing.
+        if rows >= 2 && judged == 0 {
+            dead.push(label);
+        }
+        detail.push(format!("{} {} rows/{} judged", label, rows, judged));
+    }
+    let ok = dead.is_empty();
+    let detail = if ok {
+        detail.join(", ")
+    } else {
+        format!("never judged a pair (threshold likely unreachable): {} | {}", dead.join(", "), detail.join(", "))
+    };
+    health::Check { name, ok, detail }
+}
+
+/// Reports drifted projects and projects whose directory has vanished.
+///
+/// Not a failure when a project is merely drifted — that is a prompt to
+/// re-index, and the SessionStart notice already carries it. A directory
+/// that no longer exists IS a failure: its memories are now unreachable
+/// from any session and only a human knows whether it moved or died.
+fn check_projects(conn_result: &Result<Connection, KbError>) -> health::Check {
+    let name = "projects".to_string();
+    let conn = match conn_result {
+        Ok(c) => c,
+        Err(e) => return health::Check { name, ok: false, detail: e.to_string() },
+    };
+    let now = store::now_rfc3339();
+    let rows = match store::list_projects(conn) {
+        Ok(r) => r,
+        Err(e) => return health::Check { name, ok: false, detail: e.to_string() },
+    };
+    let mut missing = Vec::new();
+    let mut drifted = 0usize;
+    for p in &rows {
+        let root = Path::new(&p.root_path);
+        if !root.is_dir() {
+            missing.push(p.name.clone());
+            continue;
+        }
+        if matches!(
+            projects::drift_state(p.indexed_commits, projects::commit_count(root), p.indexed_at.as_deref(), &now),
+            projects::DriftState::Drifted { .. } | projects::DriftState::NeverIndexed
+        ) {
+            drifted += 1;
+        }
+    }
+    let ok = missing.is_empty();
+    let detail = if missing.is_empty() {
+        format!("{} tracked, {} due a re-index", rows.len(), drifted)
+    } else {
+        format!(
+            "{} tracked, {} due a re-index, MISSING ON DISK: {} (run `mach kb projects forget <name>` to clear a project whose directory is gone for good)",
+            rows.len(),
+            drifted,
+            missing.join(", ")
+        )
+    };
+    health::Check { name, ok, detail }
+}
+
 fn check_kb_socket() -> health::Check {
     let name = "kb-socket".to_string();
     let path = crate::socket::socket_path();
@@ -5058,6 +6370,8 @@ fn cmd_health(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         check_kb_db(&conn_result),
         check_reflect_completion(&conn_result),
         check_improve(&conn_result),
+        check_projects(&conn_result),
+        check_thresholds(&conn_result),
         check_kb_socket(),
         check_recall_log_writable(),
         check_disk_headroom(),
@@ -5799,7 +7113,8 @@ mod tests {
 
         let conn = mem_conn();
         let embedder = FakeEmbedder;
-        let llm = FixedReflectLlm { reply: Ok("The user prefers dark mode.\nThe user works on project Zenith.") };
+        let llm =
+            FixedReflectLlm { reply: Ok("STATED: The user prefers dark mode.\nINFERRED: The user works on project Zenith.") };
         let filter = FixedFilter { dialogue: Some("USER: I use dark mode\nASSISTANT: noted") };
 
         let summary =
@@ -6109,11 +7424,59 @@ mod tests {
         }
     }
 
+    /// A SAME verdict is remembered, so the name resolves later with no
+    /// call at all. Proven by a judge that would answer DIFFERENT: if it
+    /// were consulted again the test would fail.
+    #[test]
+    fn a_judged_alias_is_cached_and_never_re_asked() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let moses = store::insert_entity(&conn, "Moses", Some("person"), Some(&[1.0, 0.0])).unwrap();
+        store::mark_alias_verdict(&conn, "Moses Kimani", moses, true, &now).unwrap();
+        let would_refuse = FixedReflectLlm { reply: Ok("DIFFERENT") };
+        let (id, created) =
+            resolve_or_create_entity(&conn, &FakeEmbedder, &would_refuse, "Moses Kimani", None, &now).unwrap();
+        assert_eq!(id, moses);
+        assert!(!created, "the cached SAME resolves without asking again");
+    }
+
+    /// A DIFFERENT verdict is remembered too, so a name that is genuinely
+    /// distinct is not re-judged on every extraction that mentions it.
+    #[test]
+    fn a_rejected_alias_is_remembered_rather_than_re_judged() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let gh = store::insert_entity(&conn, "GitHub", Some("technology"), Some(&[1.0, 0.0])).unwrap();
+        store::mark_alias_verdict(&conn, "GitHub Actions", gh, false, &now).unwrap();
+        assert_eq!(store::alias_verdict(&conn, "GitHub Actions", gh).unwrap(), Some(false));
+        assert_eq!(store::alias_target(&conn, "GitHub Actions").unwrap(), None, "DIFFERENT is not an alias");
+    }
+
+    /// A judge that fails must not leave a verdict behind: recording
+    /// DIFFERENT would cache an answer nobody gave, and the pair would
+    /// never be asked about again.
+    #[test]
+    fn a_failed_alias_judge_records_nothing_and_mints_the_entity() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let existing = store::insert_entity(&conn, "Remos Space", Some("organization"), Some(&[1.0, 0.0])).unwrap();
+        let broken = FixedReflectLlm { reply: Err("offline") };
+        let (id, created) =
+            resolve_or_create_entity(&conn, &FakeEmbedder, &broken, "Remos Spaces", None, &now).unwrap();
+        assert!(created, "no verdict means no merge");
+        assert_ne!(id, existing);
+        assert_eq!(
+            store::alias_verdict(&conn, "Remos Spaces", existing).unwrap(),
+            None,
+            "a failed call must stay unjudged so a later run can decide"
+        );
+    }
+
     #[test]
     fn resolve_or_create_entity_reuses_an_exact_case_insensitive_name_match() {
         let conn = mem_conn();
         let existing = store::insert_entity(&conn, "Moses", Some("person"), None).unwrap();
-        let (id, created) = resolve_or_create_entity(&conn, &FakeEmbedder, "MOSES", Some("person")).unwrap();
+        let (id, created) = resolve_or_create_entity(&conn, &FakeEmbedder, &FixedReflectLlm { reply: Ok("DIFFERENT") }, "MOSES", Some("person"), &store::now_rfc3339()).unwrap();
         assert_eq!(id, existing);
         assert!(!created);
     }
@@ -6126,7 +7489,7 @@ mod tests {
         // ENTITY_RESOLUTION_SIM_THRESHOLD, and the exact-name path can never
         // catch this (the strings differ).
         let existing = store::insert_entity(&conn, "Moses", Some("person"), Some(&FakeEmbedder.embed("Moses").unwrap())).unwrap();
-        let (id, created) = resolve_or_create_entity(&conn, &FakeEmbedder, "Moxes", Some("person")).unwrap();
+        let (id, created) = resolve_or_create_entity(&conn, &FakeEmbedder, &FixedReflectLlm { reply: Ok("SAME") }, "Moxes", Some("person"), &store::now_rfc3339()).unwrap();
         assert_eq!(id, existing, "a near-spelling must resolve to the same entity via similarity");
         assert!(!created);
     }
@@ -6134,7 +7497,7 @@ mod tests {
     #[test]
     fn resolve_or_create_entity_creates_a_new_entity_when_nothing_matches() {
         let conn = mem_conn();
-        let (id, created) = resolve_or_create_entity(&conn, &FakeEmbedder, "Umoja", Some("project")).unwrap();
+        let (id, created) = resolve_or_create_entity(&conn, &FakeEmbedder, &FixedReflectLlm { reply: Ok("DIFFERENT") }, "Umoja", Some("project"), &store::now_rfc3339()).unwrap();
         assert!(created);
         let e = store::get_entity(&conn, id).unwrap().unwrap();
         assert_eq!(e.name, "Umoja");
@@ -6248,6 +7611,42 @@ mod tests {
         assert!(store::get_relation(&conn, elena_edge).unwrap().unwrap().is_active());
     }
 
+    #[test]
+    fn run_insight_dedupe_pass_merges_same_and_remembers_different() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let a = store::insert_insight(&conn, "the user audits before building", 0.6, &["1".to_string()], Some(&[1.0, 0.0])).unwrap();
+        let b = store::insert_insight(&conn, "the user checks state first", 0.9, &["2".to_string()], Some(&[0.99, 0.14])).unwrap();
+
+        let llm = FixedReflectLlm { reply: Ok("1: SAME") };
+        let (examined, merged, failed) = run_insight_dedupe_pass(&conn, &llm, &now).unwrap();
+        assert_eq!((examined, merged, failed), (1, 1, false));
+        let kept = store::get_insight(&conn, a).unwrap().unwrap();
+        assert_eq!(kept.source_ids.len(), 2, "evidence is unioned onto the keeper");
+        assert!((kept.confidence - 0.9).abs() < 1e-9);
+        assert!(!store::get_insight(&conn, b).unwrap().unwrap().is_active());
+        assert_eq!(run_insight_dedupe_pass(&conn, &llm, &now).unwrap().0, 0, "nothing left to pair");
+    }
+
+    #[test]
+    fn run_insight_dedupe_pass_never_marks_seen_on_a_failed_call() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        store::insert_insight(&conn, "one phrasing", 0.6, &["1".to_string()], Some(&[1.0, 0.0])).unwrap();
+        store::insert_insight(&conn, "another phrasing", 0.6, &["2".to_string()], Some(&[0.99, 0.14])).unwrap();
+
+        let broken = FixedReflectLlm { reply: Err("offline") };
+        let (examined, merged, failed) = run_insight_dedupe_pass(&conn, &broken, &now).unwrap();
+        assert_eq!((examined, merged), (0, 0));
+        assert!(failed);
+        assert!(store::insight_dedupe_seen_pairs(&conn).unwrap().is_empty(), "retried, not written off");
+
+        let different = FixedReflectLlm { reply: Ok("1: DIFFERENT") };
+        let (examined, merged, _) = run_insight_dedupe_pass(&conn, &different, &now).unwrap();
+        assert_eq!((examined, merged), (1, 0));
+        assert_eq!(store::insight_dedupe_seen_pairs(&conn).unwrap().len(), 1, "and never re-judged");
+    }
+
     // --- run_entity_card_pass ---
 
     /// Replies with a well-formed card citing the first two memory ids the
@@ -6283,8 +7682,8 @@ mod tests {
         let llm = FixedReflectLlm {
             reply: Ok("- argues hotfixes are underrated\n- pushes for owner-settable TLEs\nevidence: 1, 2, 999"),
         };
-        let (examined, built, failed) = run_entity_card_pass(&conn, &FakeEmbedder, &llm, &now).unwrap();
-        assert_eq!((examined, built, failed), (1, 1, false));
+        let (examined, built, error) = run_entity_card_pass(&conn, &FakeEmbedder, &llm, &now).unwrap();
+        assert_eq!((examined, built, error), (1, 1, None));
 
         let card = store::get_entity_card(&conn, moses).unwrap().unwrap();
         assert!(card.text.starts_with("- argues hotfixes"));
@@ -6302,14 +7701,18 @@ mod tests {
         store::upsert_entity_card(&conn, moses, "- the old card", &["1".to_string()], None, 0, 0, &now).unwrap();
 
         let none = FixedReflectLlm { reply: Ok("NONE") };
-        let (examined, built, failed) = run_entity_card_pass(&conn, &FakeEmbedder, &none, &now).unwrap();
-        assert_eq!((examined, built, failed), (1, 0, false));
+        let (examined, built, error) = run_entity_card_pass(&conn, &FakeEmbedder, &none, &now).unwrap();
+        assert_eq!((examined, built, error), (1, 0, None));
         assert_eq!(store::get_entity_card(&conn, moses).unwrap().unwrap().text, "- the old card");
 
         let broken = FixedReflectLlm { reply: Err("offline") };
-        let (examined, built, failed) = run_entity_card_pass(&conn, &FakeEmbedder, &broken, &now).unwrap();
+        let (examined, built, error) = run_entity_card_pass(&conn, &FakeEmbedder, &broken, &now).unwrap();
         assert_eq!((examined, built), (1, 0));
-        assert!(failed, "a failed call is reported so the caller can degrade");
+        assert_eq!(
+            error.as_deref(),
+            Some("offline"),
+            "the failure reason reaches the caller, not just the fact of failure"
+        );
         assert_eq!(store::get_entity_card(&conn, moses).unwrap().unwrap().text, "- the old card");
         assert!(!store::entity_card_candidates(&conn, 10).unwrap().is_empty(), "still due after a failure");
     }
@@ -6345,7 +7748,7 @@ mod tests {
         let hop = store::insert(&conn, "Moses prefers pragmatic hotfixes", None, None, true, Some(&unit_vec(4, 1)), 5)
             .unwrap();
         let embedder = FixedVecEmbedder(q);
-        let resp = search_hits(&conn, &embedder, "what about Moses", 2, false, false, 0.3, &now).unwrap();
+        let resp = search_hits(&conn, &embedder, "what about Moses", 2, false, false, 0.3, &now, None).unwrap();
         let direct: Vec<&SearchHit> = resp.hits.iter().filter(|h| h.via_assoc.is_none()).collect();
         assert_eq!(direct.len(), 2, "the limit still bounds query matches");
         let hopped = resp.hits.iter().find(|h| h.id == hop).expect("the hop is appended, not truncated away");
@@ -6362,15 +7765,165 @@ mod tests {
         store::upsert_entity_card(&conn, moses, "- argues hotfixes are underrated", &["1".to_string()], None, 1, 1, &now)
             .unwrap();
         let embedder = FixedVecEmbedder(unit_vec(4, 0));
-        let resp = search_hits(&conn, &embedder, "what does Moses want", 5, false, false, 0.0, &now).unwrap();
+        let resp = search_hits(&conn, &embedder, "what does Moses want", 5, false, false, 0.0, &now, None).unwrap();
         assert_eq!(resp.cards.len(), 1);
         assert_eq!(resp.cards[0].entity, "Moses");
         assert_eq!(resp.cards[0].kind.as_deref(), Some("person"));
         assert_eq!(resp.cards[0].evidence, 1);
         assert!(resp.cards[0].text.contains("hotfixes"));
 
-        let none = search_hits(&conn, &embedder, "unrelated question about nothing", 5, false, false, 0.0, &now).unwrap();
+        let none = search_hits(&conn, &embedder, "unrelated question about nothing", 5, false, false, 0.0, &now, None).unwrap();
         assert!(none.cards.is_empty());
+    }
+
+    #[test]
+    fn the_project_card_is_injected_for_the_session_project_only() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let (pid, _) = store::upsert_project(&conn, "git:abc", "umoja", "/tmp/umoja", &now).unwrap();
+        store::set_project_card(&conn, pid, "layout: fastapi-hub, react-app").unwrap();
+
+        let card = project_card_for(&conn, Some("umoja")).unwrap();
+        assert!(card.unwrap().contains("fastapi-hub"));
+        assert!(project_card_for(&conn, Some("helios")).unwrap().is_none(), "another project's card must not leak");
+        assert!(project_card_for(&conn, None).unwrap().is_none(), "no project, no card");
+    }
+
+    #[test]
+    fn search_hits_carries_the_session_projects_card_when_one_is_passed() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let (pid, _) = store::upsert_project(&conn, "git:abc", "umoja", "/tmp/umoja", &now).unwrap();
+        store::set_project_card(&conn, pid, "layout: fastapi-hub, react-app").unwrap();
+        let embedder = FixedVecEmbedder(unit_vec(4, 0));
+
+        let resp = search_hits(&conn, &embedder, "anything", 5, false, false, 0.0, &now, Some("umoja")).unwrap();
+        let card = resp.project_card.expect("the session's own project card should ride along with its hits");
+        assert!(card.contains("fastapi-hub"));
+
+        // No project passed -- the field stays absent, same as before this
+        // parameter existed.
+        let none = search_hits(&conn, &embedder, "anything", 5, false, false, 0.0, &now, None).unwrap();
+        assert!(none.project_card.is_none());
+    }
+
+    #[test]
+    fn pack_to_budget_drops_the_project_card_that_does_not_fit() {
+        let resp = SearchResponse {
+            hits: Vec::new(),
+            connections: Vec::new(),
+            cards: Vec::new(),
+            project_card: Some("layout: fastapi-hub, react-app".to_string()),
+        };
+        let cost = est_tokens("layout: fastapi-hub, react-app");
+        assert!(cost > 1, "fixture text must actually cost something to make the budget bite");
+        let packed = pack_to_budget(resp, cost - 1);
+        assert!(packed.project_card.is_none(), "a card that cannot fit must not be injected");
+    }
+
+    #[test]
+    fn pack_to_budget_keeps_the_project_card_alongside_an_entity_card_when_both_fit() {
+        let project_text = "layout: fastapi-hub, react-app".to_string();
+        let entity_card = CardHit {
+            entity: "Moses".to_string(),
+            kind: Some("person".to_string()),
+            text: "- argues hotfixes are underrated".to_string(),
+            updated: "2026-01-01".to_string(),
+            evidence: 1,
+        };
+        // Budget large enough that the card also clears its own quarter-
+        // budget reservation cap (see PROJECT_CARD_BUDGET_NUMERATOR/
+        // DENOMINATOR), not just the overall budget.
+        let budget = est_tokens(&project_text) * PROJECT_CARD_BUDGET_DENOMINATOR / PROJECT_CARD_BUDGET_NUMERATOR
+            + est_tokens(&entity_card.text)
+            + 10;
+        let resp = SearchResponse {
+            hits: Vec::new(),
+            connections: Vec::new(),
+            cards: vec![entity_card],
+            project_card: Some(project_text.clone()),
+        };
+        let packed = pack_to_budget(resp, budget);
+        // Both charge against the same budget and both fit: the project
+        // card being charged first (see `pack_to_budget`'s doc comment)
+        // must not starve the entity card out when there's room for both.
+        assert_eq!(packed.project_card, Some(project_text));
+        assert_eq!(packed.cards.len(), 1);
+        assert_eq!(packed.cards[0].entity, "Moses");
+    }
+
+    fn hit_with_content(id: i64, content: &str) -> SearchHit {
+        SearchHit {
+            id,
+            content: content.to_string(),
+            source: None,
+            project: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            score: 1.0,
+            sim: 1.0,
+            recency: 1.0,
+            strength: 1.0,
+            importance: 0,
+            superseded: false,
+            derived: false,
+            confidence: None,
+            level: None,
+            via_assoc: None,
+            via_edge: None,
+            basis: None,
+            lexical: 0.0,
+        }
+    }
+
+    #[test]
+    fn pack_to_budget_never_lets_an_oversized_project_card_evict_hits_that_fit() {
+        let budget = 400;
+        // 600 chars -> 150 tokens, over budget/4 (100) though under the
+        // whole budget -- the case that used to evict a ranked hit.
+        let big_card = "x".repeat(600);
+        assert!(est_tokens(&big_card) > budget * PROJECT_CARD_BUDGET_NUMERATOR / PROJECT_CARD_BUDGET_DENOMINATOR);
+        // Three hits at 100 tokens each (400 chars) -- 300 total, well
+        // within the 400 budget on their own.
+        let hits = vec![
+            hit_with_content(1, &"a".repeat(400)),
+            hit_with_content(2, &"b".repeat(400)),
+            hit_with_content(3, &"c".repeat(400)),
+        ];
+        let resp = SearchResponse { hits, connections: Vec::new(), cards: Vec::new(), project_card: Some(big_card) };
+        let packed = pack_to_budget(resp, budget);
+        assert!(packed.project_card.is_none(), "a card over a quarter of the budget must not be kept");
+        assert_eq!(packed.hits.len(), 3, "all three hits must survive when the oversized card is dropped");
+    }
+
+    #[test]
+    fn pack_to_budget_keeps_a_small_project_card_alongside_hits_that_all_fit() {
+        let budget = 400;
+        // 160 chars -> 40 tokens, well under budget/4 (100).
+        let small_card = "x".repeat(160);
+        assert!(est_tokens(&small_card) <= budget * PROJECT_CARD_BUDGET_NUMERATOR / PROJECT_CARD_BUDGET_DENOMINATOR);
+        let hits = vec![
+            hit_with_content(1, &"a".repeat(400)),
+            hit_with_content(2, &"b".repeat(400)),
+            hit_with_content(3, &"c".repeat(400)),
+        ];
+        let resp = SearchResponse { hits, connections: Vec::new(), cards: Vec::new(), project_card: Some(small_card.clone()) };
+        let packed = pack_to_budget(resp, budget);
+        assert_eq!(packed.project_card, Some(small_card));
+        assert_eq!(packed.hits.len(), 3, "a small card must not crowd out any of the three hits");
+    }
+
+    #[test]
+    fn check_projects_names_the_forget_escape_hatch_when_a_root_is_missing() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        store::upsert_project(&conn, "path:/tmp/does-not-exist-mach-kb-test", "vanished", "/tmp/does-not-exist-mach-kb-test", &now).unwrap();
+        let check = check_projects(&Ok(conn));
+        assert!(!check.ok, "a missing root must still fail the check");
+        assert!(
+            check.detail.contains("mach kb projects forget"),
+            "the health output must name the escape hatch that clears a permanently-missing project: {}",
+            check.detail
+        );
     }
 
     #[test]
@@ -6525,6 +8078,33 @@ mod tests {
         );
     }
 
+    /// The other half of the truncation rule: when the reply DOES address
+    /// the last fact it cannot have been cut short, so a fact it skipped
+    /// carries no extractable relation and must stop being retried. Without
+    /// this the skipped rows became a permanent backlog that starved every
+    /// newly added memory of extraction.
+    #[test]
+    fn a_complete_reply_that_skips_a_fact_marks_it_extracted_anyway() {
+        let conn = mem_conn();
+        let id1 = store::insert(&conn, "fact one", None, None, true, None, 5).unwrap();
+        let id2 = store::insert(&conn, "fact two", None, None, true, None, 5).unwrap();
+        let id3 = store::insert(&conn, "fact three", None, None, true, None, 5).unwrap();
+        // Facts 1 and 3 answered, fact 2 silently skipped. Fact 3 is the
+        // last, so the reply is complete and fact 2 was a real omission.
+        let llm = FixedReflectLlm { reply: Ok("1: NONE\n3: NONE") };
+        let (_examined, _edges, _entities, failed) =
+            run_graph_extraction_pass(&conn, &FakeEmbedder, &llm, &store::now_rfc3339()).unwrap();
+        assert!(!failed);
+        for id in [id1, id2, id3] {
+            assert!(
+                store::get(&conn, id).unwrap().unwrap().graph_extracted_at.is_some(),
+                "memory {} should not be retried forever",
+                id
+            );
+        }
+        assert!(store::graph_extraction_candidates(&conn, 10).unwrap().is_empty(), "backlog drained");
+    }
+
     // --- search enrichment: entity connections ---
 
     #[test]
@@ -6537,7 +8117,7 @@ mod tests {
         store::insert_relation(&conn, moses, "boss-of", user, Some(mem_id), Some(0.9), &store::now_rfc3339()).unwrap();
 
         let embedder = FixedVecEmbedder(q);
-        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &store::now_rfc3339())
+        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &store::now_rfc3339(), None)
             .unwrap();
         assert_eq!(resp.connections.len(), 1);
         assert_eq!(resp.connections[0].src_name, "Moses");
@@ -6553,7 +8133,7 @@ mod tests {
         store::insert_entity(&conn, "Moses", Some("person"), Some(&unit_vec(4, 1))).unwrap();
         let embedder = FixedVecEmbedder(unit_vec(4, 0));
         let resp =
-            search_hits(&conn, &embedder, "anything", 10, false, false, 0.0, &store::now_rfc3339()).unwrap();
+            search_hits(&conn, &embedder, "anything", 10, false, false, 0.0, &store::now_rfc3339(), None).unwrap();
         assert!(resp.connections.is_empty());
     }
 
@@ -6573,7 +8153,7 @@ mod tests {
         store::insert_relation(&conn, user, "works-on", umoja, Some(mem2), Some(0.8), &now).unwrap();
 
         let embedder = FixedVecEmbedder(q);
-        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &now).unwrap();
+        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &now, None).unwrap();
         assert_eq!(resp.connections.len(), 2, "one hop-1 edge plus one hop-2 chain through it");
 
         let hop1 = &resp.connections[0];
@@ -6603,7 +8183,7 @@ mod tests {
         let embedder = FixedVecEmbedder(q);
         // min_score above what recency alone earns, so the orthogonal row is
         // NOT a direct hit and has to arrive over the entity link.
-        let resp = search_hits(&conn, &embedder, "who wants ownership", 10, false, false, 0.3, &now).unwrap();
+        let resp = search_hits(&conn, &embedder, "who wants ownership", 10, false, false, 0.3, &now, None).unwrap();
         let d = resp.hits.iter().find(|h| h.id == direct).expect("direct hit");
         let h = resp.hits.iter().find(|h| h.id == hop).expect("hop hit");
         assert!(d.via_assoc.is_none());
@@ -6691,7 +8271,7 @@ mod tests {
         store::insert_relation(&conn, dash, "deployed-to", site, None, Some(0.9), &now).unwrap();
 
         let embedder = FixedVecEmbedder(q);
-        let resp = search_hits(&conn, &embedder, "remosspace.com", 5, false, false, 0.0, &now).unwrap();
+        let resp = search_hits(&conn, &embedder, "remosspace.com", 5, false, false, 0.0, &now, None).unwrap();
         let ones: Vec<&ConnectionHit> = resp.connections.iter().filter(|c| c.hops == 1).collect();
         assert_eq!(ones.len(), 2, "one line per distinct claim: {:?}", ones.iter().map(|c| (&c.src_name, &c.predicate, &c.dst_name)).collect::<Vec<_>>());
         assert_eq!(ones.iter().filter(|c| c.predicate.eq_ignore_ascii_case("deploys-to")).count(), 1);
@@ -6713,7 +8293,7 @@ mod tests {
         store::insert_relation(&conn, user, "intends-to-build", tools, None, Some(0.9), &now).unwrap();
 
         let embedder = FixedVecEmbedder(q);
-        let resp = search_hits(&conn, &embedder, "what runs on the site", 10, false, false, 0.0, &now).unwrap();
+        let resp = search_hits(&conn, &embedder, "what runs on the site", 10, false, false, 0.0, &now, None).unwrap();
         assert_eq!(resp.connections.len(), 2);
 
         let hop1 = &resp.connections[0];
@@ -6740,7 +8320,7 @@ mod tests {
         store::insert_relation(&conn, user, "works-on", umoja, None, Some(0.9), &now).unwrap();
 
         let embedder = FixedVecEmbedder(q);
-        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &now).unwrap();
+        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &now, None).unwrap();
         assert_eq!(resp.connections.len(), 1, "a low-confidence hop-1 edge must not seed a hop-2 walk");
         assert_eq!(resp.connections[0].hops, 1);
     }
@@ -6763,7 +8343,7 @@ mod tests {
         store::insert_relation(&conn, user, "frustrated-by", moses, None, Some(0.9), &now).unwrap();
 
         let embedder = FixedVecEmbedder(q);
-        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &now).unwrap();
+        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &now, None).unwrap();
         assert_eq!(resp.connections.len(), 2, "both direct edges between Moses and user are hop-1 connections");
         assert!(resp.connections.iter().all(|c| c.hops == 1), "neither edge must be re-surfaced as a spurious hop-2 walk");
     }
@@ -6782,7 +8362,7 @@ mod tests {
         }
 
         let embedder = FixedVecEmbedder(q);
-        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &now).unwrap();
+        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &now, None).unwrap();
         // 1 hop-1 edge + at most 2 hop-2 edges through the one neighbor.
         assert_eq!(resp.connections.len(), 3);
         assert_eq!(resp.connections.iter().filter(|c| c.hops == 2).count(), 2);
@@ -6800,7 +8380,7 @@ mod tests {
         }
 
         let embedder = FixedVecEmbedder(q);
-        let resp = search_hits(&conn, &embedder, "who does Moses know", 10, false, false, 0.0, &now).unwrap();
+        let resp = search_hits(&conn, &embedder, "who does Moses know", 10, false, false, 0.0, &now, None).unwrap();
         assert_eq!(resp.connections.len(), 5, "6 direct edges must still cap at the overall limit");
         assert!(resp.connections.iter().all(|c| c.hops == 1), "hop-1 edges fill the cap before any hop-2 walk runs");
     }
@@ -7029,7 +8609,8 @@ mod tests {
         let projects_root = scratch.path.join("projects");
         let recall_root = scratch.path.join("recall-log");
         let now = store::now_rfc3339();
-        let llm = DigestCountingLlm { calls: std::cell::Cell::new(0), facts: "fact one\nfact two" };
+        let llm =
+            DigestCountingLlm { calls: std::cell::Cell::new(0), facts: "STATED: Ivan ships releases on Fridays\nSTATED: Ivan runs Arch Linux locally" };
         let filter = EchoFilter { seen: std::cell::RefCell::new(Vec::new()) };
 
         // 100 raw lines, first checkpoint: everything is new
@@ -7145,13 +8726,13 @@ mod tests {
         let strangler = store::insert(&conn, "strangler pattern", None, None, true, Some(&e.embed("strangler").unwrap()), 5).unwrap();
         let _lonely = store::insert(&conn, "lonely", None, None, true, Some(&e.embed("lonely").unwrap()), 5).unwrap();
 
-        let before = search_hits(&conn, &e, "audit hub endpoints", 5, false, false, 0.5, &now).unwrap();
+        let before = search_hits(&conn, &e, "audit hub endpoints", 5, false, false, 0.5, &now, None).unwrap();
         assert!(before.hits.iter().all(|h| h.via_assoc.is_none()));
         assert!(!before.hits.iter().any(|h| h.id == strangler), "no edge yet: strangler is not near the query");
 
         store::reinforce_assoc(&conn, &[hub, strangler], &now).unwrap();
         store::reinforce_assoc(&conn, &[hub, strangler], &now).unwrap();
-        let after = search_hits(&conn, &e, "audit hub endpoints", 5, false, false, 0.3, &now).unwrap();
+        let after = search_hits(&conn, &e, "audit hub endpoints", 5, false, false, 0.3, &now, None).unwrap();
         let assoc = after.hits.iter().find(|h| h.id == strangler).expect("strangler pulled in by association");
         assert_eq!(assoc.via_assoc, Some(hub));
         let src = after.hits.iter().find(|h| h.id == hub).unwrap();
@@ -7160,6 +8741,46 @@ mod tests {
         assert!(!after.hits.iter().any(|h| h.content.contains("lonely")));
     }
 
+    // --- refresh_one_project ---
+
+    #[test]
+    fn refresh_registers_renames_and_retags_without_touching_other_projects() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        store::insert(&conn, "umoja fact", Some("project-index:umoja"), Some("umoja"), true, None, 5).unwrap();
+        let (_id, _) = store::upsert_project(&conn, "git:abc", "umoja", "/tmp/old-umoja", &now).unwrap();
+
+        // Same fingerprint appears under a new basename.
+        let (renamed, retagged) = refresh_one_project(&conn, "git:abc", "umoja-v2", "/tmp/umoja-v2", None, &now).unwrap();
+        assert!(renamed, "a rename did happen");
+        assert_eq!(retagged, 2, "project column plus source string");
+        let row = store::get_project_by_fingerprint(&conn, "git:abc").unwrap().unwrap();
+        assert_eq!(row.name, "umoja-v2");
+        assert_eq!(row.root_path, "/tmp/umoja-v2");
+    }
+
+    #[test]
+    fn refresh_is_a_no_op_for_an_unchanged_project() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        store::upsert_project(&conn, "git:def", "helios", "/tmp/helios", &now).unwrap();
+        assert_eq!(refresh_one_project(&conn, "git:def", "helios", "/tmp/helios", None, &now).unwrap(), (false, 0));
+    }
+
+    #[test]
+    fn refresh_reports_a_rename_with_zero_memories_as_renamed_not_as_zero_renamed() {
+        // The bug: renamed (bool from `previous.is_some()`) and retagged
+        // (row count from `retag_project`) used to be conflated into one
+        // number, so a project with no memories yet -- a rename with
+        // nothing to retag -- printed "0 renamed" even though a rename DID
+        // happen. The two must be distinguishable.
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        store::upsert_project(&conn, "git:xyz", "old-name", "/tmp/old-name", &now).unwrap();
+        let (renamed, retagged) = refresh_one_project(&conn, "git:xyz", "new-name", "/tmp/new-name", None, &now).unwrap();
+        assert!(renamed, "a rename happened even though there was nothing to retag");
+        assert_eq!(retagged, 0, "no memories existed yet, so nothing was retagged");
+    }
 }
 
 #[cfg(test)]

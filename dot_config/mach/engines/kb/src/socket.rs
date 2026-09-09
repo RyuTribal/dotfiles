@@ -73,6 +73,12 @@ struct Req {
     /// unit for an injection: four one-line preferences and four
     /// paragraph-long facts cost the same four slots.
     budget: Option<usize>,
+    /// The session's project (looked up by name, not similarity -- see
+    /// `cli::project_card_for`), so its card can ride along in the same
+    /// response. `#[serde(default)]` so an older client that omits the key
+    /// still works: it just never gets a project card.
+    #[serde(default)]
+    project: Option<String>,
 }
 
 /// Matches `kb-recall.sh`'s own defaults (`--limit 4 --min-score 0.45`) so a
@@ -111,9 +117,10 @@ fn run_one_search(
     limit: usize,
     min_score: f32,
     budget: Option<usize>,
+    project: Option<&str>,
 ) -> Result<Value, KbError> {
     let now = store::now_rfc3339();
-    let resp = search_hits(conn, embedder, query, limit, false, false, min_score, &now)?;
+    let resp = search_hits(conn, embedder, query, limit, false, false, min_score, &now, project)?;
     let resp = match budget {
         Some(b) => crate::cli::pack_to_budget(resp, b),
         None => resp,
@@ -136,13 +143,14 @@ fn handle_search(req: &Req, conn: &mut Connection, embedder: &OllamaEmbedder) ->
     let limit = req.limit.unwrap_or(DEFAULT_LIMIT);
     let min_score = req.min_score.unwrap_or(DEFAULT_MIN_SCORE);
     let budget = req.budget;
+    let project = req.project.as_deref();
 
-    match run_one_search(conn, embedder, query, limit, min_score, budget) {
+    match run_one_search(conn, embedder, query, limit, min_score, budget, project) {
         Ok(v) => v,
         Err(_first_err) => match store::open() {
             Ok(fresh) => {
                 *conn = fresh;
-                match run_one_search(conn, embedder, query, limit, min_score, budget) {
+                match run_one_search(conn, embedder, query, limit, min_score, budget, project) {
                     Ok(v) => v,
                     Err(e) => json!({"error": e.to_string()}),
                 }
@@ -354,7 +362,7 @@ mod tests {
         store::insert(&conn, "hello world", Some("note:test"), None, true, Some(&emb), 5).unwrap();
 
         let now = store::now_rfc3339();
-        let resp = search_hits(&conn, &fake, "hello world", 4, false, false, 0.0, &now).unwrap();
+        let resp = search_hits(&conn, &fake, "hello world", 4, false, false, 0.0, &now, None).unwrap();
         assert_eq!(resp.hits.len(), 1);
         assert_eq!(resp.hits[0].content, "hello world");
         assert!(resp.hits[0].score > 0.0);

@@ -88,24 +88,71 @@ its contents. Same rule as everywhere in the kb.
 
 ## Re-indexing (updating the map)
 
-Re-run after a major refactor, or whenever recall about the project proves
-stale mid-session (wrong architecture claims, dead paths). Don't re-run on
-a schedule — the session-digest channel keeps incremental drift covered;
-this skill is for the map, and maps get redrawn when the territory
-changes, not weekly.
+The derivable half of the index — layout, manifests, entry points, test
+command, remote — is rebuilt automatically every reflect run by
+`mach kb projects refresh`, with no LLM call. You never re-index that by
+hand.
+
+What this skill refreshes is the interpretive half: architecture,
+invariants, workflows, decisions. Those cannot be recomputed, so they need
+you.
+
+You will be told when. At SessionStart, a project whose index has fallen
+past `PROJECT_DRIFT_COMMITS` commits or `PROJECT_DRIFT_DAYS` days behind
+prints a drift notice. Re-index when you see one, or when recall about the
+project proves stale mid-session (wrong architecture claims, dead paths).
+
+After re-indexing, reset the watermark or the notice will keep firing:
+
+    mach kb projects mark-indexed <project>
+
+If the project's directory is gone for good instead (moved, deleted,
+renamed outside mach's tracking), there is nothing left to re-index — drop
+the registry row so `mach kb health` stops flagging it:
+
+    mach kb projects forget <project>
+
+This only removes the tracking row. Every `project-index:<name>` memory it
+built stays in the bank untouched; `forget` is not the same as deleting the
+index.
+
+Project identity is a fingerprint (`git:<root-commit>`, or `path:<abs>` for
+non-git directories), not the folder name, and the project key is the
+LOWERCASED basename. A rename or a case change is detected on the next
+`mach kb projects refresh` and every `project-index:<name>` memory is
+re-tagged automatically. Before this existed, `~/programming/Expedite`
+tagged its sessions "Expedite" while its 28 index rows sat under
+"expedite", unreachable.
 
 An update is a diff, not a rewrite:
 
-1. Pull the current index:
-   `mach kb search "<project>" --json --limit 25` filtered to
-   `source: project-index:<project>` (plus a targeted search per area that
-   changed).
+1. Enumerate the current index EXHAUSTIVELY. `mach kb search` returns
+   RANKED hits, so it silently shows only the top slice — a re-index driven
+   by search reviews a fraction of the facts and then resets the watermark,
+   which is worse than not re-indexing at all, because the drift notice
+   stops firing over facts nobody read. Query the rows directly instead:
+
+   ```
+   sqlite3 ~/.local/share/mach/kb.db "select id, content from memories
+     where source='project-index:<project>' and invalidated_at is null
+     order by id"
+   ```
+
+   Count the rows first and hold that number: your review must account for
+   every one of them.
 2. Compare each existing fact against present reality.
 3. **Still true** → leave it alone (no re-add — a duplicate wastes a
    dedupe-pass judgment).
 4. **Changed** → add the corrected fact WITHOUT `--no-classify`, so the
    classifier supersedes the stale one (this is the one case where the
    bulk-index flag rule inverts — you WANT the update semantics here).
+   NOT for a fact scoped to a date ("<project> state as of YYYY-MM-DD",
+   "As of YYYY-MM-DD, X was N"): that is history, and superseding it
+   destroys the only record of what was true then. Add the new snapshot
+   with `--no-classify` and its own date, and leave the old one active.
+   An uncommitted working-tree edit is likewise in-progress, not landed —
+   record it as its own fact, never as grounds to supersede a
+   committed-state fact.
 5. **Gone entirely** (component deleted, workflow removed) → supersession
    has nothing new to attach to; state the removal as a fact ("As of
    YYYY-MM-DD, <project> no longer has X; replaced by Y") — a removal is

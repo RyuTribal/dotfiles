@@ -84,6 +84,26 @@ said, save the correction as a memory (`mach kb add`) and the next reflect
 rebuilds the card; never argue from a card against the live user. Inspect
 one with `mach kb entity <name>`, count them with `mach kb graph --stats`.
 
+## Project cards (since 2026-09-09)
+
+Each registered project has a card holding its derivable structure —
+layout, manifests, entry points, test command, remote — rebuilt with no LLM
+call on every reflect run, so it cannot go stale. When a session is in that
+project the card is injected by name, not by similarity, and it competes in
+the same token budget as entity cards.
+
+Interpretive facts (architecture, invariants, workflows) stay ordinary
+memories under `project-index:<name>` and are refreshed by the
+index-project skill when a drift notice fires.
+
+`mach kb projects list` shows every project, its drift state, and whether
+its directory still exists. When a project's directory is gone for good
+(moved, deleted, renamed outside mach's tracking) it shows `[MISSING ON
+DISK]` and keeps failing `mach kb health` with no way to clear on its own;
+`mach kb projects forget <name>` drops that registry row. It only removes
+the tracking entry — every `project-index:<name>` memory stays exactly as
+it is, since those are knowledge, not registry state.
+
 ## Tracing a memory: `mach kb why`
 
 `mach kb why <id>` (or `mach kb why insight <id>`) is the read-only
@@ -127,6 +147,20 @@ with `store::set_occurrence`; it stays NULL when unknown rather than
 defaulting to the write date. A query naming a date or a relative period
 ("yesterday", "last week", "in June") activates a temporal channel that
 matches against those ranges.
+
+Retrieval uses occurrence, and how it uses it matters. A query naming a
+date or a relative phrase ("yesterday", "last week", "in June") is parsed
+to a range by `store::query_date_range`; rows whose occurrence overlaps get
+their topical score MULTIPLIED by `TEMPORAL_BONUS` (0.35), and a date-only
+question with no topical signal falls back to `TEMPORAL_FLOOR` (0.5) so it
+is still answerable.
+
+The date is a constraint, not a relevance signal. It used to be a third
+`max()` channel at weight 0.75, which meant every row from the named day
+scored identically — asking about "yesterday" tied 27 rows and the order
+fell to recency, so a question about one topic yesterday returned four
+arbitrary rows from yesterday. Measured on the 33-question harness:
+82% -> 94% overall, temporal 4/6 -> 6/6, relative-date 3/5 -> 5/5.
 
 ## Retrieval is hybrid (since 2026-09-08)
 
@@ -174,6 +208,19 @@ The recall hook fires on every prompt. Your job per prompt:
    in view** → verify the load-bearing part cheaply, then answer.
    If reality moved on, save the corrected fact (`mach kb add` — the
    classifier will supersede the stale one).
+
+   One exception, and it matters: a memory that scopes itself to a date
+   ("As of 2026-09-07, the bank held 150 memories", "Umoja state as of
+   2026-09-08: ...") is a historical record, not a stale claim. A newer
+   snapshot does not replace it — both are accurate for their own date,
+   and the older one is the only record of what was true then. Write the
+   new snapshot with its own date and let both stand. If a dated snapshot
+   has been tombstoned anyway, `mach kb restore <id>` undoes the
+   supersession (`mach kb list --superseded` shows what is tombstoned).
+   This is not hypothetical: on 2026-09-09 four dated snapshots were
+   superseded that way and the retrieval harness dropped from 26/33 to
+   23/33, with every lost point in the temporal categories; restoring them
+   took it to 27/33.
 4. **Recall is thin or off-target** → investigate normally (explore,
    spelunk, read the project). Afterwards, if you learned durable
    user-facts, save them — that's the "relearning" loop: explore once,
@@ -222,7 +269,13 @@ mach kb add "<fact>" --source "<context>" --project "<project>" --importance 6
 mach kb search "<query>" --json
 ```
 
-Add `--limit N` to control result count. Search is organic by default: an
+Add `--limit N` to control result count, and `--project <name>` to get
+that project's derivable card (layout, remote, branch, manifests, test
+command) alongside the hits — the recall hook passes it automatically for
+the session's project, so you rarely need it by hand. The card costs about
+one hit's worth of the injection budget and is capped so it can never cost
+more, because it exists to replace the derivable-structure memories that
+used to occupy those slots. Search is organic by default: an
 unreviewed row (auto-captured, not yet curated) surfaces right alongside
 everything else, just at a small confidence penalty, so you never have to
 think about review state while searching — pass `--reviewed-only` on the
@@ -236,6 +289,125 @@ on every response, not something you need to ask for separately. Don't
 pass `--touch` here — that reinforces a memory as if it were actually
 recalled and injected as context, and belongs only to the automated recall
 hook, not a manual search you run yourself.
+
+## Hard questions: `mach kb ask` (since 2026-09-09)
+
+```
+mach kb ask "<question>" [--rounds N] [--json] [--verbose]
+```
+
+Iterative agentic recall, for the questions a single ranked pass cannot
+reach: the answer sits two hops away, or the question shares no vocabulary
+with the memory that holds it. A round gathers, then a cheap model judges
+whether what is gathered answers the question. If not it picks the next
+gather — a rewording in the vocabulary a stored fact would actually use, or
+a hop to an entity named in the evidence, reading every memory that
+mentions it. Up to 3 rounds, then one synthesis with `[id]` citations,
+checked against the ids actually sent so an invented citation is dropped.
+
+Costs LLM calls and runs 20-40s, so it is the deliberate path, not the
+reflex. Reach for it after `mach kb search` has come back thin on a
+question you believe the bank should answer — not before it. It is
+deliberately absent from the recall hook and must stay that way: an LLM
+call inside automatic recall would stall every prompt you type.
+
+Worked example — "what are the projects worked on by the person who is my
+boss" resolves in three rounds: search, hop to `Moses`, then a reworded
+search the judge chose itself.
+
+The judge has a fourth move, `TRANSCRIPT: <keywords>`, which full-text
+searches the raw conversation logs rather than the distilled facts. Use
+`ask` (not `search`) when the thing you want was said once in passing, or
+is an exact name, number or phrase that no one would have distilled into a
+memory. Transcript passages come back verbatim and carry no memory id, so
+they are never citable as bank rows and never reach the recall hook.
+
+## The transcript index: `mach kb index-transcripts` (since 2026-09-09)
+
+```
+mach kb index-transcripts [--all]
+```
+
+Builds the index `ask`'s `TRANSCRIPT:` step searches, over
+`~/.claude/projects/**/*.jsonl` (subagent transcripts included). Extracts
+only user and assistant prose — `tool_use`, `tool_result`, thinking blocks,
+hook output and system reminders are all dropped, which is why 962MB of
+transcripts becomes roughly 9.5k passages. Incremental by mtime and size,
+so a re-run costs only changed files (full corpus ~21s cold, ~7s warm);
+`--all` forces a re-read of everything.
+
+Consequence worth knowing: because tool output is not indexed, `ask` cannot
+recover an exact compiler error or command output from a past session. It
+knows what was *said*, not what was *printed*.
+
+Passage search is hybrid (since 2026-09-09): cosine over per-passage
+embeddings fused with normalized BM25 by the same `max()` rule memories
+use. BM25 alone could not answer a paraphrase — "which clip space depth
+convention was confirmed by hand" shares no token with the passage naming
+`GLM_FORCE_DEPTH_ZERO_TO_ONE` — so indexing now embeds each passage. An
+embed failure stores NULL and the passage stays lexically searchable.
+`mach kb index-transcripts --embed-missing` fills in absent embeddings
+without re-reading transcripts, which a plain re-index cannot do (unchanged
+mtime means the file is skipped) and `--all` does only by re-reading 962MB.
+
+`mach kb transcripts "<query>"` searches passages directly. Reach for it
+when you want to know whether retrieval found something or the judge worded
+the query badly — `ask` is two LLM calls deep, so guessing costs minutes.
+
+Measured on eval-ask: 6/12 with transcripts behind a judge verb and BM25
+only, 8/12 as a parallel channel, 9/12 after the question set was
+calibrated, 10/12 with passage embeddings, 11/12 once TRANSCRIPT_LIMIT went
+4 -> 8. Retrieval reaches 12/12; the last failure is synthesis ignoring a
+passage it was given. The limit mattered because a 1500-char passage
+dilutes one specific line: the target passage for the depth-convention
+question ranked 7th of 10 candidates, so a pool of 4 never saw it.
+
+Also filtered out: mach's own chore transcripts. Every card, digest, judge
+and `ask` call runs as `claude -p` and leaves a session file, and those were
+49% of the corpus — phrased in the vocabulary of the knowledge bank, so they
+matched precisely the questions asked *about* the bank.
+
+## When memory maintenance is silently doing nothing
+
+`mach kb health` includes a `thresholds` check, and it exists because the
+same mistake happened three times in one day. Insight dedupe, entity merge
+and memory dedupe each had a similarity threshold set above what this
+embedding space actually produces for real prose (0.90, 0.90 and 0.85
+against real maxima of 0.8767, 0.8453 and 0.8661). All three passes ran
+every three hours, judged nothing, reported zero work and no errors, and
+looked healthy — while insight duplicates grew to 34 rows and entities to
+420.
+
+The check keys on the exact signature: no candidates available AND nothing
+ever recorded in that pass's seen table, while the source table holds
+enough rows to pair. "No candidates, plenty judged" is the healthy steady
+state. "Nothing judged, ever" is a threshold that cannot be met.
+
+Before setting any similarity threshold by intuition, measure the actual
+pairwise maximum in the bank. Prose embeddings do not reach 0.95 the way
+duplicate short strings do.
+
+## Measuring `ask`: `mach kb eval-ask` (since 2026-09-09)
+
+```
+mach kb eval-ask [--file F] [--rounds N] [--json]
+```
+
+The `ask` counterpart to `mach kb eval`. Same discipline — deterministic,
+no LLM judge, real code path, read-only — but graded on substrings rather
+than memory ids, because most of what `ask` should reach is a transcript
+passage and those carry no id. Question set:
+`~/.local/share/mach/eval/ask-questions.jsonl`, where `transcript/*`
+questions have answers that exist ONLY in raw sessions and `memory/*`
+controls check the loop still answers from distilled facts without
+over-reaching for transcripts.
+
+Retrieval and answering score separately, on purpose: a run that gathers
+the right passage then writes around it is a synthesis bug, one that never
+gathers it is a retrieval bug, and the fixes live in different places.
+
+Expect run-to-run variance of roughly one question — the loop makes LLM
+calls, so a single run is not a measurement. Compare two.
 
 ## The association graph — what you associate things with
 

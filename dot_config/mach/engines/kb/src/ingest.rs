@@ -278,8 +278,8 @@ pub fn parse_digest_facts(output: &str) -> Vec<String> {
 
 /// One digest line with its `STATED:`/`INFERRED:`/`EXPERIENCE:` tag
 /// resolved to a `Memory::basis` value, plus any `[when: ...]` occurrence
-/// dates it carried. `basis` is `None` when the model omitted the tag
-/// (older prompt, or a lapse) -- the fact is still kept, just basis-unknown.
+/// dates it carried. `basis` is always set: an untagged line is not a fact
+/// (see `parse_digest_facts_with_basis`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DigestFact {
     pub content: String,
@@ -288,9 +288,66 @@ pub struct DigestFact {
     pub when: Option<(String, String)>,
 }
 
-/// `parse_digest_facts` keeping the basis tag: strips a leading `STATED:`
-/// or `INFERRED:` (case-insensitive, optional surrounding whitespace) and
-/// records which it was. A line that is only a tag is dropped.
+/// Shortest text that can carry a durable fact. Deliberately low: "User
+/// installed RecruitPrisoners mod for Kenshi" is 46 characters and
+/// perfectly good, so this only rules out the obviously empty.
+pub const MIN_FACT_CHARS: usize = 15;
+
+/// Whether a digest line is shaped like a fact at all.
+///
+/// The basis tag stops a conversational REPLY becoming facts, but not a
+/// conversational FRAGMENT that happens to be tagged. The bank holds these,
+/// all from before the tag rule: `---`, `Which?`, `**Changes**`, `Not
+/// committed.`, `- Glass, blur, gradient tokens back.`, and `Best sources
+/// of high-skill recruits:` — a markdown rule, a question, a bold heading,
+/// a bullet, and a heading introducing a list someone else will read.
+///
+/// Shape, not length, is the test. A heading ends in a colon and promises
+/// content that never arrives. A question is the opposite of a fact. A
+/// bullet is a fragment of a list. None of them stand alone months later,
+/// which is the whole contract `DIGEST_INSTRUCTIONS` states.
+pub fn is_fact_shaped(text: &str) -> bool {
+    let t = text.trim();
+    if t.chars().count() < MIN_FACT_CHARS {
+        return false;
+    }
+    // Markdown structure rather than prose.
+    if t.starts_with("---") || t.starts_with("***") || t.starts_with("- ") || t.starts_with("* ") {
+        return false;
+    }
+    // "1. thing" — an item out of a numbered list.
+    let mut cs = t.chars();
+    if cs.next().is_some_and(|c| c.is_ascii_digit()) && t[1..].starts_with(". ") {
+        return false;
+    }
+    // A heading promising a list, or a question.
+    if t.ends_with(':') || t.ends_with('?') {
+        return false;
+    }
+    // Bold-only, e.g. `**Changes**`.
+    if t.starts_with("**") && t.ends_with("**") {
+        return false;
+    }
+    // Needs to be a sentence, not a label. Three words, not four: "He
+    // works nights." is a real fact and "Not committed." is not.
+    t.split_whitespace().count() >= 3
+}
+
+/// `parse_digest_facts` keeping the basis tag: strips a leading `STATED:`,
+/// `INFERRED:` or `EXPERIENCE:` (case-insensitive, optional surrounding
+/// whitespace) and records which it was. A line that is only a tag is
+/// dropped, and so is a line carrying no tag at all.
+///
+/// Requiring the tag is the whole filter. `DIGEST_INSTRUCTIONS` says
+/// "Begin every line with exactly one of three tags", so a reply without
+/// them is not a digest -- it is the model answering conversationally,
+/// and this used to store every line of that answer as a durable fact.
+/// Nine such rows landed on 2026-09-08 from one chatty reply: a
+/// "**Root cause:** ..." heading, numbered list items, and the closing
+/// "Which is your preference ...?" question, all filed as facts about the
+/// user. Shape heuristics (leading "N.", bold, trailing "?") would have
+/// caught those particular nine and leaked the next batch; the tag is a
+/// contract the prompt already states, so hold the reply to it.
 pub fn parse_digest_facts_with_basis(output: &str) -> Vec<DigestFact> {
     output
         .lines()
@@ -298,12 +355,13 @@ pub fn parse_digest_facts_with_basis(output: &str) -> Vec<DigestFact> {
         .filter(|l| !l.is_empty())
         .filter_map(|l| {
             let (content, basis) = strip_basis_tag(l);
+            let basis = basis?; // untagged: not a fact, not the model following the prompt
             let (content, when) = strip_when_tag(content.trim());
             let content = content.trim();
-            if content.is_empty() {
+            if !is_fact_shaped(content) {
                 None
             } else {
-                Some(DigestFact { content: content.to_string(), basis, when })
+                Some(DigestFact { content: content.to_string(), basis: Some(basis), when })
             }
         })
         .collect()
@@ -568,11 +626,62 @@ mod tests {
 
     #[test]
     fn parse_digest_facts_splits_nonblank_trimmed_lines() {
-        let out = "  The user prefers dark mode.  \n\nThe user works on project Zenith.\n";
+        let out = "  STATED: The user prefers dark mode.  \n\nINFERRED: The user works on project Zenith.\n";
         assert_eq!(
             parse_digest_facts(out),
             vec!["The user prefers dark mode.".to_string(), "The user works on project Zenith.".to_string()]
         );
+    }
+
+    /// The digest asks for tagged lines. A reply that ignores that is the
+    /// model talking, not a fact list, and every line of it used to become
+    /// a memory -- this is the 2026-09-08 incident in miniature.
+    /// Every one of these is really in the bank, filed as a durable fact
+    /// about the user before the tag rule existed.
+    #[test]
+    fn a_tagged_fragment_is_still_not_a_fact() {
+        for junk in [
+            "---",
+            "Which?",
+            "**Changes**",
+            "Not committed.",
+            "- Glass, blur, gradient tokens back.",
+            "Best sources of high-skill recruits:",
+            "1. Env flag - mach sets MACH_SUBPROCESS=1",
+        ] {
+            let line = format!("STATED: {}", junk);
+            assert!(parse_digest_facts(&line).is_empty(), "should be rejected: {}", junk);
+        }
+    }
+
+    #[test]
+    fn a_short_but_real_fact_survives() {
+        for good in [
+            "User installed RecruitPrisoners mod for Kenshi",
+            "Uses ThinkPad laptop with Arch Linux",
+            "User works on C++ project called helios",
+        ] {
+            let line = format!("STATED: {}", good);
+            assert_eq!(parse_digest_facts(&line).len(), 1, "should be kept: {}", good);
+        }
+    }
+
+    #[test]
+    fn an_untagged_conversational_reply_yields_no_facts() {
+        let out = "**Root cause:** When mach spawns `claude -p` it inherits the hooks.\n\
+1. **Env flag** -- mach sets MACH_SUBPROCESS=1 and the hooks bail early.\n\
+Which is your preference -- env signal, or a built-in subprocess mode?\n";
+        assert_eq!(parse_digest_facts(out), Vec::<String>::new());
+        assert!(parse_digest_facts_with_basis(out).is_empty());
+    }
+
+    #[test]
+    fn one_untagged_line_among_tagged_ones_is_dropped_not_kept() {
+        let out = "STATED: Ivan ships on Fridays.\nsome stray prose\nINFERRED: He works nights.\n";
+        let facts = parse_digest_facts_with_basis(out);
+        assert_eq!(facts.len(), 2, "the stray line is not a fact");
+        assert_eq!(facts[0].basis, Some("stated"));
+        assert_eq!(facts[1].basis, Some("inferred"));
     }
 
     #[test]
@@ -604,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_digest_facts_with_basis_reads_the_tags_and_tolerates_their_absence() {
+    fn parse_digest_facts_with_basis_reads_the_tags_and_requires_them() {
         let out = "STATED: The user prefers dark mode.\ninferred: The user works nights.\nThe user likes tea.\nINFERRED:\n";
         let facts = parse_digest_facts_with_basis(out);
         assert_eq!(
@@ -612,8 +721,8 @@ mod tests {
             vec![
                 DigestFact { content: "The user prefers dark mode.".into(), basis: Some("stated"), when: None },
                 DigestFact { content: "The user works nights.".into(), basis: Some("inferred"), when: None },
-                DigestFact { content: "The user likes tea.".into(), basis: None, when: None },
-            ]
+            ],
+            "the untagged line and the bare tag are both dropped"
         );
         // the tag never leaks into the content the plain parser returns
         assert_eq!(parse_digest_facts(out)[0], "The user prefers dark mode.");
@@ -678,7 +787,7 @@ mod tests {
         // attributed testimony, not as a standing rule. The mock's reply
         // documents the expected model behavior; parsing it is unchanged,
         // ordinary fact-line splitting.
-        let reframed_reply = "In the 2026-09-07 session, the user asserted that deploys should skip verification.\nThe user prefers dark mode.";
+        let reframed_reply = "STATED: In the 2026-09-07 session, the user asserted that deploys should skip verification.\nSTATED: The user prefers dark mode.";
         let facts = parse_digest_facts(reframed_reply);
         assert_eq!(
             facts,

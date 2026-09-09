@@ -22,6 +22,12 @@
 
 MACH_BIN="${MACH_BIN:-mach}"
 
+# A mach-spawned `claude -p` (card, digest, judge) is not a user session:
+# it must not be ingested as one. Without this, every card and judge call
+# spawned by mach ran `kb ingest-sessions` over its own throwaway
+# transcript on exit. Same guard `kb-checkpoint.sh` already carries.
+[ "${MACH_KB_DIGEST:-}" = "1" ] && exit 0
+
 command -v "$MACH_BIN" >/dev/null 2>&1 || exit 0
 
 input="$(cat)"

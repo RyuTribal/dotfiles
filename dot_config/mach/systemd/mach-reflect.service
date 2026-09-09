@@ -19,6 +19,19 @@ Type=oneshot
 # the reflect pass that follows -- see ingest.rs's own offline discipline
 # for why a degraded run there is always safe to retry later.
 ExecStartPre=-%h/.local/bin/mach kb ingest-sessions
+# Refresh the raw-transcript index (`mach kb ask`'s TRANSCRIPT: step) on the
+# same wakeup. It is incremental by mtime and size, so an unchanged corpus
+# costs a few seconds of stat calls and only new or grown transcripts are
+# re-read. Without this the index only advances when someone runs the
+# command by hand, and a stale index makes `ask` quietly answer from an
+# older conversation history than the one on disk. `-` for the same reason
+# as above: never fail or block the reflect pass.
+ExecStartPre=-%h/.local/bin/mach kb index-transcripts
+# Project registry: rename and case detection, card rebuilds, drift
+# recomputation. No LLM call, so it is safe on every wakeup, and it is what
+# keeps a renamed project's index from being orphaned until someone
+# notices. `-` for the same reason as the steps above: never block reflect.
+ExecStartPre=-%h/.local/bin/mach kb projects refresh
 # Catch-up path for `mach meet process`: normally it runs as a detached
 # background spawn from `mach meet stop` (see cli.rs's spawn_detached_process),
 # but a meeting recorded (and stopped) while offline can leave its

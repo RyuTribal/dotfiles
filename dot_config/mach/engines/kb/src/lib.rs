@@ -23,6 +23,7 @@
 //! Embeddings come from Ollama's HTTP API (`nomic-embed-text`, 768 dims).
 //! `embed` wraps that call behind an `Embedder` trait so store/search logic
 //! can be tested with a fake embedder that never touches the network.
+pub mod ask;
 pub mod classify;
 pub mod cli;
 pub mod embed;
@@ -32,8 +33,10 @@ pub mod health;
 pub mod improve;
 pub mod ingest;
 pub mod note;
+pub mod projects;
 pub mod reflect;
 pub mod socket;
 pub mod store;
+pub mod transcripts;
 
 pub use store::{KbError, Memory};

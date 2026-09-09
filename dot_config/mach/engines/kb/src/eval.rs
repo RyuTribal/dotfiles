@@ -43,6 +43,12 @@ pub struct Question {
     /// recall serves the stale fact alongside the fresh one.
     #[serde(default)]
     pub forbid: Vec<i64>,
+    /// Session project, exercising the in-project recall path (project
+    /// card + project-scoped hits) the same way a real in-project prompt
+    /// would. Absent means `None`, exactly as before this field existed --
+    /// every question without it keeps its current meaning and score.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 impl Question {
@@ -165,7 +171,7 @@ mod tests {
     use super::*;
 
     fn q(expect: Vec<i64>, forbid: Vec<i64>) -> Question {
-        Question { id: "q".into(), category: "c".into(), query: "why".into(), expect, forbid }
+        Question { id: "q".into(), category: "c".into(), query: "why".into(), expect, forbid, project: None }
     }
 
     #[test]
@@ -217,5 +223,145 @@ mod tests {
         assert!(parse_questions("{not json}").is_err());
         assert!(parse_questions("").is_err(), "an empty set would score a meaningless 0/0");
         assert!(parse_questions("{\"id\":\"q\",\"category\":\"c\",\"query\":\"  \"}").is_err());
+    }
+
+    #[test]
+    fn parse_questions_round_trips_an_optional_project_field() {
+        let content = "{\"id\":\"q1\",\"category\":\"extraction\",\"query\":\"where\",\"expect\":[85],\"project\":\"umoja\"}\n{\"id\":\"q2\",\"category\":\"abstention\",\"query\":\"huh\"}\n";
+        let qs = parse_questions(content).unwrap();
+        assert_eq!(qs.len(), 2);
+        assert_eq!(qs[0].project, Some("umoja".to_string()), "a present project field must round-trip to Some");
+        assert_eq!(qs[1].project, None, "an absent project field must stay None, exactly as before this field existed");
+    }
+}
+
+// --- ask evaluation: does iterative recall reach what one-shot cannot? ---
+
+/// One `mach kb eval-ask` question.
+///
+/// Scored on substrings rather than memory ids, because the thing being
+/// graded is whether the loop *reached the material* -- and that material
+/// is usually a transcript passage, which has no id by design. `expect_any`
+/// holds distinctive literals from the source text; a run passes retrieval
+/// when the gathered pool contains one of them.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct AskQuestion {
+    pub id: String,
+    pub category: String,
+    pub query: String,
+    /// Distinctive literals; any one is a hit (case-insensitive).
+    pub expect_any: Vec<String>,
+    /// When true the bank genuinely lacks the answer and the run should say
+    /// so rather than assemble something.
+    #[serde(default)]
+    pub unanswerable: bool,
+}
+
+/// How one question scored.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AskResult {
+    pub id: String,
+    pub category: String,
+    /// The gathered pool contained the material.
+    pub retrieved: bool,
+    /// The final answer actually used it.
+    pub answered: bool,
+    pub rounds: usize,
+    pub used_transcript: bool,
+    pub passed: bool,
+}
+
+fn contains_any(haystack: &str, needles: &[String]) -> bool {
+    let h = haystack.to_lowercase();
+    needles.iter().any(|n| h.contains(&n.to_lowercase()))
+}
+
+/// Scores one ask run.
+///
+/// `pool` is everything gathered (memories plus transcript passages),
+/// `answer` the synthesis. Retrieval and answering are reported separately
+/// on purpose: a loop that finds the passage and then writes an answer that
+/// ignores it is a different failure from one that never finds it, and the
+/// fixes are in different places.
+pub fn score_ask(q: &AskQuestion, pool: &str, answer: &str, rounds: usize, used_transcript: bool) -> AskResult {
+    let retrieved = contains_any(pool, &q.expect_any);
+    let answered = contains_any(answer, &q.expect_any);
+    let passed = if q.unanswerable {
+        // For an unanswerable question the only pass is not claiming the
+        // material: retrieval may still surface neighbours, and that is fine.
+        !answered
+    } else {
+        answered
+    };
+    AskResult { id: q.id.clone(), category: q.category.clone(), retrieved, answered, rounds, used_transcript, passed }
+}
+
+/// Parses the ask question set (one JSON object per line).
+pub fn parse_ask_questions(content: &str) -> Result<Vec<AskQuestion>, KbError> {
+    let mut out = Vec::new();
+    for (i, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        let q: AskQuestion = serde_json::from_str(line)
+            .map_err(|e| KbError::Other(format!("ask question set line {}: {}", i + 1, e)))?;
+        out.push(q);
+    }
+    Ok(out)
+}
+
+/// Default location of the ask question set.
+pub const DEFAULT_ASK_QUESTIONS_PATH: &str = ".local/share/mach/eval/ask-questions.jsonl";
+
+#[cfg(test)]
+mod ask_tests {
+    use super::*;
+
+    fn q(unanswerable: bool) -> AskQuestion {
+        AskQuestion {
+            id: "a1".into(),
+            category: "transcript".into(),
+            query: "what did we decide".into(),
+            expect_any: vec!["Alpha-5".into()],
+            unanswerable,
+        }
+    }
+
+    #[test]
+    fn retrieval_and_answering_are_scored_separately() {
+        let r = score_ask(&q(false), "passage mentioning alpha-5 support", "the answer avoids it", 2, true);
+        assert!(r.retrieved, "the pool held the material");
+        assert!(!r.answered, "the synthesis did not use it");
+        assert!(!r.passed, "finding it and then ignoring it is not a pass");
+    }
+
+    #[test]
+    fn a_question_passes_when_the_answer_carries_the_material() {
+        let r = score_ask(&q(false), "pool with Alpha-5", "we chose Alpha-5 TLE support", 1, false);
+        assert!(r.retrieved && r.answered && r.passed);
+    }
+
+    #[test]
+    fn an_unanswerable_question_passes_only_by_not_claiming_it() {
+        let honest = score_ask(&q(true), "unrelated pool", "the bank does not hold that", 3, true);
+        assert!(honest.passed);
+        let confabulated = score_ask(&q(true), "unrelated pool", "we decided on Alpha-5", 3, true);
+        assert!(!confabulated.passed, "inventing the material is the failure this catches");
+    }
+
+    #[test]
+    fn matching_ignores_case() {
+        let r = score_ask(&q(false), "POOL WITH ALPHA-5", "ALPHA-5 it is", 1, false);
+        assert!(r.retrieved && r.answered);
+    }
+
+    #[test]
+    fn parse_ask_questions_skips_blanks_and_comments_and_rejects_bad_lines() {
+        let good = r#"{"id":"a1","category":"transcript","query":"q","expect_any":["x"]}"#;
+        let parsed = parse_ask_questions(&format!("// note\n\n{}\n", good)).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert!(!parsed[0].unanswerable, "defaults to answerable");
+        assert!(parse_ask_questions("{not json}").is_err());
     }
 }

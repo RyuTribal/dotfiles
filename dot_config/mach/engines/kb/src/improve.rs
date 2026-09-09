@@ -822,8 +822,17 @@ impl Outcome {
 /// most-recent failures. `recent_failed` is newest-first.
 pub fn health_ok(hours_since_completion: Option<f64>, recent_failed: &[bool]) -> bool {
     let fresh = matches!(hours_since_completion, Some(h) if h <= STALE_WARN_HOURS);
-    let streak = recent_failed.iter().take(HEALTH_FAIL_STREAK).filter(|f| **f).count();
-    fresh && streak < HEALTH_FAIL_STREAK
+    fresh && failure_streak(recent_failed) < HEALTH_FAIL_STREAK
+}
+
+/// Consecutive failures counting back from the newest run.
+///
+/// `take_while`, not `filter`: the doc above says consecutive and the
+/// threshold is a three-strikes rule, but this counted every failure in the
+/// window, so one success between two failures still read as a streak of
+/// two. A run that succeeded is evidence the pass works, and it resets.
+pub fn failure_streak(recent_failed: &[bool]) -> usize {
+    recent_failed.iter().take(HEALTH_FAIL_STREAK).take_while(|f| **f).count()
 }
 
 /// Whether a memory is one of this pass's outcome records that was a failure.

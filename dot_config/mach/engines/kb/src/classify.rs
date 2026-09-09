@@ -140,6 +140,20 @@ pub fn run_claude(claude_bin: &str, model: &str, timeout: Duration, prompt: &str
         .arg("none")
         .arg("--disallowedTools")
         .arg("Bash Edit Write NotebookEdit WebFetch WebSearch Agent")
+        // No MCP servers. Every tool is already disallowed above, so a
+        // spawned call can never reach one, yet the CLI still connects each
+        // configured server on startup. Measured over interleaved pairs this
+        // buys no wall time (server connect overlaps model latency) but
+        // halves client CPU per call, ~3.1s to ~1.5s user. Kept for the
+        // isolation as much as the CPU: a chore subprocess has no business
+        // holding connections to Asana, Blender or a browser.
+        .arg("--strict-mcp-config")
+        .arg("--mcp-config")
+        .arg("{\"mcpServers\":{}}")
+        // Read by the kb hooks (kb-recall, kb-model, kb-capture,
+        // kb-checkpoint, kb-decision, kb-pretool-recall), which all exit
+        // early on it: a chore subprocess must not be handed recalled
+        // memories, and must not be ingested as if it were a user session.
         .env("MACH_KB_DIGEST", "1");
     run_with_stdin(cmd, timeout, prompt)
 }
@@ -150,12 +164,24 @@ pub fn run_claude(claude_bin: &str, model: &str, timeout: Duration, prompt: &str
 /// whose agentic `claude -p` needs a different flag set (an allowlist of
 /// file-editing tools instead of a denylist) but the same stdin/timeout
 /// discipline.
+/// The last `n` non-blank lines of `text`, joined with " | ". Keeps a
+/// failure message to one line while preserving the part of a stderr dump
+/// that actually says what went wrong (which is the end of it).
+pub fn last_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join(" | ")
+}
+
 pub fn run_with_stdin(mut cmd: Command, timeout: Duration, prompt: &str) -> Result<String, String> {
     let program = cmd.get_program().to_string_lossy().into_owned();
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // Piped, not null: a failed unattended run used to leave only
+        // "exited with Some(1)" behind, which names the failure without
+        // saying anything about it.
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to spawn '{}': {}", program, e))?;
 
@@ -174,10 +200,23 @@ pub fn run_with_stdin(mut cmd: Command, timeout: Duration, prompt: &str) -> Resu
                 if let Some(mut stdout) = child.stdout.take() {
                     let _ = stdout.read_to_string(&mut out);
                 }
+                let mut err = String::new();
+                if let Some(mut stderr) = child.stderr.take() {
+                    let _ = stderr.read_to_string(&mut err);
+                }
                 return if status.success() {
                     Ok(out)
                 } else {
-                    Err(format!("'{}' exited with {:?}", program, status.code()))
+                    // Include stderr: "exited with Some(1)" names the
+                    // failure without saying anything about it, and that is
+                    // exactly what an unattended timer run leaves behind to
+                    // debug from.
+                    let tail = last_lines(&err, 3);
+                    if tail.is_empty() {
+                        Err(format!("'{}' exited with {:?} (no stderr)", program, status.code()))
+                    } else {
+                        Err(format!("'{}' exited with {:?}: {}", program, status.code(), tail))
+                    }
                 };
             }
             Ok(None) => {
@@ -261,5 +300,18 @@ mod tests {
         assert!(prompt.contains("new fact text"));
         assert!(prompt.contains("#3: old fact text"));
         assert!(prompt.contains("NOOP"));
+    }
+}
+
+#[cfg(test)]
+mod stderr_tests {
+    use super::last_lines;
+
+    #[test]
+    fn last_lines_keeps_the_informative_tail() {
+        assert_eq!(last_lines("a\nb\nc\nd", 2), "c | d");
+        assert_eq!(last_lines("only", 3), "only");
+        assert_eq!(last_lines("  \n\n", 3), "", "blank stderr yields nothing to report");
+        assert_eq!(last_lines("x\n\n  y  \n", 5), "x | y");
     }
 }

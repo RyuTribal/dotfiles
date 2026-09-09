@@ -75,10 +75,10 @@ def project_name(cwd):
     return base
 
 
-def search(query):
-    resp = search_via_socket(query)
+def search(query, project=None):
+    resp = search_via_socket(query, project)
     if resp is None:
-        resp = search_via_subprocess(query)
+        resp = search_via_subprocess(query, project)
     return resp
 
 
@@ -88,11 +88,15 @@ def merge_responses(primary, secondary):
     `id` space). Either side may be None."""
     if not primary and not secondary:
         return None
-    out = {"hits": [], "connections": [], "cards": []}
+    out = {"hits": [], "connections": [], "cards": [], "project_card": None}
     seen_ids, seen_text, seen_conn, seen_cards = set(), set(), set(), set()
     for resp in (primary, secondary):
         if not resp:
             continue
+        if out["project_card"] is None:
+            pc = resp.get("project_card")
+            if isinstance(pc, str) and pc.strip():
+                out["project_card"] = pc
         for h in resp.get("hits") or []:
             if not isinstance(h, dict):
                 continue
@@ -128,7 +132,7 @@ def _valid_response(data):
     return data if isinstance(data, dict) and isinstance(data.get("hits"), list) else None
 
 
-def search_via_socket(query):
+def search_via_socket(query, project=None):
     """machd's kb socket subsystem (engines/kb/src/socket.rs) keeps a warm
     db connection + a warm ollama HTTP agent alive. Tried first; ANY failure
     (daemon down, socket missing, timeout, error response) returns None and
@@ -140,13 +144,19 @@ def search_via_socket(query):
     try:
         if not os.path.exists(sock_path):
             return None
-        req = json.dumps({
+        payload = {
             "op": "search",
             "query": query,
             "limit": SEARCH_LIMIT,
             "min_score": SCORE_THRESHOLD,
             "budget": TOKEN_BUDGET,
-        }) + "\n"
+        }
+        # Omit rather than send "" — project_name() returns "" for the home
+        # directory (no project), and an empty string is not a project; the
+        # Rust side treats the key's absence and `None` the same way.
+        if project:
+            payload["project"] = project
+        req = json.dumps(payload) + "\n"
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(SOCKET_TIMEOUT)
         s.connect(sock_path)
@@ -164,13 +174,19 @@ def search_via_socket(query):
         return None
 
 
-def search_via_subprocess(query):
+def search_via_subprocess(query, project=None):
+    argv = [MACH_BIN, "kb", "search", query,
+            "--limit", str(SEARCH_LIMIT), "--json",
+            "--min-score", str(SCORE_THRESHOLD),
+            "--budget", str(TOKEN_BUDGET)]
+    # Same reasoning as search_via_socket: omit rather than send "" --
+    # project_name() returns "" for the home directory (no project), and an
+    # empty string is not a project.
+    if project:
+        argv += ["--project", project]
     try:
         proc = subprocess.run(
-            [MACH_BIN, "kb", "search", query,
-             "--limit", str(SEARCH_LIMIT), "--json",
-             "--min-score", str(SCORE_THRESHOLD),
-             "--budget", str(TOKEN_BUDGET)],
+            argv,
             capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT,
         )
     except Exception:
@@ -270,6 +286,23 @@ def suppressed_cards(log_path):
     can inject, so repeating it every prompt about the same entity is the
     most expensive kind of waste."""
     return {k for k in _suppressed_field(log_path, "cards") if isinstance(k, str)}
+
+
+def project_card_text(resp):
+    """Extract the session's project card from a search response, or None.
+    It arrives as an Option<String> on the wire (engines/kb/src/socket.rs
+    marks it `skip_serializing_if = "Option::is_none"`), so it is ABSENT
+    from the response rather than null when the session's project has no
+    card yet -- but treat a missing key, a null, and a blank/whitespace
+    string identically as "no card" rather than trusting the key's mere
+    presence."""
+    if not isinstance(resp, dict):
+        return None
+    card = resp.get("project_card")
+    if not isinstance(card, str):
+        return None
+    card = card.strip()
+    return card or None
 
 
 def card_lines(card):
@@ -374,19 +407,19 @@ def main():
     if not prompt or len(prompt) < MIN_PROMPT_LEN or prompt.startswith("/"):
         return
 
-    resp = search(prompt)
+    project = project_name(cwd)
+    resp = search(prompt, project)
     # Query expansion: the same prompt anchored to the project the session
     # runs in, so "fix the tutorial drift" inside ~/programming/umoja also
     # pulls Umoja-specific memories the bare prompt does not embed near.
-    project = project_name(cwd)
     if project and project.lower() not in prompt.lower():
-        resp = merge_responses(resp, search("{} {}".format(project, prompt)))
+        resp = merge_responses(resp, search("{} {}".format(project, prompt), project))
     if not resp:
         return
     hits = resp.get("hits") or []
     connections = resp.get("connections") or []
     cards = resp.get("cards") or []
-    if not hits and not connections and not cards:
+    if not hits and not connections and not cards and not project_card_text(resp):
         return
 
     log_path = os.path.join(RECALL_LOG_DIR, session_id + ".jsonl") if session_id else ""
@@ -467,6 +500,19 @@ def main():
             continue
         connection_lines.append(line)
         conn_keys.append(key)
+
+    # Project card: the session's own project, rebuilt with no LLM call on
+    # every reflect run (see `mach kb projects refresh`), so it is the
+    # cheapest orientation in this injection and never stale. Rendered
+    # first, ahead of even the entity cards — it is deterministic structure
+    # about where the session already is, not something reflection derived
+    # from what the prompt named.
+    project_card = project_card_text(resp)
+    if project_card:
+        print("Derivable structure of this project (rebuilt automatically, never stale):")
+        for l in project_card.splitlines():
+            print(l)
+        print()
 
     # Entity cards: `mach kb reflect`'s consolidated profile of something
     # this prompt named — a person, project, practice or tool. Rendered

@@ -75,10 +75,18 @@ fn build_prompt(new_fact: &str, similar: &[(i64, String)]) -> String {
     }
     s.push_str(
         "\nReply with exactly one line and no other text: ADD, UPDATE <id>, SUPERSEDE <id>, or NOOP.\n\
-         UPDATE <id> — the new fact refines or corrects memory <id> about the same thing (keep both, as history).\n\
+         UPDATE <id> — the new fact refines memory <id> about the same thing (keep both, as history).\n\
          SUPERSEDE <id> — the new fact replaces memory <id>, which is now obsolete or contradicted.\n\
          NOOP — the new fact is a duplicate that adds nothing.\n\
-         ADD — the new fact is genuinely new information.\n",
+         ADD — the new fact is genuinely new information.\n\
+         \n\
+         SUPERSEDE only when the new fact gives a different value for the same attribute of the \
+         same subject, so the old statement is now false.\n\
+         Two facts about the same project or person but different attributes (for example a \
+         colour decision and a font decision) are ADD, not SUPERSEDE.\n\
+         A fact anchored to a date or period (\"on 2026-09-07\", \"as of 2026-09-09\", \"shipped \
+         2026-08-31\") is history: never SUPERSEDE it; use ADD.\n\
+         When unsure, ADD.\n",
     );
     s
 }
@@ -300,6 +308,30 @@ mod tests {
         assert!(prompt.contains("new fact text"));
         assert!(prompt.contains("#3: old fact text"));
         assert!(prompt.contains("NOOP"));
+    }
+
+    #[test]
+    fn build_prompt_contains_different_attribute_rule() {
+        let prompt = build_prompt("new fact text", &[(3, "old fact text".to_string())]);
+        assert!(prompt.contains(
+            "Two facts about the same project or person but different attributes (for example a \
+             colour decision and a font decision) are ADD, not SUPERSEDE."
+        ));
+    }
+
+    #[test]
+    fn build_prompt_contains_dated_fact_rule() {
+        let prompt = build_prompt("new fact text", &[(3, "old fact text".to_string())]);
+        assert!(prompt.contains(
+            "A fact anchored to a date or period (\"on 2026-09-07\", \"as of 2026-09-09\", \
+             \"shipped 2026-08-31\") is history: never SUPERSEDE it; use ADD."
+        ));
+    }
+
+    #[test]
+    fn build_prompt_contains_when_unsure_rule() {
+        let prompt = build_prompt("new fact text", &[(3, "old fact text".to_string())]);
+        assert!(prompt.contains("When unsure, ADD."));
     }
 }
 

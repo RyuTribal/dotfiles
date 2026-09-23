@@ -49,6 +49,18 @@ pub struct Question {
     /// every question without it keeps its current meaning and score.
     #[serde(default)]
     pub project: Option<String>,
+    /// `YYYY-MM-DD` anchor for relative-date terms in `query` ("yesterday",
+    /// "last week", "in august"), threaded to `search_hits`/`search_hybrid`
+    /// as `date_anchor` and used ONLY for `store::query_date_range` -- it
+    /// never touches recency or strength scoring. Without this a
+    /// `temporal_relative` question rots: it was written against the date
+    /// it was authored, and "yesterday" silently starts meaning a different
+    /// calendar day every time the harness runs on a later date. Absent
+    /// means `None`, exactly as before this field existed -- every question
+    /// without it resolves relative dates against the real today, same as
+    /// always.
+    #[serde(default)]
+    pub as_of: Option<String>,
 }
 
 impl Question {
@@ -98,6 +110,44 @@ pub struct QuestionResult {
     /// answer, so a recall change that buys accuracy by injecting twice as
     /// much is visible rather than hidden.
     pub chars: usize,
+}
+
+/// Longest `superseded_by` chain `resolve_expect` follows before giving up
+/// -- a guard against a cycle, far above any real merge depth.
+const MAX_SUPERSESSION_HOPS: usize = 32;
+
+/// Rewrites `q.expect` so each id is the row that now carries its fact:
+/// dedupe and the contradiction patrol merge rows into a winner and
+/// tombstone the loser, so an id pinned when the question was written
+/// stops being injectable and the question fails even though recall
+/// serves the same fact under the winner's id. `successor(id)` returns a
+/// row's `superseded_by`. `forbid` is left as written: those ids name the
+/// stale row on purpose.
+///
+/// Also returns every `(original, resolved)` pair where the chain actually
+/// moved the id somewhere else -- silent otherwise, since most questions'
+/// ids never get superseded. `mach kb eval --verbose` reports these so a
+/// drop in pass rate can be told apart from "the question set's ids quietly
+/// drifted out from under it" rather than a real retrieval regression.
+pub fn resolve_expect(q: &Question, successor: impl Fn(i64) -> Option<i64>) -> (Question, Vec<(i64, i64)>) {
+    let mut expect: Vec<i64> = Vec::new();
+    let mut remapped: Vec<(i64, i64)> = Vec::new();
+    for &id in &q.expect {
+        let mut cur = id;
+        for _ in 0..MAX_SUPERSESSION_HOPS {
+            match successor(cur) {
+                Some(next) if next != cur => cur = next,
+                _ => break,
+            }
+        }
+        if cur != id {
+            remapped.push((id, cur));
+        }
+        if !expect.contains(&cur) {
+            expect.push(cur);
+        }
+    }
+    (Question { expect, ..q.clone() }, remapped)
 }
 
 /// Scores one question against what recall injected. `injected` must be
@@ -171,7 +221,50 @@ mod tests {
     use super::*;
 
     fn q(expect: Vec<i64>, forbid: Vec<i64>) -> Question {
-        Question { id: "q".into(), category: "c".into(), query: "why".into(), expect, forbid, project: None }
+        Question { id: "q".into(), category: "c".into(), query: "why".into(), expect, forbid, project: None, as_of: None }
+    }
+
+    #[test]
+    fn resolve_expect_follows_supersession_chain_to_the_live_row() {
+        // 10 merged into 20, 20 later merged into 30; 40 untouched.
+        let successor = |id: i64| match id {
+            10 => Some(20),
+            20 => Some(30),
+            _ => None,
+        };
+        let (r, remapped) = resolve_expect(&q(vec![10, 40], vec![5]), successor);
+        assert_eq!(r.expect, vec![30, 40]);
+        assert_eq!(r.forbid, vec![5], "forbid ids are deliberate stale rows and stay as written");
+        assert_eq!(remapped, vec![(10, 30)], "only the id that actually moved is reported, not the untouched one");
+    }
+
+    #[test]
+    fn resolve_expect_dedupes_ids_that_merged_into_the_same_row() {
+        let successor = |id: i64| if id == 1 || id == 2 { Some(3) } else { None };
+        let (r, remapped) = resolve_expect(&q(vec![1, 2, 3], vec![]), successor);
+        assert_eq!(r.expect, vec![3]);
+        assert_eq!(remapped, vec![(1, 3), (2, 3)], "each remapped original is reported even into a shared target");
+    }
+
+    #[test]
+    fn resolve_expect_terminates_on_a_supersession_cycle() {
+        let successor = |id: i64| Some(if id == 1 { 2 } else { 1 });
+        let (r, _remapped) = resolve_expect(&q(vec![1], vec![]), successor);
+        assert_eq!(r.expect.len(), 1);
+    }
+
+    #[test]
+    fn resolve_expect_keeps_abstention_questions_empty() {
+        let (r, remapped) = resolve_expect(&q(vec![], vec![]), |_| Some(99));
+        assert!(r.is_abstention());
+        assert!(remapped.is_empty(), "an abstention question has no ids to remap");
+    }
+
+    #[test]
+    fn resolve_expect_reports_no_remaps_when_nothing_moved() {
+        let (r, remapped) = resolve_expect(&q(vec![7, 8], vec![]), |_| None);
+        assert_eq!(r.expect, vec![7, 8]);
+        assert!(remapped.is_empty(), "untouched ids must not be reported as remapped");
     }
 
     #[test]
@@ -232,6 +325,15 @@ mod tests {
         assert_eq!(qs.len(), 2);
         assert_eq!(qs[0].project, Some("umoja".to_string()), "a present project field must round-trip to Some");
         assert_eq!(qs[1].project, None, "an absent project field must stay None, exactly as before this field existed");
+    }
+
+    #[test]
+    fn parse_questions_round_trips_an_optional_as_of_field() {
+        let content = "{\"id\":\"q1\",\"category\":\"temporal_relative\",\"query\":\"yesterday\",\"expect\":[85],\"as_of\":\"2026-09-09\"}\n{\"id\":\"q2\",\"category\":\"abstention\",\"query\":\"huh\"}\n";
+        let qs = parse_questions(content).unwrap();
+        assert_eq!(qs.len(), 2);
+        assert_eq!(qs[0].as_of, Some("2026-09-09".to_string()), "a present as_of field must round-trip to Some");
+        assert_eq!(qs[1].as_of, None, "an absent as_of field must stay None, exactly as before this field existed");
     }
 }
 

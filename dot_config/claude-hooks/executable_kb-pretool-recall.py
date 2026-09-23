@@ -21,7 +21,12 @@ exploration and would only add latency with nothing to warn about.
 
 Reuses kb-recall.py's search, formatting, session dedupe window and recall
 log, so engagement-gated reinforcement sees these injections exactly like
-prompt-time ones.
+prompt-time ones. Memory hits keep that sliding window (`suppressed_ids`,
+`DEDUPE_WINDOW`); an entity card or the project card is different — the
+longest single thing recall can inject, so once one has appeared anywhere
+in the session's recall log (a prompt line or an earlier pretool line) it
+is never injected again by this hook (`session_seen_cards`, unbounded,
+unlike the memory-hit window).
 
 Contract: never blocks a tool call. Every failure path is silent exit 0.
 """
@@ -152,22 +157,36 @@ def main():
         return
     tool_name = data.get("tool_name") or ""
     session_id = data.get("session_id") or ""
-    query = build_query(tool_name, data.get("tool_input"), data.get("cwd") or "")
+    cwd = data.get("cwd") or ""
+    query = build_query(tool_name, data.get("tool_input"), cwd)
     if len(query) < kb_recall.MIN_PROMPT_LEN:
         return
 
-    resp = kb_recall.search_via_socket(query)
+    # project_name() (the basename) stays the fallback label folded into
+    # the query text by build_query() above; `cwd` itself now also rides
+    # along on the search call so the Rust side can resolve the actual
+    # session project against the `projects` registry (see kb-recall.py's
+    # own main() for the same split).
+    project = project_name(cwd)
+    resp = kb_recall.search_via_socket(query, project, cwd)
     if resp is None:
-        resp = kb_recall.search_via_subprocess(query)
+        resp = kb_recall.search_via_subprocess(query, project, cwd)
     if not resp:
         return
     hits = resp.get("hits") or []
     cards = resp.get("cards") or []
-    if not hits and not cards:
+    project_card = kb_recall.project_card_text(resp)
+    if not hits and not cards and not project_card:
         return
 
     log_path = os.path.join(kb_recall.RECALL_LOG_DIR, session_id + ".jsonl") if session_id else ""
     suppressed = kb_recall.suppressed_ids(log_path)
+    # Unbounded "ever shown this session" check for cards (entity cards and
+    # the project card) — unlike suppressed (memory hits), which keeps its
+    # sliding DEDUPE_WINDOW. A card already logged by ANY earlier line of
+    # this session's recall log, prompt or pretool, is never re-injected
+    # here.
+    seen_cards = kb_recall.session_seen_cards(log_path)
 
     lines, ids, scores = [], [], {}
     for h in hits:
@@ -207,11 +226,23 @@ def main():
                     round(float(h.get("strength") or 0), 3),
                     round(score, 3),
                 ] + ([via] if isinstance(via, int) else [])
+    card_keys = []
     for card in cards:
-        if isinstance(card, dict):
-            rendered = kb_recall.card_lines(card)
-            if rendered:
-                lines = rendered + lines
+        if not isinstance(card, dict):
+            continue
+        name = (card.get("entity") or "").strip()
+        if not name or name in seen_cards:
+            continue
+        rendered = kb_recall.card_lines(card)
+        if not rendered:
+            continue
+        lines = rendered + lines
+        card_keys.append(name)
+
+    if project_card and kb_recall.PROJECT_CARD_KEY not in seen_cards:
+        rendered = ["- Project:"] + ["  " + l.strip() for l in project_card.splitlines() if l.strip()]
+        lines = rendered + lines
+        card_keys.append(kb_recall.PROJECT_CARD_KEY)
 
     if not lines:
         return
@@ -233,13 +264,24 @@ def main():
         }
     }))
 
-    if session_id and ids:
+    # Logged whenever there are memory ids (existing behavior) OR card_keys
+    # (new): a card-only injection (no scored memory hit — e.g. a fresh
+    # project card with nothing else above threshold) must still be
+    # recorded, or session_seen_cards would never see it and this hook
+    # would keep re-injecting the same card forever.
+    if session_id and (ids or card_keys):
         try:
             os.makedirs(kb_recall.RECALL_LOG_DIR, exist_ok=True)
             import datetime
             ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            entry = {"ts": ts, "via": "pretool:" + tool_name}
+            if ids:
+                entry["ids"] = ids
+                entry["scores"] = scores
+            if card_keys:
+                entry["cards"] = card_keys
             with open(log_path, "a") as f:
-                f.write(json.dumps({"ts": ts, "ids": ids, "scores": scores, "via": "pretool:" + tool_name}) + "\n")
+                f.write(json.dumps(entry) + "\n")
         except Exception:
             pass
 

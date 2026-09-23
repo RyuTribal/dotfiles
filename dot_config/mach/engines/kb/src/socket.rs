@@ -79,6 +79,15 @@ struct Req {
     /// still works: it just never gets a project card.
     #[serde(default)]
     project: Option<String>,
+    /// The session's working directory. When it resolves against the
+    /// `projects` registry (`store::project_for_path`), that match wins
+    /// over `project` as the session project for both the card and
+    /// `cli::search_hits`'s other-project down-weighting -- see that
+    /// function's own doc comment. `#[serde(default)]` keeps this
+    /// backward compatible: an older client that omits the key gets
+    /// exactly today's `project`-only behavior.
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 /// Matches `kb-recall.sh`'s own defaults (`--limit 4 --min-score 0.45`) so a
@@ -110,6 +119,7 @@ pub fn socket_path() -> PathBuf {
 
 /// One search request, using the shared `cli::search_hits` merge so the
 /// response shape matches `mach kb search --json` exactly.
+#[allow(clippy::too_many_arguments)]
 fn run_one_search(
     conn: &Connection,
     embedder: &OllamaEmbedder,
@@ -118,9 +128,10 @@ fn run_one_search(
     min_score: f32,
     budget: Option<usize>,
     project: Option<&str>,
+    cwd: Option<&str>,
 ) -> Result<Value, KbError> {
     let now = store::now_rfc3339();
-    let resp = search_hits(conn, embedder, query, limit, false, false, min_score, &now, project)?;
+    let resp = search_hits(conn, embedder, query, limit, false, false, min_score, &now, project, cwd, None)?;
     let resp = match budget {
         Some(b) => crate::cli::pack_to_budget(resp, b),
         None => resp,
@@ -144,13 +155,14 @@ fn handle_search(req: &Req, conn: &mut Connection, embedder: &OllamaEmbedder) ->
     let min_score = req.min_score.unwrap_or(DEFAULT_MIN_SCORE);
     let budget = req.budget;
     let project = req.project.as_deref();
+    let cwd = req.cwd.as_deref();
 
-    match run_one_search(conn, embedder, query, limit, min_score, budget, project) {
+    match run_one_search(conn, embedder, query, limit, min_score, budget, project, cwd) {
         Ok(v) => v,
         Err(_first_err) => match store::open() {
             Ok(fresh) => {
                 *conn = fresh;
-                match run_one_search(conn, embedder, query, limit, min_score, budget, project) {
+                match run_one_search(conn, embedder, query, limit, min_score, budget, project, cwd) {
                     Ok(v) => v,
                     Err(e) => json!({"error": e.to_string()}),
                 }
@@ -362,7 +374,7 @@ mod tests {
         store::insert(&conn, "hello world", Some("note:test"), None, true, Some(&emb), 5).unwrap();
 
         let now = store::now_rfc3339();
-        let resp = search_hits(&conn, &fake, "hello world", 4, false, false, 0.0, &now, None).unwrap();
+        let resp = search_hits(&conn, &fake, "hello world", 4, false, false, 0.0, &now, None, None, None).unwrap();
         assert_eq!(resp.hits.len(), 1);
         assert_eq!(resp.hits[0].content, "hello world");
         assert!(resp.hits[0].score > 0.0);

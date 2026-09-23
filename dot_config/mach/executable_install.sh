@@ -219,6 +219,18 @@ install_telegramd_unit() {
   else
     echo "WARNING: 'systemctl --user enable --now mach-telegramd.service' failed — enable it by hand once mach is on PATH."
   fi
+  # `enable --now` STARTS a stopped unit but never restarts a running one,
+  # so on every reinstall after the first, machd kept serving the previous
+  # binary from memory. The kb socket lives in that process, which means
+  # the recall hook's fast path silently answered from stale code while the
+  # CLI answered from the new one -- three times in one session that had to
+  # be caught and restarted by hand. try-restart is the right verb: it
+  # restarts the unit if it is running and does nothing at all if it is
+  # not, so the enable path above stays the only thing that starts it.
+  if ! systemctl --user try-restart mach-telegramd.service >/dev/null 2>&1; then
+    echo "WARNING: 'systemctl --user try-restart mach-telegramd.service' failed — restart it by hand,"
+    echo "         or the kb socket keeps serving the binary it started with."
+  fi
 }
 install_telegramd_unit
 

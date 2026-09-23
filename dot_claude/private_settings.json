@@ -139,6 +139,14 @@
             "command": "'/home/ryutribal/.caveman/bin/caveman-proxy' native-hook claude --adapter '/usr/lib/node_modules/@caveman-ai/cli/dist/native-hook-fast.js'"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /home/ryutribal/.config/claude-hooks/kb-subagent.sh"
+          }
+        ]
       }
     ],
     "SubagentStop": [

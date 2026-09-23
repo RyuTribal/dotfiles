@@ -14,8 +14,11 @@ Type=oneshot
 # sweep is the guarantee — it scans every transcript idle >=10min and not
 # yet processed, so nothing is ever permanently missed. Runs before `mach
 # kb reflect` (not after) so any facts it just extracted are picked up by
-# the very same reflect run via `memories_since`, rather than waiting for
-# the next one. `-` means a failure here never fails this unit or blocks
+# the very same reflect run -- they land as unreflected (reflected_at IS
+# NULL) active memories, so the insight stage's own working-set selection
+# (cli.rs's reflect_working_set) sees them immediately -- rather than
+# waiting for the next one. `-` means a failure here never fails this unit
+# or blocks
 # the reflect pass that follows -- see ingest.rs's own offline discipline
 # for why a degraded run there is always safe to retry later.
 ExecStartPre=-%h/.local/bin/mach kb ingest-sessions

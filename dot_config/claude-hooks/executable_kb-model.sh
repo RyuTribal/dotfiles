@@ -22,10 +22,25 @@ MACH_BIN="${MACH_BIN:-mach}"
 
 command -v "$MACH_BIN" >/dev/null 2>&1 || exit 0
 
-model="$(timeout 2s "$MACH_BIN" kb model 2>/dev/null)"
+model="$(timeout 2s "$MACH_BIN" kb model --max-chars 8000 2>/dev/null)"
 rc=$?
 
-[ "$rc" -ne 0 ] && exit 0
+# An installed binary older than the --max-chars flag (see install.sh
+# rollout gap) rejects it outright rather than ignoring it -- fall back to
+# the unflagged call and truncate here instead, so this hook degrades to
+# "briefly stale binary" rather than "no mental model at all" until the
+# next install. Truncation is char-based via python3 (not `head -c`, which
+# can cut mid-UTF-8-character) to match what --max-chars itself promises.
+if [ "$rc" -ne 0 ]; then
+    model="$(timeout 2s "$MACH_BIN" kb model 2>/dev/null)"
+    rc=$?
+    [ "$rc" -ne 0 ] && exit 0
+    model="$(printf '%s' "$model" | python3 -c '
+import sys
+sys.stdout.write(sys.stdin.read()[:8000])
+' 2>/dev/null)"
+fi
+
 [ -z "$model" ] && exit 0
 
 printf '%s\n' "What you know about this user and their world (your accumulated understanding from all past sessions; specific memories surface per-prompt):"

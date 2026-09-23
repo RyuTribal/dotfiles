@@ -150,6 +150,11 @@ struct MemoryRow {
     occurred_from: Option<String>,
     #[serde(default)]
     occurred_to: Option<String>,
+    // Added for pinning (`mach kb restore`/`unpin`, schema v28).
+    // `#[serde(default)]` so an export line written before this field
+    // existed still imports cleanly, as an unpinned row.
+    #[serde(default)]
+    pinned_at: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -165,6 +170,13 @@ struct InsightRow {
     flagged_at: Option<String>,
     last_verified_at: Option<String>,
     level: i64,
+    // Added for re-verification's revise/drop/keep judge (schema v31).
+    // `#[serde(default)]` so an export line written before this field
+    // existed still imports cleanly, as a never-revised insight.
+    #[serde(default)]
+    revised_at: Option<String>,
+    #[serde(default)]
+    prev_text: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -198,6 +210,7 @@ fn memory_to_row(m: &Memory) -> MemoryRow {
         basis: m.basis.clone(),
         occurred_from: m.occurred_from.clone(),
         occurred_to: m.occurred_to.clone(),
+        pinned_at: m.pinned_at.clone(),
     }
 }
 
@@ -231,6 +244,7 @@ fn row_to_memory(row: MemoryRow) -> Result<Memory, KbError> {
         basis: row.basis,
         occurred_from: row.occurred_from,
         occurred_to: row.occurred_to,
+        pinned_at: row.pinned_at,
     })
 }
 
@@ -247,6 +261,8 @@ fn insight_to_row(i: &Insight) -> InsightRow {
         flagged_at: i.flagged_at.clone(),
         last_verified_at: i.last_verified_at.clone(),
         level: i.level,
+        revised_at: i.revised_at.clone(),
+        prev_text: i.prev_text.clone(),
     }
 }
 
@@ -269,6 +285,8 @@ fn row_to_insight(row: InsightRow) -> Result<Insight, KbError> {
         flagged_at: row.flagged_at,
         last_verified_at: row.last_verified_at,
         level: row.level,
+        revised_at: row.revised_at,
+        prev_text: row.prev_text,
     })
 }
 
@@ -590,6 +608,7 @@ mod tests {
             basis: None,
             occurred_from: None,
             occurred_to: None,
+            pinned_at: None,
         };
         let mut buf: Vec<u8> = Vec::new();
         writeln!(
@@ -651,5 +670,211 @@ mod tests {
         let dst = mem_conn();
         let err = import_from_reader(&dst, Cursor::new(Vec::new()), false).unwrap_err();
         assert!(err.to_string().contains("header"));
+    }
+
+    // --- pinned_at: a backup/restore round trip must never silently unpin a row ---
+
+    #[test]
+    fn export_then_import_into_empty_db_preserves_pinned_at() {
+        let src = mem_conn();
+        let old_id = store::insert(&src, "restored fact", None, None, true, None, 5).unwrap();
+        let sibling = store::insert(&src, "throwaway", None, None, true, None, 5).unwrap();
+        let now = store::now_rfc3339();
+        store::supersede(&src, old_id, sibling, &now).unwrap();
+        store::restore(&src, old_id, &now).unwrap();
+        assert!(store::is_pinned(&src, old_id).unwrap(), "test setup must actually pin the row");
+
+        let mut buf: Vec<u8> = Vec::new();
+        export_to_writer(&src, &mut buf).unwrap();
+
+        let dst = mem_conn();
+        import_from_reader(&dst, Cursor::new(buf), false).unwrap();
+        assert!(
+            store::is_pinned(&dst, old_id).unwrap(),
+            "pinned_at must survive an export/import round trip — a dropped pin reopens the re-tombstoning bug"
+        );
+    }
+
+    #[test]
+    fn import_merge_of_unpinned_incoming_row_keeps_the_local_pin() {
+        // The incoming (other-machine) row never pinned this id, but the
+        // local row is pinned. A merge-import must apply the incoming
+        // row's other fields (it's genuinely newer) while never clearing
+        // the local pin — an incoming pin would still be applied, per
+        // `raw_upsert_memory`'s `COALESCE(excluded.pinned_at,
+        // memories.pinned_at)`, but a NULL incoming value must not win.
+        let dst = mem_conn();
+        let id = store::insert(&dst, "old content", None, None, true, None, 5).unwrap();
+        let sibling = store::insert(&dst, "throwaway", None, None, true, None, 5).unwrap();
+        let now = store::now_rfc3339();
+        store::supersede(&dst, id, sibling, &now).unwrap();
+        store::restore(&dst, id, &now).unwrap();
+        assert!(store::is_pinned(&dst, id).unwrap(), "test setup must actually pin the local row");
+
+        // Age the local row back so the incoming row is unambiguously
+        // newer, forcing a real update rather than a last-write-wins skip.
+        dst.execute(
+            "UPDATE memories SET created_at = '2020-01-01T00:00:00Z', valid_from = '2020-01-01T00:00:00Z' WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
+
+        let now2 = store::now_rfc3339();
+        let row = MemoryRow {
+            table: "memories".to_string(),
+            id,
+            content: "new content from another machine".to_string(),
+            source: None,
+            project: None,
+            created_at: now2.clone(),
+            reviewed: true,
+            embedding_b64: None,
+            importance: 5,
+            stability: Some(35.0),
+            access_count: 0,
+            first_accessed_at: None,
+            last_accessed_at: None,
+            valid_from: now2,
+            invalidated_at: None,
+            superseded_by: None,
+            dormant_at: None,
+            last_verified_at: None,
+            graph_extracted_at: None,
+            basis: None,
+            occurred_from: None,
+            occurred_to: None,
+            pinned_at: None, // the incoming machine never pinned this row
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        writeln!(
+            &mut buf,
+            "{}",
+            serde_json::to_string(&ExportHeader {
+                kind: EXPORT_KIND.to_string(),
+                version: EXPORT_VERSION,
+                exported_at: store::now_rfc3339()
+            })
+            .unwrap()
+        )
+        .unwrap();
+        writeln!(&mut buf, "{}", serde_json::to_string(&row).unwrap()).unwrap();
+
+        let counts = import_from_reader(&dst, Cursor::new(buf), true).unwrap();
+        assert_eq!(counts.memories_updated, 1, "the row must actually update, not skip, to prove the pin survives a real merge");
+        let m = store::get(&dst, id).unwrap().unwrap();
+        assert_eq!(m.content, "new content from another machine", "the incoming row's other fields must still apply");
+        assert!(m.pinned_at.is_some(), "a merge-import must never clear an existing local pin");
+    }
+
+    #[test]
+    fn import_pre_v28_export_line_without_pinned_at_key_imports_cleanly() {
+        // Simulates a backup taken before schema v28 (no `pinned_at` key
+        // at all, not even null) — must still import without error, as an
+        // unpinned row.
+        let line = serde_json::json!({
+            "table": "memories",
+            "id": 1,
+            "content": "old-format row",
+            "source": null,
+            "project": null,
+            "created_at": store::now_rfc3339(),
+            "reviewed": true,
+            "embedding_b64": null,
+            "importance": 5,
+            "stability": null,
+            "access_count": 0,
+            "first_accessed_at": null,
+            "last_accessed_at": null,
+            "valid_from": store::now_rfc3339(),
+            "invalidated_at": null,
+            "superseded_by": null,
+            "dormant_at": null
+        });
+        let mut buf: Vec<u8> = Vec::new();
+        writeln!(
+            &mut buf,
+            "{}",
+            serde_json::to_string(&ExportHeader {
+                kind: EXPORT_KIND.to_string(),
+                version: EXPORT_VERSION,
+                exported_at: store::now_rfc3339()
+            })
+            .unwrap()
+        )
+        .unwrap();
+        writeln!(&mut buf, "{}", line).unwrap();
+
+        let dst = mem_conn();
+        let counts = import_from_reader(&dst, Cursor::new(buf), false).unwrap();
+        assert_eq!(counts.memories_inserted, 1);
+        let m = store::get(&dst, 1).unwrap().unwrap();
+        assert_eq!(m.content, "old-format row");
+        assert!(
+            !store::is_pinned(&dst, 1).unwrap(),
+            "a pre-v28 export line has no pin to carry — must import as unpinned, not error"
+        );
+    }
+
+    // --- revised_at/prev_text (schema v31) ---
+
+    #[test]
+    fn export_then_import_preserves_a_revised_insight_s_prev_text_and_revised_at() {
+        let src = mem_conn();
+        let ins_id = store::insert_insight(&src, "original wording", 0.6, &["1".to_string()], None).unwrap();
+        store::revise_insight(&src, ins_id, "corrected wording", Some(&fake_embed(4)), &[], "2026-09-23T00:00:00Z")
+            .unwrap();
+
+        let mut buf: Vec<u8> = Vec::new();
+        export_to_writer(&src, &mut buf).unwrap();
+
+        let dst = mem_conn();
+        import_from_reader(&dst, Cursor::new(buf), false).unwrap();
+
+        let ins = store::get_insight(&dst, ins_id).unwrap().unwrap();
+        assert_eq!(ins.text, "corrected wording");
+        assert_eq!(ins.prev_text.as_deref(), Some("original wording"), "prev_text must survive the round trip");
+        assert_eq!(ins.revised_at.as_deref(), Some("2026-09-23T00:00:00Z"));
+        assert!(!ins.is_flagged());
+    }
+
+    #[test]
+    fn import_pre_v31_export_insight_line_without_revised_columns_imports_cleanly() {
+        // Simulates a backup taken before schema v31 (no `revised_at`/
+        // `prev_text` keys at all, not even null) — must still import
+        // without error, as a never-revised insight.
+        let line = serde_json::json!({
+            "table": "insights",
+            "id": 1,
+            "text": "old-format insight",
+            "created_at": store::now_rfc3339(),
+            "confidence": 0.5,
+            "source_ids": ["1", "2"],
+            "embedding_b64": null,
+            "invalidated_at": null,
+            "flagged_at": null,
+            "last_verified_at": null,
+            "level": 1
+        });
+        let mut buf: Vec<u8> = Vec::new();
+        writeln!(
+            &mut buf,
+            "{}",
+            serde_json::to_string(&ExportHeader {
+                kind: EXPORT_KIND.to_string(),
+                version: EXPORT_VERSION,
+                exported_at: store::now_rfc3339()
+            })
+            .unwrap()
+        )
+        .unwrap();
+        writeln!(&mut buf, "{}", line).unwrap();
+
+        let dst = mem_conn();
+        let counts = import_from_reader(&dst, Cursor::new(buf), false).unwrap();
+        assert_eq!(counts.insights_inserted, 1);
+        let ins = store::get_insight(&dst, 1).unwrap().unwrap();
+        assert_eq!(ins.text, "old-format insight");
+        assert_eq!(ins.revised_at, None);
+        assert_eq!(ins.prev_text, None);
     }
 }

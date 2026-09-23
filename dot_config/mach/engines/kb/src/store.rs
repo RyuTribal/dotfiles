@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::classify::Verdict;
@@ -111,6 +112,14 @@ pub struct Memory {
     // temporal question answer "today".
     pub occurred_from: Option<String>,
     pub occurred_to: Option<String>,
+    // Set by `mach kb restore` (never by anything automatic), cleared by
+    // `mach kb unpin`. A pinned row is never tombstoned by an automatic
+    // pass (dedupe Keep, contradiction Conflict/ConflictRetro, verdict
+    // Update/Supersede) — see `is_pinned`/`unpin` and each of those
+    // callers' own doc comments. Exported/imported like any other column
+    // (`export::MemoryRow`) so a backup/restore round-trip can't silently
+    // drop a pin and reopen the re-tombstoning bug it exists to prevent.
+    pub pinned_at: Option<String>,
 }
 
 impl Memory {
@@ -153,6 +162,17 @@ pub struct Insight {
     /// `cli::run_meta_pass`). The tower caps at two derived stories on top
     /// of the memory leaves, so no level higher than 2 is ever produced.
     pub level: i64,
+    /// When `revise_insight` last rewrote `text` in place — `None` for an
+    /// insight never revised. Set only by a `REVISE` verdict from
+    /// re-verification's revise/drop/keep check (`reflect::parse_revise`,
+    /// `cli::run_insight_stage`), schema v31.
+    pub revised_at: Option<String>,
+    /// The text `revise_insight` overwrote, one hop back — `None` for an
+    /// insight never revised. Only the immediately-preceding wording is
+    /// kept (a second revision overwrites this with the text it just
+    /// replaced, not appended), same one-hop-back convention as
+    /// `Memory::superseded_by`'s predecessor chain. Schema v31.
+    pub prev_text: Option<String>,
 }
 
 impl Insight {
@@ -241,7 +261,9 @@ fn init_schema(conn: &Connection) -> Result<(), KbError> {
             invalidated_at TEXT,
             flagged_at TEXT,
             last_verified_at TEXT,
-            level INTEGER NOT NULL DEFAULT 1
+            level INTEGER NOT NULL DEFAULT 1,
+            revised_at TEXT,
+            prev_text TEXT
         );
         CREATE TABLE IF NOT EXISTS reflect_state (
             id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -1077,6 +1099,190 @@ fn migrate_v24_to_v25(conn: &Connection) -> Result<(), KbError> {
     Ok(())
 }
 
+/// `PRAGMA user_version`-gated, idempotent 25 -> 26 migration: the judge
+/// log. One row per `ReflectLlm` call made by reflect, graph audit and
+/// ingest (see `reflect::LoggedLlm`): pass tag, model, the exact prompt,
+/// the raw reply (NULL on failure) or the error (NULL on success), and
+/// latency. Verdicts are deliberately not parsed here — the `*_seen`
+/// tables keep only negatives and `superseded_by` has no cause, so this
+/// raw log is the only record that yields balanced labels, and re-parsing
+/// later with `reflect::parse_*` keeps it exact across parser changes.
+fn migrate_v25_to_v26(conn: &Connection) -> Result<(), KbError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS judge_log (
+            id         INTEGER PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            pass       TEXT NOT NULL,
+            model      TEXT NOT NULL,
+            prompt     TEXT NOT NULL,
+            reply      TEXT,
+            error      TEXT,
+            latency_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ix_judge_log_pass ON judge_log (pass, created_at);",
+    )?;
+    conn.execute("PRAGMA user_version = 26", [])?;
+    Ok(())
+}
+
+/// `PRAGMA user_version`-gated, idempotent 26 -> 27 migration: durable
+/// per-session engagement verdicts. `ingest_sessions_impl`'s engagement
+/// pass already judges ENGAGED vs SHOWN per memory id injected into a
+/// session (`ingest::parse_engagement_verdicts`), but previously only kept
+/// running `access_count`/`stability` touches on the engaged rows -- the
+/// per-session verdict itself, and every SHOWN-but-not-engaged id, was
+/// discarded once applied. Worse, the recall-log JSONL that named which
+/// ids were shown to a given session is pruned 14 days after ingestion
+/// (`should_prune_recall_log`), so nothing durable was left to compute
+/// recall precision from. One row per (session, memory) the judge actually
+/// returned a verdict for: `engaged` is 0/1, `judged_at` is the ingest
+/// run's `now`. `mach kb recall-stats` aggregates this table.
+fn migrate_v26_to_v27(conn: &Connection) -> Result<(), KbError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS recall_engagement (
+            session_id TEXT NOT NULL,
+            memory_id  INTEGER NOT NULL,
+            engaged    INTEGER NOT NULL,
+            judged_at  TEXT NOT NULL,
+            PRIMARY KEY (session_id, memory_id)
+        );",
+    )?;
+    conn.execute("PRAGMA user_version = 27", [])?;
+    Ok(())
+}
+
+/// `PRAGMA user_version`-gated, idempotent 27 -> 28 migration:
+/// `memories.pinned_at`.
+///
+/// `mach kb restore <id>` used to only clear a tombstone, with nothing
+/// recorded to tell the nightly reflect pass the row had just been judged
+/// by a human. The very next dedupe/contradiction pass re-asked the same
+/// pair, got the same verdict, and tombstoned the row again — four
+/// restored rows were re-tombstoned within hours of being restored. A
+/// pinned row (`restore` sets `pinned_at`; `mach kb unpin` clears it) is
+/// never touched by an automatic supersession path: `store::supersede`
+/// and `store::merge_and_supersede` themselves stay pin-blind (manual
+/// `mach kb supersede` must keep working unguarded), but every automatic
+/// caller checks `is_pinned` first and records the pair as judged instead
+/// of tombstoning, so it isn't re-asked every run either.
+fn migrate_v27_to_v28(conn: &Connection) -> Result<(), KbError> {
+    add_column_if_missing(conn, "memories", "pinned_at", "TEXT")?;
+    conn.execute("PRAGMA user_version = 28", [])?;
+    Ok(())
+}
+
+/// `PRAGMA user_version`-gated, idempotent 28 -> 29 migration:
+/// `supersession_audit`.
+///
+/// Automatic supersession (dedupe's Keep branch, contradiction's
+/// Conflict/ConflictRetro, `apply_verdict`'s Supersede) has tombstoned 164
+/// rows in the live bank, and spot-checking found several that are lossy:
+/// the old row carried a distinct fact -- often a dated one -- that the
+/// successor doesn't restate, sometimes several hops down a chain (a row
+/// tombstoned into a summary that was itself later tombstoned into a more
+/// generic summary). `mach kb audit-supersessions` judges every tombstone
+/// against its direct successor and restores the ones that lost
+/// information; this table is its durable record, one row per audited hop,
+/// keyed on the tombstoned row's own id (`old_id`) so a multi-hop chain
+/// (A->B->C) gets one independently-keyed row per hop instead of the
+/// second hop colliding with the first. A row already in this table is
+/// skipped on the next run unless `--reaudit` -- same "don't re-pay for a
+/// verdict" rule as `dedupe_seen`/`insight_dedupe_seen`, except here both
+/// OK and LOSSY verdicts are recorded (a pair the judge never addressed at
+/// all is not, so it's retried next run, matching every other batched
+/// judge in this codebase).
+fn migrate_v28_to_v29(conn: &Connection) -> Result<(), KbError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS supersession_audit (
+            old_id     INTEGER PRIMARY KEY,
+            new_id     INTEGER NOT NULL,
+            verdict    TEXT NOT NULL,
+            reason     TEXT NOT NULL,
+            audited_at TEXT NOT NULL
+        );",
+    )?;
+    conn.execute("PRAGMA user_version = 29", [])?;
+    Ok(())
+}
+
+/// `PRAGMA user_version`-gated, idempotent 29 -> 30 migration:
+/// `memories.reflected_at`, replacing the single-watermark
+/// `reflect_state.last_memory_id`/`should_advance_watermark` gate with
+/// per-memory progress.
+///
+/// The watermark required an entire `mach kb reflect` run — insight stage,
+/// dedupe, contradiction, curation, strength review, graph extraction,
+/// graph hygiene, dormancy, insight dedupe, entity cards, meta — to finish
+/// with zero `claude` call failures anywhere before it moved at all. Given
+/// per-pass error rates of 13-55% (`judge_log`, see the reflection-usage
+/// evidence report), that happened on 0 of 43 runs over 7 days, so it froze
+/// at `last_memory_id = 196` on 2026-09-08 while the bank kept growing past
+/// id 1600 — 1300+ memories the insight stage had never once examined, all
+/// invisible to `memories_since`. `reflected_at` tracks the insight stage's
+/// own progress per row instead: set only on the exact rows its own
+/// working set examined, only when that stage itself (not some unrelated
+/// pass) succeeded — see `reflect::should_mark_reflected` and
+/// `cli::run_insight_stage`.
+///
+/// Backfilled so the fix doesn't immediately treat the pre-migration
+/// watermark's own progress as unexamined backlog: every id at or below
+/// the frozen `reflect_state.last_memory_id` is marked reflected as of that
+/// state's own `last_run_at` (falling back to `now` when no run has ever
+/// completed). Everything above the old watermark — the very backlog this
+/// migration exists to unstick — is left `NULL`, i.e. due.
+fn migrate_v29_to_v30(conn: &Connection) -> Result<(), KbError> {
+    add_column_if_missing(conn, "memories", "reflected_at", "TEXT")?;
+    backfill_reflected_at(conn)?;
+    conn.execute("PRAGMA user_version = 30", [])?;
+    Ok(())
+}
+
+/// `PRAGMA user_version`-gated, idempotent 30 -> 31 migration:
+/// `insights.revised_at` and `insights.prev_text`.
+///
+/// Re-verification (`cli::run_insight_stage`'s Step 4) used to have exactly
+/// one response to an insight its evidence now contradicts: flag it,
+/// forever, at whatever wording it was minted with — the session-start
+/// mental model (`mental_model`/`cmd_model`) then keeps rendering that
+/// stale belief until a human runs `mach kb insight-forget`. These two
+/// columns let it do better: a `REVISE` verdict from the new revise/drop/
+/// keep judge (`reflect::build_revise_prompt`/`parse_revise`) rewrites
+/// `text` in place via `revise_insight`, stamping `revised_at` and stashing
+/// the wording it replaced in `prev_text` (one hop back, same convention as
+/// `Memory::superseded_by`'s predecessor chain) so the correction has an
+/// audit trail instead of silently overwriting history. Both columns are
+/// additive and default `NULL` — an insight never revised looks exactly as
+/// it did before this migration.
+fn migrate_v30_to_v31(conn: &Connection) -> Result<(), KbError> {
+    add_column_if_missing(conn, "insights", "revised_at", "TEXT")?;
+    add_column_if_missing(conn, "insights", "prev_text", "TEXT")?;
+    conn.execute("PRAGMA user_version = 31", [])?;
+    Ok(())
+}
+
+/// Backfill helper for `migrate_v29_to_v30` (also exposed for tests, same
+/// convention as `backfill_occurrence_from_text`): marks every memory with
+/// `id <= reflect_state.last_memory_id` reflected as of
+/// `reflect_state.last_run_at` (or `now` when that's unset, i.e. a database
+/// that never completed a run). A no-op (returns `Ok(0)`) when the
+/// watermark was never set — a fresh database has no pre-migration progress
+/// to preserve, so leaving every row `NULL` is already correct. Idempotent:
+/// only touches rows still `NULL`, so re-running it (or running it against
+/// a database where `reflected_at` already has values from normal use)
+/// never clobbers a real timestamp with the migration's own fallback.
+pub fn backfill_reflected_at(conn: &Connection) -> Result<usize, KbError> {
+    let state = get_reflect_state(conn)?;
+    let last_id = match state.last_memory_id {
+        Some(id) if id > 0 => id,
+        _ => return Ok(0),
+    };
+    let ts = state.last_run_at.unwrap_or_else(now_rfc3339);
+    Ok(conn.execute(
+        "UPDATE memories SET reflected_at = ?1 WHERE id <= ?2 AND reflected_at IS NULL",
+        params![ts, last_id],
+    )?)
+}
+
 /// One registered project.
 #[derive(Debug, Clone)]
 pub struct ProjectRow {
@@ -1137,6 +1343,42 @@ pub fn get_project_by_name(conn: &Connection, name: &str) -> Result<Option<Proje
         Some(r) => Ok(Some(r?)),
         None => Ok(None),
     }
+}
+
+/// Resolves a filesystem path to the most specific registered project whose
+/// `root_path` contains it -- the path equals the root, or the root is a
+/// directory prefix of it (`path == root || path.starts_with(root + "/")`,
+/// never a raw string prefix: `/ab` must not match root `/a`). When more
+/// than one registered root contains the path (a project nested inside
+/// another's tree), the longest root wins as the more specific match.
+///
+/// Table-scans `projects` rather than a `LIKE`/`GLOB` query: the registry
+/// is a handful of rows (one per project this user has ever indexed), so a
+/// linear scan comparing real path components is simpler and safer than an
+/// SQL pattern that would need its own escaping for `_`/`%` in a path.
+pub fn project_for_path(conn: &Connection, path: &str) -> Result<Option<ProjectRow>, KbError> {
+    let mut stmt = conn.prepare("SELECT * FROM projects")?;
+    let rows = stmt.query_map([], |r| row_to_project(r))?;
+    let mut best: Option<ProjectRow> = None;
+    for row in rows {
+        let row = row?;
+        let root = row.root_path.trim_end_matches('/');
+        if root.is_empty() {
+            continue;
+        }
+        let matches = path == root || path.starts_with(&format!("{}/", root));
+        if !matches {
+            continue;
+        }
+        let better = match &best {
+            Some(b) => root.len() > b.root_path.trim_end_matches('/').len(),
+            None => true,
+        };
+        if better {
+            best = Some(row);
+        }
+    }
+    Ok(best)
 }
 
 pub fn list_projects(conn: &Connection) -> Result<Vec<ProjectRow>, KbError> {
@@ -1414,18 +1656,32 @@ pub fn backfill_occurrence_from_text(conn: &Connection) -> Result<usize, KbError
 /// Every `YYYY-MM-DD` in `text`, sorted and deduped. Deliberately strict:
 /// a looser matcher would read version numbers, IP addresses and NORAD ids
 /// as dates.
+///
+/// A candidate span is rejected unless it sits on a real boundary on both
+/// sides: the byte immediately before must be start-of-text or NOT
+/// alphanumeric/`-`/`_`/`/`, and the byte immediately after must be
+/// end-of-text or NOT alphanumeric/`-`/`_`/`/` — otherwise a date-shaped
+/// span embedded in an identifier or path reads as a date it isn't
+/// (`"TICKET-2026-01-15-hotfix"`, `".../reports/2026-01-15/summary"`,
+/// `"req-2026-01-15-abcxyz"`). The one exception: a following `T` then a
+/// digit (`"2026-01-15T10:00:00Z"`, an ISO timestamp) still counts — that
+/// really is a date, just with a time attached.
 pub fn iso_dates_in(text: &str) -> Vec<String> {
     let b = text.as_bytes();
     let mut out: Vec<String> = Vec::new();
     let digits = |i: usize, n: usize| -> bool {
         i + n <= b.len() && b[i..i + n].iter().all(|c| c.is_ascii_digit())
     };
+    let is_word_byte = |c: u8| c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c == b'/';
     let mut i = 0usize;
     while i + 10 <= b.len() {
         if digits(i, 4) && b[i + 4] == b'-' && digits(i + 5, 2) && b[i + 7] == b'-' && digits(i + 8, 2) {
-            // reject a longer number running into it (e.g. "12026-01-01")
-            let left_ok = i == 0 || !b[i - 1].is_ascii_digit();
-            let right_ok = i + 10 == b.len() || !b[i + 10].is_ascii_digit();
+            // reject a longer identifier/path running into either side
+            // (e.g. "12026-01-01", "TICKET-2026-01-15-hotfix") -- unless
+            // what follows is really an ISO timestamp's "T10:00:00Z".
+            let left_ok = i == 0 || !is_word_byte(b[i - 1]);
+            let is_timestamp = i + 11 < b.len() && b[i + 10] == b'T' && b[i + 11].is_ascii_digit();
+            let right_ok = i + 10 == b.len() || is_timestamp || !is_word_byte(b[i + 10]);
             if left_ok && right_ok {
                 let d = &text[i..i + 10];
                 let month: u32 = text[i + 5..i + 7].parse().unwrap_or(0);
@@ -1614,13 +1870,14 @@ const MEMORY_COLUMNS: &[(&str, &str)] = &[
     ("basis", "TEXT"),
     ("occurred_from", "TEXT"),
     ("occurred_to", "TEXT"),
+    ("pinned_at", "TEXT"),
 ];
 
 /// The schema version a fully migrated database lands on. Tests assert
 /// against this rather than a literal: every schema addition used to
 /// require hunting down a dozen hard-coded version numbers across the
 /// migration tests, which is busywork that also invites getting one wrong.
-pub const SCHEMA_VERSION: i64 = 25;
+pub const SCHEMA_VERSION: i64 = 31;
 
 fn ensure_memory_columns(conn: &Connection) -> Result<(), KbError> {
     if !table_exists(conn, "memories")? {
@@ -1711,6 +1968,24 @@ fn migrate(conn: &Connection) -> Result<(), KbError> {
     }
     if version < 25 {
         migrate_v24_to_v25(conn)?;
+    }
+    if version < 26 {
+        migrate_v25_to_v26(conn)?;
+    }
+    if version < 27 {
+        migrate_v26_to_v27(conn)?;
+    }
+    if version < 28 {
+        migrate_v27_to_v28(conn)?;
+    }
+    if version < 29 {
+        migrate_v28_to_v29(conn)?;
+    }
+    if version < 30 {
+        migrate_v29_to_v30(conn)?;
+    }
+    if version < 31 {
+        migrate_v30_to_v31(conn)?;
     }
     Ok(())
 }
@@ -1922,6 +2197,7 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         basis: row.get("basis")?,
         occurred_from: row.get("occurred_from")?,
         occurred_to: row.get("occurred_to")?,
+        pinned_at: row.get("pinned_at")?,
         created_at,
     })
 }
@@ -2073,6 +2349,28 @@ pub fn list_dormant(conn: &Connection, limit: Option<usize>) -> Result<Vec<Memor
     Ok(out)
 }
 
+/// Pinned memories only (see `restore`, which sets `pinned_at`), most
+/// recent first, optionally capped — the audit view `mach kb list
+/// --pinned`. A separate function from `list`'s `superseded_only` flag,
+/// same reasoning as `list_dormant`: pin state is an independent axis a
+/// row can carry alongside any tombstone/dormancy state (a pinned row
+/// stays pinned even if a human later re-supersedes it by hand — see
+/// `supersede`'s own doc comment — so this view is not restricted to
+/// active rows).
+pub fn list_pinned(conn: &Connection, limit: Option<usize>) -> Result<Vec<Memory>, KbError> {
+    let sql = match limit {
+        Some(n) => format!("SELECT * FROM memories WHERE pinned_at IS NOT NULL ORDER BY id DESC LIMIT {}", n),
+        None => "SELECT * FROM memories WHERE pinned_at IS NOT NULL ORDER BY id DESC".to_string(),
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], row_to_memory)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
 /// All `reviewed = 0` rows (auto-extracted candidates awaiting `mach kb
 /// review`), oldest first so review works through them in insertion order.
 /// `mach kb reflect`'s curation pass (`curation_candidates`, below) is the
@@ -2166,6 +2464,70 @@ pub fn get(conn: &Connection, id: i64) -> Result<Option<Memory>, KbError> {
 /// already gone.
 pub fn delete(conn: &Connection, id: i64) -> Result<bool, KbError> {
     let tx = conn.unchecked_transaction()?;
+    // Graph references first: `relations.evidence_memory_id` carries a real
+    // `REFERENCES memories(id)`, so deleting a cited memory used to fail
+    // outright with "FOREIGN KEY constraint failed" -- measured on this
+    // machine, 214 of 738 active memories (29%) were undeletable, and the
+    // selection was backwards, failing on the OLDER well-integrated rows
+    // that graph extraction had had time to reach.
+    //
+    // The design this collides with is `relations_with_dead_evidence`,
+    // whose doc names "hard-deleted (`mach kb forget`)" as one of the
+    // states it detects -- it expects a dangling id the FK forbids. Rather
+    // than drop the constraint, do here, deterministically, what the
+    // hygiene pass would have done later: an edge that still has other
+    // evidence is repointed at a survivor, and an edge whose only evidence
+    // this was gets tombstoned. Same end state, no dangling reference, and
+    // no edge is left silently orphaned with a NULL pointer that
+    // `relations_with_dead_evidence` would never look at again.
+    //
+    // Guarded on the tables existing: `delete` is reachable from migration
+    // paths that run at schema versions predating the graph layer (the
+    // v6->v7 AUTOINCREMENT test deletes a row on a `relations`-less
+    // database), and an unguarded query there fails with "no such table".
+    let now = now_rfc3339();
+    let has_graph = table_exists(&tx, "relations")? && table_exists(&tx, "relation_evidence")?;
+    let citing: Vec<i64> = if has_graph {
+        let mut stmt =
+            tx.prepare("SELECT id FROM relations WHERE evidence_memory_id = ?1")?;
+        let rows = stmt.query_map(params![id], |r| r.get(0))?;
+        rows.collect::<Result<Vec<i64>, _>>()?
+    } else {
+        Vec::new()
+    };
+    if has_graph {
+        tx.execute("DELETE FROM relation_evidence WHERE memory_id = ?1", params![id])?;
+    }
+    for relation_id in citing {
+        let survivor: Option<i64> = {
+            let mut stmt = tx.prepare(
+                "SELECT memory_id FROM relation_evidence
+                 WHERE relation_id = ?1 ORDER BY created_at ASC, memory_id ASC LIMIT 1",
+            )?;
+            stmt.query_row(params![relation_id], |r| r.get(0)).optional()?
+        };
+        match survivor {
+            Some(m) => {
+                tx.execute(
+                    "UPDATE relations SET evidence_memory_id = ?1 WHERE id = ?2",
+                    params![m, relation_id],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "UPDATE relations SET evidence_memory_id = NULL, invalidated_at = ?1
+                     WHERE id = ?2 AND invalidated_at IS NULL",
+                    params![now, relation_id],
+                )?;
+                // Already-tombstoned edges still need the pointer cleared,
+                // or the delete below trips the constraint anyway.
+                tx.execute(
+                    "UPDATE relations SET evidence_memory_id = NULL WHERE id = ?1",
+                    params![relation_id],
+                )?;
+            }
+        }
+    }
     let n = tx.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
     if n > 0 {
         tx.execute("DELETE FROM dedupe_seen WHERE id_a = ?1 OR id_b = ?1", params![id])?;
@@ -2246,33 +2608,235 @@ pub fn supersede(conn: &Connection, old_id: i64, new_id: i64, now: &str) -> Resu
 /// it exists to answer. `build_contradiction_pass_prompt` now tells the
 /// judge to return BOTH_HOLD for that shape, but judgments already applied
 /// need a way back, and `forget` is the wrong tool: it deletes.
-pub fn restore(conn: &Connection, id: i64) -> Result<bool, KbError> {
+///
+/// Also pins the row (`pinned_at = now`): a human just looked at this pair
+/// and decided the tombstone was wrong, so the row must not be silently
+/// re-judged and re-tombstoned by the very next automatic pass. Every
+/// automatic supersession path (`run_dedupe_pass`'s Keep branch,
+/// `apply_contradiction_verdict`'s Conflict/ConflictRetro,
+/// `apply_verdict`'s Supersede) checks `is_pinned` first and skips a
+/// pinned row (`apply_verdict`'s Update never tombstones to begin with, so
+/// pin status doesn't come into it there). `mach kb unpin <id>` clears the
+/// pin; manual `mach kb supersede` is unaffected either way — it is a
+/// human decision, not one this guard second-guesses.
+pub fn restore(conn: &Connection, id: i64, now: &str) -> Result<bool, KbError> {
     let n = conn.execute(
-        "UPDATE memories SET invalidated_at = NULL, superseded_by = NULL
-         WHERE id = ?1 AND invalidated_at IS NOT NULL",
-        params![id],
+        "UPDATE memories SET invalidated_at = NULL, superseded_by = NULL, pinned_at = ?1
+         WHERE id = ?2 AND invalidated_at IS NOT NULL",
+        params![now, id],
     )?;
     Ok(n > 0)
+}
+
+/// Whether `id` is currently pinned (set by `restore`, cleared by `unpin`).
+/// A missing id reports `false` rather than erroring — every caller of
+/// this is a fail-safe skip check ("don't tombstone this automatically"),
+/// and a row that doesn't exist can't be tombstoned anyway.
+pub fn is_pinned(conn: &Connection, id: i64) -> Result<bool, KbError> {
+    let pinned: Option<Option<String>> = conn
+        .query_row("SELECT pinned_at FROM memories WHERE id = ?1", params![id], |r| r.get::<_, Option<String>>(0))
+        .optional()?;
+    Ok(pinned.flatten().is_some())
+}
+
+/// Clears a pin set by `restore` (`mach kb unpin <id>`). Returns `false`
+/// (no-op) if `id` doesn't exist or isn't pinned.
+pub fn unpin(conn: &Connection, id: i64) -> Result<bool, KbError> {
+    let n = conn.execute("UPDATE memories SET pinned_at = NULL WHERE id = ?1 AND pinned_at IS NOT NULL", params![id])?;
+    Ok(n > 0)
+}
+
+// --- supersession audit: was a tombstone lossy? ---
+
+/// One tombstoned memory joined to its direct (one-hop) successor — the
+/// raw candidate set for `mach kb audit-supersessions`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupersessionCandidate {
+    pub old_id: i64,
+    pub old_content: String,
+    pub new_id: i64,
+    pub new_content: String,
+}
+
+/// Every tombstoned memory (`superseded_by IS NOT NULL`) joined to its
+/// direct successor, oldest tombstoned row first (`created_at`, then `id`
+/// to break ties) — the working set `mach kb audit-supersessions` chunks
+/// into LLM batches. A chain (A -> B -> C) yields one row per hop (A's row
+/// names B as its successor; B's own row, since B is itself tombstoned,
+/// names C), never a row skipping straight from A to C — each hop is
+/// judged on its own merits, per the task's own chains rule.
+///
+/// A `superseded_by` that no longer resolves to a live row (shouldn't
+/// happen — `supersede`/`restore` only ever point it at a real id, and
+/// nothing deletes rows) is skipped: there is nothing to compare the old
+/// content against.
+pub fn supersession_candidates(conn: &Connection) -> Result<Vec<SupersessionCandidate>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT m.id, m.content, s.id, s.content
+         FROM memories m
+         JOIN memories s ON s.id = m.superseded_by
+         WHERE m.superseded_by IS NOT NULL
+         ORDER BY m.created_at ASC, m.id ASC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(SupersessionCandidate { old_id: r.get(0)?, old_content: r.get(1)?, new_id: r.get(2)?, new_content: r.get(3)? })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// `old_id -> new_id` for every pair already recorded in
+/// `supersession_audit` — a candidate is skipped by a normal `mach kb
+/// audit-supersessions` run (`--reaudit` re-examines it anyway) only when
+/// its CURRENT `new_id` (from `supersession_candidates`'s live join)
+/// equals the recorded one. A bare "was `old_id` ever audited" set is not
+/// enough: if a restored row is later manually re-superseded to a
+/// different winner (`A -> B` audited, `A` restored, then a human runs
+/// `mach kb supersede A D`), the new `A -> D` hop is a fresh decision the
+/// old `A -> B` verdict says nothing about, and must be judged again, not
+/// silently skipped as "already audited".
+pub fn supersession_audited_pairs(conn: &Connection) -> Result<HashMap<i64, i64>, KbError> {
+    let mut stmt = conn.prepare("SELECT old_id, new_id FROM supersession_audit")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+    let mut out = HashMap::new();
+    for r in rows {
+        let (old_id, new_id) = r?;
+        out.insert(old_id, new_id);
+    }
+    Ok(out)
+}
+
+/// One row of `mach kb audit-supersessions`'s durable record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupersessionAuditRow {
+    pub old_id: i64,
+    pub new_id: i64,
+    pub verdict: String,
+    pub reason: String,
+    pub audited_at: String,
+}
+
+/// Records one audited hop (`old_id -> new_id`, `verdict` is `"OK"` or
+/// `"LOSSY"`, `reason` the judge's short explanation). Upserts on `old_id`
+/// so `--reaudit` overwrites a prior verdict rather than erroring on the
+/// primary key. A pair the judge never addressed at all must NOT be passed
+/// here — the caller leaves it unrecorded so it is retried next run,
+/// mirroring every other batched judge in this module.
+pub fn record_supersession_audit(
+    conn: &Connection,
+    old_id: i64,
+    new_id: i64,
+    verdict: &str,
+    reason: &str,
+    now: &str,
+) -> Result<(), KbError> {
+    conn.execute(
+        "INSERT INTO supersession_audit (old_id, new_id, verdict, reason, audited_at) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(old_id) DO UPDATE SET
+            new_id = excluded.new_id,
+            verdict = excluded.verdict,
+            reason = excluded.reason,
+            audited_at = excluded.audited_at",
+        params![old_id, new_id, verdict, reason, now],
+    )?;
+    Ok(())
+}
+
+/// Fetches one `old_id`'s audit row, if it has been judged.
+pub fn get_supersession_audit(conn: &Connection, old_id: i64) -> Result<Option<SupersessionAuditRow>, KbError> {
+    let row = conn
+        .query_row(
+            "SELECT old_id, new_id, verdict, reason, audited_at FROM supersession_audit WHERE old_id = ?1",
+            params![old_id],
+            |r| {
+                Ok(SupersessionAuditRow {
+                    old_id: r.get(0)?,
+                    new_id: r.get(1)?,
+                    verdict: r.get(2)?,
+                    reason: r.get(3)?,
+                    audited_at: r.get(4)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Every `LOSSY`-verdict row on record, oldest audited first — the repair
+/// queue `mach kb audit-supersessions --apply` restores from. Deliberately
+/// not scoped to "this run": a dry run may have recorded a LOSSY verdict
+/// that no `--apply` invocation has acted on yet (or an earlier `--apply`
+/// run that was interrupted before reaching every row), and those rows
+/// stay just as actionable as one judged in the current run. The caller
+/// restores a row only when its CURRENT `superseded_by` still equals this
+/// row's recorded `new_id` — a row this table calls LOSSY but that's
+/// already been restored (by a prior `--apply` run, or `mach kb restore`
+/// by hand) needs no repeat work, and one a human has since manually
+/// re-superseded to a different winner (`mach kb supersede <old> <new>`)
+/// must never be restored on the strength of a verdict recorded against
+/// the earlier hop.
+pub fn supersession_audit_lossy_rows(conn: &Connection) -> Result<Vec<SupersessionAuditRow>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT old_id, new_id, verdict, reason, audited_at FROM supersession_audit
+         WHERE verdict = 'LOSSY' ORDER BY audited_at ASC, old_id ASC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(SupersessionAuditRow { old_id: r.get(0)?, new_id: r.get(1)?, verdict: r.get(2)?, reason: r.get(3)?, audited_at: r.get(4)? })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
 }
 
 /// Reinforcement (`mach kb search --touch`): for each id, bumps
 /// `access_count`, resets `last_accessed_at` to `now`, sets
 /// `first_accessed_at` if this is the first touch, and grows `stability`
-/// by 30%, capped at 365 days. One transaction for the whole batch.
+/// by an interval-aware fraction of the flat 30% gain — the spacing
+/// effect: `stability * (1 + 0.3 * min(1, elapsed_days / stability))`,
+/// where `elapsed_days` is days since `last_accessed_at` (or since
+/// `created_at` for a row that has never been touched), still capped at
+/// 365 days. Two touches moments apart therefore barely move stability;
+/// a touch after a gap at least as long as the current stability earns
+/// the full ×1.3, same as the old flat rule. One transaction for the
+/// whole batch; each row's current `stability`/`importance`/
+/// `last_accessed_at`/`created_at` is read before its update so the gain
+/// is computed per row rather than in one blanket SQL expression.
 pub fn touch(conn: &Connection, ids: &[i64], now: &str) -> Result<(), KbError> {
     if ids.is_empty() {
         return Ok(());
     }
+    let now_secs = parse_rfc3339(now).unwrap_or_else(|| now_secs() as i64);
     let tx = conn.unchecked_transaction()?;
     for id in ids {
+        let row: Option<(Option<f64>, i64, Option<String>, String)> = tx
+            .query_row(
+                "SELECT stability, importance, last_accessed_at, created_at FROM memories WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((stability, importance, last_accessed_at, created_at)) = row else {
+            continue;
+        };
+        let base = stability.unwrap_or(importance as f64 * 7.0);
+        let last = last_accessed_at.as_deref().unwrap_or(&created_at);
+        let last_secs = parse_rfc3339(last).unwrap_or(now_secs);
+        let elapsed_days = days_between(now_secs, last_secs);
+        let ratio = if base > 0.0 { (elapsed_days / base).min(1.0) } else { 1.0 };
+        let new_stability = (base * (1.0 + 0.3 * ratio)).min(365.0);
         tx.execute(
             "UPDATE memories SET
                 access_count = access_count + 1,
                 last_accessed_at = ?1,
                 first_accessed_at = COALESCE(first_accessed_at, ?1),
-                stability = MIN(COALESCE(stability, importance * 7.0) * 1.3, 365.0)
-             WHERE id = ?2",
-            params![now, id],
+                stability = ?2
+             WHERE id = ?3",
+            params![now, new_stability, id],
         )?;
     }
     tx.commit()?;
@@ -2421,9 +2985,11 @@ pub struct RankedHit {
     pub recency: f32,
     pub strength: f32,
     pub superseded: bool,
-    // Normalized BM25 from the FTS5 index for the query's exact tokens:
-    // 1.0 for the best lexical match, 0.0 when the row matched no token
-    // (or the search ran without query text). See `search_hybrid`.
+    // IDF-weighted term coverage from the FTS5 index for the query's exact
+    // tokens (see `lexical_scores`): 1.0 when the row matched every query
+    // term's IDF mass, not normalized against the best hit in the result
+    // set; 0.0 when the row matched no token (or the search ran without
+    // query text). See `search_hybrid`.
     pub lexical: f32,
 }
 
@@ -2685,14 +3251,23 @@ pub fn normalize_sim(raw: f32) -> f32 {
 pub const LEXICAL_CANDIDATES: usize = 200;
 
 /// `search_ranked` plus the FTS5 lexical channel (Honcho-style hybrid):
-/// the query's exact tokens are looked up in `memories_fts`, BM25 is
-/// normalized to `[0, 1]` against the best lexical hit, and each row's
-/// similarity term becomes `max(cosine, LEXICAL_WEIGHT * lexical)`. The
-/// recency/strength/penalty blend is unchanged, so scores stay on the same
-/// scale the hooks threshold against (`kb-recall.py`'s 0.45). A row with no
+/// the query's exact tokens are looked up in `memories_fts` and scored as
+/// IDF-weighted term coverage (see `lexical_scores`) -- 1.0 means the row
+/// matched every query term's IDF mass, not "best hit in this result set"
+/// -- and each row's similarity term becomes `max(cosine, LEXICAL_WEIGHT *
+/// lexical)`. The recency/strength/penalty blend is unchanged, so scores
+/// stay on the same scale the hooks threshold against (`kb-recall.py`'s
+/// 0.45). A row with no
 /// embedding can now surface on a lexical hit alone; a row with neither is
 /// still excluded. Any FTS failure (bad syntax that slipped past
 /// `fts_query`, index missing) degrades to plain cosine, never an error.
+///
+/// `date_anchor`, when `Some`, is the "today" `query_date_range` resolves
+/// relative-date terms against, in place of `now`'s own date -- `now`
+/// itself is passed through unchanged to `rank_with_lexical` and keeps
+/// driving recency/strength, so this anchors ONLY the date-range parse.
+/// `None` (every caller but `mach kb eval`'s `as_of`) keeps today's date
+/// exactly as before this parameter existed.
 pub fn search_hybrid(
     conn: &Connection,
     query_text: &str,
@@ -2702,9 +3277,11 @@ pub fn search_hybrid(
     include_superseded: bool,
     min_score: f32,
     now: &str,
+    date_anchor: Option<&str>,
 ) -> Result<Vec<RankedHit>, KbError> {
     let lexical = lexical_scores(conn, query_text, LEXICAL_CANDIDATES).unwrap_or_default();
-    let range = query_date_range(query_text, &now[..10.min(now.len())]);
+    let today = date_anchor.unwrap_or(now);
+    let range = query_date_range(query_text, &today[..10.min(today.len())]);
     rank_with_lexical(
         conn,
         query_embedding,
@@ -2878,12 +3455,12 @@ const FTS_STOPWORDS: &[&str] = &[
     "everything", "really", "actually", "very", "still", "even", "only", "same", "such", "each", "every",
 ];
 
-/// Minimum term coverage for the lexical channel to count at all. Below
-/// this a "lexical match" is one or two shared common words, which is not
-/// evidence: "what is the staging postgres password" matched a deploy
-/// memory on "staging" alone at 0.33 coverage and scored high enough to
-/// inject. Set at half the query's terms, which is also the coverage real
-/// paraphrase answers reach (measured 0.5 to 1.0 on the harness).
+/// Minimum IDF-weighted coverage (see `lexical_scores`) for the lexical
+/// channel to count at all. Below this a "lexical match" is one or two
+/// shared common words, which is not evidence: "what is the staging
+/// postgres password" matched a deploy memory on "staging" alone, which is
+/// not enough of the query's IDF mass to trust. 0.5 is also the coverage
+/// real paraphrase answers reach (measured 0.5 to 1.0 on the harness).
 pub const LEXICAL_MIN_COVERAGE: f32 = 0.5;
 
 /// Turns free text into a safe FTS5 MATCH expression: lowercase alphanumeric
@@ -2935,11 +3512,28 @@ pub fn fts_terms(text: &str) -> Vec<String> {
 }
 
 /// `memory id -> lexical score` for the query's terms, from the FTS5 index.
-/// The score is the FRACTION OF THE QUERY'S CONTENT TERMS the memory
-/// contains, computed from a per-term MATCH and capped at `limit` rows by
-/// coverage.
+/// The score is IDF-WEIGHTED COVERAGE: `sum(idf(t) for matched t) /
+/// sum(idf(t) for all query terms)`, computed from a per-term MATCH and
+/// capped at `limit` rows by coverage.
 ///
-/// Two earlier designs failed here, both worth naming:
+/// `idf(t) = ln((N + 1) / (df(t) + 1)) + 1`, where `df(t)` is the number of
+/// `memories_fts` rows the term matches (the per-term MATCH loop already
+/// counts these) and `N` is the total row count of `memories_fts`. This is
+/// the standard smoothed IDF (as in scikit-learn's TF-IDF): `df(t) = N`
+/// (every row matches) floors `idf(t)` at 1 rather than letting it hit 0,
+/// so a ubiquitous term still counts for something; `df(t) = 0` (an unmatched
+/// term) caps it at `ln(N + 1) + 1`, the maximum weight a never-seen term
+/// can claim. A term absent from the corpus (`df(t) = 0`) still counts in
+/// the DENOMINATOR (`sum(idf(t) for all query terms)`), deliberately: no row
+/// can ever match it, so it permanently caps every candidate's achievable
+/// coverage below 1.0 for that query. Dropping it instead would let a typo
+/// or an out-of-vocabulary word be silently ignored -- "mach qwxzyv" would
+/// then score every plain "mach" row a perfect 1.0, reintroducing exactly
+/// the common-term-carries-a-weak-memory problem this task removes. The
+/// embedding channel, not the lexical one, is what should catch a paraphrase
+/// or misspelling; `search_hybrid` takes `max()` of the two for this reason.
+///
+/// Three earlier designs failed here, all worth naming:
 ///
 /// 1. BM25 normalized against the best hit in the result set made the top
 ///    lexical hit exactly 1.0 however weak it was -- "what is the staging
@@ -2952,6 +3546,47 @@ pub fn fts_terms(text: &str) -> Vec<String> {
 ///    sit outside the window and score 0. Coverage is now built from the
 ///    per-term matches directly, so the candidate set is exactly "every row
 ///    matching any query term" and the window only bounds the OUTPUT.
+/// 3. Unweighted coverage (`matched_terms / total_terms`) let a match on
+///    COMMON words carry a weak memory past the injection threshold: a
+///    project name, "rule", or "convention" shared with the query counted
+///    exactly as much as a rare, decisive term. 37% of logged injections
+///    had sub-floor similarity, riding in on this. Weighting each matched
+///    term by its rarity (IDF) fixes that: a memory has to match something
+///    distinctive, not just something frequent, to clear the floor.
+///
+/// A fourth failure survived IDF weighting itself, on SHORT queries: with
+/// only 2-3 terms surviving stopwording, one moderately common term plus
+/// one incidental term can still add up to over half the query's total IDF
+/// mass, because there just isn't a third or fourth rare term around to
+/// dilute it. "why did I build the meeting recorder" (harness ms4) left
+/// exactly 3 terms -- `build` (df 190/1607 rows, ~12% of the corpus, not a
+/// stopword: it's a normal word in a software-engineering-heavy bank),
+/// `meeting` (df 32), `recorder` (df 53). A memory that matched only
+/// `build` plus `recorder` -- via an unrelated FastAPI/Starlette version
+/// note whose text happened to contain "builds" and a stemmed "recording"
+/// -- cleared 0.5 coverage (0.61) and outranked the real answer, which
+/// matched `build` + `meeting` (0.65). Dropping `build` from
+/// `FTS_STOPWORDS` was tried and reverted: it just let a different pair of
+/// generic terms fill the same slot (see the ms4 section of the harness
+/// report), because the defect isn't about any one token, it's structural.
+/// The fix is a PARTIAL-match guard: when a candidate matches some but not
+/// all of the query's terms, at least one matched term must have a corpus
+/// df below the MEDIAN df of the query's own terms (computed once, over
+/// every query term including unmatched and out-of-vocabulary ones, same
+/// `dfs` the per-term MATCH loop already collected) -- otherwise the match
+/// is entirely built from terms at or above the query's own "common" line
+/// and is dropped regardless of coverage. `build` (df 190) sits above the
+/// 3-term median (53, `recorder`'s own df) in the ms4 query, so build+
+/// recorder no longer clears the floor, while build+meeting still does
+/// (`meeting`'s df 32 is below the median). A FULL match (every query term
+/// present) always passes: with nothing left unmatched there's no
+/// "incidental" term to blame, whatever the terms' individual df -- this
+/// is what keeps a query whose every term happens to have the same df (a
+/// tiny corpus, or a query where all terms are equally rare) from being
+/// wrongly zeroed out, since the median would otherwise equal every
+/// matched term's own df. A single-term query has no median to compare
+/// against (nothing to be "below") and is exempt entirely, unchanged from
+/// before this guard existed.
 ///
 /// Empty when the query has no usable terms or nothing matches. Errors
 /// (index missing, syntax) propagate; `search_hybrid` treats them as "no
@@ -2961,27 +3596,224 @@ pub fn lexical_scores(conn: &Connection, query_text: &str, limit: usize) -> Resu
     if terms.is_empty() {
         return Ok(HashMap::new());
     }
+    let total_docs: i64 = conn.query_row("SELECT count(*) FROM memories_fts", [], |r| r.get(0))?;
     // One MATCH per term. No stemmer of our own: FTS5's porter tokenizer
     // decides what "contains" means for both sides, so "reported" in the
-    // query finds "reporting" in the text.
-    let mut matched: HashMap<i64, usize> = HashMap::new();
-    for term in &terms {
+    // query finds "reporting" in the text. `matched[id]` collects which
+    // term INDICES hit that row, so a row's coverage sums the IDF of only
+    // the terms it actually matched. `dfs` parallels `term_weights` (same
+    // index) and feeds the dominant-term guard below.
+    let mut matched: HashMap<i64, HashSet<usize>> = HashMap::new();
+    let mut term_weights: Vec<f32> = Vec::with_capacity(terms.len());
+    let mut dfs: Vec<i64> = Vec::with_capacity(terms.len());
+    for (i, term) in terms.iter().enumerate() {
         let mut stmt = conn.prepare("SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?1")?;
         let hits = stmt.query_map(params![format!("\"{}\"", term)], |r| r.get::<_, i64>(0))?;
+        let mut df: i64 = 0;
         for h in hits {
-            *matched.entry(h?).or_insert(0) += 1;
+            matched.entry(h?).or_default().insert(i);
+            df += 1;
         }
+        term_weights.push(term_idf(total_docs, df));
+        dfs.push(df);
     }
-    let total = terms.len() as f32;
+    let total_idf: f32 = term_weights.iter().sum();
+    // Dominant-term guard (median df of the query's OWN terms; `None` when
+    // the query has under 2 terms, since a median needs something to
+    // compare against). See the doc comment above for the ms4 case this
+    // exists for.
+    let median_df: Option<f32> = if dfs.len() >= 2 {
+        let mut sorted = dfs.clone();
+        sorted.sort_unstable();
+        let mid = sorted.len() / 2;
+        Some(if sorted.len() % 2 == 0 { (sorted[mid - 1] + sorted[mid]) as f32 / 2.0 } else { sorted[mid] as f32 })
+    } else {
+        None
+    };
     let mut scored: Vec<(i64, f32)> = matched
         .into_iter()
-        .map(|(id, n)| (id, (n as f32 / total).clamp(0.0, 1.0)))
-        .filter(|(_, cov)| *cov >= LEXICAL_MIN_COVERAGE)
+        .map(|(id, term_idxs)| {
+            let cov = if total_idf > 0.0 {
+                term_idxs.iter().map(|&i| term_weights[i]).sum::<f32>() / total_idf
+            } else {
+                0.0
+            };
+            (id, cov.clamp(0.0, 1.0), term_idxs)
+        })
+        .filter(|(_, cov, term_idxs)| {
+            if *cov < LEXICAL_MIN_COVERAGE {
+                return false;
+            }
+            // A PARTIAL match (some query terms unmatched) needs at least
+            // one matched term rarer than the query's own median -- see the
+            // doc comment. A full match (every query term present) always
+            // passes: there's no "incidental" term left to be riding on a
+            // common one, whatever the terms' individual df.
+            let is_partial = term_idxs.len() < terms.len();
+            match (is_partial, median_df) {
+                (true, Some(med)) => term_idxs.iter().any(|&i| (dfs[i] as f32) < med),
+                _ => true,
+            }
+        })
+        .map(|(id, cov, _)| (id, cov))
         .collect();
     // Highest coverage first, id as a stable tiebreak, then bound the output.
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(b.0.cmp(&a.0)));
     scored.truncate(limit);
     Ok(scored.into_iter().collect())
+}
+
+/// `idf(t) = ln((N + 1) / (df(t) + 1)) + 1` — the smoothed IDF `lexical_scores`
+/// documents in full (as in scikit-learn's TF-IDF): floored at 1 for a term
+/// every row matches (`df = N`), capped at `ln(N + 1) + 1` for a term no row
+/// matches (`df = 0`). Factored out so `lexical_scores` (query/corpus
+/// ranking) and `winner_term_coverage` (single-pair coverage, used by
+/// `supersession_guard`) share one formula rather than two copies drifting
+/// apart.
+fn term_idf(total_docs: i64, df: i64) -> f32 {
+    (((total_docs + 1) as f32) / ((df + 1) as f32)).ln() + 1.0
+}
+
+/// IDF-weighted coverage of `loser_content`'s terms (`fts_terms` — the same
+/// salience-capped, stopword-filtered token list `lexical_scores` extracts
+/// from a query) by one specific row, `winner_id` — "does the winner's own
+/// content actually carry what the loser said," which is what
+/// `supersession_guard`'s coverage check (Dedupe only) turns into a block.
+///
+/// Same per-term FTS5 MATCH + `term_idf` machinery as `lexical_scores`,
+/// applied to a single candidate instead of ranking a whole result set: for
+/// each of the loser's terms, the per-term MATCH's hit set either contains
+/// `winner_id` (covered, weighted by that term's corpus-wide rarity) or it
+/// doesn't (uncovered) — `sum(idf(t) for covered t) / sum(idf(t) for all
+/// loser terms)`. A term absent from the corpus entirely still counts in the
+/// denominator (same reasoning as `lexical_scores`'s own doc comment): it
+/// can never be "covered" by anything, so it permanently caps achievable
+/// coverage below 1.0 rather than being silently dropped.
+///
+/// No loser terms at all (nothing >= 3 alnum chars, or all stopwords) ->
+/// nothing checkable -> full coverage (`1.0`): an unfingerprintable loser is
+/// not itself evidence that the winner drops something.
+pub fn winner_term_coverage(conn: &Connection, loser_content: &str, winner_id: i64) -> Result<f32, KbError> {
+    let terms = fts_terms(loser_content);
+    if terms.is_empty() {
+        return Ok(1.0);
+    }
+    let total_docs: i64 = conn.query_row("SELECT count(*) FROM memories_fts", [], |r| r.get(0))?;
+    let mut covered_idf = 0.0f32;
+    let mut total_idf = 0.0f32;
+    for term in &terms {
+        let mut stmt = conn.prepare("SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?1")?;
+        let hits = stmt.query_map(params![format!("\"{}\"", term)], |r| r.get::<_, i64>(0))?;
+        let mut df: i64 = 0;
+        let mut winner_hit = false;
+        for h in hits {
+            let id = h?;
+            df += 1;
+            if id == winner_id {
+                winner_hit = true;
+            }
+        }
+        let w = term_idf(total_docs, df);
+        total_idf += w;
+        if winner_hit {
+            covered_idf += w;
+        }
+    }
+    Ok(if total_idf > 0.0 { (covered_idf / total_idf).clamp(0.0, 1.0) } else { 1.0 })
+}
+
+/// Minimum IDF-weighted term coverage (`winner_term_coverage`) a dedupe
+/// winner must reach over its loser's terms for `supersession_guard` to let
+/// the merge through. Calibrated against all 162 pairs in the
+/// `supersession_audit` label set (`mach kb audit-supersessions`'s verdicts,
+/// computed via this exact function against the pre-repair corpus): 0.23
+/// blocks 33/117 LOSSY pairs while falsely blocking only 3/45 OK pairs
+/// (10% of 45 floors to 4 allowed) — the most LOSSY pairs any single
+/// threshold can catch within that budget; the safe window is any value in
+/// (0.227, 0.235], and 0.25 already overshoots the budget at 5/45 OK
+/// falsely blocked. Measured, not assumed: the date guard alone blocks
+/// 20/117 LOSSY (2/45 OK), this coverage guard alone blocks 33/117 LOSSY
+/// (3/45 OK), and combined (either fires) 47/117 LOSSY are blocked at
+/// 4/45 OK falsely blocked — still under the 10% budget, but leaving
+/// 70/117 (60%) of historically-LOSSY tombstones caught by neither guard
+/// and dependent entirely on the judges. Re-run `mach kb
+/// audit-supersessions` after the guard has been live for a while and
+/// recalibrate against what it actually lets through, rather than
+/// assuming this split holds indefinitely. See `task-4-report.md` for
+/// the full confusion table and the two neighbouring values tried.
+pub const DEDUPE_MIN_COVERAGE: f32 = 0.23;
+
+/// Which automatic pass is asking `supersession_guard` — determines which
+/// checks run (see that function's own doc comment): every kind gets the
+/// date guard, only `Dedupe` also gets the coverage guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardKind {
+    /// `run_dedupe_pass`'s `Keep` branch (`mach kb reflect`'s nightly dedupe
+    /// pass).
+    Dedupe,
+    /// `apply_contradiction_verdict`'s `Conflict`/`ConflictRetro` (`mach kb
+    /// reflect`'s contradiction patrol, and the strength-review sampler's
+    /// own routing through the same function).
+    Contradiction,
+    /// `apply_verdict`'s `Supersede` (`mach kb add`'s save-time classifier).
+    AddSupersede,
+}
+
+/// Deterministic pre-check every automatic supersession path runs BEFORE
+/// tombstoning `loser` in favor of `winner` — `run_dedupe_pass`'s `Keep`
+/// branch, `apply_contradiction_verdict`'s `Conflict`/`ConflictRetro`, and
+/// `apply_verdict`'s `Supersede`. An LLM judge's verdict alone tombstoned
+/// 117 of 162 audited pairs lossily (`mach kb audit-supersessions`); this
+/// runs first and blocks the shapes that audit found the judge gets wrong
+/// in a mechanically checkable way, so a bad verdict degrades to "keep both
+/// rows" (the caller's existing pinned-row fallback) rather than destroying
+/// information. `None` means proceed exactly as before this existed —
+/// `is_pinned`, then `supersede`/`merge_and_supersede`.
+///
+/// - **Date guard** (every `kind`): a `loser` scoped to a specific date is a
+///   historical snapshot, not a stale claim to correct (see `restore`'s own
+///   doc comment for the same reasoning applied after the fact) — blocks
+///   with `"dated fact"` when `loser.occurred_from` is set and that date
+///   string does not appear verbatim in `winner`'s content (`occurred_from`
+///   can come from a relative phrase with no literal ISO date anywhere in
+///   the loser's own text, so this checks the resolved value against the
+///   winner directly), or when `loser`'s content names an ISO date
+///   (`iso_dates_in`) that does not also appear, verbatim, in `winner`'s
+///   content. A date the winner *does* restate is not a dropped fact, so
+///   that case is not blocked.
+/// - **Coverage guard** (`GuardKind::Dedupe` only): blocks with `"winner
+///   does not carry loser's content"` when `winner_term_coverage` — the
+///   loser's terms, IDF-weighted, found in the specific winner row — falls
+///   below `DEDUPE_MIN_COVERAGE`. Not run for `Contradiction`/`AddSupersede`:
+///   a contradiction's winner and loser are, by construction, two
+///   DIFFERENT claims about the same thing (that's what put them in the
+///   contradiction band rather than the dedupe band), so low lexical
+///   overlap is the expected, healthy case there, not evidence of loss —
+///   and the add-time classifier already requires the judge to call
+///   SUPERSEDE rather than UPDATE, a stronger signal than a dedupe KEEP. A
+///   `winner_term_coverage` query failure fails safe as zero coverage
+///   (blocked), consistent with "when unsure, keep both rows".
+pub fn supersession_guard(conn: &Connection, loser: &Memory, winner: &Memory, kind: GuardKind) -> Option<&'static str> {
+    if let Some(from) = &loser.occurred_from {
+        // `occurred_from` can be set from a relative phrase ("last
+        // Tuesday") with no literal ISO date anywhere in the text, so this
+        // checks the resolved date against the winner's content directly
+        // rather than relying on `iso_dates_in` to find it in the loser
+        // first.
+        if !winner.content.contains(from.as_str()) {
+            return Some("dated fact");
+        }
+    }
+    if iso_dates_in(&loser.content).iter().any(|d| !winner.content.contains(d.as_str())) {
+        return Some("dated fact");
+    }
+    if kind == GuardKind::Dedupe {
+        let coverage = winner_term_coverage(conn, &loser.content, winner.id).unwrap_or(0.0);
+        if coverage < DEDUPE_MIN_COVERAGE {
+            return Some("winner does not carry loser's content");
+        }
+    }
+    None
 }
 
 /// Fallback search when embedding the query failed (e.g. ollama is down):
@@ -3043,15 +3875,23 @@ pub fn top_similar(conn: &Connection, query_embedding: &[f32], limit: usize) -> 
 /// What `apply_verdict` actually did to the store, for the CLI to report.
 pub enum AddOutcome {
     Added { id: i64 },
+    /// `Verdict::Update`: the new fact refines an existing one about the
+    /// same thing. Both rows stay active — `old_id` is never touched.
+    AddedRefining { new_id: i64, old_id: i64 },
     AddedAndTombstoned { new_id: i64, old_id: i64, verb: &'static str },
     Skipped { reason: String },
 }
 
 /// Applies a classifier verdict (or the default `Add` when classification
-/// was skipped) to the store. `UPDATE`/`SUPERSEDE` both insert the new fact
-/// first and only then tombstone the old row — inserting unconditionally
-/// means a stale or invalid id in the verdict never costs the new fact:
-/// worst case it's just a plain add.
+/// was skipped) to the store.
+///
+/// `UPDATE` and `SUPERSEDE` diverge here: `UPDATE <id>` means the new fact
+/// *refines* memory `<id>` about the same thing, not that `<id>` is now
+/// false, so it inserts the new row and leaves the old one exactly as it
+/// was — no tombstone, pinned or not. Only `SUPERSEDE <id>` retires the old
+/// row, and it still inserts the new fact first and tombstones second:
+/// inserting unconditionally means a stale or invalid id in the verdict
+/// never costs the new fact, worst case it's just a plain add.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_verdict(
     conn: &Connection,
@@ -3076,15 +3916,53 @@ pub fn apply_verdict(
             let id = insert(conn, content, source, project, reviewed, Some(embedding), importance)?;
             Ok(AddOutcome::Added { id })
         }
-        Verdict::Update(old_id) | Verdict::Supersede(old_id) => {
+        Verdict::Update(old_id) => {
             let new_id = insert(conn, content, source, project, reviewed, Some(embedding), importance)?;
-            let tombstoned = supersede(conn, old_id, new_id, now)?;
-            if tombstoned {
-                let verb = if matches!(verdict, Verdict::Update(_)) { "updated" } else { "superseded" };
-                Ok(AddOutcome::AddedAndTombstoned { new_id, old_id, verb })
+            // Keep both, as history: UPDATE never tombstones. If the id the
+            // classifier gave doesn't actually exist (hallucinated, or the
+            // row was deleted between the k-NN check and the verdict) there
+            // is nothing to "refine", so this degrades to a plain Add —
+            // same fallback shape as Supersede's stale-id case below.
+            if get(conn, old_id)?.is_some() {
+                Ok(AddOutcome::AddedRefining { new_id, old_id })
             } else {
-                // Referenced id was already gone/tombstoned — never lose
-                // the new fact over it, just fall back to a plain add.
+                Ok(AddOutcome::Added { id: new_id })
+            }
+        }
+        Verdict::Supersede(old_id) => {
+            let new_id = insert(conn, content, source, project, reviewed, Some(embedding), importance)?;
+            // A pinned row (`mach kb restore` set that) is never touched
+            // by automatic supersession, so `is_pinned` short-circuits
+            // `supersede` entirely and this degrades to a plain Add —
+            // same fallback as when the referenced id is already
+            // gone/tombstoned below. `supersession_guard` runs right after
+            // (`GuardKind::AddSupersede`): only the date guard applies here
+            // (a dated loser the winner doesn't restate) — the coverage
+            // guard is Dedupe-only, since a classifier SUPERSEDE verdict is
+            // already a stronger signal than a dedupe pass's KEEP (see
+            // `supersession_guard`'s own doc comment). A block degrades the
+            // same way as the pin check above. Logged to stderr since this
+            // path has no per-run "seen" table to record a block in the way
+            // the reflect passes do.
+            let tombstoned = if is_pinned(conn, old_id)? {
+                false
+            } else {
+                match (get(conn, old_id)?, get(conn, new_id)?) {
+                    (Some(loser), Some(winner)) => match supersession_guard(conn, &loser, &winner, GuardKind::AddSupersede) {
+                        Some(reason) => {
+                            eprintln!("mach kb: supersession blocked ({}) #{} -> #{}", reason, old_id, new_id);
+                            false
+                        }
+                        None => supersede(conn, old_id, new_id, now)?,
+                    },
+                    // old_id already gone -- let supersede's own no-op
+                    // contract decide (mirrors the stale-id case above).
+                    _ => supersede(conn, old_id, new_id, now)?,
+                }
+            };
+            if tombstoned {
+                Ok(AddOutcome::AddedAndTombstoned { new_id, old_id, verb: "superseded" })
+            } else {
                 Ok(AddOutcome::Added { id: new_id })
             }
         }
@@ -3108,6 +3986,8 @@ fn row_to_insight(row: &rusqlite::Row) -> rusqlite::Result<Insight> {
         flagged_at: row.get("flagged_at")?,
         last_verified_at: row.get("last_verified_at")?,
         level: row.get("level")?,
+        revised_at: row.get("revised_at")?,
+        prev_text: row.get("prev_text")?,
     })
 }
 
@@ -3308,10 +4188,20 @@ pub const INSIGHT_CONFIDENCE_FLOOR: f64 = 0.05;
 /// the only way a flagged insight goes away — but the confidence keeps
 /// moving, so a belief contradicted repeatedly decays toward the floor
 /// instead of sitting at a fixed "doubted but confident".
+///
+/// Also bumps `last_verified_at = now`, same as `weaken_insight`/
+/// `mark_insight_verified` — a flag IS the outcome of a verification check
+/// that just happened, so it counts the same way. Before this, a flagged
+/// row kept whatever `last_verified_at` (often `NULL`, never-verified) it
+/// had before the flag, which meant `insights_due_for_verification`'s
+/// `ORDER BY last_verified_at ASC` (NULLs first) kept the same flagged rows
+/// at the head of the queue run after run, crowding out every other
+/// insight actually due for a first or repeat check.
 pub fn flag_insight(conn: &Connection, id: i64, now: &str) -> Result<bool, KbError> {
     let n = conn.execute(
         "UPDATE insights SET flagged_at = ?1,
-             confidence = MAX(?2, confidence - ?3)
+             confidence = MAX(?2, confidence - ?3),
+             last_verified_at = ?1
          WHERE id = ?4",
         params![now, INSIGHT_CONFIDENCE_FLOOR, 2.0 * INSIGHT_CONFIDENCE_STEP, id],
     )?;
@@ -3333,6 +4223,89 @@ pub fn weaken_insight(conn: &Connection, id: i64, now: &str) -> Result<bool, KbE
 /// evidence still holds.
 pub fn mark_insight_verified(conn: &Connection, id: i64, now: &str) -> Result<bool, KbError> {
     let n = conn.execute("UPDATE insights SET last_verified_at = ?1 WHERE id = ?2", params![now, id])?;
+    Ok(n > 0)
+}
+
+/// Rewrites an insight's text in place after re-verification's revise/
+/// drop/keep judge (`reflect::build_revise_prompt`/`parse_revise`) finds
+/// the current evidence supports a CORRECTED belief rather than the
+/// original wording or nothing at all — `cli::run_insight_stage`'s `REVISE`
+/// branch, the one path that mutates `Insight::text` after creation.
+///
+/// Unlike `mark_insight_verified`, a `REVISE` is not a free pass: the
+/// ORIGINAL wording didn't hold, so `confidence` is lowered by one
+/// `INSIGHT_CONFIDENCE_STEP` (floored at `INSIGHT_CONFIDENCE_FLOOR`) —
+/// the same step `weaken_insight` uses, less severe than `flag_insight`'s
+/// two-step drop since a REVISE means the belief itself survives,
+/// corrected, rather than being wholly rejected.
+///
+/// `cited_ids` — the memory ids `reflect::parse_revise` validated against
+/// the evidence the judge was shown — are appended to `source_ids`
+/// (deduped against what's already there, same convention as
+/// `reinforce_insight`): the corrected wording is now also backed by
+/// whatever new evidence the judge cited for it.
+///
+/// Stashes the old text in `prev_text` (one hop back — a second revision
+/// overwrites `prev_text` with the wording it just replaced, not a full
+/// history), re-embeds if the caller has a fresh embedding (`None` when
+/// the embedder itself failed, in which case the OLD embedding is kept
+/// rather than wiped to null — a stale-but-present vector still ranks
+/// better than none; `cli::run_insight_stage`'s own call site instead
+/// skips calling this function at all on an embed failure, so `None` here
+/// is for other/future callers), stamps `revised_at`, bumps
+/// `last_verified_at` (a revision IS a verification outcome that just
+/// happened), and clears any stale `flagged_at` (a `REVISE` verdict means
+/// the belief, corrected, is supported again).
+///
+/// Also clears any `insight_dedupe_seen` rows citing `id` — the dedupe
+/// pass judged the OLD wording against its neighbors; a rewritten belief
+/// deserves a fresh look rather than staying silently excluded from
+/// future candidate pairs on the strength of a verdict about text that no
+/// longer exists.
+///
+/// Returns `false` if `id` doesn't exist — never panics on a stale or
+/// hallucinated target.
+pub fn revise_insight(
+    conn: &Connection,
+    id: i64,
+    new_text: &str,
+    new_embedding: Option<&[f32]>,
+    cited_ids: &[i64],
+    now: &str,
+) -> Result<bool, KbError> {
+    let Some(prev) = get_insight(conn, id)? else {
+        return Ok(false);
+    };
+    let mut ids = prev.source_ids.clone();
+    for cid in cited_ids {
+        let s = cid.to_string();
+        if !ids.contains(&s) {
+            ids.push(s);
+        }
+    }
+    let source_ids_json =
+        serde_json::to_string(&ids).map_err(|e| KbError::Other(format!("encoding source_ids: {}", e)))?;
+    let confidence = (prev.confidence - INSIGHT_CONFIDENCE_STEP).max(INSIGHT_CONFIDENCE_FLOOR);
+    let n = match new_embedding {
+        Some(emb) => {
+            let blob = encode_embedding(emb);
+            conn.execute(
+                "UPDATE insights SET text = ?1, embedding = ?2, prev_text = ?3, revised_at = ?4,
+                     last_verified_at = ?4, flagged_at = NULL, source_ids = ?5, confidence = ?6
+                 WHERE id = ?7",
+                params![new_text, blob, prev.text, now, source_ids_json, confidence, id],
+            )?
+        }
+        None => conn.execute(
+            "UPDATE insights SET text = ?1, prev_text = ?2, revised_at = ?3,
+                 last_verified_at = ?3, flagged_at = NULL, source_ids = ?4, confidence = ?5
+             WHERE id = ?6",
+            params![new_text, prev.text, now, source_ids_json, confidence, id],
+        )?,
+    };
+    if n > 0 {
+        conn.execute("DELETE FROM insight_dedupe_seen WHERE id_a = ?1 OR id_b = ?1", params![id])?;
+    }
     Ok(n > 0)
 }
 
@@ -3486,6 +4459,131 @@ pub fn memories_since(conn: &Connection, last_id: i64) -> Result<Vec<Memory>, Kb
     for r in rows {
         out.push(r?);
     }
+    Ok(out)
+}
+
+/// Count of active, non-dormant memories the reflect insight stage has not
+/// yet examined (`reflected_at IS NULL`) — the reflect summary's own
+/// `backlog=` figure, and the cheap DB-only pre-check `cmd_reflect` uses to
+/// decide whether the insight stage has anything to do at all, without
+/// materializing any rows. Replaces the old watermark-based `has_new` check
+/// (`memories_since(last_id).is_empty()`), which stopped meaning "is there
+/// backlog" the moment the watermark itself stopped moving — see
+/// `SCHEMA_VERSION`'s v29->v30 migration for why.
+pub fn unreflected_active_count(conn: &Connection) -> Result<i64, KbError> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM memories WHERE reflected_at IS NULL AND invalidated_at IS NULL AND dormant_at IS NULL",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+/// The `limit` most recently created unreflected active memories, newest
+/// id first. Half of `cli::reflect_working_set`'s oldest/newest split — see
+/// its own doc comment for the full rationale.
+pub fn unreflected_active_newest(conn: &Connection, limit: usize) -> Result<Vec<Memory>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM memories WHERE reflected_at IS NULL AND invalidated_at IS NULL AND dormant_at IS NULL \
+         ORDER BY id DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit as i64], row_to_memory)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// The `limit` oldest unreflected active memories, oldest id first,
+/// skipping any id already in `exclude` — the other half of
+/// `cli::reflect_working_set`'s split. `exclude` is normally the newest
+/// slice already chosen, so the two halves never overlap even when the
+/// whole backlog is smaller than the newest slice's own cap (every id
+/// would otherwise be picked by both queries independently). Scans oldest-
+/// first and stops as soon as `limit` rows are collected, so this stays
+/// cheap even against a large backlog as long as `exclude` doesn't force it
+/// deep into the table (it normally holds the highest ids, which this scan
+/// only reaches last).
+pub fn unreflected_active_oldest(
+    conn: &Connection,
+    limit: usize,
+    exclude: &HashSet<i64>,
+) -> Result<Vec<Memory>, KbError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT * FROM memories WHERE reflected_at IS NULL AND invalidated_at IS NULL AND dormant_at IS NULL \
+         ORDER BY id ASC",
+    )?;
+    let mut rows = stmt.query(params![])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let m = row_to_memory(row)?;
+        if exclude.contains(&m.id) {
+            continue;
+        }
+        out.push(m);
+        if out.len() >= limit {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Marks every id in `ids` reflected as of `now` — the insight stage's own
+/// per-memory progress marker (`memories.reflected_at`, schema v30),
+/// replacing the old all-or-nothing `reflect_state.last_memory_id`
+/// watermark. Set only when the insight stage's own working set finished
+/// with no LLM failure in that stage (see `reflect::should_mark_reflected`
+/// and `cli::run_insight_stage`) — a failure in any other pass never
+/// reaches this call. Overwriting an already-reflected row (a race with a
+/// concurrent run, or a row reflected twice across two backfills) is
+/// harmless: it just means "examined again," never destructive.
+pub fn mark_memories_reflected(conn: &Connection, ids: &[i64], now: &str) -> Result<usize, KbError> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.unchecked_transaction()?;
+    let mut updated = 0usize;
+    for id in ids {
+        updated += tx.execute("UPDATE memories SET reflected_at = ?1 WHERE id = ?2", params![now, id])?;
+    }
+    tx.commit()?;
+    Ok(updated)
+}
+
+/// Ids "new since the last reflect run" for the nightly dedupe and
+/// contradiction passes, now derived from `memories.reflected_at` instead
+/// of the retired `reflect_state` watermark: unioned as (a) still-
+/// unreflected backlog (`reflected_at IS NULL`, exactly the insight
+/// stage's own definition of new) and (b) rows reflected at or after
+/// `previous_run_start` — normally this very run's own working set, marked
+/// moments before dedupe/contradiction run, plus anything the immediately
+/// preceding run reflected. Without (b), a memory the insight stage just
+/// finished examining would have to wait a full extra `mach kb reflect`
+/// invocation before dedupe/contradiction ever got a look at it, since (a)
+/// alone stops covering it the instant it's marked reflected.
+/// `previous_run_start` is `reflect_state.last_run_at` as read at the start
+/// of the current run, before this run overwrites it — `None` on a
+/// database that has never completed a run (every active row then counts
+/// as new via (a) alone, since nothing has been reflected yet).
+pub fn ids_new_since_reflect(conn: &Connection, previous_run_start: Option<&str>) -> Result<HashSet<i64>, KbError> {
+    let mut out = HashSet::new();
+    let mut stmt = match previous_run_start {
+        Some(_) => conn.prepare(
+            "SELECT id FROM memories WHERE invalidated_at IS NULL AND dormant_at IS NULL \
+             AND (reflected_at IS NULL OR reflected_at >= ?1)",
+        )?,
+        None => conn.prepare(
+            "SELECT id FROM memories WHERE invalidated_at IS NULL AND dormant_at IS NULL AND reflected_at IS NULL",
+        )?,
+    };
+    let ids: Vec<i64> = match previous_run_start {
+        Some(cutoff) => stmt.query_map(params![cutoff], |r| r.get(0))?.collect::<Result<_, _>>()?,
+        None => stmt.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?,
+    };
+    out.extend(ids);
     Ok(out)
 }
 
@@ -3714,55 +4812,159 @@ pub struct ModelRow {
     pub text: String,
     pub doubted: bool,
     pub nested: bool,
+    /// Created or revised within the last 7 days (`last_verified_at`
+    /// deliberately excluded — see `model_is_recent`). Drives
+    /// `cli::render_model_text`'s budget reservation for recent learning;
+    /// not part of `--json` output (see `cli::to_model_row_json`).
+    pub recent: bool,
 }
 
-/// Builds the tree-ordered mental model over all active insights and
-/// themes: themes first (by id), each immediately followed by its own
-/// level-1 insights (in the theme's `source_ids` order), then any level-1
-/// insights not yet folded into a theme (by id). Same shape `mach kb tree`
-/// renders, minus the memory citations — this view exists to be cheap
-/// enough to inject on every session start, not to support investigation.
+/// Ranks rows the way `mental_model` wants them read: non-doubted before
+/// doubted, then by descending `rank` (either raw confidence, for a
+/// theme's nested beliefs, or the recency-boosted `model_score`, for the
+/// merged top-level list — see call sites), then `id` as a stable
+/// tiebreaker. Applied independently within each group it's called on —
+/// never globally across a theme's children and another theme's children.
+fn sort_model_rank<T>(items: &mut [T], flagged: impl Fn(&T) -> bool, rank: impl Fn(&T) -> f64, id: impl Fn(&T) -> i64) {
+    items.sort_by(|a, b| {
+        flagged(a)
+            .cmp(&flagged(b))
+            .then_with(|| rank(b).partial_cmp(&rank(a)).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| id(a).cmp(&id(b)))
+    });
+}
+
+/// Recency-boosted rank score for `mental_model`'s merged top-level list
+/// (themes and unthemed beliefs, ranked together as of this task):
+/// `confidence * (1 + 0.5 * recency)`, `recency = exp(-days_since(latest) /
+/// 14)`, `latest` the most recent of `created_at` and `revised_at` —
+/// deliberately NOT `last_verified_at`: a routine re-verification that
+/// just confirmed an old belief still holds (`mark_insight_verified`)
+/// bumps `last_verified_at` alone, and that isn't "recent learning" the
+/// way authoring or a `REVISE` rewrite is; counting it would let a
+/// verification-only pass keep an old row artificially boosted forever
+/// just by being checked on schedule. A row touched (created or revised)
+/// in the last couple weeks outranks an equally-confident but stale one;
+/// recency decays to ~0 past a month or so, so an old row's score settles
+/// back to its raw confidence. This is what keeps old high-confidence
+/// themes from permanently burying new learning — see
+/// `cli::render_model_text` for the budget-side half of that fix.
+fn model_score(insight: &Insight, now: i64) -> f64 {
+    let mut latest = parse_rfc3339(&insight.created_at).unwrap_or(now);
+    if let Some(secs) = insight.revised_at.as_deref().and_then(parse_rfc3339) {
+        latest = latest.max(secs);
+    }
+    let recency = (-days_between(now, latest) / 14.0).exp();
+    insight.confidence * (1.0 + 0.5 * recency)
+}
+
+/// Whether `insight` was created or revised within the last 7 days.
+/// `last_verified_at` is deliberately excluded — routine re-verification
+/// touching an old row shouldn't count as "recent" the way authoring or a
+/// rewrite does. Feeds `ModelRow::recent`, which
+/// `cli::render_model_text` uses to reserve budget for recent learning.
+fn model_is_recent(insight: &Insight, now: i64) -> bool {
+    let created = parse_rfc3339(&insight.created_at).map(|c| days_between(now, c) <= 7.0).unwrap_or(false);
+    let revised = insight
+        .revised_at
+        .as_deref()
+        .and_then(parse_rfc3339)
+        .map(|r| days_between(now, r) <= 7.0)
+        .unwrap_or(false);
+    created || revised
+}
+
+/// Builds the mental model over all active insights and themes: themes and
+/// unthemed level-1 insights are ranked together in one top-level list by
+/// `(doubted, -model_score, id)` — see `model_score` — so a recently
+/// touched high-confidence belief can outrank an old theme instead of
+/// every theme sorting ahead of every belief by construction. Each theme
+/// is still immediately followed by its own level-1 insights (nested,
+/// ranked among themselves by raw confidence via `sort_model_rank` — that
+/// placement rule is unchanged from before this task). Same shape `mach kb
+/// tree` renders, minus the memory citations — this view exists to be
+/// cheap enough to inject on every session start, not to support
+/// investigation.
 pub fn mental_model(conn: &Connection) -> Result<Vec<ModelRow>, KbError> {
-    let mut themes = active_insights_by_level(conn, 2)?;
-    themes.sort_by_key(|t| t.id);
-    let mut level1 = active_insights_by_level(conn, 1)?;
-    level1.sort_by_key(|i| i.id);
+    let now = now_secs() as i64;
+    let themes = active_insights_by_level(conn, 2)?;
+    let level1 = active_insights_by_level(conn, 1)?;
     let themed = themed_insight_ids(conn)?;
 
-    let mut rows = Vec::new();
+    enum TopCandidate<'a> {
+        Theme(&'a Insight, Vec<&'a Insight>),
+        Unthemed(&'a Insight),
+    }
+
+    let mut top: Vec<TopCandidate> = Vec::new();
     for theme in &themes {
-        rows.push(ModelRow {
-            kind: ModelKind::Theme,
-            confidence: theme.confidence,
-            text: theme.text.clone(),
-            doubted: theme.is_flagged(),
-            nested: false,
-        });
+        let mut nested: Vec<&Insight> = Vec::new();
         for sid in &theme.source_ids {
             if let Some(rest) = sid.strip_prefix('i').or_else(|| sid.strip_prefix('I')) {
                 if let Ok(iid) = rest.parse::<i64>() {
                     if let Some(ins) = level1.iter().find(|i| i.id == iid) {
-                        rows.push(ModelRow {
-                            kind: ModelKind::Belief,
-                            confidence: ins.confidence,
-                            text: ins.text.clone(),
-                            doubted: ins.is_flagged(),
-                            nested: true,
-                        });
+                        nested.push(ins);
                     }
                 }
             }
         }
+        sort_model_rank(&mut nested, |i| i.is_flagged(), |i| i.confidence, |i| i.id);
+        top.push(TopCandidate::Theme(theme, nested));
+    }
+    for ins in level1.iter().filter(|i| !themed.contains(&i.id)) {
+        top.push(TopCandidate::Unthemed(ins));
     }
 
-    for ins in level1.iter().filter(|i| !themed.contains(&i.id)) {
-        rows.push(ModelRow {
-            kind: ModelKind::Belief,
-            confidence: ins.confidence,
-            text: ins.text.clone(),
-            doubted: ins.is_flagged(),
-            nested: false,
-        });
+    sort_model_rank(
+        &mut top,
+        |c| match c {
+            TopCandidate::Theme(t, _) => t.is_flagged(),
+            TopCandidate::Unthemed(i) => i.is_flagged(),
+        },
+        |c| match c {
+            TopCandidate::Theme(t, _) => model_score(t, now),
+            TopCandidate::Unthemed(i) => model_score(i, now),
+        },
+        |c| match c {
+            TopCandidate::Theme(t, _) => t.id,
+            TopCandidate::Unthemed(i) => i.id,
+        },
+    );
+
+    let mut rows = Vec::new();
+    for c in top {
+        match c {
+            TopCandidate::Theme(theme, nested) => {
+                rows.push(ModelRow {
+                    kind: ModelKind::Theme,
+                    confidence: theme.confidence,
+                    text: theme.text.clone(),
+                    doubted: theme.is_flagged(),
+                    nested: false,
+                    recent: model_is_recent(theme, now),
+                });
+                for ins in nested {
+                    rows.push(ModelRow {
+                        kind: ModelKind::Belief,
+                        confidence: ins.confidence,
+                        text: ins.text.clone(),
+                        doubted: ins.is_flagged(),
+                        nested: true,
+                        recent: model_is_recent(ins, now),
+                    });
+                }
+            }
+            TopCandidate::Unthemed(ins) => {
+                rows.push(ModelRow {
+                    kind: ModelKind::Belief,
+                    confidence: ins.confidence,
+                    text: ins.text.clone(),
+                    doubted: ins.is_flagged(),
+                    nested: false,
+                    recent: model_is_recent(ins, now),
+                });
+            }
+        }
     }
 
     Ok(rows)
@@ -3823,6 +5025,118 @@ pub fn mark_dedupe_seen(conn: &Connection, id_a: i64, id_b: i64) -> Result<(), K
     let (a, b) = normalize_pair(id_a, id_b);
     conn.execute("INSERT OR IGNORE INTO dedupe_seen (id_a, id_b) VALUES (?1, ?2)", params![a, b])?;
     Ok(())
+}
+
+/// Appends one `judge_log` row. `outcome` is the wrapped LLM call's result:
+/// `Ok(reply)` fills `reply`, `Err(error)` fills `error`. Callers treat a
+/// failure here as non-fatal — see `reflect::LoggedLlm`.
+pub fn log_judge_call(
+    conn: &Connection,
+    pass: &str,
+    model: &str,
+    prompt: &str,
+    outcome: Result<&str, &str>,
+    latency_ms: u64,
+    now: &str,
+) -> Result<(), KbError> {
+    let (reply, error) = match outcome {
+        Ok(r) => (Some(r), None),
+        Err(e) => (None, Some(e)),
+    };
+    conn.execute(
+        "INSERT INTO judge_log (created_at, pass, model, prompt, reply, error, latency_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![now, pass, model, prompt, reply, error, latency_ms as i64],
+    )?;
+    Ok(())
+}
+
+/// Retention window for `judge_log` rows (`mach kb reflect`'s raw LLM-call
+/// audit trail — see `migrate_v25_to_v26`) — 180 days. Purely diagnostic
+/// training data (balanced haiku-verdict labels for evaluating a local
+/// decision model down the line), never read by any ranking or
+/// supersession logic, so an age-only cutoff is safe. Pruned at the end of
+/// `mach kb reflect` by `prune_judge_log`.
+pub const JUDGE_LOG_RETENTION_DAYS: i64 = 180;
+
+/// Deletes every `judge_log` row whose `created_at` is older than
+/// `older_than` (an RFC3339 timestamp, compared lexicographically like
+/// every other stored timestamp here). Returns how many rows were deleted.
+/// Called at the end of `mach kb reflect` with a cutoff
+/// `JUDGE_LOG_RETENTION_DAYS` before now. Scoped to this one table only —
+/// `supersession_audit` is a permanent record and this function (like its
+/// `recall_engagement` sibling below) never touches it.
+pub fn prune_judge_log(conn: &Connection, older_than: &str) -> Result<usize, KbError> {
+    Ok(conn.execute("DELETE FROM judge_log WHERE created_at < ?1", params![older_than])?)
+}
+
+/// Persists one session's engagement verdicts: one `recall_engagement` row
+/// per id in `shown` (the ids the recall log listed and
+/// `ingest::parse_engagement_verdicts` actually returned a verdict for),
+/// flagged `engaged` if it also appears in `engaged`. `INSERT OR REPLACE`
+/// on the `(session_id, memory_id)` primary key, so re-running ingest for
+/// the same session (a retry, or a forced `--session-id` re-run) overwrites
+/// the prior verdict rather than duplicating it -- idempotent by
+/// construction. This is the durable record `mach kb recall-stats` reads,
+/// surviving the 14-day prune of the recall-log JSONL itself.
+pub fn record_engagement(conn: &Connection, session_id: &str, shown: &[i64], engaged: &[i64], now: &str) -> Result<(), KbError> {
+    let engaged_set: std::collections::HashSet<i64> = engaged.iter().copied().collect();
+    for &id in shown {
+        conn.execute(
+            "INSERT OR REPLACE INTO recall_engagement (session_id, memory_id, engaged, judged_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, id, engaged_set.contains(&id) as i64, now],
+        )?;
+    }
+    Ok(())
+}
+
+/// One session's aggregate from `recall_engagement`: how many injected ids
+/// were shown (judged at all) and how many of those were engaged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecallStatsRow {
+    pub session_id: String,
+    pub shown: i64,
+    pub engaged: i64,
+}
+
+/// Every session with at least one `recall_engagement` row judged at or
+/// after `since` (an RFC3339 timestamp, compared lexicographically like
+/// every other stored timestamp), grouped into shown/engaged counts and
+/// ordered by session id. Backs `mach kb recall-stats`.
+pub fn recall_stats_since(conn: &Connection, since: &str) -> Result<Vec<RecallStatsRow>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id, COUNT(*), SUM(engaged)
+         FROM recall_engagement
+         WHERE judged_at >= ?1
+         GROUP BY session_id
+         ORDER BY session_id",
+    )?;
+    let rows = stmt.query_map(params![since], |r| {
+        Ok(RecallStatsRow { session_id: r.get(0)?, shown: r.get(1)?, engaged: r.get::<_, i64>(2)? })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Retention window for `recall_engagement` rows (`mach kb recall-stats`'s
+/// durable per-session shown/engaged verdicts — see `migrate_v26_to_v27`)
+/// — 365 days, longer than `judge_log`'s because recall precision is
+/// tracked over quarters, not weeks. Pruned at the end of `mach kb
+/// reflect` by `prune_recall_engagement`.
+pub const RECALL_ENGAGEMENT_RETENTION_DAYS: i64 = 365;
+
+/// Deletes every `recall_engagement` row whose `judged_at` is older than
+/// `older_than` (an RFC3339 timestamp, compared lexicographically). Returns
+/// how many rows were deleted. Called at the end of `mach kb reflect` with
+/// a cutoff `RECALL_ENGAGEMENT_RETENTION_DAYS` before now. Scoped to this
+/// one table only — `supersession_audit` is a permanent record and this
+/// function (like its `judge_log` sibling above) never touches it.
+pub fn prune_recall_engagement(conn: &Connection, older_than: &str) -> Result<usize, KbError> {
+    Ok(conn.execute("DELETE FROM recall_engagement WHERE judged_at < ?1", params![older_than])?)
 }
 
 /// Every pair ever recorded by `mark_dedupe_seen`, as normalized `(min,
@@ -4219,8 +5533,8 @@ pub fn raw_upsert_memory(conn: &Connection, m: &Memory) -> Result<(), KbError> {
             (id, content, source, project, created_at, reviewed, embedding, importance, stability,
              access_count, first_accessed_at, last_accessed_at, valid_from, invalidated_at,
              superseded_by, dormant_at, last_verified_at, graph_extracted_at, basis,
-             occurred_from, occurred_to)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)
+             occurred_from, occurred_to, pinned_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)
          ON CONFLICT(id) DO UPDATE SET
             content = excluded.content, source = excluded.source, project = excluded.project,
             created_at = excluded.created_at, reviewed = excluded.reviewed, embedding = excluded.embedding,
@@ -4230,7 +5544,8 @@ pub fn raw_upsert_memory(conn: &Connection, m: &Memory) -> Result<(), KbError> {
             invalidated_at = excluded.invalidated_at, superseded_by = excluded.superseded_by,
             dormant_at = excluded.dormant_at, last_verified_at = excluded.last_verified_at,
             graph_extracted_at = excluded.graph_extracted_at, basis = excluded.basis,
-            occurred_from = excluded.occurred_from, occurred_to = excluded.occurred_to",
+            occurred_from = excluded.occurred_from, occurred_to = excluded.occurred_to,
+            pinned_at = COALESCE(excluded.pinned_at, memories.pinned_at)",
         params![
             m.id,
             m.content,
@@ -4253,6 +5568,7 @@ pub fn raw_upsert_memory(conn: &Connection, m: &Memory) -> Result<(), KbError> {
             m.basis,
             m.occurred_from,
             m.occurred_to,
+            m.pinned_at,
         ],
     )?;
     Ok(())
@@ -4266,13 +5582,14 @@ pub fn raw_upsert_insight(conn: &Connection, i: &Insight) -> Result<(), KbError>
         serde_json::to_string(&i.source_ids).map_err(|e| KbError::Other(format!("encoding source_ids: {}", e)))?;
     conn.execute(
         "INSERT INTO insights (id, text, created_at, confidence, source_ids, embedding, invalidated_at,
-             flagged_at, last_verified_at, level)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+             flagged_at, last_verified_at, level, revised_at, prev_text)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
          ON CONFLICT(id) DO UPDATE SET
             text = excluded.text, created_at = excluded.created_at, confidence = excluded.confidence,
             source_ids = excluded.source_ids, embedding = excluded.embedding,
             invalidated_at = excluded.invalidated_at, flagged_at = excluded.flagged_at,
-            last_verified_at = excluded.last_verified_at, level = excluded.level",
+            last_verified_at = excluded.last_verified_at, level = excluded.level,
+            revised_at = excluded.revised_at, prev_text = excluded.prev_text",
         params![
             i.id,
             i.text,
@@ -4284,6 +5601,8 @@ pub fn raw_upsert_insight(conn: &Connection, i: &Insight) -> Result<(), KbError>
             i.flagged_at,
             i.last_verified_at,
             i.level,
+            i.revised_at,
+            i.prev_text,
         ],
     )?;
     Ok(())
@@ -4313,10 +5632,15 @@ pub fn memory_last_modified(m: &Memory) -> &str {
 }
 
 /// Insights counterpart of `memory_last_modified` — latest of `created_at`,
-/// `last_verified_at`, `flagged_at`, `invalidated_at`.
+/// `last_verified_at`, `flagged_at`, `invalidated_at`, `revised_at`.
 pub fn insight_last_modified(i: &Insight) -> &str {
     let mut latest = i.created_at.as_str();
-    for candidate in [i.last_verified_at.as_deref(), i.flagged_at.as_deref(), i.invalidated_at.as_deref()] {
+    for candidate in [
+        i.last_verified_at.as_deref(),
+        i.flagged_at.as_deref(),
+        i.invalidated_at.as_deref(),
+        i.revised_at.as_deref(),
+    ] {
         if let Some(c) = candidate {
             if c > latest {
                 latest = c;
@@ -5935,7 +7259,7 @@ mod tests {
         let plain = search_ranked(&conn, &q, 5, false, false, 0.0, &now).unwrap();
         assert!(plain.iter().all(|h| h.sim == 0.0 && h.lexical == 0.0));
 
-        let hybrid = search_hybrid(&conn, "what is 43005", &q, 5, false, false, 0.0, &now).unwrap();
+        let hybrid = search_hybrid(&conn, "what is 43005", &q, 5, false, false, 0.0, &now, None).unwrap();
         assert_eq!(hybrid[0].memory.id, norad, "the exact catalog number must win on the lexical channel");
         assert!((hybrid[0].lexical - 1.0).abs() < 1e-6);
         assert_eq!(hybrid[0].sim, 0.0, "raw cosine is reported untouched");
@@ -5949,7 +7273,7 @@ mod tests {
         let both = insert(&conn, "catalog 43005", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
         let now = now_rfc3339();
         let q = unit_vec(4, 0); // cosine 1.0 AND lexical 1.0
-        let hybrid = search_hybrid(&conn, "43005", &q, 5, false, false, 0.0, &now).unwrap();
+        let hybrid = search_hybrid(&conn, "43005", &q, 5, false, false, 0.0, &now, None).unwrap();
         let plain = search_ranked(&conn, &q, 5, false, false, 0.0, &now).unwrap();
         assert_eq!(hybrid[0].memory.id, both);
         assert!((hybrid[0].score - plain[0].score).abs() < 1e-6, "max(), not sum: same score as cosine alone");
@@ -5962,11 +7286,11 @@ mod tests {
         let now = now_rfc3339();
         let q = unit_vec(4, 0);
         assert!(search_ranked(&conn, &q, 5, false, false, 0.0, &now).unwrap().is_empty());
-        let hybrid = search_hybrid(&conn, "popobawa", &q, 5, false, false, 0.0, &now).unwrap();
+        let hybrid = search_hybrid(&conn, "popobawa", &q, 5, false, false, 0.0, &now, None).unwrap();
         assert_eq!(hybrid.len(), 1);
         assert_eq!(hybrid[0].memory.id, id);
         // and with no usable tokens at all it is still excluded
-        assert!(search_hybrid(&conn, "the a", &q, 5, false, false, 0.0, &now).unwrap().is_empty());
+        assert!(search_hybrid(&conn, "the a", &q, 5, false, false, 0.0, &now, None).unwrap().is_empty());
     }
 
     #[test]
@@ -6067,6 +7391,56 @@ mod tests {
         }
         // and the v19 backfill still ran over it
         assert_eq!(get(&conn, 1).unwrap().unwrap().occurred_from.as_deref(), Some("2026-09-07"));
+    }
+
+    #[test]
+    fn forgetting_a_cited_memory_repoints_edges_with_other_evidence_and_tombstones_the_rest() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let user = insert_entity(&conn, "user", None, None).unwrap();
+        let helios = insert_entity(&conn, "Helios", Some("project"), None).unwrap();
+        let umoja = insert_entity(&conn, "Umoja", Some("project"), None).unwrap();
+        let doomed = insert(&conn, "the memory being forgotten", None, None, true, None, 5).unwrap();
+        let survivor = insert(&conn, "another memory backing the same claim", None, None, true, None, 5).unwrap();
+
+        // One edge has a second piece of evidence; the other has only the
+        // memory about to be forgotten.
+        let shared = insert_relation(&conn, user, "works-on", helios, Some(doomed), Some(0.9), &now).unwrap();
+        add_relation_evidence(&conn, shared, doomed, &now).unwrap();
+        add_relation_evidence(&conn, shared, survivor, &now).unwrap();
+        let sole = insert_relation(&conn, user, "works-on", umoja, Some(doomed), Some(0.9), &now).unwrap();
+        add_relation_evidence(&conn, sole, doomed, &now).unwrap();
+
+        // Before the fix this returned Err("FOREIGN KEY constraint failed"),
+        // which made 214 of 738 live memories undeletable.
+        assert!(delete(&conn, doomed).unwrap(), "a cited memory must still be deletable");
+        assert!(get(&conn, doomed).unwrap().is_none());
+
+        let shared = get_relation(&conn, shared).unwrap().unwrap();
+        assert_eq!(
+            shared.evidence_memory_id,
+            Some(survivor),
+            "an edge with other evidence is repointed at a survivor, not tombstoned"
+        );
+        assert!(shared.is_active(), "and stays active, because the claim still has backing");
+
+        let sole = get_relation(&conn, sole).unwrap().unwrap();
+        assert!(
+            !sole.is_active(),
+            "an edge whose only evidence was forgotten is tombstoned here, which is what \
+             the graph hygiene pass would have done to it later anyway"
+        );
+        assert_eq!(sole.evidence_memory_id, None, "and holds no dangling reference");
+
+        // No evidence link may outlive the memory it names.
+        let left: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM relation_evidence WHERE memory_id = ?1",
+                params![doomed],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
     }
 
     #[test]
@@ -6203,6 +7577,132 @@ mod tests {
     }
 
     #[test]
+    fn flag_insight_bumps_last_verified_at_so_it_leaves_the_head_of_the_verification_queue() {
+        let conn = mem_conn();
+        let flagged = insert_insight(&conn, "a belief that gets contradicted", 0.8, &["1".to_string()], None).unwrap();
+        let never_checked = insert_insight(&conn, "never yet verified", 0.6, &["2".to_string()], None).unwrap();
+        let now = "2026-09-23T00:00:00Z";
+        flag_insight(&conn, flagged, now).unwrap();
+
+        let after = get_insight(&conn, flagged).unwrap().unwrap();
+        assert_eq!(after.last_verified_at.as_deref(), Some(now), "a flag IS a verification outcome");
+
+        // Without the bump, `flagged` (NULL last_verified_at) would still
+        // sort ahead of `never_checked` every run -- one contradicted
+        // insight would permanently crowd out the rest of the queue.
+        let due = insights_due_for_verification(&conn, 10).unwrap();
+        let due_ids: Vec<i64> = due.iter().map(|i| i.id).collect();
+        assert!(
+            due_ids.iter().position(|&id| id == never_checked) < due_ids.iter().position(|&id| id == flagged),
+            "never-verified must now sort ahead of the just-flagged row: {:?}",
+            due_ids
+        );
+    }
+
+    #[test]
+    fn revise_insight_rewrites_text_stashes_prev_text_and_clears_a_flag() {
+        let conn = mem_conn();
+        let id = insert_insight(&conn, "the user always ships on Fridays", 0.7, &["1".to_string()], None).unwrap();
+        flag_insight(&conn, id, "2026-09-20T00:00:00Z").unwrap();
+        let flagged_confidence = get_insight(&conn, id).unwrap().unwrap().confidence;
+        assert!(get_insight(&conn, id).unwrap().unwrap().is_flagged());
+
+        let now = "2026-09-23T00:00:00Z";
+        let ok =
+            revise_insight(&conn, id, "the user ships mid-week, never on Fridays", Some(&[0.5, 0.5]), &[5, 6], now)
+                .unwrap();
+        assert!(ok);
+
+        let after = get_insight(&conn, id).unwrap().unwrap();
+        assert_eq!(after.text, "the user ships mid-week, never on Fridays");
+        assert_eq!(after.prev_text.as_deref(), Some("the user always ships on Fridays"));
+        assert_eq!(after.revised_at.as_deref(), Some(now));
+        assert_eq!(after.last_verified_at.as_deref(), Some(now), "a revision is a verification outcome too");
+        assert!(!after.is_flagged(), "a REVISE verdict means the corrected belief is supported again");
+        assert_eq!(
+            after.confidence,
+            flagged_confidence - INSIGHT_CONFIDENCE_STEP,
+            "a REVISE lowers confidence by one step, same as flag's own step (item 3 of the final fix list)"
+        );
+        assert_eq!(after.embedding, Some(vec![0.5, 0.5]));
+        assert_eq!(after.source_ids, vec!["1".to_string(), "5".to_string(), "6".to_string()], "cited ids are appended");
+    }
+
+    #[test]
+    fn revise_insight_lowers_confidence_by_one_step_with_a_floor() {
+        let conn = mem_conn();
+        let id = insert_insight(&conn, "barely-supported belief", 0.1, &["1".to_string()], None).unwrap();
+        revise_insight(&conn, id, "corrected wording", None, &[], "2026-09-23T00:00:00Z").unwrap();
+        let after = get_insight(&conn, id).unwrap().unwrap();
+        assert_eq!(
+            after.confidence, INSIGHT_CONFIDENCE_FLOOR,
+            "0.1 - INSIGHT_CONFIDENCE_STEP would go below the floor, so it must clamp there instead"
+        );
+    }
+
+    #[test]
+    fn revise_insight_appends_cited_ids_deduped_against_existing_source_ids() {
+        let conn = mem_conn();
+        let id = insert_insight(&conn, "original", 0.6, &["1".to_string(), "5".to_string()], None).unwrap();
+        revise_insight(&conn, id, "corrected", None, &[5, 6], "2026-09-23T00:00:00Z").unwrap();
+        let after = get_insight(&conn, id).unwrap().unwrap();
+        assert_eq!(
+            after.source_ids,
+            vec!["1".to_string(), "5".to_string(), "6".to_string()],
+            "id 5 was already cited and must not be duplicated; id 6 is newly appended"
+        );
+    }
+
+    #[test]
+    fn revise_insight_clears_insight_dedupe_seen_rows_for_the_revised_id() {
+        let conn = mem_conn();
+        let id = insert_insight(&conn, "original", 0.6, &["1".to_string()], None).unwrap();
+        let other = insert_insight(&conn, "an unrelated insight", 0.6, &["2".to_string()], None).unwrap();
+        let untouched_a = insert_insight(&conn, "untouched a", 0.6, &["3".to_string()], None).unwrap();
+        let untouched_b = insert_insight(&conn, "untouched b", 0.6, &["4".to_string()], None).unwrap();
+        mark_insight_dedupe_seen(&conn, id, other).unwrap();
+        mark_insight_dedupe_seen(&conn, untouched_a, untouched_b).unwrap();
+
+        revise_insight(&conn, id, "corrected", None, &[], "2026-09-23T00:00:00Z").unwrap();
+
+        let seen = insight_dedupe_seen_pairs(&conn).unwrap();
+        let (lo, hi) = if id <= other { (id, other) } else { (other, id) };
+        assert!(!seen.contains(&(lo, hi)), "the revised insight's dedupe verdict must be cleared, to be re-judged");
+        let (ulo, uhi) = if untouched_a <= untouched_b { (untouched_a, untouched_b) } else { (untouched_b, untouched_a) };
+        assert!(seen.contains(&(ulo, uhi)), "an unrelated pair's verdict must be left alone");
+    }
+
+    #[test]
+    fn revise_insight_keeps_the_old_embedding_when_the_caller_has_no_fresh_one() {
+        let conn = mem_conn();
+        let id = insert_insight(&conn, "original", 0.6, &["1".to_string()], Some(&[1.0, 0.0])).unwrap();
+
+        revise_insight(&conn, id, "corrected", None, &[], "2026-09-23T00:00:00Z").unwrap();
+
+        let after = get_insight(&conn, id).unwrap().unwrap();
+        assert_eq!(after.text, "corrected");
+        assert_eq!(after.embedding, Some(vec![1.0, 0.0]), "no fresh embedding must not wipe the old one");
+    }
+
+    #[test]
+    fn revise_insight_a_second_time_only_keeps_the_immediately_prior_wording() {
+        let conn = mem_conn();
+        let id = insert_insight(&conn, "first wording", 0.6, &["1".to_string()], None).unwrap();
+        revise_insight(&conn, id, "second wording", None, &[], "2026-09-21T00:00:00Z").unwrap();
+        revise_insight(&conn, id, "third wording", None, &[], "2026-09-22T00:00:00Z").unwrap();
+
+        let after = get_insight(&conn, id).unwrap().unwrap();
+        assert_eq!(after.text, "third wording");
+        assert_eq!(after.prev_text.as_deref(), Some("second wording"), "prev_text is one hop back, not the full history");
+    }
+
+    #[test]
+    fn revise_insight_missing_id_returns_false() {
+        let conn = mem_conn();
+        assert!(!revise_insight(&conn, 999, "text", None, &[], "2026-09-23T00:00:00Z").unwrap());
+    }
+
+    #[test]
     fn surprisal_ranks_a_novel_fact_above_a_restatement() {
         let conn = mem_conn();
         insert5(&conn, "the orchestrator deploys to popobawa", Some(&[1.0, 0.0]));
@@ -6231,7 +7731,7 @@ mod tests {
     fn a_single_common_word_is_not_a_lexical_match() {
         let conn = mem_conn();
         let id = insert(&conn, "deploying react-app to staging needs the built bundle", None, None, true, None, 5).unwrap();
-        // One content term of three ("staging") -> 0.33 coverage, under the floor.
+        // One content term of three ("staging") -> under half the query's IDF mass, under the floor.
         assert!(lexical_scores(&conn, "what is the staging postgres password", 200).unwrap().get(&id).is_none());
         // Two of three clears it.
         assert!(lexical_scores(&conn, "how is staging react-app deployed", 200).unwrap().get(&id).is_some());
@@ -6259,20 +7759,116 @@ mod tests {
     #[test]
     fn lexical_coverage_finds_a_row_matching_several_common_terms() {
         let conn = mem_conn();
-        // The target matches 3 of 4 query terms but each of those terms is
-        // common in the bank, so BM25 on the OR query ranks it poorly --
-        // the case that made coverage-over-a-BM25-window return nothing.
+        // The target matches every query term, but two of those terms
+        // ("rust", "agent") are common in the bank -- the case that made
+        // coverage-over-a-BM25-window return nothing, since BM25 on the OR
+        // query buries a row that matches only common terms. Per-term-match
+        // candidate discovery (not a BM25 window) still surfaces it; IDF
+        // weighting is what then separates it from the decoys below.
         let target = insert(&conn, "the Rust agent wraps vendor modems behind a ModemDriver trait", None, None, true, None, 5).unwrap();
         for i in 0..60 {
             insert(&conn, &format!("another rust agent note number {}", i), None, None, true, None, 5).unwrap();
         }
-        let scores = lexical_scores(&conn, "what abstracts vendor hardware in the rust agent", 200).unwrap();
+        let scores = lexical_scores(&conn, "what vendor in the rust agent", 200).unwrap();
         let got = scores.get(&target).copied().unwrap_or(0.0);
-        // terms: abstract, vendor, hardware, rust, agent -> matches vendor/rust/agent
-        assert!(got >= 0.55, "coverage {} should reflect 3 of 5 terms", got);
-        // and the decoys, matching only rust+agent, score strictly lower
+        // terms: vendor, rust, agent -> target matches all three, and
+        // "vendor" (df=1) carries far more weight than the ubiquitous
+        // "rust"/"agent" (df=61, floored idf=1 each).
+        assert!(got >= 0.9, "coverage {} should reflect a match on the rare term plus both common ones", got);
+        // the decoys match only rust+agent (both common, idf floored at 1)
+        // and are discounted below LEXICAL_MIN_COVERAGE entirely.
         let decoy = scores.iter().filter(|(id, _)| **id != target).map(|(_, v)| *v).fold(0.0f32, f32::max);
         assert!(got > decoy, "target {} vs decoy {}", got, decoy);
+        assert_eq!(decoy, 0.0, "decoys matching only common terms are dropped by the floor");
+    }
+
+    #[test]
+    fn lexical_coverage_discounts_common_terms() {
+        let conn = mem_conn();
+        // "mach" is common (present in every row below); "zeppelin" is rare
+        // (present in exactly one). A row matching only the common term
+        // must not ride "mach" past the floor, but the row that also has
+        // the rare term should clear it easily.
+        let mach_only = insert(&conn, "mach is a knowledge bank", None, None, true, None, 5).unwrap();
+        for i in 0..18 {
+            insert(&conn, &format!("mach note number {}", i), None, None, true, None, 5).unwrap();
+        }
+        let zeppelin = insert(&conn, "mach zeppelin project notes", None, None, true, None, 5).unwrap();
+        let scores = lexical_scores(&conn, "mach zeppelin", 200).unwrap();
+        let z = scores.get(&zeppelin).copied().unwrap_or(0.0);
+        assert!(z > 0.5, "zeppelin row coverage {} should clear the floor on its rare term", z);
+        let m = scores.get(&mach_only).copied().unwrap_or(0.0);
+        assert!(m < 0.5, "mach-only row coverage {} should be discounted below the floor", m);
+    }
+
+    #[test]
+    fn lexical_coverage_counts_terms_absent_from_the_corpus() {
+        let conn = mem_conn();
+        // "qwxzyv" appears in no row and never will. If an absent term were
+        // dropped from the denominator instead of counted against it, every
+        // "mach" row would score a perfect 1.0 on "mach qwxzyv" -- exactly
+        // the common-term-rides-along problem this task removes. Kept in
+        // the denominator, it permanently caps achievable coverage below
+        // the floor for this query, so nothing is returned.
+        let mut mach_ids = Vec::new();
+        for i in 0..20 {
+            mach_ids.push(insert(&conn, &format!("mach note number {}", i), None, None, true, None, 5).unwrap());
+        }
+        let scores = lexical_scores(&conn, "mach qwxzyv", 200).unwrap();
+        for id in &mach_ids {
+            assert!(scores.get(id).is_none(), "row {} should not clear the floor on a term absent from the corpus", id);
+        }
+    }
+
+    #[test]
+    fn dominant_term_guard_drops_a_partial_match_built_only_from_terms_at_or_above_the_median() {
+        let conn = mem_conn();
+        // Same shape as harness question ms4 ("why did I build the meeting
+        // recorder"): "build" is common (df 13), "meeting" is rare (df 2),
+        // "recorder" sits exactly at the query's own median df (4). A row
+        // matching only build+recorder is built entirely from terms at or
+        // above that median and must not clear the floor, even though its
+        // IDF-weighted coverage (0.56) would have cleared it before this
+        // guard existed. A row matching build+meeting still clears it,
+        // because meeting is below the median.
+        for i in 0..11 {
+            insert(&conn, &format!("build note {}", i), None, None, true, None, 5).unwrap();
+        }
+        for i in 0..3 {
+            insert(&conn, &format!("recorder note {}", i), None, None, true, None, 5).unwrap();
+        }
+        insert(&conn, "a meeting happened", None, None, true, None, 5).unwrap();
+        let build_recorder = insert(&conn, "we build a recorder", None, None, true, None, 5).unwrap();
+        let build_meeting = insert(&conn, "we build for the meeting", None, None, true, None, 5).unwrap();
+
+        let scores = lexical_scores(&conn, "why did I build the meeting recorder", 200).unwrap();
+        assert!(
+            scores.get(&build_recorder).is_none(),
+            "build+recorder is entirely at/above the query's median df ({:?}), must not clear the floor",
+            scores.get(&build_recorder)
+        );
+        assert!(
+            scores.get(&build_meeting).is_some(),
+            "build+meeting includes meeting, which is below the median, so it still clears the floor"
+        );
+    }
+
+    #[test]
+    fn dominant_term_guard_exempts_a_full_match_even_when_every_term_ties_at_the_same_df() {
+        let conn = mem_conn();
+        // A single-row corpus: every query term that matches at all matches
+        // in exactly that one row, so every matched df ties and the guard's
+        // "median" degenerates to that same value. A FULL match (every
+        // query term present) must still pass -- there's no unmatched
+        // "incidental" term left to blame, so the guard is skipped
+        // entirely regardless of how the matched terms' df compares.
+        let id = insert(&conn, "the widget calibration runbook", None, None, true, None, 5).unwrap();
+        let scores = lexical_scores(&conn, "widget calibration runbook", 200).unwrap();
+        assert_eq!(
+            scores.get(&id).copied(),
+            Some(1.0),
+            "a full match on a one-row corpus must still score 1.0, not be zeroed out by the guard"
+        );
     }
 
     #[test]
@@ -6285,6 +7881,27 @@ mod tests {
         assert!(iso_dates_in("12026-01-01").is_empty(), "a longer number is not a date");
         // deduped and ordered
         assert_eq!(iso_dates_in("2026-09-08 then 2026-09-07 then 2026-09-08"), vec!["2026-09-07", "2026-09-08"]);
+    }
+
+    #[test]
+    fn iso_dates_in_rejects_a_date_shaped_span_embedded_in_an_identifier() {
+        assert!(iso_dates_in("TICKET-2026-01-15-hotfix").is_empty(), "preceded by '-' and followed by '-'");
+        assert!(
+            iso_dates_in("https://x/reports/2026-01-15/summary").is_empty(),
+            "preceded by '/' and followed by '/'"
+        );
+        assert!(iso_dates_in("req-2026-01-15-abcxyz").is_empty(), "preceded by '-' and followed by '-'");
+    }
+
+    #[test]
+    fn iso_dates_in_accepts_real_boundaries_and_iso_timestamps() {
+        assert_eq!(iso_dates_in("shipped 2026-08-31."), vec!["2026-08-31"], "trailing punctuation is a real boundary");
+        assert_eq!(iso_dates_in("(as of 2026-09-09)"), vec!["2026-09-09"], "parens are a real boundary on both sides");
+        assert_eq!(
+            iso_dates_in("2026-01-15T10:00:00Z"),
+            vec!["2026-01-15"],
+            "a 'T' + digit right after the date is an ISO timestamp, not an identifier suffix"
+        );
     }
 
     #[test]
@@ -6332,7 +7949,7 @@ mod tests {
         let undated = insert(&conn, "some other note entirely", None, None, true, Some(&[0.0, 1.0]), 5).unwrap();
 
         let q: Vec<f32> = vec![1.0, 0.0]; // orthogonal: no semantic signal at all
-        let hits = search_hybrid(&conn, "what shipped on 2026-08-31", &q, 5, false, false, 0.0, &now).unwrap();
+        let hits = search_hybrid(&conn, "what shipped on 2026-08-31", &q, 5, false, false, 0.0, &now, None).unwrap();
         assert_eq!(hits[0].memory.id, dated, "the dated match must outrank the undated row");
         // 0.45 is the real threshold -- `socket::DEFAULT_MIN_SCORE`, and
         // `mach kb eval`'s default, both mirroring kb-recall's. The old
@@ -6345,8 +7962,49 @@ mod tests {
         assert!(hits[0].score > undated_hit.score);
 
         // The same query without a date gives the temporal channel nothing.
-        let plain = search_hybrid(&conn, "what shipped", &q, 5, false, false, 0.0, &now).unwrap();
+        let plain = search_hybrid(&conn, "what shipped", &q, 5, false, false, 0.0, &now, None).unwrap();
         assert!(plain.iter().all(|h| h.score < 0.45), "no date in the query, no temporal lift");
+    }
+
+    #[test]
+    fn date_anchor_overrides_only_the_relative_date_parse_not_recency() {
+        // `mach kb eval`'s `as_of`: the query's "yesterday" must resolve
+        // against the anchor, not against `now`, while recency (which is
+        // about how long ago the memory itself was touched, not what day
+        // the query means) keeps using the real `now` untouched.
+        let conn = mem_conn();
+        let now = now_rfc3339(); // the real "today" this test runs on
+        let anchor = "2026-09-09"; // a fixed, unrelated day: as_of on rel1..rel5
+
+        let old = insert(&conn, "umoja admin access decision", None, None, true, Some(&[0.0, 1.0]), 5).unwrap();
+        set_occurrence(&conn, old, "2026-09-08", "2026-09-08").unwrap(); // "yesterday" relative to the anchor
+        let undated = insert(&conn, "some unrelated other note", None, None, true, Some(&[0.0, 1.0]), 5).unwrap();
+
+        let q: Vec<f32> = vec![1.0, 0.0]; // orthogonal: no semantic signal
+
+        // Without an anchor, "yesterday" resolves against the real today,
+        // which this test's fixture predates by design -- no overlap, no
+        // temporal lift for `old`.
+        let unanchored = search_hybrid(&conn, "what did I decide yesterday", &q, 5, false, false, 0.0, &now, None).unwrap();
+        let old_unanchored = unanchored.iter().find(|h| h.memory.id == old).unwrap();
+        assert!(old_unanchored.score < 0.45, "2026-09-08 is not 'yesterday' relative to the real today");
+
+        // With the anchor, "yesterday" resolves to 2026-09-08 and `old`
+        // gets the temporal lift.
+        let anchored =
+            search_hybrid(&conn, "what did I decide yesterday", &q, 5, false, false, 0.0, &now, Some(anchor)).unwrap();
+        let old_anchored = anchored.iter().find(|h| h.memory.id == old).unwrap();
+        assert!(old_anchored.score > 0.45, "anchored to 2026-09-09, 'yesterday' is 2026-09-08 and must overlap `old`");
+
+        // Recency is computed from `now`, never from the anchor: an
+        // undated row (temporal channel always 0, anchored or not) must
+        // score identically either way, and both its `recency` fields must
+        // match exactly -- the anchor changed the date RANGE, not the
+        // clock recency is measured against.
+        let undated_unanchored = unanchored.iter().find(|h| h.memory.id == undated).unwrap();
+        let undated_anchored = anchored.iter().find(|h| h.memory.id == undated).unwrap();
+        assert_eq!(undated_unanchored.recency, undated_anchored.recency, "recency must not move with the date anchor");
+        assert_eq!(undated_unanchored.score, undated_anchored.score, "an undated row's score is untouched by the anchor");
     }
 
     #[test]
@@ -6639,7 +8297,7 @@ mod tests {
         // and its correction, so the older reading was tombstoned
         assert!(supersede(&conn, dated_2026_09_07, dated_2026_09_09, &now).unwrap());
 
-        assert!(restore(&conn, dated_2026_09_07).unwrap());
+        assert!(restore(&conn, dated_2026_09_07, &now).unwrap());
         let back = get(&conn, dated_2026_09_07).unwrap().unwrap();
         assert!(
             back.invalidated_at.is_none() && back.superseded_by.is_none(),
@@ -6647,7 +8305,134 @@ mod tests {
              superseded_by would still point at a survivor that never replaced it"
         );
         // nothing to undo on a live row
-        assert!(!restore(&conn, dated_2026_09_07).unwrap());
+        assert!(!restore(&conn, dated_2026_09_07, &now_rfc3339()).unwrap());
+    }
+
+    #[test]
+    fn restore_pins_the_row() {
+        // The bug this closes: restore cleared a tombstone but recorded
+        // nothing, so the very next reflect pass re-judged the same pair
+        // and tombstoned it again. Restore must pin the row so every
+        // automatic tombstone path skips it from here on.
+        let conn = mem_conn();
+        let old_id = insert5(&conn, "old fact", None);
+        let new_id = insert5(&conn, "new fact", None);
+        let now = now_rfc3339();
+        assert!(supersede(&conn, old_id, new_id, &now).unwrap());
+        assert!(!is_pinned(&conn, old_id).unwrap(), "not pinned before restore");
+
+        assert!(restore(&conn, old_id, &now).unwrap());
+        assert!(is_pinned(&conn, old_id).unwrap(), "restore must pin the row");
+
+        // a no-op restore (already active) must not pin anything
+        let never_tombstoned = insert5(&conn, "always active", None);
+        assert!(!restore(&conn, never_tombstoned, &now).unwrap());
+        assert!(!is_pinned(&conn, never_tombstoned).unwrap());
+    }
+
+    // --- supersession audit ---
+
+    #[test]
+    fn supersession_candidates_joins_old_to_direct_successor_oldest_first() {
+        let conn = mem_conn();
+        let old_a = insert(&conn, "old A", None, None, true, None, 5).unwrap();
+        let ts_a = now_rfc3339_from_secs(now_secs() - 20 * 86400);
+        conn.execute("UPDATE memories SET created_at = ?1 WHERE id = ?2", params![ts_a, old_a]).unwrap();
+        let old_b = insert(&conn, "old B", None, None, true, None, 5).unwrap();
+        let ts_b = now_rfc3339_from_secs(now_secs() - 10 * 86400);
+        conn.execute("UPDATE memories SET created_at = ?1 WHERE id = ?2", params![ts_b, old_b]).unwrap();
+        let new_a = insert(&conn, "new A", None, None, true, None, 5).unwrap();
+        let new_b = insert(&conn, "new B", None, None, true, None, 5).unwrap();
+        let live = insert(&conn, "never tombstoned", None, None, true, None, 5).unwrap();
+        let now = now_rfc3339();
+        assert!(supersede(&conn, old_b, new_b, &now).unwrap());
+        assert!(supersede(&conn, old_a, new_a, &now).unwrap());
+        let _ = live;
+
+        let candidates = supersession_candidates(&conn).unwrap();
+        assert_eq!(candidates.len(), 2, "only the two tombstoned rows are candidates");
+        assert_eq!(candidates[0].old_id, old_a, "the older tombstone comes first");
+        assert_eq!(candidates[0].new_content, "new A");
+        assert_eq!(candidates[1].old_id, old_b);
+        assert_eq!(candidates[1].new_content, "new B");
+    }
+
+    #[test]
+    fn supersession_candidates_audits_each_hop_of_a_chain_independently() {
+        let conn = mem_conn();
+        let a = insert(&conn, "A", None, None, true, None, 5).unwrap();
+        let b = insert(&conn, "B", None, None, true, None, 5).unwrap();
+        let c = insert(&conn, "C", None, None, true, None, 5).unwrap();
+        let now = now_rfc3339();
+        assert!(supersede(&conn, a, b, &now).unwrap());
+        assert!(supersede(&conn, b, c, &now).unwrap());
+
+        let candidates = supersession_candidates(&conn).unwrap();
+        assert_eq!(candidates.len(), 2, "A->B and B->C are each their own hop");
+        let by_old: HashMap<i64, i64> = candidates.iter().map(|c| (c.old_id, c.new_id)).collect();
+        assert_eq!(by_old.get(&a), Some(&b));
+        assert_eq!(by_old.get(&b), Some(&c));
+    }
+
+    #[test]
+    fn record_supersession_audit_round_trips_and_reaudit_overwrites() {
+        let conn = mem_conn();
+        let old_id = insert5(&conn, "old fact", None);
+        let new_id = insert5(&conn, "new fact", None);
+        let now = now_rfc3339();
+        assert!(get_supersession_audit(&conn, old_id).unwrap().is_none());
+
+        record_supersession_audit(&conn, old_id, new_id, "OK", "no lost facts", &now).unwrap();
+        let row = get_supersession_audit(&conn, old_id).unwrap().unwrap();
+        assert_eq!(row.new_id, new_id);
+        assert_eq!(row.verdict, "OK");
+        assert_eq!(row.reason, "no lost facts");
+        assert_eq!(supersession_audited_pairs(&conn).unwrap().get(&old_id), Some(&new_id));
+
+        // --reaudit overwrites the same primary key rather than erroring
+        let later = now_rfc3339();
+        record_supersession_audit(&conn, old_id, new_id, "LOSSY", "dated fact dropped", &later).unwrap();
+        let row = get_supersession_audit(&conn, old_id).unwrap().unwrap();
+        assert_eq!(row.verdict, "LOSSY");
+        assert_eq!(row.reason, "dated fact dropped");
+    }
+
+    #[test]
+    fn supersession_audit_lossy_rows_excludes_ok_verdicts_oldest_first() {
+        let conn = mem_conn();
+        let (old_a, new_a) = (insert5(&conn, "old A", None), insert5(&conn, "new A", None));
+        let (old_b, new_b) = (insert5(&conn, "old B", None), insert5(&conn, "new B", None));
+        let (old_ok, new_ok) = (insert5(&conn, "old OK", None), insert5(&conn, "new OK", None));
+        record_supersession_audit(&conn, old_b, new_b, "LOSSY", "reason b", "2026-09-10T00:00:00Z").unwrap();
+        record_supersession_audit(&conn, old_a, new_a, "LOSSY", "reason a", "2026-09-01T00:00:00Z").unwrap();
+        record_supersession_audit(&conn, old_ok, new_ok, "OK", "fine", "2026-09-05T00:00:00Z").unwrap();
+
+        let rows = supersession_audit_lossy_rows(&conn).unwrap();
+        assert_eq!(rows.len(), 2, "the OK-verdict row must not appear");
+        assert_eq!(rows[0].old_id, old_a, "oldest audited_at first");
+        assert_eq!(rows[1].old_id, old_b);
+    }
+
+    #[test]
+    fn unpin_clears_pinned_at() {
+        let conn = mem_conn();
+        let old_id = insert5(&conn, "old fact", None);
+        let new_id = insert5(&conn, "new fact", None);
+        let now = now_rfc3339();
+        supersede(&conn, old_id, new_id, &now).unwrap();
+        restore(&conn, old_id, &now).unwrap();
+        assert!(is_pinned(&conn, old_id).unwrap());
+
+        assert!(unpin(&conn, old_id).unwrap());
+        assert!(!is_pinned(&conn, old_id).unwrap());
+        // second unpin is a no-op
+        assert!(!unpin(&conn, old_id).unwrap());
+    }
+
+    #[test]
+    fn is_pinned_false_for_unknown_id() {
+        let conn = mem_conn();
+        assert!(!is_pinned(&conn, 999_999).unwrap());
     }
 
     #[test]
@@ -6776,12 +8561,19 @@ mod tests {
     // --- reinforcement ---
 
     #[test]
-    fn touch_resets_recency_and_grows_stability_capped_at_365() {
+    fn touch_resets_recency_and_updates_access_bookkeeping() {
         let conn = mem_conn();
         let id = insert5(&conn, "reinforced fact", None);
         // importance 5 -> initial stability 35.0
         let m = get(&conn, id).unwrap().unwrap();
         assert_eq!(m.stability, Some(35.0));
+
+        // Backdate creation well past the current 35.0-day stability so
+        // this touch is a fully spaced repetition (elapsed >= stability),
+        // isolating the access-bookkeeping assertions from the interval
+        // math covered by the dedicated spacing tests below.
+        let created = now_rfc3339_from_secs(now_secs() - 40 * 86400);
+        conn.execute("UPDATE memories SET created_at = ?1 WHERE id = ?2", params![created, id]).unwrap();
 
         let now = now_rfc3339();
         touch(&conn, &[id], &now).unwrap();
@@ -6789,14 +8581,81 @@ mod tests {
         assert_eq!(m.access_count, 1);
         assert_eq!(m.last_accessed_at.as_deref(), Some(now.as_str()));
         assert_eq!(m.first_accessed_at.as_deref(), Some(now.as_str()));
-        assert!((m.stability.unwrap() - 35.0 * 1.3).abs() < 1e-9);
+        assert!((m.stability.unwrap() - 35.0 * 1.3).abs() < 1e-6);
+    }
 
-        // enough touches to hit the 365-day cap
+    #[test]
+    fn touch_same_minute_repeat_barely_grows_stability() {
+        // Two touches moments apart (elapsed_days ~= 0) must not deliver
+        // the flat 30% gain — that's the spacing effect this task adds.
+        let conn = mem_conn();
+        let id = insert5(&conn, "reinforced fact", None);
+        let now = now_rfc3339();
+        touch(&conn, &[id], &now).unwrap();
+        let after_first = get(&conn, id).unwrap().unwrap().stability.unwrap();
+
+        touch(&conn, &[id], &now).unwrap();
+        let after_second = get(&conn, id).unwrap().unwrap().stability.unwrap();
+
+        let growth = (after_second - after_first) / after_first;
+        assert!(growth < 0.01, "same-instant re-touch grew stability by {}%, expected < 1%", growth * 100.0);
+    }
+
+    #[test]
+    fn touch_after_full_interval_grows_by_flat_1_3x() {
+        // A gap at least as long as the current stability earns the full
+        // ×1.3 gain, same as the old flat rule (spacing effect saturates).
+        let conn = mem_conn();
+        let id = insert5(&conn, "spaced fact", None); // stability 35.0
+        let created = now_rfc3339_from_secs(now_secs() - 100 * 86400);
+        conn.execute("UPDATE memories SET created_at = ?1 WHERE id = ?2", params![created, id]).unwrap();
+
+        let now = now_rfc3339();
+        touch(&conn, &[id], &now).unwrap();
+        let after_first = get(&conn, id).unwrap().unwrap().stability.unwrap();
+        assert!((after_first - 35.0 * 1.3).abs() < 1e-6);
+
+        // second touch after another gap >= the new stability (45.5 days)
+        let later_secs = parse_rfc3339(&now).unwrap() + (after_first.ceil() as i64 + 1) * 86400;
+        let later = now_rfc3339_from_secs(later_secs as u64);
+        touch(&conn, &[id], &later).unwrap();
+        let after_second = get(&conn, id).unwrap().unwrap().stability.unwrap();
+        assert!((after_second - after_first * 1.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn touch_stability_cap_holds_at_365() {
+        let conn = mem_conn();
+        let id = insert5(&conn, "very reinforced fact", None);
+        let mut t = parse_rfc3339(&now_rfc3339()).unwrap();
+        // Each touch is spaced by more than the row's current stability so
+        // every touch earns the full 1.3x gain; a handful of those clears
+        // the 365-day cap.
         for _ in 0..40 {
-            touch(&conn, &[id], &now).unwrap();
+            let stability = get(&conn, id).unwrap().unwrap().stability.unwrap_or(35.0);
+            t += ((stability.ceil() as i64) + 1) * 86400;
+            let ts = now_rfc3339_from_secs(t as u64);
+            touch(&conn, &[id], &ts).unwrap();
         }
         let m = get(&conn, id).unwrap().unwrap();
         assert_eq!(m.stability, Some(365.0));
+    }
+
+    #[test]
+    fn touch_first_touch_of_never_accessed_row_uses_created_at() {
+        // A row that has never been touched has no last_accessed_at, so
+        // the elapsed interval for its first touch must be measured from
+        // created_at, not from "now" (which would always read as 0 days).
+        let conn = mem_conn();
+        let id = insert5(&conn, "never touched fact", None); // stability 35.0
+        let created = now_rfc3339_from_secs(now_secs() - 50 * 86400);
+        conn.execute("UPDATE memories SET created_at = ?1 WHERE id = ?2", params![created, id]).unwrap();
+        assert!(get(&conn, id).unwrap().unwrap().last_accessed_at.is_none());
+
+        let now = now_rfc3339();
+        touch(&conn, &[id], &now).unwrap();
+        let m = get(&conn, id).unwrap().unwrap();
+        assert!((m.stability.unwrap() - 35.0 * 1.3).abs() < 1e-6);
     }
 
     #[test]
@@ -6910,7 +8769,10 @@ mod tests {
     }
 
     #[test]
-    fn apply_verdict_update_inserts_new_and_tombstones_old() {
+    fn apply_verdict_update_keeps_old_row_active() {
+        // UPDATE means "refines" — keep both, as history — not "replaces".
+        // A colour decision tombstoned by a later, unrelated font decision
+        // is exactly the data loss this must never do again.
         let conn = mem_conn();
         let old_id = insert5(&conn, "old version of the fact", None);
         let now = now_rfc3339();
@@ -6920,14 +8782,14 @@ mod tests {
         )
         .unwrap();
         match outcome {
-            AddOutcome::AddedAndTombstoned { new_id, old_id: o, verb } => {
+            AddOutcome::AddedRefining { new_id, old_id: o } => {
                 assert_eq!(o, old_id);
-                assert_eq!(verb, "updated");
+                assert!(get(&conn, new_id).unwrap().is_some());
                 let old = get(&conn, old_id).unwrap().unwrap();
-                assert_eq!(old.superseded_by, Some(new_id));
-                assert!(old.invalidated_at.is_some());
+                assert_eq!(old.superseded_by, None, "UPDATE must not tombstone the old row");
+                assert!(old.invalidated_at.is_none(), "UPDATE must not tombstone the old row");
             }
-            _ => panic!("expected AddedAndTombstoned"),
+            _ => panic!("expected AddedRefining"),
         }
     }
 
@@ -6981,6 +8843,190 @@ mod tests {
             AddOutcome::Added { id } => assert!(get(&conn, id).unwrap().is_some()),
             _ => panic!("expected a plain Added fallback"),
         }
+    }
+
+    #[test]
+    fn apply_verdict_supersede_of_pinned_row_adds_instead() {
+        // A restored (pinned) row must never be re-tombstoned by an
+        // automatic verdict — the whole point of pinning it.
+        let conn = mem_conn();
+        let old_id = insert5(&conn, "restored fact", None);
+        let now = now_rfc3339();
+        assert!(restore_pins_via_supersede_then_restore(&conn, old_id, &now));
+
+        let outcome = apply_verdict(
+            &conn, Verdict::Supersede(old_id), "a would-be replacement", None, None, true,
+            &fake_embed("a would-be replacement"), 5, &now, Some(old_id),
+        )
+        .unwrap();
+        match outcome {
+            AddOutcome::Added { id } => assert!(get(&conn, id).unwrap().is_some()),
+            _ => panic!("expected a plain Added fallback, not a tombstone of the pinned row"),
+        }
+        let old = get(&conn, old_id).unwrap().unwrap();
+        assert!(old.invalidated_at.is_none(), "the pinned row must stay active");
+        assert!(old.superseded_by.is_none());
+    }
+
+    #[test]
+    fn apply_verdict_update_of_pinned_row_keeps_it_active() {
+        // Update never tombstones at all, so a pinned row is no different
+        // from any other here — it still comes back as AddedRefining, and
+        // pin status never even gets consulted.
+        let conn = mem_conn();
+        let old_id = insert5(&conn, "restored fact", None);
+        let now = now_rfc3339();
+        assert!(restore_pins_via_supersede_then_restore(&conn, old_id, &now));
+
+        let outcome = apply_verdict(
+            &conn, Verdict::Update(old_id), "a would-be update", None, None, true,
+            &fake_embed("a would-be update"), 5, &now, Some(old_id),
+        )
+        .unwrap();
+        match outcome {
+            AddOutcome::AddedRefining { old_id: o, .. } => assert_eq!(o, old_id),
+            _ => panic!("expected AddedRefining, not a tombstone of the pinned row"),
+        }
+        assert!(!get(&conn, old_id).unwrap().unwrap().is_superseded());
+    }
+
+    /// Test helper: tombstones `id` behind a throwaway sibling row, then
+    /// immediately restores it, so `id` ends up pinned and active — the
+    /// exact state `mach kb restore` leaves a row in.
+    fn restore_pins_via_supersede_then_restore(conn: &Connection, id: i64, now: &str) -> bool {
+        let sibling = insert(conn, "throwaway", None, None, true, None, 5).unwrap();
+        supersede(conn, id, sibling, now).unwrap();
+        restore(conn, id, now).unwrap()
+    }
+
+    #[test]
+    fn apply_verdict_supersede_blocked_by_date_guard_adds_instead() {
+        // Same fail-safe shape as the pinned-row test above, but via the
+        // deterministic guard instead of a pin: the loser names a date the
+        // winner doesn't restate, so the classifier's SUPERSEDE must never
+        // tombstone it.
+        let conn = mem_conn();
+        let old_id = insert5(&conn, "as of 2026-09-07 the bank held 150 memories", None);
+        let now = now_rfc3339();
+        let outcome = apply_verdict(
+            &conn, Verdict::Supersede(old_id), "the bank holds many memories now", None, None, true,
+            &fake_embed("the bank holds many memories now"), 5, &now, Some(old_id),
+        )
+        .unwrap();
+        match outcome {
+            AddOutcome::Added { id } => assert!(get(&conn, id).unwrap().is_some()),
+            _ => panic!("expected a plain Added fallback, not a tombstone of the dated loser"),
+        }
+        let old = get(&conn, old_id).unwrap().unwrap();
+        assert!(old.invalidated_at.is_none(), "the dated loser must stay active");
+        assert!(old.superseded_by.is_none());
+    }
+
+    // --- supersession_guard ---
+
+    #[test]
+    fn supersession_guard_blocks_a_dated_loser_for_every_kind() {
+        let conn = mem_conn();
+        let loser_id = insert5(&conn, "as of 2026-09-07 the bank held 150 memories", None);
+        let winner_id = insert5(&conn, "the bank holds many memories now", None);
+        let loser = get(&conn, loser_id).unwrap().unwrap();
+        let winner = get(&conn, winner_id).unwrap().unwrap();
+        assert!(loser.occurred_from.is_some(), "test setup: the date must have been backfilled at insert time");
+        for kind in [GuardKind::Dedupe, GuardKind::Contradiction, GuardKind::AddSupersede] {
+            assert_eq!(supersession_guard(&conn, &loser, &winner, kind), Some("dated fact"), "{:?}", kind);
+        }
+    }
+
+    #[test]
+    fn supersession_guard_undated_content_naming_a_date_also_blocks() {
+        // occurred_from is NULL (no explicit occurrence set), but the loser's
+        // own text names a date the winner drops -- the second half of the
+        // date guard's rule, not just the occurred_from column.
+        let conn = mem_conn();
+        let loser_id = insert5(&conn, "shipped the fix on 2026-08-31", None);
+        let winner_id = insert5(&conn, "shipped the fix", None);
+        conn.execute("UPDATE memories SET occurred_from = NULL, occurred_to = NULL WHERE id = ?1", params![loser_id])
+            .unwrap();
+        let loser = get(&conn, loser_id).unwrap().unwrap();
+        let winner = get(&conn, winner_id).unwrap().unwrap();
+        assert!(loser.occurred_from.is_none(), "test setup: occurred_from must be cleared");
+        assert_eq!(supersession_guard(&conn, &loser, &winner, GuardKind::Dedupe), Some("dated fact"));
+    }
+
+    #[test]
+    fn supersession_guard_date_present_in_both_is_not_blocked_by_the_date_guard() {
+        let conn = mem_conn();
+        let loser_id = insert5(&conn, "as of 2026-09-07 the bank held 150 memories", None);
+        let winner_id = insert5(&conn, "as of 2026-09-07 the bank held 150 memories, restated", None);
+        let loser = get(&conn, loser_id).unwrap().unwrap();
+        let winner = get(&conn, winner_id).unwrap().unwrap();
+        for kind in [GuardKind::Dedupe, GuardKind::Contradiction, GuardKind::AddSupersede] {
+            assert_eq!(supersession_guard(&conn, &loser, &winner, kind), None, "{:?}", kind);
+        }
+    }
+
+    #[test]
+    fn supersession_guard_dedupe_blocks_a_short_summary_winner_over_a_detailed_loser() {
+        let conn = mem_conn();
+        let loser_id = insert5(
+            &conn,
+            "staging deploy uses postgres pgbouncer pooling flyway migrations nightly reindex vacuum",
+            None,
+        );
+        let winner_id = insert5(&conn, "staging deploy runs smoothly", None);
+        let loser = get(&conn, loser_id).unwrap().unwrap();
+        let winner = get(&conn, winner_id).unwrap().unwrap();
+        assert_eq!(
+            supersession_guard(&conn, &loser, &winner, GuardKind::Dedupe),
+            Some("winner does not carry loser's content")
+        );
+    }
+
+    #[test]
+    fn supersession_guard_dedupe_passes_a_true_duplicate() {
+        let conn = mem_conn();
+        let loser_id = insert5(
+            &conn,
+            "staging deploy uses postgres pgbouncer pooling flyway migrations nightly reindex vacuum",
+            None,
+        );
+        let winner_id = insert5(
+            &conn,
+            "staging deploy uses postgres pgbouncer pooling flyway migrations nightly reindex vacuum, restated",
+            None,
+        );
+        let loser = get(&conn, loser_id).unwrap().unwrap();
+        let winner = get(&conn, winner_id).unwrap().unwrap();
+        assert_eq!(supersession_guard(&conn, &loser, &winner, GuardKind::Dedupe), None);
+    }
+
+    #[test]
+    fn supersession_guard_coverage_check_is_dedupe_only() {
+        // The exact short-summary-over-detailed shape that blocks Dedupe
+        // above must NOT block Contradiction or AddSupersede: those two
+        // never run the coverage guard at all.
+        let conn = mem_conn();
+        let loser_id = insert5(
+            &conn,
+            "staging deploy uses postgres pgbouncer pooling flyway migrations nightly reindex vacuum",
+            None,
+        );
+        let winner_id = insert5(&conn, "staging deploy runs smoothly", None);
+        let loser = get(&conn, loser_id).unwrap().unwrap();
+        let winner = get(&conn, winner_id).unwrap().unwrap();
+        assert_eq!(
+            supersession_guard(&conn, &loser, &winner, GuardKind::Contradiction),
+            None,
+            "coverage guard must not apply outside Dedupe"
+        );
+        assert_eq!(supersession_guard(&conn, &loser, &winner, GuardKind::AddSupersede), None);
+    }
+
+    #[test]
+    fn winner_term_coverage_is_full_when_loser_has_no_usable_terms() {
+        let conn = mem_conn();
+        let winner_id = insert5(&conn, "anything at all", None);
+        assert_eq!(winner_term_coverage(&conn, "as it to a", winner_id).unwrap(), 1.0);
     }
 
     // --- reflection subsystem ---
@@ -7768,7 +9814,14 @@ mod tests {
     }
 
     #[test]
-    fn mental_model_orders_themes_before_their_insights_then_unthemed_insights() {
+    fn mental_model_ranks_themes_and_unthemed_insights_together_but_keeps_nesting() {
+        // Updated for Task 4: themes no longer sort ahead of every belief
+        // by construction -- everything created "now" has ~equal recency,
+        // so the merged top-level list falls back to confidence, and the
+        // 0.7 unthemed insight now outranks the 0.55 theme. A theme's own
+        // nested insights are still ranked among themselves by confidence
+        // (insight b's 0.6 over insight a's 0.5) and still immediately
+        // follow their theme, wherever that theme lands.
         let conn = mem_conn();
         let a = insert_insight(&conn, "insight a", 0.5, &["1".into(), "2".into()], None).unwrap();
         let b = insert_insight(&conn, "insight b", 0.6, &["1".into(), "2".into()], None).unwrap();
@@ -7778,23 +9831,97 @@ mod tests {
         let rows = mental_model(&conn).unwrap();
         assert_eq!(rows.len(), 4, "1 theme + 2 nested insights + 1 unthemed insight");
 
-        assert_eq!(rows[0].kind, ModelKind::Theme);
-        assert_eq!(rows[0].text, "a theme");
-        assert!(!rows[0].nested);
+        assert_eq!(rows[0].kind, ModelKind::Belief);
+        assert_eq!(rows[0].text, "unthemed insight");
+        assert!(!rows[0].nested, "not folded into any theme");
+        assert_eq!(rows[0].confidence, 0.7);
 
-        assert_eq!(rows[1].kind, ModelKind::Belief);
-        assert_eq!(rows[1].text, "insight a");
-        assert!(rows[1].nested, "insight a is nested under its theme");
+        assert_eq!(rows[1].kind, ModelKind::Theme);
+        assert_eq!(rows[1].text, "a theme");
+        assert!(!rows[1].nested);
 
         assert_eq!(rows[2].kind, ModelKind::Belief);
         assert_eq!(rows[2].text, "insight b");
-        assert!(rows[2].nested, "insight b is nested under its theme");
+        assert!(rows[2].nested, "insight b is nested under its theme, immediately after it");
 
         assert_eq!(rows[3].kind, ModelKind::Belief);
-        assert_eq!(rows[3].text, "unthemed insight");
-        assert!(!rows[3].nested, "not folded into any theme");
-        assert_eq!(rows[3].confidence, 0.7);
+        assert_eq!(rows[3].text, "insight a");
+        assert!(rows[3].nested, "insight a is nested under its theme");
         let _ = unthemed; // id only asserted via ordering/content above
+    }
+
+    #[test]
+    fn mental_model_ranks_a_recent_high_confidence_belief_ahead_of_an_old_low_confidence_theme() {
+        let conn = mem_conn();
+        let theme_id = insert_theme(&conn, "old theme", 0.5, &["1".into(), "2".into()], None).unwrap();
+        let old_at = now_rfc3339_from_secs(now_secs() - 60 * 86400);
+        conn.execute("UPDATE insights SET created_at = ?1 WHERE id = ?2", params![old_at, theme_id]).unwrap();
+
+        insert_insight(&conn, "fresh belief", 0.9, &["3".into(), "4".into()], None).unwrap();
+
+        let rows = mental_model(&conn).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].text, "fresh belief", "a new 0.9 belief must outrank an old 0.5 theme");
+        assert_eq!(rows[1].text, "old theme");
+    }
+
+    #[test]
+    fn model_score_ignores_last_verified_at_for_recency() {
+        // Fix-list item 4: recency uses max(created_at, revised_at) only.
+        // Two insights, both created 60 days ago and never revised, but one
+        // was just re-verified (last_verified_at = now) and the other was
+        // never verified at all -- they must score identically, since a
+        // routine "still holds" check is not "recent learning."
+        let old_at = now_rfc3339_from_secs(now_secs() - 60 * 86400);
+        let now_ts = now_rfc3339_from_secs(now_secs());
+        let base = Insight {
+            id: 1,
+            text: "an old belief".to_string(),
+            created_at: old_at.clone(),
+            confidence: 0.6,
+            source_ids: vec!["1".into(), "2".into()],
+            embedding: None,
+            invalidated_at: None,
+            flagged_at: None,
+            last_verified_at: None,
+            level: 1,
+            revised_at: None,
+            prev_text: None,
+        };
+        let just_reverified = Insight { last_verified_at: Some(now_ts.clone()), ..base.clone() };
+        let never_verified = Insight { last_verified_at: None, ..base };
+
+        let now = parse_rfc3339(&now_ts).unwrap();
+        assert_eq!(
+            model_score(&just_reverified, now),
+            model_score(&never_verified, now),
+            "last_verified_at alone must not change the recency score"
+        );
+
+        // A REVISE, by contrast, DOES move the score -- revised_at is one
+        // of the two timestamps recency is computed from.
+        let just_revised = Insight { revised_at: Some(now_ts), last_verified_at: None, ..just_reverified.clone() };
+        assert!(
+            model_score(&just_revised, now) > model_score(&never_verified, now),
+            "revised_at, unlike last_verified_at, must boost the score"
+        );
+    }
+
+    #[test]
+    fn mental_model_orders_non_doubted_high_confidence_first() {
+        let conn = mem_conn();
+        let low_flagged = insert_insight(&conn, "shaky", 0.3, &["1".into(), "2".into()], None).unwrap();
+        insert_insight(&conn, "highest", 0.9, &["1".into(), "2".into()], None).unwrap();
+        insert_insight(&conn, "middle", 0.5, &["1".into(), "2".into()], None).unwrap();
+        let now = now_rfc3339();
+        flag_insight(&conn, low_flagged, &now).unwrap();
+
+        let rows = mental_model(&conn).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].text, "highest");
+        assert_eq!(rows[1].text, "middle");
+        assert_eq!(rows[2].text, "shaky");
+        assert!(rows[2].doubted, "flagged row sorts last despite none of these being themed");
     }
 
     #[test]
@@ -7880,10 +10007,22 @@ mod tests {
         let conn = mem_conn();
         let winner = insert(&conn, "the user likes tea", None, None, true, None, 5).unwrap();
         let loser = insert(&conn, "the user is fond of tea", None, None, true, None, 5).unwrap();
+        // Backdate both rows so a touch is a genuinely spaced repetition
+        // (elapsed >= stability) rather than a same-instant no-op under
+        // the interval-aware gain.
+        let created = now_rfc3339_from_secs(now_secs() - 100 * 86400);
+        conn.execute("UPDATE memories SET created_at = ?1 WHERE id = ?2", params![created, winner]).unwrap();
+        conn.execute("UPDATE memories SET created_at = ?1 WHERE id = ?2", params![created, loser]).unwrap();
+
         let now = now_rfc3339();
         touch(&conn, &[winner], &now).unwrap(); // access_count 1, stability 35*1.3=45.5
-        touch(&conn, &[loser], &now).unwrap();
-        touch(&conn, &[loser], &now).unwrap(); // access_count 2, stability higher than winner's
+        touch(&conn, &[loser], &now).unwrap(); // access_count 1, same growth as winner so far
+        // A second touch after another gap at least as long as the loser's
+        // current stability earns another full 1.3x, pushing it decisively
+        // above the winner's.
+        let later_secs = parse_rfc3339(&now).unwrap() + 60 * 86400;
+        let later = now_rfc3339_from_secs(later_secs as u64);
+        touch(&conn, &[loser], &later).unwrap(); // access_count 2, stability higher than winner's
 
         let winner_before = get(&conn, winner).unwrap().unwrap();
         let loser_before = get(&conn, loser).unwrap().unwrap();
@@ -8008,6 +10147,7 @@ mod tests {
             basis: None,
             occurred_from: None,
             occurred_to: None,
+            pinned_at: None,
         }
     }
 
@@ -8156,6 +10296,35 @@ mod tests {
         let dormant_view = list_dormant(&conn, None).unwrap();
         assert_eq!(dormant_view.len(), 1);
         assert_eq!(dormant_view[0].id, sleeping_id);
+    }
+
+    #[test]
+    fn list_pinned_shows_only_pinned_rows_regardless_of_tombstone_state() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let plain_id = insert5(&conn, "plain", None);
+        let old_id = insert5(&conn, "old fact", None);
+        let new_id = insert5(&conn, "new fact", None);
+        assert!(supersede(&conn, old_id, new_id, &now).unwrap());
+        assert!(restore(&conn, old_id, &now).unwrap()); // restore pins it, active again
+        assert!(is_pinned(&conn, old_id).unwrap());
+
+        // A later manual re-supersede tombstones it again but does not
+        // clear the pin (pin state is an independent axis).
+        let later_id = insert5(&conn, "later fact", None);
+        assert!(supersede(&conn, old_id, later_id, &now).unwrap());
+        assert!(is_pinned(&conn, old_id).unwrap(), "pin must survive a manual re-supersede");
+
+        let pinned_view = list_pinned(&conn, None).unwrap();
+        assert_eq!(pinned_view.len(), 1);
+        assert_eq!(pinned_view[0].id, old_id);
+
+        // Default `list` is unaffected by pin state -- pinned is an
+        // independent axis, not a visibility filter like superseded/dormant.
+        let default_view = list(&conn, None, false).unwrap();
+        assert!(default_view.iter().all(|m| m.id != old_id), "old_id is tombstoned again -- excluded by the ordinary superseded filter regardless of its pin");
+        assert!(default_view.iter().any(|m| m.id == plain_id));
+        let _ = new_id;
     }
 
     #[test]
@@ -8318,6 +10487,8 @@ mod tests {
             flagged_at: None,
             last_verified_at: None,
             level: 1,
+            revised_at: None,
+            prev_text: None,
         };
         raw_upsert_insight(&conn, &i).unwrap();
         assert_eq!(get_insight(&conn, 7).unwrap().unwrap().text, "explicit id insight");
@@ -8952,6 +11123,35 @@ mod tests {
     }
 
     #[test]
+    fn project_for_path_picks_longest_root_prefix() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        upsert_project(&conn, "git:a", "a", "/a", &now).unwrap();
+        upsert_project(&conn, "git:ab", "ab", "/a/b", &now).unwrap();
+
+        // A path under both roots resolves to the more specific (longer)
+        // one, not just the first row a table scan happens to reach.
+        let found = project_for_path(&conn, "/a/b/c").unwrap().unwrap();
+        assert_eq!(found.name, "ab");
+
+        // A path under only the outer root resolves to it.
+        let found = project_for_path(&conn, "/a/x").unwrap().unwrap();
+        assert_eq!(found.name, "a");
+
+        // The root path itself matches too, not just its children.
+        let found = project_for_path(&conn, "/a/b").unwrap().unwrap();
+        assert_eq!(found.name, "ab");
+
+        // A sibling that merely shares a prefix string ("/ab" vs root
+        // "/a") must NOT match -- prefix matching is on path components,
+        // not raw strings.
+        assert!(project_for_path(&conn, "/ab").unwrap().is_none());
+
+        // No registered root contains this path at all.
+        assert!(project_for_path(&conn, "/elsewhere").unwrap().is_none());
+    }
+
+    #[test]
     fn list_projects_orders_by_name_ascending() {
         let conn = mem_conn();
         let now = now_rfc3339();
@@ -9075,5 +11275,446 @@ mod tests {
         let row = get_project_by_fingerprint(&conn, "git:def").unwrap().unwrap();
         assert_eq!(row.indexed_commits, Some(42));
         assert!(row.indexed_at.is_some());
+    }
+
+    #[test]
+    fn open_migrates_to_v26_with_empty_judge_log() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION, "a fresh open lands on the latest schema, past v26");
+        let n: i64 = conn.query_row("SELECT count(*) FROM judge_log", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn log_judge_call_records_success_and_failure_rows() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        log_judge_call(&conn, "dedupe", "haiku", "prompt one", Ok("DISTINCT"), 12, "2026-09-23T00:00:00Z").unwrap();
+        log_judge_call(&conn, "contradiction", "haiku", "prompt two", Err("offline"), 5, "2026-09-23T00:00:01Z").unwrap();
+
+        let mut stmt = conn
+            .prepare("SELECT pass, model, prompt, reply, error, latency_ms, created_at FROM judge_log ORDER BY id")
+            .unwrap();
+        let rows: Vec<(String, String, String, Option<String>, Option<String>, i64, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            ("dedupe".into(), "haiku".into(), "prompt one".into(), Some("DISTINCT".into()), None, 12, "2026-09-23T00:00:00Z".into())
+        );
+        assert_eq!(
+            rows[1],
+            ("contradiction".into(), "haiku".into(), "prompt two".into(), None, Some("offline".into()), 5, "2026-09-23T00:00:01Z".into())
+        );
+    }
+
+    #[test]
+    fn migrate_v25_to_v26_is_idempotent() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        migrate_v25_to_v26(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 26);
+    }
+
+    #[test]
+    fn open_migrates_to_v27_with_empty_recall_engagement() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        let n: i64 = conn.query_row("SELECT count(*) FROM recall_engagement", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn migrate_v26_to_v27_is_idempotent() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        migrate_v26_to_v27(&conn).unwrap();
+        migrate_v26_to_v27(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 27);
+    }
+
+    #[test]
+    fn open_migrates_to_v28_with_pinned_at_column() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION, "a fresh open lands on the latest schema, past v27");
+        let cols = existing_columns(&conn).unwrap();
+        assert!(cols.iter().any(|c| c == "pinned_at"), "memories.pinned_at must exist");
+    }
+
+    #[test]
+    fn migrate_v27_to_v28_is_idempotent() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        migrate_v27_to_v28(&conn).unwrap();
+        migrate_v27_to_v28(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 28);
+    }
+
+    #[test]
+    fn open_migrates_to_v29_with_empty_supersession_audit_table() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION, "a fresh open lands on the latest schema, past v28");
+        let n: i64 = conn.query_row("SELECT count(*) FROM supersession_audit", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn migrate_v28_to_v29_is_idempotent() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        migrate_v28_to_v29(&conn).unwrap();
+        migrate_v28_to_v29(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 29);
+    }
+
+    #[test]
+    fn open_migrates_to_v30_with_reflected_at_column() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION, "a fresh open lands on the latest schema, past v29");
+        let cols = existing_columns(&conn).unwrap();
+        assert!(cols.iter().any(|c| c == "reflected_at"), "memories.reflected_at must exist");
+    }
+
+    #[test]
+    fn migrate_v29_to_v30_is_idempotent() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        migrate_v29_to_v30(&conn).unwrap();
+        migrate_v29_to_v30(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 30);
+    }
+
+    #[test]
+    fn open_migrates_to_v31_with_revised_at_and_prev_text_columns() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION, "a fresh open lands on the latest schema, past v30");
+        let mut stmt = conn.prepare("PRAGMA table_info(insights)").unwrap();
+        let cols: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert!(cols.iter().any(|c| c == "revised_at"), "insights.revised_at must exist");
+        assert!(cols.iter().any(|c| c == "prev_text"), "insights.prev_text must exist");
+    }
+
+    #[test]
+    fn migrate_v30_to_v31_is_idempotent() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        migrate_v30_to_v31(&conn).unwrap();
+        migrate_v30_to_v31(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 31);
+    }
+
+    #[test]
+    fn backfill_reflected_at_marks_ids_at_or_below_the_frozen_watermark() {
+        let conn = mem_conn();
+        let below = insert(&conn, "below the old watermark", None, None, true, None, 5).unwrap();
+        let at = insert(&conn, "exactly at the old watermark", None, None, true, None, 5).unwrap();
+        let above = insert(&conn, "above the old watermark -- the starved backlog", None, None, true, None, 5).unwrap();
+        update_reflect_state(&conn, "2026-09-08T01:21:26Z", Some(at)).unwrap();
+
+        let n = backfill_reflected_at(&conn).unwrap();
+        assert_eq!(n, 2, "both below and at the watermark get backfilled");
+
+        let get_reflected = |id: i64| -> Option<String> {
+            conn.query_row("SELECT reflected_at FROM memories WHERE id = ?1", params![id], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(get_reflected(below).as_deref(), Some("2026-09-08T01:21:26Z"));
+        assert_eq!(get_reflected(at).as_deref(), Some("2026-09-08T01:21:26Z"));
+        assert_eq!(get_reflected(above), None, "the starved backlog above the watermark must stay due");
+    }
+
+    #[test]
+    fn backfill_reflected_at_falls_back_to_now_when_last_run_at_is_unset() {
+        let conn = mem_conn();
+        let below = insert(&conn, "below the watermark, but the run that set it never recorded when", None, None, true, None, 5).unwrap();
+        // last_run_at left NULL, only last_memory_id set -- an edge case a
+        // hand-edited or partially-imported reflect_state row can produce.
+        conn.execute(
+            "INSERT INTO reflect_state (id, last_run_at, last_memory_id) VALUES (1, NULL, ?1) \
+             ON CONFLICT(id) DO UPDATE SET last_memory_id = excluded.last_memory_id",
+            params![below],
+        )
+        .unwrap();
+
+        let n = backfill_reflected_at(&conn).unwrap();
+        assert_eq!(n, 1);
+        let reflected: Option<String> =
+            conn.query_row("SELECT reflected_at FROM memories WHERE id = ?1", params![below], |r| r.get(0)).unwrap();
+        assert!(reflected.is_some(), "must fall back to now rather than stay NULL");
+    }
+
+    #[test]
+    fn backfill_reflected_at_is_a_noop_when_the_watermark_was_never_set() {
+        let conn = mem_conn();
+        insert(&conn, "a fresh database with no reflect history", None, None, true, None, 5).unwrap();
+        assert_eq!(backfill_reflected_at(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn backfill_reflected_at_never_overwrites_an_existing_timestamp() {
+        let conn = mem_conn();
+        let id = insert(&conn, "already reflected by ordinary use", None, None, true, None, 5).unwrap();
+        mark_memories_reflected(&conn, &[id], "2026-09-20T00:00:00Z").unwrap();
+        update_reflect_state(&conn, "2026-09-23T00:00:00Z", Some(id)).unwrap();
+
+        backfill_reflected_at(&conn).unwrap();
+        let reflected: Option<String> =
+            conn.query_row("SELECT reflected_at FROM memories WHERE id = ?1", params![id], |r| r.get(0)).unwrap();
+        assert_eq!(reflected.as_deref(), Some("2026-09-20T00:00:00Z"), "the real timestamp must survive the backfill");
+    }
+
+    // --- reflected_at query/write primitives (schema v30) ---
+
+    #[test]
+    fn unreflected_active_count_excludes_reflected_dormant_and_superseded_rows() {
+        let conn = mem_conn();
+        let unreflected = insert(&conn, "still due", None, None, true, None, 5).unwrap();
+        let reflected = insert(&conn, "already examined", None, None, true, None, 5).unwrap();
+        mark_memories_reflected(&conn, &[reflected], &now_rfc3339()).unwrap();
+        let dormant = insert(&conn, "asleep", None, None, true, None, 5).unwrap();
+        set_dormant(&conn, dormant, &now_rfc3339()).unwrap();
+        let old = insert(&conn, "superseded", None, None, true, None, 5).unwrap();
+        let new = insert(&conn, "superseding", None, None, true, None, 5).unwrap();
+        supersede(&conn, old, new, &now_rfc3339()).unwrap();
+        mark_memories_reflected(&conn, &[new], &now_rfc3339()).unwrap();
+
+        assert_eq!(unreflected_active_count(&conn).unwrap(), 1);
+        let _ = unreflected;
+    }
+
+    #[test]
+    fn unreflected_active_newest_and_oldest_split_without_overlap() {
+        let conn = mem_conn();
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            ids.push(insert(&conn, &format!("backlog row {}", i), None, None, true, None, 5).unwrap());
+        }
+        let newest = unreflected_active_newest(&conn, 3).unwrap();
+        assert_eq!(newest.iter().map(|m| m.id).collect::<Vec<_>>(), vec![ids[9], ids[8], ids[7]]);
+
+        let newest_ids: HashSet<i64> = newest.iter().map(|m| m.id).collect();
+        let oldest = unreflected_active_oldest(&conn, 3, &newest_ids).unwrap();
+        assert_eq!(oldest.iter().map(|m| m.id).collect::<Vec<_>>(), vec![ids[0], ids[1], ids[2]]);
+
+        let oldest_ids: HashSet<i64> = oldest.iter().map(|m| m.id).collect();
+        assert!(newest_ids.is_disjoint(&oldest_ids));
+    }
+
+    #[test]
+    fn unreflected_active_oldest_excludes_the_whole_backlog_when_everything_is_already_chosen() {
+        let conn = mem_conn();
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            ids.push(insert(&conn, &format!("small backlog {}", i), None, None, true, None, 5).unwrap());
+        }
+        let exclude: HashSet<i64> = ids.iter().copied().collect();
+        let oldest = unreflected_active_oldest(&conn, 50, &exclude).unwrap();
+        assert!(oldest.is_empty(), "every id is already excluded, so nothing more is left to add");
+    }
+
+    #[test]
+    fn mark_memories_reflected_sets_exactly_the_given_ids() {
+        let conn = mem_conn();
+        let a = insert(&conn, "a", None, None, true, None, 5).unwrap();
+        let b = insert(&conn, "b", None, None, true, None, 5).unwrap();
+        let c = insert(&conn, "c", None, None, true, None, 5).unwrap();
+        let n = mark_memories_reflected(&conn, &[a, c], "2026-09-23T00:00:00Z").unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(unreflected_active_count(&conn).unwrap(), 1, "only b is left unreflected");
+        let get_reflected = |id: i64| -> Option<String> {
+            conn.query_row("SELECT reflected_at FROM memories WHERE id = ?1", params![id], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(get_reflected(a).as_deref(), Some("2026-09-23T00:00:00Z"));
+        assert_eq!(get_reflected(b), None);
+        assert_eq!(get_reflected(c).as_deref(), Some("2026-09-23T00:00:00Z"));
+    }
+
+    #[test]
+    fn mark_memories_reflected_on_an_empty_slice_is_a_noop() {
+        let conn = mem_conn();
+        assert_eq!(mark_memories_reflected(&conn, &[], "2026-09-23T00:00:00Z").unwrap(), 0);
+    }
+
+    #[test]
+    fn mark_memories_reflected_returns_only_the_rows_actually_updated() {
+        let conn = mem_conn();
+        let a = insert(&conn, "a", None, None, true, None, 5).unwrap();
+        let vanished = a + 9999; // never inserted -- simulates a row deleted mid-run
+        let n = mark_memories_reflected(&conn, &[a, vanished], "2026-09-23T00:00:00Z").unwrap();
+        assert_eq!(n, 1, "the summed row count from each UPDATE, not ids.len()");
+    }
+
+    #[test]
+    fn ids_new_since_reflect_includes_unreflected_backlog_and_recently_reflected_rows() {
+        let conn = mem_conn();
+        let old_reflected = insert(&conn, "reflected long ago", None, None, true, None, 5).unwrap();
+        mark_memories_reflected(&conn, &[old_reflected], "2026-09-01T00:00:00Z").unwrap();
+        let recently_reflected = insert(&conn, "reflected by this run's own working set", None, None, true, None, 5).unwrap();
+        mark_memories_reflected(&conn, &[recently_reflected], "2026-09-23T09:00:00Z").unwrap();
+        let still_unreflected = insert(&conn, "still backlog", None, None, true, None, 5).unwrap();
+
+        let ids = ids_new_since_reflect(&conn, Some("2026-09-23T00:00:00Z")).unwrap();
+        assert!(ids.contains(&recently_reflected), "reflected at/after previous_run_start counts as new");
+        assert!(ids.contains(&still_unreflected), "unreflected backlog always counts as new");
+        assert!(!ids.contains(&old_reflected), "reflected well before previous_run_start is no longer new");
+    }
+
+    #[test]
+    fn ids_new_since_reflect_treats_reflected_at_equal_to_previous_run_start_as_new() {
+        // The boundary case: reflected_at == previous_run_start exactly
+        // (the common case in practice -- the previous run's own `now`,
+        // stored as this run's previous_run_start, is the SAME timestamp
+        // it used to mark its own working set reflected). The comparison
+        // is `>=`, not `>`, so this must count as new.
+        let conn = mem_conn();
+        let boundary = insert(&conn, "reflected at exactly the cutoff", None, None, true, None, 5).unwrap();
+        mark_memories_reflected(&conn, &[boundary], "2026-09-23T00:00:00Z").unwrap();
+
+        let ids = ids_new_since_reflect(&conn, Some("2026-09-23T00:00:00Z")).unwrap();
+        assert!(ids.contains(&boundary), "reflected_at == previous_run_start must count as new (>=, not >)");
+    }
+
+    #[test]
+    fn ids_new_since_reflect_with_no_previous_run_treats_only_unreflected_rows_as_new() {
+        let conn = mem_conn();
+        let reflected = insert(&conn, "reflected", None, None, true, None, 5).unwrap();
+        mark_memories_reflected(&conn, &[reflected], &now_rfc3339()).unwrap();
+        let unreflected = insert(&conn, "unreflected", None, None, true, None, 5).unwrap();
+
+        let ids = ids_new_since_reflect(&conn, None).unwrap();
+        assert_eq!(ids, [unreflected].into_iter().collect::<HashSet<i64>>());
+    }
+
+    #[test]
+    fn record_engagement_writes_shown_and_engaged_flags() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        record_engagement(&conn, "sess1", &[1, 2, 3], &[2], "2026-09-23T00:00:00Z").unwrap();
+
+        let mut stmt = conn
+            .prepare("SELECT memory_id, engaged, judged_at FROM recall_engagement WHERE session_id = 'sess1' ORDER BY memory_id")
+            .unwrap();
+        let rows: Vec<(i64, i64, String)> =
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (1, 0, "2026-09-23T00:00:00Z".to_string()),
+                (2, 1, "2026-09-23T00:00:00Z".to_string()),
+                (3, 0, "2026-09-23T00:00:00Z".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn record_engagement_is_idempotent_and_overwrites_on_rerun() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        record_engagement(&conn, "sess1", &[1], &[], "2026-09-23T00:00:00Z").unwrap();
+        record_engagement(&conn, "sess1", &[1], &[1], "2026-09-23T01:00:00Z").unwrap();
+
+        let n: i64 = conn.query_row("SELECT count(*) FROM recall_engagement", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "re-running the same session overwrites, never duplicates");
+        let (engaged, judged_at): (i64, String) = conn
+            .query_row(
+                "SELECT engaged, judged_at FROM recall_engagement WHERE session_id = 'sess1' AND memory_id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(engaged, 1, "the second run's verdict wins");
+        assert_eq!(judged_at, "2026-09-23T01:00:00Z");
+    }
+
+    #[test]
+    fn record_engagement_distinguishes_sessions_sharing_a_memory_id() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        record_engagement(&conn, "sessA", &[7], &[7], "2026-09-23T00:00:00Z").unwrap();
+        record_engagement(&conn, "sessB", &[7], &[], "2026-09-23T00:00:01Z").unwrap();
+
+        let n: i64 = conn.query_row("SELECT count(*) FROM recall_engagement", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2, "same memory id in two sessions is two rows, not a collision");
+    }
+
+    #[test]
+    fn recall_stats_since_groups_by_session_and_filters_the_window() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        record_engagement(&conn, "sessA", &[1, 2], &[1], "2026-09-20T00:00:00Z").unwrap();
+        record_engagement(&conn, "sessA", &[3], &[3], "2026-09-21T00:00:00Z").unwrap();
+        record_engagement(&conn, "sessB", &[4], &[], "2026-09-01T00:00:00Z").unwrap(); // outside window
+
+        let rows = recall_stats_since(&conn, "2026-09-10T00:00:00Z").unwrap();
+        assert_eq!(rows, vec![RecallStatsRow { session_id: "sessA".to_string(), shown: 3, engaged: 2 }]);
+    }
+
+    #[test]
+    fn recall_stats_since_empty_table_is_empty() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        let rows = recall_stats_since(&conn, "2000-01-01T00:00:00Z").unwrap();
+        assert!(rows.is_empty());
+    }
+
+    // --- retention: judge_log / recall_engagement ---
+
+    #[test]
+    fn prune_judge_log_deletes_older_rows_keeps_newer_and_returns_count() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        log_judge_call(&conn, "dedupe", "haiku", "prompt A", Ok("DISTINCT"), 100, "2026-01-01T00:00:00Z").unwrap();
+        log_judge_call(&conn, "dedupe", "haiku", "prompt B", Ok("DISTINCT"), 100, "2026-06-01T00:00:00Z").unwrap();
+        log_judge_call(&conn, "dedupe", "haiku", "prompt C", Ok("DISTINCT"), 100, "2026-09-01T00:00:00Z").unwrap();
+
+        let pruned = prune_judge_log(&conn, "2026-03-01T00:00:00Z").unwrap();
+        assert_eq!(pruned, 1, "only the 2026-01-01 row is older than the cutoff");
+
+        let remaining: i64 = conn.query_row("SELECT COUNT(*) FROM judge_log", [], |r| r.get(0)).unwrap();
+        assert_eq!(remaining, 2);
+        let mut stmt = conn.prepare("SELECT prompt FROM judge_log ORDER BY created_at").unwrap();
+        let prompts: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(prompts, vec!["prompt B".to_string(), "prompt C".to_string()], "newer rows survive untouched");
+    }
+
+    #[test]
+    fn prune_judge_log_never_touches_supersession_audit() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        record_supersession_audit(&conn, 1, 2, "OK", "identical facts", "2020-01-01T00:00:00Z").unwrap();
+        log_judge_call(&conn, "dedupe", "haiku", "an old prompt", Ok("DISTINCT"), 100, "2020-01-01T00:00:00Z").unwrap();
+
+        prune_judge_log(&conn, "2026-01-01T00:00:00Z").unwrap();
+
+        let audit_count: i64 = conn.query_row("SELECT COUNT(*) FROM supersession_audit", [], |r| r.get(0)).unwrap();
+        assert_eq!(audit_count, 1, "supersession_audit is a permanent record and must never be pruned");
+    }
+
+    #[test]
+    fn prune_recall_engagement_deletes_older_rows_keeps_newer_and_returns_count() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        record_engagement(&conn, "sess-old", &[1], &[1], "2025-01-01T00:00:00Z").unwrap();
+        record_engagement(&conn, "sess-mid", &[2], &[], "2026-06-01T00:00:00Z").unwrap();
+        record_engagement(&conn, "sess-new", &[3], &[3], "2026-09-01T00:00:00Z").unwrap();
+
+        let pruned = prune_recall_engagement(&conn, "2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(pruned, 1, "only sess-old's row is older than the cutoff");
+
+        let remaining: i64 = conn.query_row("SELECT COUNT(*) FROM recall_engagement", [], |r| r.get(0)).unwrap();
+        assert_eq!(remaining, 2);
+        let mut stmt = conn.prepare("SELECT session_id FROM recall_engagement ORDER BY session_id").unwrap();
+        let sessions: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(sessions, vec!["sess-mid".to_string(), "sess-new".to_string()], "newer rows survive untouched");
+    }
+
+    #[test]
+    fn prune_recall_engagement_never_touches_supersession_audit() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        record_supersession_audit(&conn, 1, 2, "OK", "identical facts", "2020-01-01T00:00:00Z").unwrap();
+        record_engagement(&conn, "sess-old", &[1], &[], "2020-01-01T00:00:00Z").unwrap();
+
+        prune_recall_engagement(&conn, "2026-01-01T00:00:00Z").unwrap();
+
+        let audit_count: i64 = conn.query_row("SELECT COUNT(*) FROM supersession_audit", [], |r| r.get(0)).unwrap();
+        assert_eq!(audit_count, 1, "supersession_audit is a permanent record and must never be pruned");
     }
 }

@@ -45,6 +45,32 @@ SOCKET_TIMEOUT = 0.5
 SUBPROCESS_TIMEOUT = 2.0
 DEDUPE_WINDOW = 10
 
+# Sentinel card key logged in the same "cards" log field as real entity-card
+# names, whenever a project card is shown — reserved so it can never
+# collide with an actual entity name (see `session_seen_cards` below).
+PROJECT_CARD_KEY = "__project_card__"
+
+# Appended whenever this hook actually injects something (a memory line, a
+# connection, a card, or the project card) -- the injected block on its own
+# gets skimmed past (64% of real sessions never call `mach kb`); this line
+# asks explicitly for one of the three actions available: use it, search or
+# `why` deeper, or write a new fact down.
+ACTION_LINE = (
+    'If these memories bear on the task, use them; if they are close but '
+    'incomplete, run `mach kb search "<topic>"` or `mach kb why <id>` '
+    'before exploring files. Save durable new facts with `mach kb add`.'
+)
+
+# Printed instead of ACTION_LINE when nothing was injected at all (either
+# the search truly found nothing, or everything it found was suppressed by
+# session dedupe) and the session's project is known -- at most once per
+# session (see `no_match_already_shown`), so a long session of unrelated
+# prompts doesn't repeat it every time.
+NO_MATCH_LINE = (
+    'No stored memory matched. For project history or decisions, try '
+    '`mach kb search "<topic>" --cwd .` before re-deriving from files.'
+)
+
 RECALL_LOG_DIR = os.path.expanduser("~/.local/share/mach/recall-log")
 MACH_BIN = os.environ.get("MACH_BIN", "mach")
 
@@ -75,10 +101,10 @@ def project_name(cwd):
     return base
 
 
-def search(query, project=None):
-    resp = search_via_socket(query, project)
+def search(query, project=None, cwd=None):
+    resp = search_via_socket(query, project, cwd)
     if resp is None:
-        resp = search_via_subprocess(query, project)
+        resp = search_via_subprocess(query, project, cwd)
     return resp
 
 
@@ -132,7 +158,7 @@ def _valid_response(data):
     return data if isinstance(data, dict) and isinstance(data.get("hits"), list) else None
 
 
-def search_via_socket(query, project=None):
+def search_via_socket(query, project=None, cwd=None):
     """machd's kb socket subsystem (engines/kb/src/socket.rs) keeps a warm
     db connection + a warm ollama HTTP agent alive. Tried first; ANY failure
     (daemon down, socket missing, timeout, error response) returns None and
@@ -156,6 +182,15 @@ def search_via_socket(query, project=None):
         # Rust side treats the key's absence and `None` the same way.
         if project:
             payload["project"] = project
+        # cwd is the session's actual working directory (not the basename
+        # `project` is derived from). The Rust side resolves it against the
+        # `projects` registry (`store::project_for_path`) and, when it
+        # matches a registered root, that match wins over `project` as the
+        # session project for both the project card and down-weighting
+        # other-project memories (`cli::search_hits`) -- a registered root
+        # is an actual claim of identity, a basename is only a guess.
+        if cwd:
+            payload["cwd"] = cwd
         req = json.dumps(payload) + "\n"
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(SOCKET_TIMEOUT)
@@ -174,23 +209,44 @@ def search_via_socket(query, project=None):
         return None
 
 
-def search_via_subprocess(query, project=None):
-    argv = [MACH_BIN, "kb", "search", query,
-            "--limit", str(SEARCH_LIMIT), "--json",
-            "--min-score", str(SCORE_THRESHOLD),
-            "--budget", str(TOKEN_BUDGET)]
-    # Same reasoning as search_via_socket: omit rather than send "" --
-    # project_name() returns "" for the home directory (no project), and an
-    # empty string is not a project.
-    if project:
-        argv += ["--project", project]
+def search_via_subprocess(query, project=None, cwd=None):
+    def build_argv(include_cwd):
+        argv = [MACH_BIN, "kb", "search", query,
+                "--limit", str(SEARCH_LIMIT), "--json",
+                "--min-score", str(SCORE_THRESHOLD),
+                "--budget", str(TOKEN_BUDGET)]
+        # Same reasoning as search_via_socket: omit rather than send "" --
+        # project_name() returns "" for the home directory (no project), and
+        # an empty string is not a project.
+        if project:
+            argv += ["--project", project]
+        # Same as search_via_socket's cwd field, for the subprocess
+        # fallback: `mach kb search --cwd PATH` resolves it against the
+        # `projects` registry and, on a match, uses it as the session
+        # project instead of `--project`.
+        if include_cwd and cwd:
+            argv += ["--cwd", cwd]
+        return argv
+
     try:
         proc = subprocess.run(
-            argv,
+            build_argv(True),
             capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT,
         )
     except Exception:
         return None
+    if proc.returncode != 0 and cwd:
+        # An installed binary older than --cwd (rollout gap between this
+        # change landing and the next install.sh) rejects it outright as an
+        # unknown argument -- retry once without it rather than losing
+        # subprocess-fallback recall entirely until the next install.
+        try:
+            proc = subprocess.run(
+                build_argv(False),
+                capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT,
+            )
+        except Exception:
+            return None
     if proc.returncode != 0:
         return None
     # `mach kb search` degrades to a substring fallback (every hit forced to
@@ -286,6 +342,83 @@ def suppressed_cards(log_path):
     can inject, so repeating it every prompt about the same entity is the
     most expensive kind of waste."""
     return {k for k in _suppressed_field(log_path, "cards") if isinstance(k, str)}
+
+
+def session_seen_cards(log_path):
+    """Every card key (an entity name, or `PROJECT_CARD_KEY` for the
+    project card) ever logged this session, across ALL lines — unlike
+    `suppressed_cards` above, not bounded to the last `DEDUPE_WINDOW`
+    entries. Pretool recall's own once-per-session card rule (see
+    kb-pretool-recall.py) needs the whole session's history: a card shown
+    on prompt 1 must still suppress a pretool hit on tool call 50, long
+    outside any sliding window. Same silence-on-error contract as every
+    other log reader here."""
+    out = set()
+    if not log_path:
+        return out
+    try:
+        with open(log_path) as f:
+            lines = [ln for ln in f if ln.strip()]
+    except Exception:
+        return out
+    for ln in lines:
+        try:
+            entry = json.loads(ln)
+        except Exception:
+            continue
+        for v in entry.get("cards") or []:
+            if isinstance(v, str):
+                out.add(v)
+    return out
+
+
+def no_match_already_shown(log_path):
+    """Unbounded scan of the whole session's recall log for a prior
+    `no_match` marker (see `emit_no_match`) -- same "ever, not just within
+    DEDUPE_WINDOW" shape as `session_seen_cards`, because the point of the
+    once-per-session rule is exactly that: once, not once per window."""
+    if not log_path:
+        return False
+    try:
+        with open(log_path) as f:
+            lines = [ln for ln in f if ln.strip()]
+    except Exception:
+        return False
+    for ln in lines:
+        try:
+            entry = json.loads(ln)
+        except Exception:
+            continue
+        if entry.get("no_match"):
+            return True
+    return False
+
+
+def emit_no_match(project, log_path):
+    """Print NO_MATCH_LINE and log it, but only when the session's project
+    is known (a bare, project-less session has no `--cwd .` for the
+    suggested command to anchor to), a session id is known (`log_path` is
+    derived from it, and is "" without one -- with no session log to dedupe
+    against, this would otherwise repeat on every single prompt instead of
+    at most once per session), and it hasn't been shown yet this session.
+    Silent, like every other path here, on any log failure -- the line
+    still gets printed even if logging it fails, at the cost of possibly
+    repeating on a later prompt."""
+    if not project:
+        return
+    if not log_path:
+        return
+    if no_match_already_shown(log_path):
+        return
+    print(NO_MATCH_LINE)
+    try:
+        os.makedirs(RECALL_LOG_DIR, exist_ok=True)
+        import datetime
+        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with open(log_path, "a") as f:
+            f.write(json.dumps({"ts": ts, "no_match": True}) + "\n")
+    except Exception:
+        pass
 
 
 def project_card_text(resp):
@@ -407,22 +540,38 @@ def main():
     if not prompt or len(prompt) < MIN_PROMPT_LEN or prompt.startswith("/"):
         return
 
+    # project_name() (the basename) stays the fallback label used to build
+    # the query-expansion string below; `cwd` itself now also rides along
+    # on every search so the Rust side can resolve the actual session
+    # project against the `projects` registry rather than trusting a
+    # basename guess (see `search_via_socket`/`search_via_subprocess`).
     project = project_name(cwd)
-    resp = search(prompt, project)
+    resp = search(prompt, project, cwd)
     # Query expansion: the same prompt anchored to the project the session
     # runs in, so "fix the tutorial drift" inside ~/programming/umoja also
     # pulls Umoja-specific memories the bare prompt does not embed near.
     if project and project.lower() not in prompt.lower():
-        resp = merge_responses(resp, search("{} {}".format(project, prompt), project))
-    if not resp:
-        return
-    hits = resp.get("hits") or []
-    connections = resp.get("connections") or []
-    cards = resp.get("cards") or []
-    if not hits and not connections and not cards and not project_card_text(resp):
-        return
+        resp = merge_responses(resp, search("{} {}".format(project, prompt), project, cwd))
 
     log_path = os.path.join(RECALL_LOG_DIR, session_id + ".jsonl") if session_id else ""
+
+    if resp is None:
+        # Both socket and subprocess search failed outright -- an
+        # infrastructure failure, not "nothing matched." Reporting a
+        # no-match here would falsely claim the bank was actually searched,
+        # so this degrades to silence instead, per this hook's own
+        # never-block-a-prompt contract (see the module docstring).
+        return
+
+    hits = (resp or {}).get("hits") or []
+    connections = (resp or {}).get("connections") or []
+    cards = (resp or {}).get("cards") or []
+    if not hits and not connections and not cards and not (resp and project_card_text(resp)):
+        # Nothing matched at all -- the fallback line below (not the action
+        # line, which requires something actually injected) is the only
+        # thing that can still be shown.
+        emit_no_match(project, log_path)
+        return
     suppressed = suppressed_ids(log_path)
     suppressed_conn_keys = suppressed_conns(log_path)
     suppressed_card_keys = suppressed_cards(log_path)
@@ -532,6 +681,14 @@ def main():
         card_block.extend(rendered)
         card_keys.append(name)
 
+    # This hook always re-shows the project card every prompt (it's cheap
+    # and never stale, see above) — this marker changes no behavior here.
+    # It exists purely so pretool recall's own once-per-session card rule
+    # (session_seen_cards, checked against this same log file) knows the
+    # project card has already been shown in this session at least once.
+    if project_card:
+        card_keys.append(PROJECT_CARD_KEY)
+
     if card_block:
         print("What you know about what this prompt names (consolidated from many "
               "memories by reflection; the memories themselves follow):")
@@ -553,6 +710,20 @@ def main():
         # `conn_keys` above.
         for l in connection_lines:
             print(l)
+
+    # Whatever actually got printed above (post session-dedupe -- a hit
+    # list that arrived non-empty but was entirely suppressed counts as
+    # nothing injected, same as an empty response) decides which closing
+    # line this prompt gets: the action line when something real is there
+    # to act on, or the once-per-session no-match fallback when there
+    # isn't. The project card alone counts as "injected" too — it's
+    # rendered content, not a placeholder.
+    injected = bool(project_card) or bool(card_block) or bool(lines) or bool(connection_lines)
+    if injected:
+        print()
+        print(ACTION_LINE)
+    else:
+        emit_no_match(project, log_path)
 
     # Only ids/connection keys actually rendered above are logged — the
     # engagement sweep (`mach kb ingest-sessions`) depends on the "ids"

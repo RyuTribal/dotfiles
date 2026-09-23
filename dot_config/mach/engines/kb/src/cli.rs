@@ -2,7 +2,7 @@
 //! kb — subcommand dispatch for `mach kb ...`, matching the hand-rolled
 //! arg-parsing style the sweep engine's `cli` module already uses (no
 //! clap).
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -49,10 +49,14 @@ fn print_help() {
     println!("  review                  interactive review of unreviewed candidates — optional");
     println!("                          human override; `mach kb reflect`'s curation pass");
     println!("                          already promotes/demotes this queue on its own");
-    println!("  list [--limit N] [--superseded] [--dormant]");
-    println!("                          most recent memories (--superseded/--dormant: audit views)");
+    println!("  list [--limit N] [--superseded] [--dormant] [--pinned]");
+    println!("                          most recent memories (--superseded/--dormant/--pinned: audit views)");
     println!("  forget <id>             permanently delete a memory");
-    println!("  restore <id>            undo a supersession: make a tombstoned memory active again");
+    println!("  restore <id>            undo a supersession: make a tombstoned memory active again;");
+    println!("                          pins it so dedupe/contradiction/verdict passes never");
+    println!("                          re-tombstone it automatically (manual supersede still can)");
+    println!("  unpin <id>              clear a pin set by `restore`, so automatic passes may");
+    println!("                          tombstone the row again");
     println!("  wake <id>               clear a memory's dormant status (mach kb list --dormant)");
     println!("  reflect [--meta]        examine new memories, derive/reinforce durable");
     println!("                          insights, re-verify a sample of existing ones, curate");
@@ -63,7 +67,8 @@ fn print_help() {
     println!("  insights [--flagged]    list derived insights and themes (confidence + source ids)");
     println!("  insight-forget <id>     permanently delete an insight or theme");
     println!("  tree                    render the theme -> insight -> memory hierarchy");
-    println!("  model [--json]          compact mental-model view (active themes/insights only,");
+    println!("  model [--json] [--max-chars N]");
+    println!("                          compact mental-model view (active themes/insights only,");
     println!("                          no source ids or memory leaves) for context injection");
     println!("  export [--out FILE]     full-fidelity JSONL backup of every row (default: stdout)");
     println!("  import FILE [--merge]   restore from a `mach kb export` file; refuses a non-empty");
@@ -121,6 +126,19 @@ fn print_help() {
     println!("  health [--notify]       operational self-check (ollama, kb.db, kb socket, reflect");
     println!("                          cadence, disk headroom, recall-log dir, telegram-state");
     println!("                          staleness); --notify sends one desktop alert on failure");
+    println!("  recall-stats [--days N]");
+    println!("                          the recall-precision tuning metric: per session judged in");
+    println!("                          the window (default 14 days), how many injected memories");
+    println!("                          were shown vs actually engaged (`mach kb ingest-sessions`'s");
+    println!("                          verdicts, persisted past the recall-log's own 14-day prune),");
+    println!("                          then an overall precision line");
+    println!("  audit-supersessions [--limit N] [--apply] [--json] [--reaudit]");
+    println!("                          LLM-judged audit of every tombstoned memory against its");
+    println!("                          direct successor: did the tombstone lose a fact (often a");
+    println!("                          dated one) the successor doesn't carry? Dry run by default");
+    println!("                          (prints LOSSY pairs + a summary, changes nothing); --apply");
+    println!("                          restores and pins each LOSSY row; --reaudit re-examines");
+    println!("                          rows already recorded (skipped by default)");
 }
 
 /// Runs the kb CLI given the arguments following `kb` in `mach kb ...`.
@@ -133,6 +151,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Some("list") => cmd_list(args),
         Some("forget") => cmd_forget(args),
         Some("restore") => cmd_restore(args),
+        Some("unpin") => cmd_unpin(args),
         Some("wake") => cmd_wake(args),
         Some("reflect") => cmd_reflect(args),
         Some("insights") => cmd_insights(args),
@@ -154,6 +173,8 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Some("transcripts") => cmd_transcripts(args),
         Some("graph") => cmd_graph(args),
         Some("health") => cmd_health(args),
+        Some("recall-stats") => cmd_recall_stats(args),
+        Some("audit-supersessions") => cmd_audit_supersessions(args),
         Some("-h") | Some("--help") => {
             print_help();
             Ok(())
@@ -282,6 +303,10 @@ fn cmd_add(mut args: impl Iterator<Item = String>) -> io::Result<()> {
             let _ = store::set_basis(&conn, id, store::BASIS_STATED);
             println!("stored memory #{}", id)
         }
+        AddOutcome::AddedRefining { new_id, old_id } => {
+            let _ = store::set_basis(&conn, new_id, store::BASIS_STATED);
+            println!("stored memory #{} (refines memory #{})", new_id, old_id);
+        }
         AddOutcome::AddedAndTombstoned { new_id, old_id, verb } => {
             let _ = store::set_basis(&conn, new_id, store::BASIS_STATED);
             println!("stored memory #{} ({} memory #{})", new_id, verb, old_id);
@@ -335,11 +360,13 @@ pub struct SearchHit {
     // classify). Lets kb-recall.py say "you told me" vs "I inferred".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub basis: Option<String>,
-    // Normalized BM25 from the FTS5 lexical channel (`store::search_hybrid`):
-    // 1.0 for the query's best exact-token match, omitted when 0 (no token
-    // matched, or the hit came from insights/association where the channel
-    // does not apply). `sim` stays the raw cosine; the blended `score`
-    // already reflects whichever of the two was higher.
+    // IDF-weighted term coverage from the FTS5 lexical channel
+    // (`store::search_hybrid` / `store::lexical_scores`): 1.0 when the hit
+    // matched every query term's IDF mass, not normalized against the best
+    // hit in the result set; omitted when 0 (no token matched, or the hit
+    // came from insights/association where the channel does not apply).
+    // `sim` stays the raw cosine; the blended `score` already reflects
+    // whichever of the two was higher.
     #[serde(skip_serializing_if = "f32_is_zero")]
     pub lexical: f32,
 }
@@ -735,6 +762,32 @@ pub fn project_card_for(conn: &Connection, project: Option<&str>) -> Result<Opti
 /// embed call serves both the ordinary hit ranking and this additive
 /// "here's something connected to what you asked about" field, so this is
 /// the one shared path both the kb socket and `mach kb search` build on.
+///
+/// `project` is the caller's best guess at the session project (today,
+/// `basename(cwd)` -- see `kb-recall.py`'s `project_name`), used only as a
+/// fallback label. `cwd`, when given, is resolved against the `projects`
+/// registry (`store::project_for_path`) and its match -- an actual claim
+/// about identity, not a guess -- wins as the SESSION PROJECT: it decides
+/// which project's card rides along (`project_card_for`). A caller with no
+/// `cwd` (every existing one: `cmd_eval`, `ask`, every test) falls back to
+/// `project` exactly as before this parameter existed.
+///
+/// The other-project down-weight (`apply_project_penalty`) is narrower than
+/// the card lookup: it fires only when `cwd` itself resolved to a
+/// registered project (never for the `project` basename fallback, which is
+/// a guess, not a claim), and only against hits tagged with another name
+/// that is ALSO registered in the `projects` table -- an unregistered tag
+/// like `claude-config` is left alone. See `apply_project_penalty`'s doc
+/// comment for why both restrictions matter.
+///
+/// `date_anchor`, when given, overrides `now` as the "today" that relative-
+/// date query terms ("yesterday", "last week", "in august") resolve
+/// against (see `store::query_date_range`) -- `now` itself keeps driving
+/// recency and strength scoring unchanged. This exists solely for `mach kb
+/// eval`'s `Question.as_of`, so a relative-date question written on one day
+/// keeps scoring correctly on a later day; every other caller passes
+/// `None` and gets exactly today's behaviour.
+#[allow(clippy::too_many_arguments)]
 pub fn search_hits<E: Embedder>(
     conn: &Connection,
     embedder: &E,
@@ -745,14 +798,52 @@ pub fn search_hits<E: Embedder>(
     min_score: f32,
     now: &str,
     project: Option<&str>,
+    cwd: Option<&str>,
+    date_anchor: Option<&str>,
 ) -> Result<SearchResponse, KbError> {
+    let cwd_project = cwd.and_then(|c| store::project_for_path(conn, c).ok().flatten());
+    let resolved_from_cwd = cwd_project.is_some();
+    let session_project: Option<String> = match cwd_project {
+        Some(row) => Some(row.name),
+        None => project.map(|p| p.to_string()),
+    };
+    // Only a `cwd` match against the `projects` registry is an actual claim
+    // about identity (see the doc comment above); the `project` fallback is
+    // just a basename guess and must never trigger the penalty below, or an
+    // unrelated same-named directory could down-weight real memories.
+    // Loaded once per call (not per hit) and only when it can matter.
+    let registered_projects: HashSet<String> = if resolved_from_cwd {
+        store::list_projects(conn)?.iter().map(|p| p.name.to_lowercase()).collect()
+    } else {
+        HashSet::new()
+    };
     let q_emb = embedder.embed(query)?;
     // Hybrid: cosine over embeddings plus the FTS5 exact-token channel
     // (`store::search_hybrid`), so a NORAD number, hostname, or ticket name
     // the embedding blurs still ranks.
-    let mem_hits = store::search_hybrid(conn, query, &q_emb, limit, reviewed_only, include_superseded, 0.0, now)?;
+    //
+    // Fetch double the candidates when a session project is known: rows
+    // from OTHER projects are about to be scored down
+    // (`OTHER_PROJECT_PENALTY`, below) before the truncate to `limit`, and
+    // without the extra headroom a page of other-project hits could crowd
+    // the session project's own hits out of contention entirely rather
+    // than merely rank behind them.
+    let fetch_limit = if session_project.is_some() { limit * 2 } else { limit };
+    let mem_hits =
+        store::search_hybrid(conn, query, &q_emb, fetch_limit, reviewed_only, include_superseded, 0.0, now, date_anchor)?;
     let insight_hits = store::search_insights_ranked(conn, &q_emb, limit, now)?;
     let mut mem_hits: Vec<SearchHit> = mem_hits.into_iter().map(to_hit).collect();
+    // Down-weight memories explicitly tagged to a DIFFERENT project than
+    // the session's own, so memories tagged with other projects no longer
+    // compete equally against ones relevant to where the session actually
+    // is. A memory with `project = None` (most of them) is left alone --
+    // there is nothing to compare against, and it was never a competing
+    // claim to begin with.
+    if resolved_from_cwd {
+        if let Some(sp) = session_project.as_deref() {
+            apply_project_penalty(&mut mem_hits, sp, &registered_projects);
+        }
+    }
     // Threshold the query matches before spreading: a memory that only
     // scraped in under the floor by embedding must still be reachable as a
     // graph neighbour of a real hit (and then carries the neighbour score).
@@ -777,14 +868,54 @@ pub fn search_hits<E: Embedder>(
     // (already capped at `store::SPREAD_MAX_OUT`, and held to the same score
     // floor so a faint hop is never injected).
     let mut hops = spread_graph(conn, &combined, now, Some(&q_emb))?;
+    // Same down-weighting as the direct hits, applied before the same
+    // score-floor filter below -- a hop into another project's memory is no
+    // more entitled to a slot than a direct hit on one.
+    if resolved_from_cwd {
+        if let Some(sp) = session_project.as_deref() {
+            apply_project_penalty(&mut hops, sp, &registered_projects);
+        }
+    }
     if min_score > 0.0 {
         hops.retain(|h| h.score >= min_score);
     }
     combined.extend(hops);
     let connections = entity_connections_for_query(conn, query, &q_emb);
     let cards = cards_for_query(conn, query, &q_emb);
-    let project_card = project_card_for(conn, project)?;
+    let project_card = project_card_for(conn, session_project.as_deref())?;
     Ok(SearchResponse { hits: combined, connections, cards, project_card })
+}
+
+/// How much an other-project memory's score is scaled by in `search_hits`
+/// when the session's own project is known -- see `apply_project_penalty`.
+/// 0.5 rather than something harsher: an other-project memory is still a
+/// real memory of this same user and may be the best (or only) answer to a
+/// cross-project question; it should rank behind an equally-relevant
+/// same-project or unlabeled memory, not be silenced outright.
+pub const OTHER_PROJECT_PENALTY: f32 = 0.5;
+
+/// Scales the score of every hit tagged to a REGISTERED project other than
+/// `session_project` (case-insensitive) by `OTHER_PROJECT_PENALTY`, in
+/// place. `registered_projects` is the lowercased set of names in the
+/// `projects` table, loaded once by the caller. A hit with `project = None`
+/// -- most memories, and every insight hit (`insight_to_hit` always sets it
+/// to `None`) -- is left untouched, and so is a hit tagged with a project
+/// name that was never registered (`claude-config`, `fastapi-hub` as a raw
+/// tag, ad-hoc labels, ...): those are not a competing claim about *this*
+/// user's *other* indexed project, just a label, and penalizing them made
+/// ordinary same-project memories rank behind their own kind. The caller
+/// must only invoke this when the session project itself was resolved from
+/// `cwd` via `store::project_for_path` -- a basename guess is not a real
+/// identity claim either, so it must never be the basis for penalizing
+/// other memories.
+fn apply_project_penalty(hits: &mut [SearchHit], session_project: &str, registered_projects: &HashSet<String>) {
+    for h in hits.iter_mut() {
+        if let Some(p) = h.project.as_deref() {
+            if registered_projects.contains(&p.to_lowercase()) && !p.eq_ignore_ascii_case(session_project) {
+                h.score *= OTHER_PROJECT_PENALTY;
+            }
+        }
+    }
 }
 
 /// Spreading activation over the memory graph (`store::spread_activation`):
@@ -843,6 +974,7 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut min_score: f32 = 0.0;
     let mut budget: Option<usize> = None;
     let mut project: Option<String> = None;
+    let mut cwd: Option<String> = None;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -859,10 +991,17 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
             // exits 1 and the hook injects NOTHING -- strictly worse than
             // the missing card the flag was added to fix.
             "--project" => project = args.next(),
+            // Resolved against the `projects` registry (`store::
+            // project_for_path`) and, when it matches, wins over
+            // `--project` as the session project for both the card and
+            // the other-project down-weighting in `search_hits` -- a
+            // registered root is an actual claim of identity, `--project`
+            // today is just a basename guess.
+            "--cwd" => cwd = args.next(),
             "-h" | "--help" => {
                 println!(
                     "usage: mach kb search \"<query>\" [--limit N] [--budget N] [--json] [--reviewed-only] [--touch] \
-                     [--include-superseded] [--min-score F] [--project NAME]"
+                     [--include-superseded] [--min-score F] [--project NAME] [--cwd PATH]"
                 );
                 return Ok(());
             }
@@ -893,7 +1032,7 @@ fn cmd_search(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     // the kb socket daemon uses for `kb-recall.sh`'s fast path — only the
     // substring-fallback branch below is unique to this subprocess entry
     // point.
-    let mut response = match search_hits(&conn, &embedder, &query, limit, reviewed_only, include_superseded, 0.0, &now, project.as_deref()) {
+    let mut response = match search_hits(&conn, &embedder, &query, limit, reviewed_only, include_superseded, 0.0, &now, project.as_deref(), cwd.as_deref(), None) {
         Ok(r) => {
             if touch {
                 let ids: Vec<i64> = r.hits.iter().filter(|h| !h.derived).map(|h| h.id).collect();
@@ -1148,13 +1287,15 @@ fn cmd_list(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut limit: usize = 20;
     let mut superseded_only = false;
     let mut dormant_only = false;
+    let mut pinned_only = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--limit" => limit = args.next().and_then(|v| v.parse().ok()).unwrap_or(20),
             "--superseded" => superseded_only = true,
             "--dormant" => dormant_only = true,
+            "--pinned" => pinned_only = true,
             "-h" | "--help" => {
-                println!("usage: mach kb list [--limit N] [--superseded] [--dormant]");
+                println!("usage: mach kb list [--limit N] [--superseded] [--dormant] [--pinned]");
                 return Ok(());
             }
             other => {
@@ -1164,7 +1305,9 @@ fn cmd_list(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         }
     }
     let conn: Connection = store::open().map_err(to_io)?;
-    let rows = if dormant_only {
+    let rows = if pinned_only {
+        store::list_pinned(&conn, Some(limit)).map_err(to_io)?
+    } else if dormant_only {
         store::list_dormant(&conn, Some(limit)).map_err(to_io)?
     } else {
         store::list(&conn, Some(limit), superseded_only).map_err(to_io)?
@@ -1172,7 +1315,9 @@ fn cmd_list(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     if rows.is_empty() {
         println!(
             "{}",
-            if dormant_only {
+            if pinned_only {
+                "no pinned memories"
+            } else if dormant_only {
                 "no dormant memories"
             } else if superseded_only {
                 "no superseded memories"
@@ -1186,11 +1331,13 @@ fn cmd_list(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         let flag = if m.reviewed { ' ' } else { '*' };
         let sup = if m.is_superseded() { '!' } else { ' ' };
         let dor = if m.is_dormant() { 'z' } else { ' ' };
+        let pin = if m.pinned_at.is_some() { 'p' } else { ' ' };
         println!(
-            "{}{}{}{:>5}  {}  {:<10} {:<12}  {}",
+            "{}{}{}{}{:>5}  {}  {:<10} {:<12}  {}",
             flag,
             sup,
             dor,
+            pin,
             m.id,
             m.created_at,
             m.source.as_deref().unwrap_or("-"),
@@ -1200,7 +1347,8 @@ fn cmd_list(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     }
     println!(
         "\n(* = awaiting review — run `mach kb review`; ! = superseded — run `mach kb list --superseded`; \
-         z = dormant — run `mach kb list --dormant`, wake with `mach kb wake <id>`)"
+         z = dormant — run `mach kb list --dormant`, wake with `mach kb wake <id>`; \
+         p = pinned — run `mach kb list --pinned`, clear with `mach kb unpin <id>`)"
     );
     Ok(())
 }
@@ -1247,14 +1395,40 @@ fn cmd_restore(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         }
     };
     let conn = store::open().map_err(to_io)?;
-    if store::restore(&conn, id).map_err(to_io)? {
-        println!("restored memory #{} (supersession undone)", id);
+    let now = store::now_rfc3339();
+    if store::restore(&conn, id, &now).map_err(to_io)? {
+        println!("restored memory #{} (supersession undone, pinned so reflect won't re-judge it)", id);
         Ok(())
     } else {
         eprintln!(
             "mach kb restore: memory {} is not superseded (see `mach kb list --superseded`)",
             id
         );
+        std::process::exit(1);
+    }
+}
+
+fn cmd_unpin(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let id_str = match args.next() {
+        Some(s) => s,
+        None => {
+            eprintln!("mach kb unpin: missing <id> argument");
+            std::process::exit(1);
+        }
+    };
+    let id: i64 = match id_str.parse() {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("mach kb unpin: '{}' is not a valid id", id_str);
+            std::process::exit(1);
+        }
+    };
+    let conn = store::open().map_err(to_io)?;
+    if store::unpin(&conn, id).map_err(to_io)? {
+        println!("unpinned memory #{} (automatic passes may tombstone it again)", id);
+        Ok(())
+    } else {
+        eprintln!("mach kb unpin: memory {} is not pinned", id);
         std::process::exit(1);
     }
 }
@@ -1288,7 +1462,13 @@ fn cmd_wake(mut args: impl Iterator<Item = String>) -> io::Result<()> {
 // --- reflect: the periodic reflection pass ---
 
 const REFLECT_WORKING_SET_CAP: usize = 60;
-const REFLECT_NEIGHBORS_PER_MEMORY: usize = 3;
+// Up to this many of the NEWEST unreflected rows are always included in the
+// working set, so a fact added this week is never stuck behind a
+// four-figure backlog; whatever cap remains is filled with the OLDEST
+// unreflected rows -- see `reflect_working_set`'s own doc comment for the
+// full split and why it replaces the old watermark-gated "newest 60"
+// truncation.
+const REFLECT_NEWEST_SLICE: usize = 20;
 const REFLECT_EVIDENCE_PER_QUESTION: usize = 8;
 const REFLECT_EXISTING_INSIGHTS_CONTEXT: usize = 3;
 const REFLECT_VERIFICATION_SAMPLE: usize = 5;
@@ -1324,11 +1504,21 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let conn = store::open().map_err(to_io)?;
     let now = store::now_rfc3339();
     let state = store::get_reflect_state(&conn).map_err(to_io)?;
-    let last_id = state.last_memory_id.unwrap_or(0);
+    // Captured before this run's own completion overwrites `last_run_at`
+    // below -- the cutoff `store::ids_new_since_reflect` uses to decide
+    // which already-reflected rows still count as "new" for the dedupe and
+    // contradiction passes (see that function's own doc comment).
+    let previous_run_start = state.last_run_at.clone();
 
-    // Step 1: input selection.
-    let new_memories = store::memories_since(&conn, last_id).map_err(to_io)?;
-    let has_new = !new_memories.is_empty();
+    // Step 1: input selection. Replaces the old single-watermark
+    // `memories_since(last_id)` -- see `SCHEMA_VERSION`'s v29->v30
+    // migration and `reflect::should_mark_reflected` for why: a database-
+    // wide watermark that only moved on a zero-failure run froze for two
+    // weeks in the live bank while the backlog grew past 1300 unexamined
+    // rows. `unreflected_active_count` is the per-memory replacement: cheap
+    // (a single COUNT), so it costs nothing extra on this pre-check path.
+    let backlog_before = store::unreflected_active_count(&conn).map_err(to_io)?;
+    let has_new = backlog_before > 0;
 
     // Cheap, DB-only pre-check — no network, no `claude` spawn — so an
     // early exit costs nothing on a laptop merely waking up opportunistically
@@ -1337,11 +1527,17 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     // unconditionally (it has no staleness filter of its own — see its own
     // doc comment), so "empty" here precisely means zero active insights
     // exist yet, not merely that none happen to be old enough to re-check.
-    // The nightly dedupe pass needs no separate check here: every candidate
-    // pair requires at least one side to be "new" (see
-    // `reflect::dedupe_candidate_pairs`), so `!has_new` already rules its
-    // queue out too. A --meta-only invocation (e.g. for manual testing once
-    // enough insights already exist) must still be able to run even when
+    // Note this early exit is conservative, not exact, for the nightly
+    // dedupe/contradiction passes: their own "new" set
+    // (`store::ids_new_since_reflect`) can be non-empty even when
+    // `has_new` is false here, if the immediately preceding run reflected
+    // rows at or after its own `last_run_at` (see that function's doc
+    // comment) -- a database with an empty backlog but a just-finished
+    // prior run legitimately still has dedupe/contradiction work, so it
+    // must not early-exit on `has_new` alone; `verification_queue`/
+    // `graph_backlog` below already keep that door open. A --meta-only
+    // invocation (e.g. for manual testing once enough insights already
+    // exist) must still be able to run even when
     // there's nothing new or due — this is the only early exit before the
     // connectivity guard below.
     let verification_queue = store::insights_due_for_verification(&conn, REFLECT_VERIFICATION_SAMPLE).map_err(to_io)?;
@@ -1357,6 +1553,26 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     if pruned_assoc > 0 {
         println!("mach kb reflect: pruned {} faded memory associations", pruned_assoc);
     }
+
+    // Retention: age out `judge_log` (raw LLM-call audit trail) and
+    // `recall_engagement` (per-session shown/engaged verdicts) rows past
+    // their retention window. DB-only, unconditional (like `prune_assoc`
+    // just above) — this runs before BOTH early exits below ("nothing
+    // new" and "offline, deferring"), so a quiet stretch with nothing new
+    // to examine still gets pruned rather than silently skipping
+    // retention indefinitely. Never touches `supersession_audit`, which
+    // has no retention and is never pruned. The counts are folded into
+    // the full run's summary line at the end of this function; an early
+    // exit below prints its own short message and never reaches that
+    // summary, so nothing extra is printed for these counts on that path.
+    let judge_log_cutoff =
+        store::now_rfc3339_from_secs(store::now_secs().saturating_sub(store::JUDGE_LOG_RETENTION_DAYS as u64 * 86400));
+    let judge_log_pruned = store::prune_judge_log(&conn, &judge_log_cutoff).map_err(to_io)?;
+    let recall_engagement_cutoff = store::now_rfc3339_from_secs(
+        store::now_secs().saturating_sub(store::RECALL_ENGAGEMENT_RETENTION_DAYS as u64 * 86400),
+    );
+    let recall_engagement_pruned = store::prune_recall_engagement(&conn, &recall_engagement_cutoff).map_err(to_io)?;
+
     if !has_new && !force_meta && verification_queue.is_empty() && !graph_backlog {
         // Still a genuine completion for `mach kb health`'s purposes — the
         // process ran and had nothing to do, which is different from never
@@ -1382,52 +1598,447 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     }
 
     let embedder = OllamaEmbedder::new();
-    let llm = ProcessReflectLlm::new();
+    // `mach kb reflect` is the one caller that opts into the transient-
+    // failure retry (`ProcessReflectLlm::with_retry`'s own doc comment) —
+    // it runs opportunistically every ~3h, not on an interactive or
+    // tighter-timer cadence, so the extra `retry_delay` per failed call is
+    // cheap here and expensive everywhere else `ProcessReflectLlm::new()`
+    // is used (`ask`, `cards`, `graph audit`, `audit-supersessions`,
+    // `ingest-sessions`, `eval-ask` all stay off by default).
+    let llm = ProcessReflectLlm::new().with_retry(true);
     // Set on any `claude` call failing mid-run (a network drop after the
-    // connectivity guard above passed, a spawn error, a timeout) — gates
-    // the watermark advance at the very end so a degraded run stays fully
-    // retry-able next time instead of orphaning whatever it never got to.
+    // connectivity guard above passed, a spawn error, a timeout) — reported
+    // in the summary line's "(degraded: ...)" suffix. No longer gates
+    // anything: each pass isolates and retries its own failures on its own
+    // progress mechanism, and only stage-1/stage-2's OWN failure (folded in
+    // just below via `stage.stage_failed`, NOT `stage.any_failed` — see
+    // `InsightStageOutcome::stage_failed`'s own doc comment) decides
+    // whether the insight stage's working set gets marked reflected — see
+    // `reflect::should_mark_reflected`.
     let mut llm_failed = false;
 
-    let mut examined = 0usize;
+    // Steps 2-4 (stage-1 questions, stage-2 insight synthesis, insight
+    // re-verification) plus marking the working set reflected all live in
+    // `run_insight_stage` now, so the exact same logic is exercised by unit
+    // tests without spawning `store::open()`'s real db or a real `claude`
+    // process — see that function's own doc comment for why only stage-1
+    // and stage-2 (not re-verification) gate `reflected_at`.
+    let insight_llm = reflect::LoggedLlm::new(&conn, "insights", &llm);
+    let stage = run_insight_stage(&conn, &embedder, &insight_llm, &verification_queue, &now).map_err(to_io)?;
+    let examined = stage.examined;
+    let questions_count = stage.questions;
+    let insights_added = stage.insights_added;
+    let reinforced = stage.reinforced;
+    let flagged = stage.flagged;
+    let weakened = stage.weakened;
+    let verified = stage.verified;
+    let revised = stage.revised;
+    let reflected = stage.reflected;
+    let max_reflected_id = stage.max_reflected_id;
+    // `any_failed`, not `stage_failed`: the summary line's "(degraded: ...)"
+    // suffix should reflect a verification failure too, even though that
+    // failure never blocked marking the working set reflected.
+    llm_failed = llm_failed || stage.any_failed;
+
+    // Step 4.5: nightly dedupe — fast capture paths (`mach note`, digests)
+    // deliberately skip save-time dedupe classification, so near-duplicate
+    // raw memories accumulate; this catches them here, where LLM time is
+    // free. Only pairs touching a memory "new" by `store::ids_new_since_reflect`
+    // are considered, capped at reflect::DEDUPE_MAX_PAIRS_PER_RUN. That set
+    // replaces the old watermark-derived `new_memories.map(|m| m.id)`: it's
+    // now unreflected backlog (`reflected_at IS NULL`) unioned with rows
+    // reflected at or after `previous_run_start` (this run's own working
+    // set, marked moments ago by `run_insight_stage`, plus anything the
+    // immediately preceding run reflected) — see that function's own doc
+    // comment. Deliberately runs BEFORE dormancy (below): a memory
+    // old/stale/uncited enough to qualify for dormancy this very run is
+    // exactly the kind of long-neglected fact a dedupe or contradiction
+    // pair most needs to catch — dormancy would otherwise drop it out of
+    // `active_memories_for_dormancy`'s pool (dormant rows are excluded from
+    // it) before either judge ever got a look at it.
+    let new_ids = store::ids_new_since_reflect(&conn, previous_run_start.as_deref()).map_err(to_io)?;
+    let (deduped, dedupe_llm_failed) =
+        run_dedupe_pass(&conn, &reflect::LoggedLlm::new(&conn, "dedupe", &llm), &new_ids, &now).map_err(to_io)?;
+    llm_failed = llm_failed || dedupe_llm_failed;
+
+    // Step 4.55: contradiction patrol (after dedupe) — catches the case the
+    // nightly dedupe pass's own similarity band never sees: two memories
+    // about the same changing thing (e.g. a changed boss) that are similar
+    // enough to be semantic siblings but too textually different to ever
+    // land at dedupe's >= 0.85 floor, so the stale fact would otherwise
+    // just sit there accumulating reinforcement forever. Only pairs
+    // touching a memory created since the last reflect run are considered,
+    // same "new-vs-all" shape as the dedupe pass, capped at
+    // reflect::CONTRADICTION_MAX_PAIRS_PER_RUN. Same before-dormancy
+    // rationale as the dedupe pass above.
+    let (contradictions, contradiction_llm_failed) =
+        run_contradiction_pass(&conn, &reflect::LoggedLlm::new(&conn, "contradiction", &llm), &new_ids, &now)
+            .map_err(to_io)?;
+    llm_failed = llm_failed || contradiction_llm_failed;
+
+    // Step 4.57: curation — the organic promotion path for the unreviewed
+    // queue (`mach kb add --unreviewed`/digests): judges ACTIVE unreviewed
+    // rows past their 3-day settling period (reflect::CURATION_MIN_AGE_DAYS),
+    // oldest-first, capped at reflect::CURATION_MAX_PER_RUN. `mach kb review`
+    // remains an optional, immediate human override over the same rows —
+    // this pass is what makes it optional rather than a required gate. Runs
+    // every invocation regardless of has_new (like dormancy, below — it's a
+    // sweep over the whole unreviewed queue, not gated on new material).
+    // Deliberately before dormancy: not because same-run burial is otherwise
+    // possible (a row just DEMOTEd here is at most a few days old, and
+    // dormancy's own floor is store::DORMANCY_MIN_AGE_DAYS = 90 days, so it
+    // can never qualify in the same run regardless of ordering) but to keep
+    // this pass grouped with the other judge-driven sweeps above it.
+    let (curated, promoted, demoted, curation_llm_failed) =
+        run_curation_pass(&conn, &reflect::LoggedLlm::new(&conn, "curation", &llm), &now).map_err(to_io)?;
+    llm_failed = llm_failed || curation_llm_failed;
+
+    // Step 4.6: strength review — extends re-verification (step 4, above)
+    // from insights to raw memories themselves: samples up to
+    // REFLECT_STRENGTH_SAMPLE oldest-verified ACTIVE memories at importance
+    // >= STRENGTH_MIN_IMPORTANCE and checks each against its own top-3
+    // semantic neighbors, routing any genuine conflict through the same
+    // judge the contradiction patrol above uses. Also runs before dormancy
+    // for the same reason.
+    let (mem_verified, mem_stale, mem_routed, strength_llm_failed) =
+        run_strength_review_pass(&conn, &reflect::LoggedLlm::new(&conn, "strength_review", &llm), &now).map_err(to_io)?;
+    llm_failed = llm_failed || strength_llm_failed;
+
+    // Step 4.63: graph extraction — entities/relations derived from facts
+    // that have now been through this run's own truth-maintenance (the
+    // contradiction patrol and strength review above), so extraction reads
+    // already-resolved facts rather than a stale one a later pass this same
+    // run might still have tombstoned. Runs every invocation regardless of
+    // has_new, same as curation/dormancy — it drains the not-yet-extracted
+    // backlog (`store::graph_extraction_candidates`), not just this run's
+    // new material. Deliberately before dormancy: a memory dormancy is about
+    // to put to sleep this very run is still exactly the kind of fact worth
+    // extracting a durable edge from before it drops out of active view.
+    let (graph_examined, graph_edges, graph_entities, graph_llm_failed) =
+        run_graph_extraction_pass(&conn, &embedder, &reflect::LoggedLlm::new(&conn, "graph_extraction", &llm), &now)
+            .map_err(to_io)?;
+    llm_failed = llm_failed || graph_llm_failed;
+
+    // Step 4.64: graph hygiene — runs right after edge extraction and before
+    // dormancy: (a) evidence-death propagation (deterministic, no LLM) —
+    // an active edge whose evidence memory has since died (invalidated or
+    // hard-deleted) is invalidated too, `superseded_by` left NULL (it died
+    // with its evidence, it wasn't beaten by a rival edge); a dormant
+    // evidence memory is deliberately left alone here (it can wake) and is
+    // instead excluded only at recall-query time (see
+    // `active_relations_for_recall`). (b) entity merge (batched LLM
+    // confirm) — candidate pairs found by name-embedding similarity or a
+    // case/punctuation-insensitive exact match are batch-judged SAME/
+    // DIFFERENT; a SAME verdict keeps the older entity, repoints every edge
+    // off the newer one (deduping any resulting identical edges), and
+    // deletes the newer entity row. Runs every invocation regardless of
+    // has_new, same as curation/dormancy/graph-extraction — both halves are
+    // sweeps over the whole graph, not gated on this run's new material.
+    let (evidence_dead, entities_merged, hygiene_llm_failed) =
+        run_graph_hygiene_pass(&conn, &reflect::LoggedLlm::new(&conn, "graph_hygiene", &llm), &now).map_err(to_io)?;
+    llm_failed = llm_failed || hygiene_llm_failed;
+
+    // Step 4.65: dormancy — put stale, low-importance, uncited memories to
+    // sleep (reviewed and unreviewed alike, on the exact same criteria —
+    // see store::memory_qualifies_for_dormancy's own doc comment; there is
+    // no separate absolute clock for an unreviewed row anymore, the
+    // curation pass above is what handles that queue now), then consolidate
+    // this run's freshly-dormant rows into new durable facts where a
+    // cluster of them shares something worth keeping. Runs
+    // every invocation regardless of has_new/force_meta — it's a nightly
+    // sweep over the whole active store, not gated on new material. Runs
+    // last among these sweeps so a memory the contradiction patrol just
+    // tombstoned above is already excluded from its pool (tombstoned rows
+    // never qualify for dormancy in the first place) rather than racing it.
+    let (dormant, consolidated, dormancy_llm_failed) =
+        run_dormancy_pass(&conn, &embedder, &reflect::LoggedLlm::new(&conn, "dormancy", &llm), &now).map_err(to_io)?;
+    llm_failed = llm_failed || dormancy_llm_failed;
+
+    // Step 4.655: insight dedupe — fold beliefs that say the same thing into
+    // one row before the card and theme passes read them, so a theme is
+    // never derived from four rephrasings of one insight.
+    let (insight_pairs_judged, insights_merged, insight_dedupe_failed) =
+        run_insight_dedupe_pass(&conn, &reflect::LoggedLlm::new(&conn, "insight_dedupe", &llm), &now).map_err(to_io)?;
+    llm_failed = llm_failed || insight_dedupe_failed;
+
+    // Step 4.66: entity cards — rebuild the consolidated profile of every
+    // entity whose evidence has moved since its card was written. Runs after
+    // merges (so a card is never built for an entity about to be merged
+    // away) and after dormancy (so it reflects what actually survived), and
+    // like those, every invocation regardless of has_new: staleness is
+    // measured against the mention watermark, not this run's new material.
+    let (cards_examined, cards_built, cards_error) =
+        run_entity_card_pass(&conn, &embedder, &reflect::LoggedLlm::new(&conn, "entity_cards", &llm), &now)
+            .map_err(to_io)?;
+    if let Some(e) = &cards_error {
+        eprintln!("mach kb reflect: entity card call failed: {}", e);
+    }
+    llm_failed = llm_failed || cards_error.is_some();
+
+    // Step 5: meta-reflection (theme) pass — only when triggered, or
+    // forced via --meta for manual runs.
+    let level1_active = store::count_active_insights_level(&conn, 1).map_err(to_io)?;
+    let newest_theme = store::newest_active_theme(&conn).map_err(to_io)?;
+    let since_newest_theme = match &newest_theme {
+        Some(t) => store::count_active_level1_created_after(&conn, t.id).map_err(to_io)?,
+        None => 0,
+    };
+    let meta_trigger = reflect::should_run_meta_pass(level1_active, newest_theme.is_some(), since_newest_theme);
+    let mut themes_added = 0usize;
+    if meta_trigger || force_meta {
+        let (added, meta_llm_failed) =
+            run_meta_pass(&conn, &embedder, &reflect::LoggedLlm::new(&conn, "meta", &llm)).map_err(to_io)?;
+        themes_added = added;
+        llm_failed = llm_failed || meta_llm_failed;
+    }
+
+    // Step 6: `reflect_state.last_run_at` now updates every run
+    // unconditionally (it's `store::ids_new_since_reflect`'s own cutoff for
+    // the *next* run, not a gate on anything) and `last_memory_id` simply
+    // tracks the highest id `run_insight_stage` actually marked reflected
+    // this run — status/display only (`mach kb health`), nothing reads it
+    // to decide what to examine any more. Monotonic: never regresses below
+    // whatever it already was, since `run_insight_stage` returning
+    // `max_reflected_id: None` (nothing marked, whether because there was
+    // no backlog or the insight stage itself failed) simply leaves it alone.
+    let new_last_memory_id = match (state.last_memory_id, max_reflected_id) {
+        (Some(old), Some(new)) => Some(old.max(new)),
+        (None, Some(new)) => Some(new),
+        (old, None) => old,
+    };
+    store::update_reflect_state(&conn, &now, new_last_memory_id).map_err(to_io)?;
+
+    // Records this run's completion for `mach kb health`'s own "is reflect
+    // still running" check — unconditional, same as the `last_run_at`
+    // update just above (see `store::ReflectState::last_completed_at`'s own
+    // doc comment).
+    store::mark_reflect_completed(&conn, &now).map_err(to_io)?;
+
+    let backlog_after = store::unreflected_active_count(&conn).map_err(to_io)?;
+
+    println!(
+        "mach kb reflect: examined={} questions={} insights_added={} reinforced={} \
+         reflected={} backlog={} \
+         themes_added={} flagged={} weakened={} verified={} revised={} curated={} promoted={} demoted={} dormant={} \
+         consolidated={} deduped={} contradictions={} mem_verified={} mem_stale={} mem_routed={} \
+         graph_examined={} graph_edges={} graph_entities={} evidence_dead={} entities_merged={} \
+         cards_examined={} cards_built={} insight_pairs={} insights_merged={} \
+         judge_log_pruned={} recall_engagement_pruned={}{}",
+        examined,
+        questions_count,
+        insights_added,
+        reinforced,
+        reflected,
+        backlog_after,
+        themes_added,
+        flagged,
+        weakened,
+        verified,
+        revised,
+        curated,
+        promoted,
+        demoted,
+        dormant,
+        consolidated,
+        deduped,
+        contradictions,
+        mem_verified,
+        mem_stale,
+        mem_routed,
+        graph_examined,
+        graph_edges,
+        graph_entities,
+        evidence_dead,
+        entities_merged,
+        cards_examined,
+        cards_built,
+        insight_pairs_judged,
+        insights_merged,
+        judge_log_pruned,
+        recall_engagement_pruned,
+        if llm_failed { " (degraded: some claude calls failed this run)" } else { "" }
+    );
+    Ok(())
+}
+
+/// Selects `mach kb reflect`'s insight-stage working set: up to
+/// `REFLECT_WORKING_SET_CAP` (60) memories still due for the insight stage
+/// (`reflected_at IS NULL`, active), split as up to `newest_slice` (20) of
+/// the NEWEST unreflected rows plus the OLDEST unreflected rows filling
+/// whatever cap remains (40 when the newest slice is full, more when the
+/// backlog is smaller than `newest_slice`). Deterministic and duplicate-
+/// free: the newest slice is chosen first, and the oldest slice explicitly
+/// excludes those ids (`store::unreflected_active_oldest`'s own `exclude`
+/// parameter) rather than deduping two independently-run queries after the
+/// fact. Returned oldest-id-first, matching the ordering every downstream
+/// prompt-building/evidence path already expects.
+///
+/// This replaces the pre-migration selection this codebase used to run:
+/// every active memory created since `reflect_state.last_memory_id`,
+/// bridged with each one's top-3 semantic neighbors, then truncated to the
+/// newest 60 when over cap. That truncation quietly discarded anything
+/// older whenever the bridged set overflowed, so the same newest-60 window
+/// got re-examined run after run while a watermark that only ever advanced
+/// on a zero-failure run sat frozen for two weeks — the backlog could never
+/// shrink even in principle. The newest slice here preserves the one
+/// property worth keeping (a fact added this week is never stuck behind a
+/// four-figure backlog); the oldest slice is the actual fix, draining the
+/// backlog by a bounded amount every single run regardless of what any
+/// other pass in that run does.
+fn reflect_working_set(conn: &Connection, cap: usize, newest_slice: usize) -> Result<Vec<Memory>, KbError> {
+    let newest = store::unreflected_active_newest(conn, newest_slice.min(cap))?;
+    let newest_ids: HashSet<i64> = newest.iter().map(|m| m.id).collect();
+    let remaining = cap.saturating_sub(newest.len());
+    let oldest = store::unreflected_active_oldest(conn, remaining, &newest_ids)?;
+    let mut out = oldest;
+    out.extend(newest);
+    out.sort_by_key(|m| m.id);
+    Ok(out)
+}
+
+/// What `run_insight_stage` did this run — everything `cmd_reflect`'s
+/// summary line reports about the insight stage, plus what it needs to
+/// update `reflect_state.last_memory_id` and decide whether to fold this
+/// stage's own failure into the run-wide `llm_failed` flag.
+struct InsightStageOutcome {
+    examined: usize,
+    questions: usize,
+    insights_added: usize,
+    reinforced: usize,
+    flagged: usize,
+    weakened: usize,
+    verified: usize,
+    /// Contradicted insights the revise/drop/keep judge corrected in place
+    /// (`store::revise_insight`) instead of flagging — see that call site's
+    /// own comment for the three-way verdict.
+    revised: usize,
+    /// Rows actually marked `reflected_at = now` this run — 0 whenever
+    /// `stage_failed` is true or the working set was empty.
+    reflected: usize,
+    /// `MAX(id)` among the rows marked reflected this run, or `None` when
+    /// nothing was marked.
+    max_reflected_id: Option<i64>,
+    /// Whether stage-1 (questions) or stage-2 (insight synthesis) itself
+    /// failed this run — the ONLY thing `reflect::should_mark_reflected`
+    /// looks at. Re-verification's own failures never set this: it keeps
+    /// its OWN progress mechanism (`Insight::last_verified_at`, untouched
+    /// on a failed check — see the verification loop below), so a
+    /// verification call failing has no bearing on whether the memory
+    /// working set gets marked reflected. A failure in any pass this
+    /// function doesn't run at all (dedupe, contradiction, curation,
+    /// strength review, graph extraction, hygiene, dormancy, insight
+    /// dedupe, entity cards, meta) obviously has no bearing on it either.
+    /// The gating decision is already made inside this function (see
+    /// "Step 6a" below) before this struct is even built, so `cmd_reflect`
+    /// itself never needs to read this field back out — it exists on the
+    /// struct purely so the failure-isolation behavior is directly
+    /// assertable from a unit test rather than only inferable from
+    /// `reflected`/`unreflected_active_count`.
+    #[allow(dead_code)]
+    stage_failed: bool,
+    /// `stage_failed` OR a re-verification call failing this run — folded
+    /// into `cmd_reflect`'s run-wide `llm_failed` flag for the summary
+    /// line's "(degraded: ...)" reporting only. Never used to gate
+    /// anything; `reflect::should_mark_reflected` never sees this field.
+    any_failed: bool,
+}
+
+/// Hard cap on the stage-1 questions prompt (`reflect::build_questions_prompt`
+/// over the working set), in `char`s. A deterministic slab of unusually
+/// large memories occupying the oldest slice could otherwise make stage-1's
+/// own prompt too large for `claude` to answer reliably within its own
+/// timeout, every single run — re-freezing exactly the insight stage this
+/// whole per-memory-progress change exists to unstick, just via prompt
+/// size instead of the old watermark. Enforced by `cap_stage1_prompt`.
+const REFLECT_STAGE1_PROMPT_CHAR_CAP: usize = 20_000;
+
+/// Shrinks `working_vec` (already sorted ascending by id, as
+/// `reflect_working_set` returns it) so `reflect::build_questions_prompt`
+/// over it fits `char_cap` chars — by dropping rows from the OLDEST
+/// slice's own end (the highest ids within that slice, i.e. the
+/// "least-old" members of it) until it fits, or the oldest slice is empty.
+/// The up-to-`newest_slice` newest rows (the tail of `working_vec`, by
+/// construction — see `reflect_working_set`'s doc comment for why every
+/// oldest-slice id is guaranteed lower than every newest-slice id) are
+/// ALWAYS kept in full and never trimmed, even if the prompt is still over
+/// cap afterward. A row dropped this way is simply not part of this run's
+/// working set at all — it's never marked reflected, and stays backlog for
+/// a later run (as either an oldest or, eventually, a newest candidate
+/// again).
+fn cap_stage1_prompt(mut working_vec: Vec<Memory>, newest_slice: usize, char_cap: usize) -> Vec<Memory> {
+    let newest_count = newest_slice.min(working_vec.len());
+    let split_at = working_vec.len() - newest_count;
+    if split_at == 0 {
+        return working_vec; // nothing but the newest slice -- never trimmed
+    }
+    let newest_part: Vec<Memory> = working_vec.split_off(split_at);
+    let mut oldest_part = working_vec; // now just the first split_at elements
+    let prompt_chars = |oldest: &[Memory], newest: &[Memory]| -> usize {
+        let lines: Vec<(i64, String)> =
+            oldest.iter().chain(newest.iter()).map(|m| (m.id, m.content.clone())).collect();
+        reflect::build_questions_prompt(&lines).chars().count()
+    };
+    while prompt_chars(&oldest_part, &newest_part) > char_cap && !oldest_part.is_empty() {
+        oldest_part.pop();
+    }
+    oldest_part.extend(newest_part);
+    oldest_part
+}
+
+/// The insight stage: `mach kb reflect`'s steps 2-4 (stage-1 salient
+/// questions, stage-2 durable-insight synthesis, and insight
+/// re-verification), plus marking its own working set reflected
+/// (`store::mark_memories_reflected`) when — and only when — stage-1 and
+/// stage-2 came through this run with no LLM failure
+/// (`reflect::should_mark_reflected`; see `InsightStageOutcome::stage_failed`'s
+/// own doc comment for why re-verification is deliberately excluded from
+/// that gate despite living in this same function). Extracted from
+/// `cmd_reflect` into its own generic-over-`ReflectLlm`/`Embedder`
+/// function, same pattern as `run_dedupe_pass`/`run_graph_extraction_pass`/
+/// etc. below, so it's exercised by unit tests against a fake LLM and an
+/// in-memory store instead of only being reachable through a real
+/// `claude -p` run.
+///
+/// `verification_queue` is the caller's already-fetched
+/// `insights_due_for_verification` sample (re-verification's own working
+/// set is insights, not memories, and is independent of the memory working
+/// set `reflect_working_set` selects here — see `cli::cmd_reflect`'s "Step
+/// 1" for why both need to be computed before the early-exit check, which
+/// is why the caller still fetches it rather than this function).
+fn run_insight_stage<E: Embedder, L: ReflectLlm>(
+    conn: &Connection,
+    embedder: &E,
+    llm: &L,
+    verification_queue: &[Insight],
+    now: &str,
+) -> Result<InsightStageOutcome, KbError> {
+    let mut stage_failed = false;
     let mut questions_count = 0usize;
     let mut insights_added = 0usize;
     let mut reinforced = 0usize;
 
-    if has_new {
-        // Working set: the new memories, bridged with each one's top-3
-        // neighbors from the whole active store (reviewed and unreviewed
-        // alike) so a fresh fact can connect to an older pattern. Deduped by
-        // id via the BTreeMap; capped at 60, most-recent-first when over.
-        let mut working: BTreeMap<i64, Memory> = BTreeMap::new();
-        for m in &new_memories {
-            working.insert(m.id, m.clone());
-        }
-        for m in &new_memories {
-            if let Some(emb) = &m.embedding {
-                if let Ok(neighbors) = store::top_similar_active(&conn, emb, REFLECT_NEIGHBORS_PER_MEMORY) {
-                    for (nm, _) in neighbors {
-                        working.entry(nm.id).or_insert(nm);
-                    }
-                }
-            }
-        }
-        let mut working_vec: Vec<Memory> = working.into_values().collect();
-        if working_vec.len() > REFLECT_WORKING_SET_CAP {
-            working_vec.sort_by(|a, b| b.id.cmp(&a.id));
-            working_vec.truncate(REFLECT_WORKING_SET_CAP);
-        }
-        working_vec.sort_by_key(|m| m.id);
-        examined = working_vec.len();
+    let working_vec = reflect_working_set(conn, REFLECT_WORKING_SET_CAP, REFLECT_NEWEST_SLICE)?;
+    // Cap the stage-1 prompt size before anything else touches `working_vec`
+    // — `examined`, the ids eventually marked reflected, and the prompt
+    // itself must all agree on exactly the same (possibly shrunk) set. See
+    // `cap_stage1_prompt`'s own doc comment for the freeze risk this
+    // guards against.
+    let working_vec = cap_stage1_prompt(working_vec, REFLECT_NEWEST_SLICE, REFLECT_STAGE1_PROMPT_CHAR_CAP);
+    let examined = working_vec.len();
 
+    if !working_vec.is_empty() {
         // Step 2 (stage 1): salient questions, one haiku call over the
-        // whole working set.
+        // whole working set. TIMEOUT_HAIKU_BATCH (60s), not the shorter
+        // single-fact TIMEOUT_HAIKU (30s): this call already covers up to
+        // REFLECT_WORKING_SET_CAP (60) memories at once (the same scale
+        // `TIMEOUT_HAIKU_BATCH` was raised for elsewhere), and the 20,000-
+        // char prompt cap above still bounds it even so.
         let question_lines: Vec<(i64, String)> = working_vec.iter().map(|m| (m.id, m.content.clone())).collect();
         let q_prompt = reflect::build_questions_prompt(&question_lines);
-        let questions: Vec<String> = match llm.call("haiku", &q_prompt, TIMEOUT_HAIKU) {
+        let questions: Vec<String> = match llm.call("haiku", &q_prompt, reflect::TIMEOUT_HAIKU_BATCH) {
             Ok(out) => reflect::parse_questions(&out),
             Err(_) => {
-                llm_failed = true;
+                stage_failed = true;
                 Vec::new()
             }
         };
@@ -1439,19 +2050,32 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         for question in &questions {
             let q_emb = match embedder.embed(question) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(_) => {
+                    // An embedding-provider failure here is a real failure
+                    // of this stage's own machinery, not "insufficient
+                    // evidence" — must set stage_failed (unlike the
+                    // evidence.len() < 2 case just below, which is a
+                    // legitimate, non-failing outcome).
+                    stage_failed = true;
+                    continue;
+                }
             };
-            let evidence = match store::top_similar_active(&conn, &q_emb, REFLECT_EVIDENCE_PER_QUESTION) {
+            let evidence = match store::top_similar_active(conn, &q_emb, REFLECT_EVIDENCE_PER_QUESTION) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(_) => {
+                    stage_failed = true;
+                    continue;
+                }
             };
             if evidence.len() < 2 {
                 // Can never clear the 2-citation floor regardless of what
-                // the model says — skip the sonnet call entirely.
+                // the model says — skip the sonnet call entirely. Not a
+                // failure: the query succeeded and legitimately found too
+                // little evidence.
                 continue;
             }
             let existing_near =
-                store::top_similar_insights(&conn, &q_emb, REFLECT_EXISTING_INSIGHTS_CONTEXT).unwrap_or_default();
+                store::top_similar_insights(conn, &q_emb, REFLECT_EXISTING_INSIGHTS_CONTEXT).unwrap_or_default();
 
             let evidence_pairs: Vec<(i64, String)> = evidence.iter().map(|(m, _)| (m.id, m.content.clone())).collect();
             let existing_pairs: Vec<(i64, String)> =
@@ -1461,7 +2085,7 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
             let raw = match llm.call("sonnet", &prompt, TIMEOUT_SONNET) {
                 Ok(out) => out,
                 Err(_) => {
-                    llm_failed = true;
+                    stage_failed = true;
                     continue;
                 }
             };
@@ -1482,8 +2106,7 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
                     let confidence = reflect::compute_confidence(valid_ids.len());
                     let source_ids: Vec<String> = valid_ids.iter().map(|id| id.to_string()).collect();
                     let text_embedding = embedder.embed(&text).ok();
-                    if store::insert_insight(&conn, &text, confidence, &source_ids, text_embedding.as_deref()).is_ok()
-                    {
+                    if store::insert_insight(conn, &text, confidence, &source_ids, text_embedding.as_deref()).is_ok() {
                         insights_added += 1;
                     }
                 }
@@ -1499,7 +2122,7 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
                     if valid_ids.is_empty() {
                         continue;
                     }
-                    match store::get_insight(&conn, insight_id) {
+                    match store::get_insight(conn, insight_id) {
                         Ok(Some(target)) if target.is_active() => {
                             let existing_raw: HashSet<i64> =
                                 target.source_ids.iter().filter_map(|s| s.parse::<i64>().ok()).collect();
@@ -1508,7 +2131,7 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
                             if new_ids.is_empty() {
                                 continue; // only already-cited ids — reject
                             }
-                            if store::reinforce_insight(&conn, insight_id, &new_ids, &now).is_ok() {
+                            if store::reinforce_insight(conn, insight_id, &new_ids, now).is_ok() {
                                 reinforced += 1;
                             }
                         }
@@ -1520,17 +2143,30 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         }
     }
 
-    // Step 4: re-verification, same run — up to 5 oldest insights by
-    // last_verified_at (never-verified first; reuses the sample already
-    // fetched by the cheap pre-check above rather than querying twice).
-    // Never deletes, only flags. Runs across BOTH levels (level-2 themes
-    // share this table and this query), so a theme is just as due for a
-    // check as a plain insight.
+    // Step 4: re-verification, same run — up to REFLECT_VERIFICATION_SAMPLE
+    // oldest insights by last_verified_at (never-verified first; flagging
+    // now also bumps last_verified_at -- see store::flag_insight's own doc
+    // comment -- so a contradicted insight leaves the head of this queue
+    // instead of crowding it out run after run). Never deletes -- flags,
+    // revises, or (broken citation) weakens. Runs across BOTH levels
+    // (level-2 themes share this table and this query), so a theme is just
+    // as due for a check as a plain insight. Independent of the memory
+    // working set above (it can run, and fail, even when that working set
+    // was empty). Deliberately does NOT set `stage_failed`: verification
+    // tracks its own progress via `Insight::last_verified_at`, exactly like
+    // every other pass below this function (dedupe, contradiction,
+    // curation, ...) tracks its own — a verification call failing here
+    // only means that specific insight stays due and gets retried, same as
+    // any of those; it must never also hold the memory working set
+    // hostage. Its failure still feeds `any_failed` (this function's own
+    // aggregate, folded by the caller into `llm_failed` for the summary
+    // line) so it's visible in the "(degraded: ...)" report.
+    let mut any_failed = stage_failed;
     let mut flagged = 0usize;
     let mut weakened = 0usize;
     let mut verified = 0usize;
-    let stale = verification_queue;
-    for insight in &stale {
+    let mut revised = 0usize;
+    for insight in verification_queue {
         let mut broken_citation = false;
         for sid in &insight.source_ids {
             if let Some(rest) = sid.strip_prefix('i').or_else(|| sid.strip_prefix('I')) {
@@ -1540,10 +2176,9 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
                 // the citing row (the theme) is flagged too — a theme is
                 // only as sound as the insights it names.
                 let ok = match rest.parse::<i64>() {
-                    Ok(cid) => matches!(
-                        store::get_insight(&conn, cid),
-                        Ok(Some(ci)) if ci.is_active() && !ci.is_flagged()
-                    ),
+                    Ok(cid) => {
+                        matches!(store::get_insight(conn, cid), Ok(Some(ci)) if ci.is_active() && !ci.is_flagged())
+                    }
                     Err(_) => false,
                 };
                 if !ok {
@@ -1553,7 +2188,7 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
                 continue;
             }
             let still_active = match sid.parse::<i64>() {
-                Ok(mid) => matches!(store::get(&conn, mid), Ok(Some(m)) if m.invalidated_at.is_none()),
+                Ok(mid) => matches!(store::get(conn, mid), Ok(Some(m)) if m.invalidated_at.is_none()),
                 Err(_) => false,
             };
             if !still_active {
@@ -1566,25 +2201,28 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
             // A citation that died under it is thinning evidence, not a
             // contradiction: weaken by one step and let the next pass judge
             // the claim itself, rather than flagging it as doubted outright.
-            store::weaken_insight(&conn, insight.id, &now).map_err(to_io)?;
+            store::weaken_insight(conn, insight.id, now)?;
             weakened += 1;
             continue;
         }
 
         let mut call_failed = false;
+        let mut evidence_pairs: Vec<(i64, String)> = Vec::new();
         let contradicted = match embedder.embed(&insight.text) {
-            Ok(emb) => match store::top_similar_active(&conn, &emb, REFLECT_VERIFICATION_CANDIDATES) {
+            Ok(emb) => match store::top_similar_active(conn, &emb, REFLECT_VERIFICATION_CANDIDATES) {
                 Ok(candidates) if !candidates.is_empty() => {
                     let pairs: Vec<(i64, String)> =
                         candidates.iter().map(|(m, _)| (m.id, m.content.clone())).collect();
                     let prompt = reflect::build_contradiction_prompt(&insight.text, &pairs);
-                    match llm.call("haiku", &prompt, TIMEOUT_HAIKU) {
+                    let verdict = match llm.call("haiku", &prompt, TIMEOUT_HAIKU) {
                         Ok(out) => reflect::parse_contradiction(&out).is_some(),
                         Err(_) => {
                             call_failed = true;
                             false
                         }
-                    }
+                    };
+                    evidence_pairs = pairs;
+                    verdict
                 }
                 _ => false,
             },
@@ -1596,216 +2234,145 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
             // timeout) — leave this insight's verification state exactly
             // as it was rather than crediting a check that never actually
             // happened; it stays due and gets retried on a later run.
-            llm_failed = true;
+            // Feeds `any_failed` only, never `stage_failed` -- see this
+            // function's own "Step 4" comment above.
+            any_failed = true;
             continue;
         }
 
-        if contradicted {
-            // Flags AND lowers confidence by two steps (see
-            // `store::flag_insight`): a belief the evidence now contradicts
-            // should not keep displaying the confidence it earned before.
-            store::flag_insight(&conn, insight.id, &now).map_err(to_io)?;
+        if contradicted && insight.level == 2 {
+            // Themes never get revised (fix-list item 2): a level-2 theme
+            // is a meta-reflection over other insights' TEXT, not a claim
+            // with its own raw-memory evidence to re-word against, so the
+            // revise/drop/keep judge is never even called for one -- same
+            // pre-existing flag behavior a contradicted theme always had.
+            store::flag_insight(conn, insight.id, now)?;
             flagged += 1;
+        } else if contradicted {
+            // Evidence has turned against this insight -- rather than
+            // unconditionally flagging it (the old behavior), ask a second,
+            // sonnet-tier judge whether the CURRENT evidence supports a
+            // corrected wording instead of just doubting the original one.
+            // Same `llm` (already tagged "insights" by the caller) as
+            // stage-1/stage-2/the contradiction check above -- see
+            // `reflect::build_revise_prompt`/`parse_revise`'s own doc
+            // comments for the three-way verdict this drives.
+            let evidence_ids: Vec<i64> = evidence_pairs.iter().map(|(id, _)| *id).collect();
+            let revise_prompt = reflect::build_revise_prompt(&insight.text, &evidence_pairs);
+            match llm.call("sonnet", &revise_prompt, TIMEOUT_SONNET) {
+                Ok(out) => match reflect::parse_revise(&out, &evidence_ids) {
+                    Some(reflect::ReviseVerdict::Revise(new_text, cited_ids)) => {
+                        // Anti flip-flop (fix-list item 3): a REVISE this
+                        // soon after the insight's own last revision is
+                        // applied as DROP instead -- two judges disagreeing
+                        // about the wording inside two weeks is a sign the
+                        // belief itself is unstable, not that the newest
+                        // wording is right.
+                        let recently_revised = insight
+                            .revised_at
+                            .as_deref()
+                            .and_then(store::parse_rfc3339)
+                            .zip(store::parse_rfc3339(now))
+                            .map(|(revised_secs, now_secs)| store::days_between(now_secs, revised_secs) < 14.0)
+                            .unwrap_or(false);
+                        if recently_revised {
+                            store::flag_insight(conn, insight.id, now)?;
+                            flagged += 1;
+                        } else {
+                            // Fix-list item 5: an embed failure here skips
+                            // the revise entirely (the insight is left
+                            // completely unchanged, so it stays due for a
+                            // fresh check next run) rather than applying a
+                            // text change with a stale or missing
+                            // embedding -- only visible via `any_failed`.
+                            match embedder.embed(&new_text) {
+                                Ok(new_embedding) => {
+                                    store::revise_insight(
+                                        conn,
+                                        insight.id,
+                                        &new_text,
+                                        Some(&new_embedding),
+                                        &cited_ids,
+                                        now,
+                                    )?;
+                                    revised += 1;
+                                }
+                                Err(_) => {
+                                    any_failed = true;
+                                }
+                            }
+                        }
+                    }
+                    Some(reflect::ReviseVerdict::Drop) => {
+                        // No revision the evidence supports (or a REVISE
+                        // that failed the citation floor -- see
+                        // `reflect::parse_revise`) -- same handling as the
+                        // pre-existing "contradicted" outcome: flags AND
+                        // lowers confidence by two steps (see
+                        // `store::flag_insight`).
+                        store::flag_insight(conn, insight.id, now)?;
+                        flagged += 1;
+                    }
+                    Some(reflect::ReviseVerdict::Keep) => {
+                        // The second judge disagrees with the first: the
+                        // original wording still holds. Treated as a clean
+                        // verification, not a flag.
+                        store::mark_insight_verified(conn, insight.id, now)?;
+                        verified += 1;
+                    }
+                    None => {
+                        // Unparseable reply -- never silently revise text
+                        // the model didn't actually provide. Falls back to
+                        // the pre-existing contradicted-insight behavior.
+                        store::flag_insight(conn, insight.id, now)?;
+                        flagged += 1;
+                        any_failed = true;
+                    }
+                },
+                Err(_) => {
+                    // The revise/drop/keep call itself failed -- same
+                    // fallback as an unparseable reply: flag rather than
+                    // leave the insight's already-established contradiction
+                    // unresolved.
+                    store::flag_insight(conn, insight.id, now)?;
+                    flagged += 1;
+                    any_failed = true;
+                }
+            }
         } else {
-            store::mark_insight_verified(&conn, insight.id, &now).map_err(to_io)?;
+            store::mark_insight_verified(conn, insight.id, now)?;
             verified += 1;
         }
     }
 
-    // Step 4.5: nightly dedupe — fast capture paths (`mach note`, digests)
-    // deliberately skip save-time dedupe classification, so near-duplicate
-    // raw memories accumulate; this catches them here, where LLM time is
-    // free. Only pairs touching a memory created since the last reflect
-    // run are considered, capped at reflect::DEDUPE_MAX_PAIRS_PER_RUN.
-    // Deliberately runs BEFORE dormancy (below): a memory old/stale/uncited
-    // enough to qualify for dormancy this very run is exactly the kind of
-    // long-neglected fact a dedupe or contradiction pair most needs to
-    // catch — dormancy would otherwise drop it out of
-    // `active_memories_for_dormancy`'s pool (dormant rows are excluded from
-    // it) before either judge ever got a look at it.
-    let new_ids: HashSet<i64> = new_memories.iter().map(|m| m.id).collect();
-    let (deduped, dedupe_llm_failed) = run_dedupe_pass(&conn, &llm, &new_ids, &now).map_err(to_io)?;
-    llm_failed = llm_failed || dedupe_llm_failed;
-
-    // Step 4.55: contradiction patrol (after dedupe) — catches the case the
-    // nightly dedupe pass's own similarity band never sees: two memories
-    // about the same changing thing (e.g. a changed boss) that are similar
-    // enough to be semantic siblings but too textually different to ever
-    // land at dedupe's >= 0.85 floor, so the stale fact would otherwise
-    // just sit there accumulating reinforcement forever. Only pairs
-    // touching a memory created since the last reflect run are considered,
-    // same "new-vs-all" shape as the dedupe pass, capped at
-    // reflect::CONTRADICTION_MAX_PAIRS_PER_RUN. Same before-dormancy
-    // rationale as the dedupe pass above.
-    let (contradictions, contradiction_llm_failed) = run_contradiction_pass(&conn, &llm, &new_ids, &now).map_err(to_io)?;
-    llm_failed = llm_failed || contradiction_llm_failed;
-
-    // Step 4.57: curation — the organic promotion path for the unreviewed
-    // queue (`mach kb add --unreviewed`/digests): judges ACTIVE unreviewed
-    // rows past their 3-day settling period (reflect::CURATION_MIN_AGE_DAYS),
-    // oldest-first, capped at reflect::CURATION_MAX_PER_RUN. `mach kb review`
-    // remains an optional, immediate human override over the same rows —
-    // this pass is what makes it optional rather than a required gate. Runs
-    // every invocation regardless of has_new (like dormancy, below — it's a
-    // sweep over the whole unreviewed queue, not gated on new material).
-    // Deliberately before dormancy: not because same-run burial is otherwise
-    // possible (a row just DEMOTEd here is at most a few days old, and
-    // dormancy's own floor is store::DORMANCY_MIN_AGE_DAYS = 90 days, so it
-    // can never qualify in the same run regardless of ordering) but to keep
-    // this pass grouped with the other judge-driven sweeps above it.
-    let (curated, promoted, demoted, curation_llm_failed) = run_curation_pass(&conn, &llm, &now).map_err(to_io)?;
-    llm_failed = llm_failed || curation_llm_failed;
-
-    // Step 4.6: strength review — extends re-verification (step 4, above)
-    // from insights to raw memories themselves: samples up to
-    // REFLECT_STRENGTH_SAMPLE oldest-verified ACTIVE memories at importance
-    // >= STRENGTH_MIN_IMPORTANCE and checks each against its own top-3
-    // semantic neighbors, routing any genuine conflict through the same
-    // judge the contradiction patrol above uses. Also runs before dormancy
-    // for the same reason.
-    let (mem_verified, mem_stale, mem_routed, strength_llm_failed) =
-        run_strength_review_pass(&conn, &llm, &now).map_err(to_io)?;
-    llm_failed = llm_failed || strength_llm_failed;
-
-    // Step 4.63: graph extraction — entities/relations derived from facts
-    // that have now been through this run's own truth-maintenance (the
-    // contradiction patrol and strength review above), so extraction reads
-    // already-resolved facts rather than a stale one a later pass this same
-    // run might still have tombstoned. Runs every invocation regardless of
-    // has_new, same as curation/dormancy — it drains the not-yet-extracted
-    // backlog (`store::graph_extraction_candidates`), not just this run's
-    // new material. Deliberately before dormancy: a memory dormancy is about
-    // to put to sleep this very run is still exactly the kind of fact worth
-    // extracting a durable edge from before it drops out of active view.
-    let (graph_examined, graph_edges, graph_entities, graph_llm_failed) =
-        run_graph_extraction_pass(&conn, &embedder, &llm, &now).map_err(to_io)?;
-    llm_failed = llm_failed || graph_llm_failed;
-
-    // Step 4.64: graph hygiene — runs right after edge extraction and before
-    // dormancy: (a) evidence-death propagation (deterministic, no LLM) —
-    // an active edge whose evidence memory has since died (invalidated or
-    // hard-deleted) is invalidated too, `superseded_by` left NULL (it died
-    // with its evidence, it wasn't beaten by a rival edge); a dormant
-    // evidence memory is deliberately left alone here (it can wake) and is
-    // instead excluded only at recall-query time (see
-    // `active_relations_for_recall`). (b) entity merge (batched LLM
-    // confirm) — candidate pairs found by name-embedding similarity or a
-    // case/punctuation-insensitive exact match are batch-judged SAME/
-    // DIFFERENT; a SAME verdict keeps the older entity, repoints every edge
-    // off the newer one (deduping any resulting identical edges), and
-    // deletes the newer entity row. Runs every invocation regardless of
-    // has_new, same as curation/dormancy/graph-extraction — both halves are
-    // sweeps over the whole graph, not gated on this run's new material.
-    let (evidence_dead, entities_merged, hygiene_llm_failed) = run_graph_hygiene_pass(&conn, &llm, &now).map_err(to_io)?;
-    llm_failed = llm_failed || hygiene_llm_failed;
-
-    // Step 4.65: dormancy — put stale, low-importance, uncited memories to
-    // sleep (reviewed and unreviewed alike, on the exact same criteria —
-    // see store::memory_qualifies_for_dormancy's own doc comment; there is
-    // no separate absolute clock for an unreviewed row anymore, the
-    // curation pass above is what handles that queue now), then consolidate
-    // this run's freshly-dormant rows into new durable facts where a
-    // cluster of them shares something worth keeping. Runs
-    // every invocation regardless of has_new/force_meta — it's a nightly
-    // sweep over the whole active store, not gated on new material. Runs
-    // last among these sweeps so a memory the contradiction patrol just
-    // tombstoned above is already excluded from its pool (tombstoned rows
-    // never qualify for dormancy in the first place) rather than racing it.
-    let (dormant, consolidated, dormancy_llm_failed) = run_dormancy_pass(&conn, &embedder, &llm, &now).map_err(to_io)?;
-    llm_failed = llm_failed || dormancy_llm_failed;
-
-    // Step 4.655: insight dedupe — fold beliefs that say the same thing into
-    // one row before the card and theme passes read them, so a theme is
-    // never derived from four rephrasings of one insight.
-    let (insight_pairs_judged, insights_merged, insight_dedupe_failed) =
-        run_insight_dedupe_pass(&conn, &llm, &now).map_err(to_io)?;
-    llm_failed = llm_failed || insight_dedupe_failed;
-
-    // Step 4.66: entity cards — rebuild the consolidated profile of every
-    // entity whose evidence has moved since its card was written. Runs after
-    // merges (so a card is never built for an entity about to be merged
-    // away) and after dormancy (so it reflects what actually survived), and
-    // like those, every invocation regardless of has_new: staleness is
-    // measured against the mention watermark, not this run's new material.
-    let (cards_examined, cards_built, cards_error) =
-        run_entity_card_pass(&conn, &embedder, &llm, &now).map_err(to_io)?;
-    if let Some(e) = &cards_error {
-        eprintln!("mach kb reflect: entity card call failed: {}", e);
-    }
-    llm_failed = llm_failed || cards_error.is_some();
-
-    // Step 5: meta-reflection (theme) pass — only when triggered, or
-    // forced via --meta for manual runs.
-    let level1_active = store::count_active_insights_level(&conn, 1).map_err(to_io)?;
-    let newest_theme = store::newest_active_theme(&conn).map_err(to_io)?;
-    let since_newest_theme = match &newest_theme {
-        Some(t) => store::count_active_level1_created_after(&conn, t.id).map_err(to_io)?,
-        None => 0,
+    // Step "6a": mark the working set reflected -- only when stage-1 and
+    // stage-2 themselves (NOT re-verification -- see `stage_failed`'s own
+    // doc comment) came through clean. A failure in any later pass (dedupe
+    // onward) never reaches this decision at all; the caller folds
+    // `any_failed` into the run-wide `llm_failed` flag separately, for
+    // reporting only.
+    let working_ids: Vec<i64> = working_vec.iter().map(|m| m.id).collect();
+    let (reflected, max_reflected_id) = if reflect::should_mark_reflected(!working_vec.is_empty(), stage_failed) {
+        let n = store::mark_memories_reflected(conn, &working_ids, now)?;
+        (n, working_ids.iter().max().copied())
+    } else {
+        (0, None)
     };
-    let meta_trigger = reflect::should_run_meta_pass(level1_active, newest_theme.is_some(), since_newest_theme);
-    let mut themes_added = 0usize;
-    if meta_trigger || force_meta {
-        let (added, meta_llm_failed) = run_meta_pass(&conn, &embedder, &llm).map_err(to_io)?;
-        themes_added = added;
-        llm_failed = llm_failed || meta_llm_failed;
-    }
 
-    // Step 6: advance the watermark to the newest memory id actually
-    // examined this run (not the bridged neighbors, which may be older) —
-    // only when there was anything new AND nothing failed along the way:
-    // a --meta-only invocation with nothing new must never clobber the
-    // existing watermark back to NULL, and a run that went offline or hit
-    // a spawn/timeout partway through must leave its unexamined remainder
-    // fully retry-able next time rather than orphaning it behind an
-    // advanced watermark.
-    if reflect::should_advance_watermark(has_new, llm_failed) {
-        let new_watermark = new_memories.iter().map(|m| m.id).max();
-        store::update_reflect_state(&conn, &now, new_watermark).map_err(to_io)?;
-    }
-
-    // Records this run's completion for `mach kb health`'s own "is reflect
-    // still running" check — unconditional (see
-    // `store::ReflectState::last_completed_at`'s own doc comment for why
-    // this is deliberately separate from the has_new/llm_failed-gated
-    // watermark above).
-    store::mark_reflect_completed(&conn, &now).map_err(to_io)?;
-
-    println!(
-        "mach kb reflect: examined={} questions={} insights_added={} reinforced={} \
-         themes_added={} flagged={} weakened={} verified={} curated={} promoted={} demoted={} dormant={} \
-         consolidated={} deduped={} contradictions={} mem_verified={} mem_stale={} mem_routed={} \
-         graph_examined={} graph_edges={} graph_entities={} evidence_dead={} entities_merged={} \
-         cards_examined={} cards_built={} insight_pairs={} insights_merged={}{}",
+    Ok(InsightStageOutcome {
         examined,
-        questions_count,
+        questions: questions_count,
         insights_added,
         reinforced,
-        themes_added,
         flagged,
         weakened,
         verified,
-        curated,
-        promoted,
-        demoted,
-        dormant,
-        consolidated,
-        deduped,
-        contradictions,
-        mem_verified,
-        mem_stale,
-        mem_routed,
-        graph_examined,
-        graph_edges,
-        graph_entities,
-        evidence_dead,
-        entities_merged,
-        cards_examined,
-        cards_built,
-        insight_pairs_judged,
-        insights_merged,
-        if llm_failed { " (degraded: some claude calls failed — watermark not advanced)" } else { "" }
-    );
-    Ok(())
+        revised,
+        reflected,
+        max_reflected_id,
+        stage_failed,
+        any_failed,
+    })
 }
 
 /// The dormancy (forgetting) pass: evaluates every active memory against
@@ -1820,12 +2387,14 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
 /// not a replacement. Marking memories dormant needs no network at all;
 /// only the consolidation sub-step's haiku call can fail (offline mid-run,
 /// spawn error, timeout) — when it does, that cluster is simply skipped
-/// (as before) and the caller is told via the third return value so the
-/// watermark doesn't advance on a degraded run.
-fn run_dormancy_pass(
+/// (as before) and the caller is told via the third return value, folded
+/// into the run's summary line's "(degraded: ...)" reporting; it has no
+/// bearing on whether the insight stage's own working set gets marked
+/// reflected (see `reflect::should_mark_reflected`).
+fn run_dormancy_pass<L: ReflectLlm>(
     conn: &Connection,
     embedder: &OllamaEmbedder,
-    llm: &ProcessReflectLlm,
+    llm: &L,
     now: &str,
 ) -> Result<(usize, usize, bool), KbError> {
     let mut llm_failed = false;
@@ -1892,7 +2461,7 @@ fn run_dormancy_pass(
 /// any_llm_call_failed)`. Never touches the watermark or the per-memory
 /// reinforcement/insight logic above — this is a self-contained extra
 /// pass over the insights table.
-fn run_meta_pass(conn: &Connection, embedder: &OllamaEmbedder, llm: &ProcessReflectLlm) -> Result<(usize, bool), KbError> {
+fn run_meta_pass<L: ReflectLlm>(conn: &Connection, embedder: &OllamaEmbedder, llm: &L) -> Result<(usize, bool), KbError> {
     let themed = store::themed_insight_ids(conn)?;
     let mut pool: Vec<Insight> =
         store::active_insights_by_level(conn, 1)?.into_iter().filter(|i| !themed.contains(&i.id)).collect();
@@ -1979,7 +2548,12 @@ fn run_meta_pass(conn: &Connection, embedder: &OllamaEmbedder, llm: &ProcessRefl
 ///
 /// - `Keep` merges the loser's earned reinforcement into the winner and
 ///   tombstones the loser via the ordinary supersession mechanics, then
-///   re-points any insight citing the loser to the winner.
+///   re-points any insight citing the loser to the winner — unless the
+///   loser is pinned (`mach kb restore` set that) or `store::supersession_guard`
+///   blocks it (a dated loser, or one the winner doesn't lexically carry —
+///   see that function's own doc comment), in which case the merge is
+///   skipped and the pair is recorded in `dedupe_seen` instead, exactly
+///   like `Distinct`.
 /// - `Distinct` is recorded in `dedupe_seen` so the pair is never re-asked.
 /// - `Malformed` (or the judge call itself failing) does nothing — no
 ///   merge, no `dedupe_seen` entry — so the pair gets a fresh chance on a
@@ -2028,14 +2602,29 @@ fn run_dedupe_pass<L: ReflectLlm>(
         match reflect::parse_dedupe_verdict(&raw, id_a, id_b) {
             reflect::DedupeVerdict::Keep { keep_id } => {
                 let (winner_id, loser_id) = if keep_id == id_a { (id_a, id_b) } else { (id_b, id_a) };
-                if store::merge_and_supersede(conn, loser_id, winner_id, now)? {
+                let (winner_mem, loser_mem) = if winner_id == mem_a.id { (&mem_a, &mem_b) } else { (&mem_b, &mem_a) };
+                if store::is_pinned(conn, loser_id)? {
+                    // Fail safe: a human restored the loser, which pins
+                    // it, so an automatic merge must never tombstone it —
+                    // record the pair as judged instead, same as Distinct,
+                    // so it isn't re-asked every run.
+                    eprintln!("mach kb: supersession skipped (pinned) #{} -> #{}", loser_id, winner_id);
+                    store::mark_dedupe_seen(conn, id_a, id_b)?;
+                } else if let Some(reason) = store::supersession_guard(conn, loser_mem, winner_mem, store::GuardKind::Dedupe) {
+                    // Deterministic backstop: a dated loser, or one the
+                    // winner doesn't lexically carry, is never merged away
+                    // on the judge's KEEP alone — recorded as judged, same
+                    // as Distinct, so it isn't re-asked every run.
+                    eprintln!("mach kb: supersession blocked ({}) #{} -> #{}", reason, loser_id, winner_id);
+                    store::mark_dedupe_seen(conn, id_a, id_b)?;
+                } else if store::merge_and_supersede(conn, loser_id, winner_id, now)? {
                     store::repoint_insight_citations(conn, loser_id, winner_id, 1)?;
                     deduped += 1;
                 }
-                // Never recorded in dedupe_seen either way: a successful
-                // merge drops the loser out of the active pool (it can't
-                // resurface as a pair), and a no-op merge (loser already
-                // gone) needs no record for the same reason.
+                // Never recorded in dedupe_seen for an actual merge (or a
+                // no-op merge where the loser was already gone): a
+                // successful merge drops the loser out of the active pool
+                // (it can't resurface as a pair), so no record is needed.
             }
             reflect::DedupeVerdict::Distinct => {
                 store::mark_dedupe_seen(conn, id_a, id_b)?;
@@ -2137,13 +2726,18 @@ fn run_contradiction_pass<L: ReflectLlm>(
 ///   stats stay exactly as they are, an honest history rather than folded
 ///   into the winner) and flags (never repoints) any insight citing the
 ///   loser — the insight may rest on the now-outdated fact, so it needs
-///   human review, not a silent citation swap.
-/// - `ConflictRetro` applies the exact same `supersede`/flag mechanics but
-///   with `newer_wins`'s output consumed swapped: the *later*-recorded
-///   memory is the retrospective one and loses, the *earlier*-recorded
-///   memory is the one that's actually current and wins. Recording time
-///   and event time aren't the same thing — see `ContradictionVerdict`'s
-///   own doc comment.
+///   human review, not a silent citation swap. If the loser is pinned
+///   (`mach kb restore` set that) or `store::supersession_guard` blocks it
+///   (a dated loser — see that function's own doc comment; the coverage
+///   check does not run for contradictions), the supersede is skipped
+///   entirely and the pair is recorded in `contradiction_seen` instead,
+///   exactly like `BothHold`.
+/// - `ConflictRetro` applies the exact same `supersede`/flag/pin-skip
+///   mechanics but with `newer_wins`'s output consumed swapped: the
+///   *later*-recorded memory is the retrospective one and loses, the
+///   *earlier*-recorded memory is the one that's actually current and
+///   wins. Recording time and event time aren't the same thing — see
+///   `ContradictionVerdict`'s own doc comment.
 /// - `BothHold` is recorded in `contradiction_seen` so the pair is never
 ///   re-asked.
 /// - `Unclear` does nothing.
@@ -2161,6 +2755,26 @@ fn apply_contradiction_verdict(
     now: &str,
 ) -> Result<bool, KbError> {
     let apply_supersede = |winner_id: i64, loser_id: i64| -> Result<bool, KbError> {
+        if store::is_pinned(conn, loser_id)? {
+            // Fail safe: a human restored the loser, which pins it, so an
+            // automatic supersession must never tombstone it — record the
+            // pair as judged instead, same as BothHold, so it isn't
+            // re-asked every run.
+            eprintln!("mach kb: supersession skipped (pinned) #{} -> #{}", loser_id, winner_id);
+            store::mark_contradiction_seen(conn, id_a, id_b)?;
+            return Ok(false);
+        }
+        if let (Some(loser_mem), Some(winner_mem)) = (store::get(conn, loser_id)?, store::get(conn, winner_id)?) {
+            if let Some(reason) = store::supersession_guard(conn, &loser_mem, &winner_mem, store::GuardKind::Contradiction) {
+                // Deterministic backstop: a dated loser is never tombstoned
+                // on the judge's CONFLICT/CONFLICT_RETRO alone — recorded
+                // as judged, same as BothHold, so it isn't re-asked every
+                // run.
+                eprintln!("mach kb: supersession blocked ({}) #{} -> #{}", reason, loser_id, winner_id);
+                store::mark_contradiction_seen(conn, id_a, id_b)?;
+                return Ok(false);
+            }
+        }
         if store::supersede(conn, loser_id, winner_id, now)? {
             store::flag_insights_citing_memory(conn, loser_id, now)?;
             Ok(true)
@@ -2213,8 +2827,9 @@ fn apply_contradiction_verdict(
 ///   row demoted this run can never be swept as dormant in this same run
 ///   regardless of pass ordering.
 /// - A failed judge call is treated exactly like `Leave` (nothing
-///   recorded) but does set the caller's `llm_failed` flag so the
-///   watermark doesn't advance on a degraded run.
+///   recorded) but does set the caller's `llm_failed` flag, folded into the
+///   run's summary line's "(degraded: ...)" reporting — it has no bearing
+///   on whether the insight stage's own working set gets marked reflected.
 ///
 /// Returns `(examined, promoted, demoted, any_judge_call_failed)`. Generic
 /// over `ReflectLlm`, same as `run_dedupe_pass`/`run_contradiction_pass`,
@@ -2281,7 +2896,7 @@ fn run_curation_pass<L: ReflectLlm>(conn: &Connection, llm: &L, now: &str) -> Re
             Err(_) => {
                 // The judge call itself failed — Leave semantics (nothing
                 // recorded, retried next run) but the caller must still
-                // freeze the watermark.
+                // report it via `llm_failed`.
                 llm_failed = true;
                 continue;
             }
@@ -2561,7 +3176,11 @@ fn resolve_pending_conflicts<L: ReflectLlm>(
         .map(|(_, _, old, new)| ((old.0.as_str(), old.1.as_str(), old.2.as_str()), (new.0.as_str(), new.1.as_str(), new.2.as_str())))
         .collect();
     let prompt = reflect::build_batch_edge_contradiction_prompt(&prompt_pairs);
-    let raw = match llm.call("haiku", &prompt, reflect::TIMEOUT_HAIKU_BATCH) {
+    // TIMEOUT_GRAPH_EXTRACTION (120s), not the shared TIMEOUT_HAIKU_BATCH
+    // (60s) other batched passes still use -- see that constant's own doc
+    // comment for the judge_log measurement behind this call and
+    // `run_graph_extraction_pass`'s own batch-extraction call justifying it.
+    let raw = match llm.call("haiku", &prompt, reflect::TIMEOUT_GRAPH_EXTRACTION) {
         Ok(out) => out,
         Err(_) => return Ok(true), // whole batch call failed -- llm_failed, no edges touched
     };
@@ -2598,8 +3217,10 @@ fn resolve_pending_conflicts<L: ReflectLlm>(
 /// it stays retry-able next run (see `Memory::graph_extracted_at`'s own doc
 /// comment and `reflect::parse_batch_extraction`'s). The end-of-run
 /// conflict-judge call failing is tracked in the returned `llm_failed` flag
-/// (which gates the reflect watermark, same as every other sub-pass) but
-/// never blocks marking a memory itself extracted — the call that row's own
+/// (folded into the run's summary line's "(degraded: ...)" reporting, same
+/// as every other sub-pass — it has no bearing on whether the insight
+/// stage's own working set gets marked reflected) but never blocks marking
+/// a memory itself extracted — the call that row's own
 /// retry-ability depends on already succeeded; a missed conflict check
 /// simply leaves both edges active, same outcome as an `Unclear`/`BothHold`
 /// verdict, surfaceable later via `mach kb entity`.
@@ -2635,7 +3256,12 @@ fn run_graph_extraction_pass<E: Embedder, L: ReflectLlm>(
     for chunk in candidates.chunks(reflect::GRAPH_EXTRACTION_BATCH_SIZE) {
         let contents: Vec<&str> = chunk.iter().map(|m| m.content.as_str()).collect();
         let prompt = reflect::build_batch_extraction_prompt(&contents);
-        let raw = match llm.call("haiku", &prompt, reflect::TIMEOUT_HAIKU_BATCH) {
+        // TIMEOUT_GRAPH_EXTRACTION (120s), raised from the shared
+        // TIMEOUT_HAIKU_BATCH (60s) -- see that constant's own doc comment
+        // for the judge_log measurement (every observed timeout hit exactly
+        // the old 60s ceiling; comparably-sized successful calls took
+        // 18.5s-57.9s) and why a larger batch size was rejected instead.
+        let raw = match llm.call("haiku", &prompt, reflect::TIMEOUT_GRAPH_EXTRACTION) {
             Ok(out) => out,
             Err(_) => {
                 llm_failed = true;
@@ -3283,6 +3909,9 @@ pub fn why_report(
                 status.push(format!("last verified {}", &v[..10.min(v.len())]));
             }
             out.push_str(&format!("  status: {}\n", status.join(", ")));
+            if let Some(p) = &m.pinned_at {
+                out.push_str(&format!("  pinned: {}\n", p));
+            }
             let preds = store::predecessors_of(conn, id)?;
             for p in &preds {
                 out.push_str(&format!("  supersedes {}\n", memory_line(p)));
@@ -3579,7 +4208,7 @@ pub fn run_ask_gather<E: Embedder, L: ReflectLlm>(
                     }
                 }
                 let resp =
-                    search_hits(conn, embedder, &q, ask::ROUND_LIMIT, false, false, ask::ROUND_MIN_SCORE, now, None)
+                    search_hits(conn, embedder, &q, ask::ROUND_LIMIT, false, false, ask::ROUND_MIN_SCORE, now, None, None, None)
                         .map_err(to_io)?;
                 let found = resp.hits.len();
                 let mut added = 0usize;
@@ -4498,10 +5127,20 @@ fn cmd_eval(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let conn = store::open().map_err(to_io)?;
     let embedder = OllamaEmbedder::new();
     let now = store::now_rfc3339();
+    let mut remaps: Vec<(String, i64, i64)> = Vec::new();
+    let questions: Vec<eval::Question> = questions
+        .iter()
+        .map(|q| {
+            let (resolved, moved) =
+                eval::resolve_expect(q, |id| store::get(&conn, id).ok().flatten().and_then(|m| m.superseded_by));
+            remaps.extend(moved.into_iter().map(|(orig, new)| (q.id.clone(), orig, new)));
+            resolved
+        })
+        .collect();
 
     let mut results = Vec::new();
     for q in &questions {
-        let resp = match search_hits(&conn, &embedder, &q.query, limit, false, false, min_score, &now, q.project.as_deref()) {
+        let resp = match search_hits(&conn, &embedder, &q.query, limit, false, false, min_score, &now, q.project.as_deref(), None, q.as_of.as_deref()) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("mach kb eval: {} — search failed: {}", q.id, e);
@@ -4563,6 +5202,10 @@ fn cmd_eval(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     );
 
     if verbose {
+        for (qid, orig, resolved) in &remaps {
+            let content = store::get(&conn, *resolved).ok().flatten().map(|m| truncate(&m.content, 60)).unwrap_or_default();
+            println!("  REMAP {} #{} -> #{}  {}", qid, orig, resolved, content);
+        }
         for r in results.iter().filter(|r| !r.passed) {
             let q = questions.iter().find(|q| q.id == r.id);
             println!(
@@ -4780,7 +5423,8 @@ fn cmd_graph_audit(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let conn = store::open().map_err(to_io)?;
     let now = store::now_rfc3339();
     let llm = ProcessReflectLlm::new();
-    let (kept, invalidated, invalidated_descs, llm_failed) = run_graph_audit(&conn, &llm, &now).map_err(to_io)?;
+    let (kept, invalidated, invalidated_descs, llm_failed) =
+        run_graph_audit(&conn, &reflect::LoggedLlm::new(&conn, "graph_audit", &llm), &now).map_err(to_io)?;
 
     for desc in &invalidated_descs {
         println!("invalidated: {}", desc);
@@ -4867,6 +5511,232 @@ fn run_graph_audit<L: ReflectLlm>(conn: &Connection, llm: &L, now: &str) -> Resu
         }
     }
     Ok((kept, invalidated, invalidated_descs, llm_failed))
+}
+
+// --- audit-supersessions: find and repair lossy tombstones ---
+
+/// One LOSSY verdict from a `mach kb audit-supersessions` run, ready to
+/// print or serialize. `restored` is only ever true under `--apply`, and
+/// only when `store::restore` actually flipped the row (it stays false on
+/// a dry run, and would stay false for a row some earlier step already
+/// restored — the PK on `old_id` means that can't happen within one run,
+/// but the caller doesn't rely on that to report honestly).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct LossyRow {
+    old_id: i64,
+    new_id: i64,
+    reason: String,
+    restored: bool,
+}
+
+/// Summary + detail of one `mach kb audit-supersessions` run.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct SupersessionAuditRunResult {
+    audited: usize,
+    lossy: usize,
+    ok: usize,
+    no_verdict: usize,
+    llm_failed: bool,
+    lossy_rows: Vec<LossyRow>,
+}
+
+/// `mach kb audit-supersessions [--limit N] [--apply] [--json] [--reaudit]`
+/// — an LLM-judged second look at automatic supersession. Candidates are
+/// every tombstoned memory joined to its direct (one-hop) successor
+/// (`store::supersession_candidates`), oldest tombstoned row first, minus
+/// whatever `supersession_audit` already has a verdict for unless
+/// `--reaudit`. Batches of `reflect::SUPERSESSION_AUDIT_BATCH_SIZE` go to
+/// one sonnet call each (`reflect::build_supersession_audit_prompt` /
+/// `parse_supersession_audit_verdicts`), tagged `supersession_audit` in
+/// `judge_log`.
+///
+/// Dry run by default: every audited pair (OK or LOSSY) is still recorded
+/// in `supersession_audit` so it isn't re-asked next run, but nothing about
+/// the memories themselves changes. `--apply` additionally restores (and,
+/// via `store::restore`, pins) every LOSSY row still tombstoned — not only
+/// ones freshly judged this run, but every LOSSY verdict on record a
+/// previous run (a dry run, or an `--apply` run that didn't reach every
+/// row) hasn't acted on yet; since an already-audited pair is never
+/// re-sent to the judge, restoring only this run's fresh verdicts would
+/// otherwise leave every earlier finding tombstoned forever. An
+/// unaddressed pair — the judge's reply never named it, or its whole batch
+/// call failed — gets no verdict recorded at all and is simply retried
+/// next run; it is never restored, matching the "fail safe: when unsure,
+/// keep both rows" rule every other automatic tombstone path in this
+/// codebase follows.
+fn cmd_audit_supersessions(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut limit: Option<usize> = None;
+    let mut apply = false;
+    let mut json = false;
+    let mut reaudit = false;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--limit" => limit = args.next().and_then(|v| v.parse().ok()),
+            "--apply" => apply = true,
+            "--json" => json = true,
+            "--reaudit" => reaudit = true,
+            "-h" | "--help" => {
+                println!("usage: mach kb audit-supersessions [--limit N] [--apply] [--json] [--reaudit]");
+                println!(
+                    "       LLM-judged audit of every tombstoned memory against its direct \
+                     successor: did the tombstone lose a fact (often a dated one) that the \
+                     successor doesn't carry? Dry run by default -- prints LOSSY pairs plus a \
+                     summary and changes nothing. --apply restores and pins each LOSSY old row. \
+                     --reaudit re-examines rows already recorded in supersession_audit (skipped \
+                     by default)."
+                );
+                return Ok(());
+            }
+            other => {
+                eprintln!("mach kb audit-supersessions: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let conn = store::open().map_err(to_io)?;
+    let now = store::now_rfc3339();
+    let llm = ProcessReflectLlm::new();
+    let result = run_supersession_audit(&conn, &reflect::LoggedLlm::new(&conn, "supersession_audit", &llm), &now, limit, apply, reaudit)
+        .map_err(to_io)?;
+
+    if json {
+        println!("{}", serde_json::to_string(&result)?);
+    } else {
+        for row in &result.lossy_rows {
+            println!(
+                "LOSSY #{} -> #{}  {}{}",
+                row.old_id,
+                row.new_id,
+                row.reason,
+                if row.restored { "  restored" } else { "" }
+            );
+        }
+        println!(
+            "mach kb audit-supersessions: audited {}, lossy {}, ok {}, no-verdict {}{}",
+            result.audited,
+            result.lossy,
+            result.ok,
+            result.no_verdict,
+            if result.llm_failed { " (degraded: some claude calls failed — re-run to cover the rest)" } else { "" }
+        );
+    }
+    Ok(())
+}
+
+/// The audit pass itself, generic over `ReflectLlm` for testing against a
+/// fixed-reply fake. `filtered` candidates (oldest first, already-audited
+/// ones dropped unless `reaudit`, then capped by `limit`) are chunked at
+/// `reflect::SUPERSESSION_AUDIT_BATCH_SIZE` and sent one sonnet call per
+/// chunk. A failed call counts its whole chunk as no-verdict and sets
+/// `llm_failed`, same as `run_graph_audit`'s failure handling, except
+/// nothing here is ever "kept" implicitly — OK and LOSSY are both explicit
+/// verdicts written to `supersession_audit`; only a genuinely unaddressed
+/// pair (or a failed call) is left unrecorded and retried. `audited`/
+/// `lossy`/`ok`/`no_verdict` describe only THIS run's fresh judging.
+///
+/// The reported/restored LOSSY rows are a separate, deliberately wider
+/// query (`store::supersession_audit_lossy_rows`): every LOSSY verdict on
+/// record that is still tombstoned, not only ones freshly judged this
+/// call. A prior dry run may have found a LOSSY pair that no `--apply` run
+/// has acted on yet — since an already-audited pair is never re-sent to
+/// the judge, an `--apply` run that only restored this run's fresh
+/// verdicts would silently leave every previously-identified LOSSY row
+/// tombstoned forever. `--apply` restores (and pins) each one here; a dry
+/// run reports the same rows with `restored` left false.
+///
+/// A recorded LOSSY row is only ever restored when the memory's CURRENT
+/// `superseded_by` still equals that row's recorded `new_id` — never on
+/// bare "is this row still tombstoned". Otherwise a manual `mach kb
+/// supersede <old> <new>` run after the row was restored (a human
+/// deciding, of their own accord, that `<old>` really is superseded by
+/// some newer `<new>`) would get silently undone by a later `--apply`
+/// invocation acting on the stale earlier verdict — exactly the
+/// "audit --apply can undo a manual supersede" bug this guards against.
+/// The candidate filter (`filtered`, above) mirrors this: a pair is
+/// treated as already-audited, and so skipped rather than re-sent to the
+/// judge, only when the recorded `new_id` matches the candidate's CURRENT
+/// `new_id` (from `supersession_candidates`'s live join) — so a fresh hop
+/// created by that same manual supersede is judged again from scratch,
+/// never silently skipped on the strength of the old hop's verdict.
+fn run_supersession_audit<L: ReflectLlm>(
+    conn: &Connection,
+    llm: &L,
+    now: &str,
+    limit: Option<usize>,
+    apply: bool,
+    reaudit: bool,
+) -> Result<SupersessionAuditRunResult, KbError> {
+    let candidates = store::supersession_candidates(conn)?;
+    let audited_pairs = if reaudit { HashMap::new() } else { store::supersession_audited_pairs(conn)? };
+    // Skip a candidate as already-audited only when the recorded verdict's
+    // `new_id` still matches this candidate's CURRENT `new_id`. If `old_id`
+    // was audited before but has since been manually re-superseded to a
+    // different winner, `audited_pairs.get(&c.old_id)` won't equal
+    // `c.new_id` and the new hop is judged fresh, not skipped.
+    let mut filtered: Vec<store::SupersessionCandidate> =
+        candidates.into_iter().filter(|c| audited_pairs.get(&c.old_id) != Some(&c.new_id)).collect();
+    if let Some(l) = limit {
+        filtered.truncate(l);
+    }
+
+    let mut audited = 0usize;
+    let mut lossy = 0usize;
+    let mut ok = 0usize;
+    let mut no_verdict = 0usize;
+    let mut llm_failed = false;
+
+    for chunk in filtered.chunks(reflect::SUPERSESSION_AUDIT_BATCH_SIZE) {
+        let prompt_pairs: Vec<(i64, &str, i64, &str)> =
+            chunk.iter().map(|c| (c.old_id, c.old_content.as_str(), c.new_id, c.new_content.as_str())).collect();
+        let ids: Vec<i64> = chunk.iter().map(|c| c.old_id).collect();
+        let prompt = reflect::build_supersession_audit_prompt(&prompt_pairs);
+        let raw = match llm.call("sonnet", &prompt, reflect::TIMEOUT_SONNET) {
+            Ok(out) => out,
+            Err(_) => {
+                llm_failed = true;
+                no_verdict += chunk.len();
+                continue;
+            }
+        };
+        let verdicts = reflect::parse_supersession_audit_verdicts(&raw, &ids);
+        for c in chunk {
+            match verdicts.get(&c.old_id) {
+                Some(result) => {
+                    audited += 1;
+                    let verdict_str = match result.verdict {
+                        reflect::SupersessionAuditVerdict::Ok => "OK",
+                        reflect::SupersessionAuditVerdict::Lossy => "LOSSY",
+                    };
+                    store::record_supersession_audit(conn, c.old_id, c.new_id, verdict_str, &result.reason, now)?;
+                    match result.verdict {
+                        reflect::SupersessionAuditVerdict::Ok => ok += 1,
+                        reflect::SupersessionAuditVerdict::Lossy => lossy += 1,
+                    }
+                }
+                None => no_verdict += 1,
+            }
+        }
+    }
+
+    let mut lossy_rows: Vec<LossyRow> = Vec::new();
+    for row in store::supersession_audit_lossy_rows(conn)? {
+        let current_superseded_by = store::get(conn, row.old_id)?.and_then(|m| m.superseded_by);
+        if current_superseded_by != Some(row.new_id) {
+            // Either already fixed (an earlier --apply run, or `mach kb
+            // restore` by hand, already cleared it — `current_superseded_by`
+            // is None) or a human has since manually re-superseded this row
+            // to a DIFFERENT winner (`mach kb supersede <old> <new>`) — in
+            // which case restoring on the strength of this stale verdict
+            // would silently undo that manual decision. Either way, this
+            // recorded verdict is no longer actionable; skip it.
+            continue;
+        }
+        let restored = apply && store::restore(conn, row.old_id, now)?;
+        lossy_rows.push(LossyRow { old_id: row.old_id, new_id: row.new_id, reason: row.reason, restored });
+    }
+
+    Ok(SupersessionAuditRunResult { audited, lossy, ok, no_verdict, llm_failed, lossy_rows })
 }
 
 fn cmd_tree(mut args: impl Iterator<Item = String>) -> io::Result<()> {
@@ -4981,19 +5851,142 @@ fn to_model_row_json(row: &store::ModelRow) -> ModelRowJson {
     }
 }
 
+/// Renders text-mode `mach kb model` output, one `format_model_row` line
+/// per selected row, in the same order `rows` is already in (see
+/// `store::mental_model` for the ranking) — selection never reorders rows,
+/// it only decides which ones make the cut. `None` renders every row,
+/// unchanged from before `--max-chars` existed.
+///
+/// With `max_chars`, three passes over `rows` decide what's included, so
+/// a handful of just-created insights can't be crowded out by old
+/// high-confidence themes filling the whole budget on rank alone:
+///
+/// 1. the highest-ranked rows are added, skipping (never truncating) any
+///    that would overflow, until the running total would exceed the
+///    first 30% of the budget — the same skip-on-overflow behavior this
+///    function had before this reservation existed, just capped smaller;
+/// 2. rows not yet included, still in rank order, are added — against the
+///    full budget, not the 30% cap — but only rows flagged `recent`
+///    (`store::ModelRow::recent`: created or revised in the last 7 days),
+///    until they account for at least 30% of the whole budget or there
+///    are no more eligible recent rows left to add;
+/// 3. whatever budget remains is filled by the rest, in rank order, same
+///    skip-on-overflow behavior as pass 1.
+///
+/// A row is added at most once (a `selected` flag per row prevents a
+/// later pass from re-adding one an earlier pass already placed). A
+/// theme's nested belief rows (`row.nested`) always immediately follow it
+/// in `rows` (see `mental_model`), so `parent_idx` records each nested
+/// row's theme by position; a nested row is only ever eligible once its
+/// own theme row has been selected, in whichever pass that happened —
+/// this is what keeps an indented belief from ever appearing without its
+/// parent theme above it, across all three passes, not just the first.
+fn render_model_text(rows: &[store::ModelRow], max_chars: Option<usize>) -> String {
+    let max = match max_chars {
+        None => {
+            let mut out = String::new();
+            for row in rows {
+                out.push_str(&format_model_row(row));
+                out.push('\n');
+            }
+            return out;
+        }
+        Some(m) => m,
+    };
+
+    let n = rows.len();
+    let lines: Vec<String> = rows.iter().map(format_model_row).collect();
+    let lens: Vec<usize> = lines.iter().map(|l| l.chars().count() + 1).collect();
+
+    // Each nested row's parent theme, by position -- `None` for a theme
+    // row itself or an unthemed belief, neither of which is gated by
+    // anything else being selected first.
+    let mut parent_idx: Vec<Option<usize>> = vec![None; n];
+    {
+        let mut current_theme: Option<usize> = None;
+        for (i, row) in rows.iter().enumerate() {
+            if !row.nested {
+                current_theme = if matches!(row.kind, store::ModelKind::Theme) { Some(i) } else { None };
+            } else {
+                parent_idx[i] = current_theme;
+            }
+        }
+    }
+    let eligible = |i: usize, selected: &[bool]| match parent_idx[i] {
+        Some(p) => selected[p],
+        None => true,
+    };
+
+    let mut selected = vec![false; n];
+    let mut total = 0usize;
+    let mut recent_total = 0usize;
+    let reserved = max.saturating_mul(3) / 10; // first 30% of the budget
+
+    // Pass 1: highest-ranked rows, capped to the first 30% of the budget.
+    for i in 0..n {
+        if selected[i] || !eligible(i, &selected) || total + lens[i] > reserved {
+            continue;
+        }
+        selected[i] = true;
+        total += lens[i];
+        if rows[i].recent {
+            recent_total += lens[i];
+        }
+    }
+
+    // Pass 2: top up recent rows, in rank order, against the full budget,
+    // until they account for at least 30% of it (or none are left to add).
+    // Parent themes selected earlier in this same forward pass make their
+    // own recent children eligible later in the same pass, since a theme's
+    // index always precedes its nested rows.
+    for i in 0..n {
+        if recent_total >= reserved {
+            break;
+        }
+        if selected[i] || !rows[i].recent || !eligible(i, &selected) || total + lens[i] > max {
+            continue;
+        }
+        selected[i] = true;
+        total += lens[i];
+        recent_total += lens[i];
+    }
+
+    // Pass 3: fill whatever budget remains with the rest, in rank order.
+    for i in 0..n {
+        if selected[i] || !eligible(i, &selected) || total + lens[i] > max {
+            continue;
+        }
+        selected[i] = true;
+        total += lens[i];
+    }
+
+    let mut out = String::new();
+    for i in 0..n {
+        if selected[i] {
+            out.push_str(&lines[i]);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 fn cmd_model(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut json = false;
+    let mut max_chars: Option<usize> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--json" => json = true,
+            "--max-chars" => max_chars = args.next().and_then(|v| v.parse().ok()),
             "-h" | "--help" => {
-                println!("usage: mach kb model [--json]");
+                println!("usage: mach kb model [--json] [--max-chars N]");
                 println!(
                     "       compact mental-model view: all active (non-invalidated) insights and \
-                     themes, tree-ordered — no source ids, no memory leaves. Empty store prints \
-                     nothing. Meant for cheap always-on context injection (see \
-                     ~/.config/claude-hooks/kb-model.sh); use `mach kb tree` or `mach kb insights` \
-                     for the full picture with citations."
+                     themes, ranked non-doubted-and-highest-confidence first — no source ids, no \
+                     memory leaves. Empty store prints nothing. Meant for cheap always-on context \
+                     injection (see ~/.config/claude-hooks/kb-model.sh); use `mach kb tree` or \
+                     `mach kb insights` for the full picture with citations. --max-chars N \
+                     (text mode only) fits the output to a size budget by skipping rows that \
+                     would overflow it, favoring earlier (higher-ranked) rows."
                 );
                 return Ok(());
             }
@@ -5011,9 +6004,7 @@ fn cmd_model(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         let json_rows: Vec<ModelRowJson> = rows.iter().map(to_model_row_json).collect();
         println!("{}", serde_json::to_string(&json_rows)?);
     } else {
-        for row in &rows {
-            println!("{}", format_model_row(row));
-        }
+        print!("{}", render_model_text(&rows, max_chars));
     }
     Ok(())
 }
@@ -5435,7 +6426,7 @@ fn ingest_sessions_impl<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>
                 match llm.call("haiku", &prompt, ingest::TIMEOUT_INGEST) {
                     Ok(out) => {
                         let known_ids: Vec<i64> = memories.iter().map(|(id, _)| *id).collect();
-                        let verdicts = ingest::parse_engagement_verdicts(&out, &known_ids);
+                        let (verdicts, is_fallback) = ingest::parse_engagement_verdicts(&out, &known_ids);
                         let engaged_ids: Vec<i64> = verdicts
                             .iter()
                             .filter(|(_, v)| **v == ingest::EngagementVerdict::Engaged)
@@ -5450,6 +6441,18 @@ fn ingest_sessions_impl<E: Embedder, L: ReflectLlm, F: ingest::TranscriptFilter>
                         }
                         summary.engaged += engaged_ids.len();
                         summary.shown += verdicts.len() - engaged_ids.len();
+                        // Durable record for `mach kb recall-stats`, surviving the
+                        // 14-day prune of the recall-log JSONL: "shown" here is
+                        // exactly the ids the judge returned a verdict for. Skipped
+                        // entirely when the reply was rejected and this is the
+                        // all-SHOWN fallback (`is_fallback`) -- that isn't a real
+                        // judgment, and recording it would make recall-stats claim
+                        // the judge reviewed and passed on every one of these ids
+                        // when it actually just failed to produce a usable reply.
+                        if !is_fallback {
+                            let shown_ids: Vec<i64> = verdicts.keys().copied().collect();
+                            store::record_engagement(conn, &session_id, &shown_ids, &engaged_ids, now)?;
+                        }
                     }
                     Err(_) => needs_retry = true,
                 }
@@ -5562,7 +6565,7 @@ fn cmd_ingest_sessions(mut args: impl Iterator<Item = String>) -> io::Result<()>
     let summary = ingest_sessions_impl(
         &conn,
         &embedder,
-        &llm,
+        &reflect::LoggedLlm::new(&conn, "ingest", &llm),
         &filter,
         &projects_root,
         &recall_log_root,
@@ -5583,6 +6586,77 @@ fn cmd_ingest_sessions(mut args: impl Iterator<Item = String>) -> io::Result<()>
         summary.deferred_offline,
         summary.pruned_recall_logs
     );
+    Ok(())
+}
+
+// --- recall-stats: the injected-vs-engaged tuning metric ---
+
+/// Formats `recall_stats_since` rows into the lines `mach kb recall-stats`
+/// prints: one `session_id(8 chars)  shown  engaged  precision%` row per
+/// session, then an `OVERALL` line totalling across all of them. A separate,
+/// pure function (no db, no clock) so the exact text is unit-testable
+/// without a connection. An empty window prints a single explanatory line
+/// rather than nothing, so a fresh `recall_engagement` table doesn't read as
+/// a hung or broken command.
+fn format_recall_stats(rows: &[store::RecallStatsRow]) -> Vec<String> {
+    if rows.is_empty() {
+        return vec!["mach kb recall-stats: no judged sessions in this window".to_string()];
+    }
+    let pct = |engaged: i64, shown: i64| if shown > 0 { (engaged as f64 / shown as f64) * 100.0 } else { 0.0 };
+    let mut lines: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            // Char-based, not a byte slice: a session id is normally an
+            // ASCII UUID, but slicing raw bytes would panic if one ever
+            // isn't and byte 8 lands mid-character.
+            let short: String = r.session_id.chars().take(8).collect();
+            format!("{:<8}  {:>5}  {:>7}  {:>5.0}%", short, r.shown, r.engaged, pct(r.engaged, r.shown))
+        })
+        .collect();
+    let total_shown: i64 = rows.iter().map(|r| r.shown).sum();
+    let total_engaged: i64 = rows.iter().map(|r| r.engaged).sum();
+    lines.push(format!("{:<8}  {:>5}  {:>7}  {:>5.0}%", "OVERALL", total_shown, total_engaged, pct(total_engaged, total_shown)));
+    lines
+}
+
+fn cmd_recall_stats(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut days: i64 = 14;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--days" => days = args.next().and_then(|v| v.parse().ok()).unwrap_or(days),
+            "-h" | "--help" => {
+                println!("usage: mach kb recall-stats [--days N]");
+                println!(
+                    "       the recall-precision tuning metric, read from the durable"
+                );
+                println!(
+                    "       `recall_engagement` table `mach kb ingest-sessions` writes per"
+                );
+                println!(
+                    "       session: shown = ids the recall log listed that the engagement"
+                );
+                println!(
+                    "       judge actually returned a verdict for; engaged = the subset it"
+                );
+                println!(
+                    "       marked ENGAGED. Default window: 14 days (the recall-log JSONL's"
+                );
+                println!("       own prune age -- this table is what survives it).");
+                return Ok(());
+            }
+            other => {
+                eprintln!("mach kb recall-stats: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let conn = store::open().map_err(to_io)?;
+    let since = store::now_rfc3339_from_secs(store::now_secs().saturating_sub((days.max(0) as u64) * 86400));
+    let rows = store::recall_stats_since(&conn, &since).map_err(to_io)?;
+    for line in format_recall_stats(&rows) {
+        println!("{}", line);
+    }
     Ok(())
 }
 
@@ -5700,20 +6774,24 @@ fn check_improve(conn_result: &Result<Connection, KbError>) -> health::Check {
         Ok(v) => v,
         Err(e) => return health::Check { name, ok: false, detail: e.to_string() },
     };
-    let recent_failed: Vec<bool> = outcomes
+    // newest-first, capped at the streak window -- both the pass/fail bools
+    // `health_ok` needs and the memories themselves, so a streak that is
+    // entirely the uncommitted-write-targets guard can be named by path
+    // instead of folded into the generic message below.
+    let recent: Vec<&Memory> = outcomes
         .iter()
         .rev()
         .filter(|m| m.source.as_deref().map(|s| s.starts_with(improve::OUTCOME_SOURCE_PREFIX)).unwrap_or(false))
         .take(improve::HEALTH_FAIL_STREAK)
-        .map(improve::is_failed_outcome)
         .collect();
+    let recent_failed: Vec<bool> = recent.iter().map(|m| improve::is_failed_outcome(m)).collect();
     let ok = improve::health_ok(hours, &recent_failed);
     let streak = improve::failure_streak(&recent_failed);
     // Name the threshold in the line. "[OK] ... 2 recent failures" reads as
     // a contradiction; the check is a three-strikes rule, so say so rather
     // than leaving the reader to guess whether OK meant the failures were
     // counted.
-    let detail = match hours {
+    let generic_detail = || match hours {
         Some(h) if streak == 0 => format!("last completed {:.1}h ago", h),
         Some(h) => format!(
             "last completed {:.1}h ago, {} consecutive failures since (alerts at {})",
@@ -5722,6 +6800,16 @@ fn check_improve(conn_result: &Result<Connection, KbError>) -> health::Check {
             improve::HEALTH_FAIL_STREAK
         ),
         None => "never completed".to_string(),
+    };
+    // The special "blocked since ... uncommitted: ..." line only replaces
+    // the generic one once the streak is exactly what fails the check (a
+    // shorter streak is still `ok` and reads as the same growing-warning
+    // text it always has) -- and only when every failure in that streak was
+    // this specific guard, never some other kind.
+    let detail = if streak >= improve::HEALTH_FAIL_STREAK {
+        improve::uncommitted_block_detail(&recent[..streak]).unwrap_or_else(generic_detail)
+    } else {
+        generic_detail()
     };
     health::Check { name, ok, detail }
 }
@@ -6125,17 +7213,22 @@ fn run_improve<E: Embedder, L: ImproveLlm, V: Vcs>(
         let list: Vec<String> = unmanaged.iter().map(|p| p.display().to_string()).collect();
         return fail(format!("write targets not chezmoi-managed: {} (run `chezmoi add` on them)", list.join(", ")));
     }
-    match vcs.source_clean() {
-        Ok(true) => {}
-        Ok(false) => return fail("chezmoi source repo has uncommitted changes".to_string()),
+    match vcs.dirty_targets(&targets.roots()) {
+        Ok(dirty) if dirty.is_empty() => {}
+        Ok(dirty) => return fail(improve::uncommitted_targets_reason(&dirty)),
         Err(e) => return fail(format!("git status: {}", e)),
     }
     let pre_status: HashSet<PathBuf> = match vcs.status() {
         Ok(v) => v.into_iter().collect(),
         Err(e) => return fail(format!("chezmoi status: {}", e)),
     };
-    if let Some(p) = pre_status.iter().find(|p| targets.allows(p)) {
-        return fail(format!("{} differs from its chezmoi source before the run (human edit in progress?)", p.display()));
+    let drifted: Vec<PathBuf> = {
+        let mut d: Vec<PathBuf> = pre_status.iter().filter(|p| targets.allows(p)).cloned().collect();
+        d.sort();
+        d
+    };
+    if !drifted.is_empty() {
+        return fail(improve::pre_run_drift_reason(&drifted));
     }
 
     // --- snapshot, call, verify
@@ -6226,7 +7319,7 @@ fn run_improve<E: Embedder, L: ImproveLlm, V: Vcs>(
     let mut result = result;
     // trust the diff over the reply for the file list
     result.files = changes.iter().map(|c| c.path().to_path_buf()).collect();
-    let sha = match vcs.commit(&improve::commit_message(&result)) {
+    let sha = match vcs.commit(&improve::commit_message(&result), &targets.roots()) {
         Ok(s) => s,
         Err(e) => return fail(rollback(format!("git commit: {}", e))),
     };
@@ -6398,7 +7491,18 @@ mod tests {
     use super::*;
 
     fn row(kind: store::ModelKind, confidence: f64, text: &str, doubted: bool, nested: bool) -> store::ModelRow {
-        store::ModelRow { kind, confidence, text: text.to_string(), doubted, nested }
+        recent_row(kind, confidence, text, doubted, nested, false)
+    }
+
+    fn recent_row(
+        kind: store::ModelKind,
+        confidence: f64,
+        text: &str,
+        doubted: bool,
+        nested: bool,
+        recent: bool,
+    ) -> store::ModelRow {
+        store::ModelRow { kind, confidence, text: text.to_string(), doubted, nested, recent }
     }
 
     #[test]
@@ -6425,6 +7529,134 @@ mod tests {
         );
     }
 
+    #[test]
+    fn model_budget_none_renders_all_rows() {
+        let rows = vec![
+            row(store::ModelKind::Theme, 0.8, "a theme", false, false),
+            row(store::ModelKind::Belief, 0.6, "a belief", false, true),
+        ];
+        let rendered = render_model_text(&rows, None);
+        assert_eq!(rendered, format!("{}\n{}\n", format_model_row(&rows[0]), format_model_row(&rows[1])));
+    }
+
+    #[test]
+    fn model_budget_never_exceeds_max_chars() {
+        let rows: Vec<store::ModelRow> = (0..50)
+            .map(|i| row(store::ModelKind::Belief, 0.5, &format!("belief number {}", i), false, false))
+            .collect();
+
+        let rendered = render_model_text(&rows, Some(200));
+
+        assert!(rendered.chars().count() <= 200, "rendered {} chars, over budget", rendered.chars().count());
+        assert!(rendered.starts_with(&format_model_row(&rows[0])), "first row must still be present");
+    }
+
+    #[test]
+    fn model_budget_skips_children_of_a_skipped_theme() {
+        // A theme line long enough that it alone blows the budget, with
+        // short nested children that would each individually fit -- none of
+        // them may appear once their parent theme line was skipped.
+        let long_theme_text = "x".repeat(300);
+        let rows = vec![
+            row(store::ModelKind::Theme, 0.8, &long_theme_text, false, false),
+            row(store::ModelKind::Belief, 0.6, "short child a", false, true),
+            row(store::ModelKind::Belief, 0.55, "short child b", false, true),
+        ];
+
+        let rendered = render_model_text(&rows, Some(50));
+        assert!(rendered.is_empty(), "theme skipped for budget must skip its nested children too, got: {rendered:?}");
+    }
+
+    #[test]
+    fn model_budget_keeps_children_that_fit_when_the_theme_itself_fits() {
+        // The theme fits the budget; among its children, one fits and one
+        // does not -- the fitting child must still be emitted, since it is
+        // the theme being skipped (not the budget alone) that skips children.
+        let rows = vec![
+            row(store::ModelKind::Theme, 0.8, "a theme", false, false),
+            row(store::ModelKind::Belief, 0.6, "a short child", false, true),
+            row(store::ModelKind::Belief, 0.55, &"y".repeat(300), false, true),
+        ];
+        let theme_line = format_model_row(&rows[0]);
+        let child_a_line = format_model_row(&rows[1]);
+        let budget = theme_line.chars().count() + 1 + child_a_line.chars().count() + 1 + 5;
+
+        let rendered = render_model_text(&rows, Some(budget));
+        assert!(rendered.contains(&theme_line), "the theme itself fits and must be emitted");
+        assert!(rendered.contains(&child_a_line), "a child that fits under a theme that fit must be emitted");
+        assert!(!rendered.contains("yyyy"), "the oversized second child must not be emitted");
+    }
+
+    #[test]
+    fn model_budget_reserves_at_least_30_percent_for_recent_rows() {
+        // 10 old, non-recent, higher-ranked rows -- by rank alone these
+        // would fill the whole budget and leave nothing for the 3 recent
+        // rows ranked below them.
+        let mut rows: Vec<store::ModelRow> = (0..10)
+            .map(|i| recent_row(store::ModelKind::Belief, 0.9, &format!("old belief {i}"), false, false, false))
+            .collect();
+        for i in 0..3 {
+            rows.push(recent_row(store::ModelKind::Belief, 0.5, &format!("recent belief {i}"), false, false, true));
+        }
+
+        // Exactly enough room for all 10 old rows and nothing else, absent
+        // any reservation for recent rows.
+        let old_line_len = format_model_row(&rows[0]).chars().count() + 1;
+        let budget = old_line_len * 10;
+
+        let rendered = render_model_text(&rows, Some(budget));
+        let recent_chars: usize = rows
+            .iter()
+            .filter(|r| r.recent)
+            .map(format_model_row)
+            .filter(|line| rendered.contains(line.as_str()))
+            .map(|line| line.chars().count() + 1)
+            .sum();
+
+        assert!(
+            recent_chars * 10 >= budget * 3,
+            "recent rows got {recent_chars} of {budget} budget chars, want >= 30%"
+        );
+        assert!(
+            rendered.lines().any(|l| l.contains("recent belief")),
+            "at least one recent row must have made it in, got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn model_budget_never_emits_the_same_row_twice() {
+        let rows = vec![
+            row(store::ModelKind::Theme, 0.9, "theme one", false, false),
+            row(store::ModelKind::Belief, 0.85, "child of theme one", false, true),
+            recent_row(store::ModelKind::Belief, 0.4, "a recent belief", false, false, true),
+            row(store::ModelKind::Belief, 0.3, "an old belief", false, false),
+        ];
+        let rendered = render_model_text(&rows, Some(1000));
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), rows.len(), "every row fits comfortably in this budget and must appear exactly once");
+        let mut seen = std::collections::HashSet::new();
+        for l in &lines {
+            assert!(seen.insert(*l), "row rendered more than once: {l}");
+        }
+    }
+
+    #[test]
+    fn model_budget_never_orphans_a_recent_child_whose_theme_never_fits() {
+        // The theme line alone is too big for any of the three passes; its
+        // nested child is flagged recent, but the recency reservation
+        // (pass 2) must not let it appear without its theme.
+        let long_theme_text = "x".repeat(2000);
+        let rows = vec![
+            row(store::ModelKind::Theme, 0.9, &long_theme_text, false, false),
+            recent_row(store::ModelKind::Belief, 0.8, "recent child", false, true, true),
+        ];
+        let rendered = render_model_text(&rows, Some(100));
+        assert!(
+            rendered.is_empty(),
+            "a recent child must not appear once its own theme can never be selected, got: {rendered:?}"
+        );
+    }
+
     // --- run_dedupe_pass: offline safety + apply mechanics ---
 
     use rusqlite::params;
@@ -6447,6 +7679,18 @@ mod tests {
         let a = store::insert(conn, "the user drinks tea", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
         let b = store::insert(conn, "the user is fond of tea", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
         (a, b)
+    }
+
+    /// Shared seeding for a single dedupe candidate pair: inserts the pair
+    /// via `insert_pair` and marks one side as "new" so
+    /// `reflect::dedupe_candidate_pairs` surfaces it. Used by both the
+    /// plain `run_dedupe_pass` tests and the `LoggedLlm` wiring test below,
+    /// so the seeding logic lives in exactly one place. Returns the pair ids,
+    /// the set of new ids, and the current timestamp.
+    fn seed_one_dedupe_pair(conn: &Connection) -> ((i64, i64), HashSet<i64>, String) {
+        let (a, b) = insert_pair(conn);
+        let new_ids: HashSet<i64> = [a].into_iter().collect();
+        ((a, b), new_ids, store::now_rfc3339())
     }
 
     /// A `ReflectLlm` test double that always returns a fixed reply, or
@@ -6480,7 +7724,7 @@ mod tests {
         let new_ids: HashSet<i64> = [a].into_iter().collect();
         let (deduped, failed) = run_dedupe_pass(&conn, &llm, &new_ids, &store::now_rfc3339()).unwrap();
         assert_eq!(deduped, 0, "never merges on a failed call");
-        assert!(failed, "caller must freeze the watermark");
+        assert!(failed, "caller must report the failure");
         assert!(store::dedupe_seen_pairs(&conn).unwrap().is_empty(), "a transport failure must not be recorded as seen");
         assert!(!store::get(&conn, a).unwrap().unwrap().is_superseded());
         assert!(!store::get(&conn, b).unwrap().unwrap().is_superseded());
@@ -6503,15 +7747,35 @@ mod tests {
     #[test]
     fn run_dedupe_pass_genuine_distinct_is_recorded_as_seen() {
         let conn = mem_conn();
-        let (a, b) = insert_pair(&conn);
+        let ((a, b), new_ids, now) = seed_one_dedupe_pair(&conn);
         let llm = FixedReflectLlm { reply: Ok("DISTINCT") };
-        let new_ids: HashSet<i64> = [a].into_iter().collect();
-        let (deduped, failed) = run_dedupe_pass(&conn, &llm, &new_ids, &store::now_rfc3339()).unwrap();
+        let (deduped, failed) = run_dedupe_pass(&conn, &llm, &new_ids, &now).unwrap();
         assert_eq!(deduped, 0);
         assert!(!failed);
         let seen = store::dedupe_seen_pairs(&conn).unwrap();
-        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-        assert_eq!(seen, [(lo, hi)].into_iter().collect());
+        // Both memories from the seeded pair are still active (DISTINCT
+        // never merges), so they're exactly the (lo, hi) pair recorded.
+        let mut ids = [a, b];
+        ids.sort_unstable();
+        assert_eq!(store::active_memories_for_dormancy(&conn).unwrap().len(), 2, "seeding must leave exactly the two paired memories active");
+        assert_eq!(seen, [(ids[0], ids[1])].into_iter().collect());
+    }
+
+    #[test]
+    fn dedupe_pass_through_logged_llm_writes_judge_log_rows() {
+        let conn = mem_conn();
+        // Seed exactly as the existing DISTINCT dedupe test above does, so
+        // one candidate pair exists and `new_ids` covers it.
+        let (_pair_ids, new_ids, now) = seed_one_dedupe_pair(&conn);
+        let inner = FixedReflectLlm { reply: Ok("DISTINCT") };
+        let llm = reflect::LoggedLlm::new(&conn, "dedupe", &inner);
+
+        run_dedupe_pass(&conn, &llm, &new_ids, &now).unwrap();
+
+        let (n, pass, reply): (i64, String, String) = conn
+            .query_row("SELECT count(*), max(pass), max(reply) FROM judge_log", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        assert_eq!((n, pass.as_str(), reply.as_str()), (1, "dedupe", "DISTINCT"));
     }
 
     /// A `ReflectLlm` test double carrying an owned reply — `FixedReflectLlm`
@@ -6555,6 +7819,78 @@ mod tests {
         assert!(store::dedupe_seen_pairs(&conn).unwrap().is_empty(), "a merged pair needs no dedupe_seen record");
     }
 
+    #[test]
+    fn dedupe_pass_never_tombstones_a_pinned_row() {
+        // The bug this closes: a restored row got re-tombstoned by the
+        // very next dedupe pass. Pin the loser (as `mach kb restore`
+        // would) and confirm KEEP never merges it away.
+        let conn = mem_conn();
+        let (a, b) = insert_pair(&conn);
+        let now = store::now_rfc3339();
+        let sibling = store::insert(&conn, "throwaway", None, None, true, None, 5).unwrap();
+        store::supersede(&conn, b, sibling, &now).unwrap();
+        store::restore(&conn, b, &now).unwrap();
+        assert!(store::is_pinned(&conn, b).unwrap(), "test setup must actually pin b");
+
+        let llm = OwnedReplyLlm { reply: format!("KEEP {}", a) };
+        let new_ids: HashSet<i64> = [a].into_iter().collect();
+        let (deduped, failed) = run_dedupe_pass(&conn, &llm, &new_ids, &now).unwrap();
+        assert_eq!(deduped, 0, "a pinned loser must never be merged away");
+        assert!(!failed);
+
+        assert!(!store::get(&conn, b).unwrap().unwrap().is_superseded(), "pinned loser stays active");
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        assert_eq!(
+            store::dedupe_seen_pairs(&conn).unwrap(),
+            [(lo, hi)].into_iter().collect(),
+            "the pair must be recorded as judged so it isn't re-asked every run"
+        );
+    }
+
+    #[test]
+    fn dedupe_pass_blocked_by_supersession_guard_marks_seen_not_merged() {
+        // Same shape as the pinned-row test above, but the loser is undated
+        // — the loser names a specific date the winner drops, so
+        // `store::supersession_guard`'s date check must block the merge
+        // even though the judge said KEEP.
+        let conn = mem_conn();
+        let a = store::insert(
+            &conn,
+            "as of 2026-09-07 the bank held 150 memories",
+            None,
+            None,
+            true,
+            Some(&unit_vec(4, 0)),
+            5,
+        )
+        .unwrap();
+        let b = store::insert(
+            &conn,
+            "the bank holds many memories now",
+            None,
+            None,
+            true,
+            Some(&unit_vec(4, 0)),
+            5,
+        )
+        .unwrap();
+        let now = store::now_rfc3339();
+
+        let llm = OwnedReplyLlm { reply: format!("KEEP {}", b) }; // b (undated) would win, a (dated) would lose
+        let new_ids: HashSet<i64> = [b].into_iter().collect();
+        let (deduped, failed) = run_dedupe_pass(&conn, &llm, &new_ids, &now).unwrap();
+        assert_eq!(deduped, 0, "a dated loser must never be merged away on KEEP alone");
+        assert!(!failed);
+
+        assert!(!store::get(&conn, a).unwrap().unwrap().is_superseded(), "dated loser stays active");
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        assert_eq!(
+            store::dedupe_seen_pairs(&conn).unwrap(),
+            [(lo, hi)].into_iter().collect(),
+            "the pair must be recorded as judged so it isn't re-asked every run"
+        );
+    }
+
     // --- run_contradiction_pass: band selection, offline safety, apply mechanics ---
 
     /// Two memories at ~0.707 cosine (a 45-degree angle) — squarely inside
@@ -6594,7 +7930,7 @@ mod tests {
         let new_ids: HashSet<i64> = [a].into_iter().collect();
         let (resolved, failed) = run_contradiction_pass(&conn, &llm, &new_ids, &store::now_rfc3339()).unwrap();
         assert_eq!(resolved, 0, "never tombstones on a failed call");
-        assert!(failed, "caller must freeze the watermark");
+        assert!(failed, "caller must report the failure");
         assert!(store::contradiction_seen_pairs(&conn).unwrap().is_empty(), "a transport failure must not be recorded as seen");
         assert!(!store::get(&conn, a).unwrap().unwrap().is_superseded());
         assert!(!store::get(&conn, b).unwrap().unwrap().is_superseded());
@@ -6662,6 +7998,76 @@ mod tests {
         assert!(
             store::contradiction_seen_pairs(&conn).unwrap().is_empty(),
             "a resolved pair needs no contradiction_seen record"
+        );
+    }
+
+    #[test]
+    fn contradiction_pass_never_tombstones_a_pinned_row() {
+        // Same bug, contradiction side: pin the would-be loser (as `mach
+        // kb restore` would) and confirm CONFLICT never supersedes it.
+        let conn = mem_conn();
+        let (a, b) = insert_contradiction_pair(&conn); // a = Moses (old, would-be loser)
+        let now = store::now_rfc3339();
+        let sibling = store::insert(&conn, "throwaway", None, None, true, None, 5).unwrap();
+        store::supersede(&conn, a, sibling, &now).unwrap();
+        store::restore(&conn, a, &now).unwrap();
+        assert!(store::is_pinned(&conn, a).unwrap(), "test setup must actually pin a");
+
+        let llm = FixedReflectLlm { reply: Ok("CONFLICT") };
+        let new_ids: HashSet<i64> = [b].into_iter().collect();
+        let (resolved, failed) = run_contradiction_pass(&conn, &llm, &new_ids, &now).unwrap();
+        assert_eq!(resolved, 0, "a pinned loser must never be superseded");
+        assert!(!failed);
+
+        assert!(!store::get(&conn, a).unwrap().unwrap().is_superseded(), "pinned loser stays active");
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        assert_eq!(
+            store::contradiction_seen_pairs(&conn).unwrap(),
+            [(lo, hi)].into_iter().collect(),
+            "the pair must be recorded as judged so it isn't re-asked every run"
+        );
+    }
+
+    #[test]
+    fn contradiction_pass_blocked_by_supersession_guard_marks_seen_not_tombstoned() {
+        // Same shape as the pinned-row test above, but via the
+        // deterministic date guard: the would-be loser names a date the
+        // would-be winner drops, so CONFLICT must never supersede it.
+        let conn = mem_conn();
+        let a = store::insert(
+            &conn,
+            "as of 2026-09-07 the bank held 150 memories",
+            None,
+            None,
+            true,
+            Some(&[1.0f32, 0.0]),
+            5,
+        )
+        .unwrap(); // dated, would-be loser (older -> newer_wins picks b)
+        let b = store::insert(
+            &conn,
+            "the bank now holds a different count of memories entirely",
+            None,
+            None,
+            true,
+            Some(&[1.0f32, 1.0]),
+            5,
+        )
+        .unwrap();
+        let now = store::now_rfc3339();
+
+        let llm = FixedReflectLlm { reply: Ok("CONFLICT") };
+        let new_ids: HashSet<i64> = [b].into_iter().collect();
+        let (resolved, failed) = run_contradiction_pass(&conn, &llm, &new_ids, &now).unwrap();
+        assert_eq!(resolved, 0, "a dated loser must never be superseded on CONFLICT alone");
+        assert!(!failed);
+
+        assert!(!store::get(&conn, a).unwrap().unwrap().is_superseded(), "dated loser stays active");
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        assert_eq!(
+            store::contradiction_seen_pairs(&conn).unwrap(),
+            [(lo, hi)].into_iter().collect(),
+            "the pair must be recorded as judged so it isn't re-asked every run"
         );
     }
 
@@ -6798,7 +8204,7 @@ mod tests {
         let (examined2, promoted2, demoted2, failed2) =
             run_curation_pass(&conn, &fail_llm, &store::now_rfc3339()).unwrap();
         assert_eq!((examined2, promoted2, demoted2), (2, 0, 0));
-        assert!(failed2, "a failed judge call must freeze the watermark");
+        assert!(failed2, "a failed judge call must be reported");
 
         // Both rows must still be candidates on a later run -- nothing was
         // recorded as "seen" for either the LEAVE or the failed call.
@@ -6877,15 +8283,17 @@ mod tests {
         let now = store::now_rfc3339();
         store::touch(&conn, &[id], &now).unwrap();
         store::touch(&conn, &[id], &now).unwrap();
+        // Read back whatever touch() actually grew stability to (interval-
+        // aware now, not necessarily a flat 1.3x per call) so this test
+        // only asserts the schema multiplier is layered on top of it.
+        let stability_after_touches = store::get(&conn, id).unwrap().unwrap().stability.unwrap();
 
         let llm = FixedReflectLlm { reply: Err("must never be called") };
         let (_examined, promoted, _demoted, failed) = run_curation_pass(&conn, &llm, &now).unwrap();
         assert_eq!(promoted, 1);
         assert!(!failed);
         let m = store::get(&conn, id).unwrap().unwrap();
-        // touch() itself grows stability by 1.3x twice before the schema
-        // multiplier applies on top -- 35.0 * 1.3 * 1.3 * 1.5.
-        let expected = (35.0f64 * 1.3 * 1.3 * reflect::CURATION_SCHEMA_STABILITY_MULTIPLIER).min(365.0);
+        let expected = (stability_after_touches * reflect::CURATION_SCHEMA_STABILITY_MULTIPLIER).min(365.0);
         assert!(
             (m.stability.unwrap() - expected).abs() < 1e-6,
             "the fast path is still a promotion and must get the schema boost too, got {:?}",
@@ -7169,6 +8577,11 @@ mod tests {
         assert!(shown.last_accessed_at.is_none());
 
         assert!(store::is_session_ingested(&conn, "sess-b").unwrap());
+
+        // The durable record `mach kb recall-stats` reads: both ids were
+        // shown (the judge returned a verdict for both), only one engaged.
+        let stats = store::recall_stats_since(&conn, "2000-01-01T00:00:00Z").unwrap();
+        assert_eq!(stats, vec![store::RecallStatsRow { session_id: "sess-b".to_string(), shown: 2, engaged: 1 }]);
     }
 
     #[test]
@@ -7196,6 +8609,14 @@ mod tests {
         assert_eq!(summary.shown, 1);
         assert_eq!(store::get(&conn, id).unwrap().unwrap().access_count, 0, "never reinforce on doubt");
         assert!(store::is_session_ingested(&conn, "sess-c").unwrap());
+
+        // The rejected reply's all-SHOWN fallback is not a genuine judge
+        // verdict, so it must NOT be durably recorded via
+        // `record_engagement` -- recall-stats would otherwise claim the
+        // judge reviewed and passed on this id, when it actually just
+        // failed to produce a usable reply.
+        let stats = store::recall_stats_since(&conn, "2000-01-01T00:00:00Z").unwrap();
+        assert_eq!(stats, vec![], "a rejected verdict reply's all-SHOWN fallback must write no recall-stats row");
     }
 
     #[test]
@@ -7748,7 +9169,7 @@ mod tests {
         let hop = store::insert(&conn, "Moses prefers pragmatic hotfixes", None, None, true, Some(&unit_vec(4, 1)), 5)
             .unwrap();
         let embedder = FixedVecEmbedder(q);
-        let resp = search_hits(&conn, &embedder, "what about Moses", 2, false, false, 0.3, &now, None).unwrap();
+        let resp = search_hits(&conn, &embedder, "what about Moses", 2, false, false, 0.3, &now, None, None, None).unwrap();
         let direct: Vec<&SearchHit> = resp.hits.iter().filter(|h| h.via_assoc.is_none()).collect();
         assert_eq!(direct.len(), 2, "the limit still bounds query matches");
         let hopped = resp.hits.iter().find(|h| h.id == hop).expect("the hop is appended, not truncated away");
@@ -7765,14 +9186,14 @@ mod tests {
         store::upsert_entity_card(&conn, moses, "- argues hotfixes are underrated", &["1".to_string()], None, 1, 1, &now)
             .unwrap();
         let embedder = FixedVecEmbedder(unit_vec(4, 0));
-        let resp = search_hits(&conn, &embedder, "what does Moses want", 5, false, false, 0.0, &now, None).unwrap();
+        let resp = search_hits(&conn, &embedder, "what does Moses want", 5, false, false, 0.0, &now, None, None, None).unwrap();
         assert_eq!(resp.cards.len(), 1);
         assert_eq!(resp.cards[0].entity, "Moses");
         assert_eq!(resp.cards[0].kind.as_deref(), Some("person"));
         assert_eq!(resp.cards[0].evidence, 1);
         assert!(resp.cards[0].text.contains("hotfixes"));
 
-        let none = search_hits(&conn, &embedder, "unrelated question about nothing", 5, false, false, 0.0, &now, None).unwrap();
+        let none = search_hits(&conn, &embedder, "unrelated question about nothing", 5, false, false, 0.0, &now, None, None, None).unwrap();
         assert!(none.cards.is_empty());
     }
 
@@ -7797,14 +9218,159 @@ mod tests {
         store::set_project_card(&conn, pid, "layout: fastapi-hub, react-app").unwrap();
         let embedder = FixedVecEmbedder(unit_vec(4, 0));
 
-        let resp = search_hits(&conn, &embedder, "anything", 5, false, false, 0.0, &now, Some("umoja")).unwrap();
+        let resp = search_hits(&conn, &embedder, "anything", 5, false, false, 0.0, &now, Some("umoja"), None, None).unwrap();
         let card = resp.project_card.expect("the session's own project card should ride along with its hits");
         assert!(card.contains("fastapi-hub"));
 
         // No project passed -- the field stays absent, same as before this
         // parameter existed.
-        let none = search_hits(&conn, &embedder, "anything", 5, false, false, 0.0, &now, None).unwrap();
+        let none = search_hits(&conn, &embedder, "anything", 5, false, false, 0.0, &now, None, None, None).unwrap();
         assert!(none.project_card.is_none());
+    }
+
+    #[test]
+    fn search_hits_down_weights_other_registered_project_memories() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let emb = unit_vec(4, 0);
+        // Both tags must be REGISTERED projects, and the session project
+        // must be resolved from `cwd` (not the `project` basename guess),
+        // per the fix to `apply_project_penalty`.
+        store::upsert_project(&conn, "git:alpha", "alpha", "/tmp/alpha", &now).unwrap();
+        store::upsert_project(&conn, "git:beta", "beta", "/tmp/beta", &now).unwrap();
+        // Same embedding, same importance, inserted moments apart -- equal
+        // content relevance and near-identical recency/strength, so any
+        // score gap between the two is attributable to the project penalty
+        // alone, not to some other channel.
+        store::insert(&conn, "alpha project fact about widgets", None, Some("alpha"), true, Some(&emb), 5).unwrap();
+        store::insert(&conn, "beta project fact about widgets", None, Some("beta"), true, Some(&emb), 5).unwrap();
+        let embedder = FixedVecEmbedder(emb);
+
+        let resp =
+            search_hits(&conn, &embedder, "widgets", 5, false, false, 0.0, &now, None, Some("/tmp/alpha"), None).unwrap();
+        assert_eq!(resp.hits.len(), 2, "both memories should still surface -- down-weighted, not dropped");
+        assert_eq!(resp.hits[0].project.as_deref(), Some("alpha"), "the session project's own memory ranks first");
+        assert_eq!(resp.hits[1].project.as_deref(), Some("beta"));
+
+        let alpha_score = resp.hits[0].score;
+        let beta_score = resp.hits[1].score;
+        assert!(alpha_score > 0.0);
+        assert!(
+            (beta_score - alpha_score * OTHER_PROJECT_PENALTY).abs() < 0.01,
+            "beta's score ({beta_score}) should be about half alpha's ({alpha_score}), the OTHER_PROJECT_PENALTY"
+        );
+    }
+
+    #[test]
+    fn search_hits_does_not_penalize_an_unregistered_project_tag() {
+        // (a) A memory tagged `claude-config` -- never registered as a
+        // project -- must not be penalized even in a session resolved to a
+        // registered project.
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let emb = unit_vec(4, 0);
+        store::upsert_project(&conn, "git:alpha", "alpha", "/tmp/alpha", &now).unwrap();
+        store::insert(&conn, "alpha project fact about widgets", None, Some("alpha"), true, Some(&emb), 5).unwrap();
+        store::insert(&conn, "config fact about widgets", None, Some("claude-config"), true, Some(&emb), 5).unwrap();
+        let embedder = FixedVecEmbedder(emb);
+
+        let resp =
+            search_hits(&conn, &embedder, "widgets", 5, false, false, 0.0, &now, None, Some("/tmp/alpha"), None).unwrap();
+        assert_eq!(resp.hits.len(), 2);
+        let alpha = resp.hits.iter().find(|h| h.project.as_deref() == Some("alpha")).unwrap();
+        let cfg = resp.hits.iter().find(|h| h.project.as_deref() == Some("claude-config")).unwrap();
+        assert!((alpha.score - cfg.score).abs() < 0.0001, "an unregistered project tag must not be penalized");
+    }
+
+    #[test]
+    fn search_hits_registered_other_project_is_still_penalized_alongside_unregistered() {
+        // (b) In the same session, a tag matching ANOTHER registered
+        // project is still penalized even while an unregistered tag next to
+        // it is not -- confirms the registered-set check discriminates
+        // rather than disabling the penalty outright.
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let emb = unit_vec(4, 0);
+        store::upsert_project(&conn, "git:alpha", "alpha", "/tmp/alpha", &now).unwrap();
+        store::upsert_project(&conn, "git:beta", "beta", "/tmp/beta", &now).unwrap();
+        store::insert(&conn, "beta project fact about widgets", None, Some("beta"), true, Some(&emb), 5).unwrap();
+        store::insert(&conn, "config fact about widgets", None, Some("claude-config"), true, Some(&emb), 5).unwrap();
+        let embedder = FixedVecEmbedder(emb);
+
+        let resp =
+            search_hits(&conn, &embedder, "widgets", 5, false, false, 0.0, &now, None, Some("/tmp/alpha"), None).unwrap();
+        assert_eq!(resp.hits.len(), 2);
+        let beta = resp.hits.iter().find(|h| h.project.as_deref() == Some("beta")).unwrap();
+        let cfg = resp.hits.iter().find(|h| h.project.as_deref() == Some("claude-config")).unwrap();
+        assert!(beta.score < cfg.score, "the registered other-project tag must still be penalized");
+        assert!(
+            (beta.score - cfg.score * OTHER_PROJECT_PENALTY).abs() < 0.01,
+            "beta ({}) should be about half the unregistered tag's score ({}), the OTHER_PROJECT_PENALTY",
+            beta.score,
+            cfg.score
+        );
+    }
+
+    #[test]
+    fn search_hits_applies_no_penalty_for_a_basename_only_project() {
+        // (c) A `project` basename guess with no `cwd` match applies no
+        // penalty at all -- only a `cwd` resolved via `project_for_path` is
+        // an actual identity claim.
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let emb = unit_vec(4, 0);
+        store::upsert_project(&conn, "git:alpha", "alpha", "/tmp/alpha", &now).unwrap();
+        store::upsert_project(&conn, "git:beta", "beta", "/tmp/beta", &now).unwrap();
+        store::insert(&conn, "alpha project fact about widgets", None, Some("alpha"), true, Some(&emb), 5).unwrap();
+        store::insert(&conn, "beta project fact about widgets", None, Some("beta"), true, Some(&emb), 5).unwrap();
+        let embedder = FixedVecEmbedder(emb);
+
+        // `project` given, no `cwd` at all.
+        let resp = search_hits(&conn, &embedder, "widgets", 5, false, false, 0.0, &now, Some("alpha"), None, None).unwrap();
+        assert_eq!(resp.hits.len(), 2);
+        assert!(
+            (resp.hits[0].score - resp.hits[1].score).abs() < 0.0001,
+            "no cwd match means no penalty, even with a project basename guess"
+        );
+
+        // `cwd` given but it doesn't resolve to any registered project --
+        // still falls back to the basename guess, still no penalty.
+        let resp2 = search_hits(
+            &conn,
+            &embedder,
+            "widgets",
+            5,
+            false,
+            false,
+            0.0,
+            &now,
+            Some("alpha"),
+            Some("/tmp/unregistered-dir"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(resp2.hits.len(), 2);
+        assert!(
+            (resp2.hits[0].score - resp2.hits[1].score).abs() < 0.0001,
+            "cwd with no registry match must not apply a penalty either"
+        );
+    }
+
+    #[test]
+    fn search_hits_without_project_is_unchanged() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let emb = unit_vec(4, 0);
+        store::insert(&conn, "alpha project fact about widgets", None, Some("alpha"), true, Some(&emb), 5).unwrap();
+        store::insert(&conn, "beta project fact about widgets", None, Some("beta"), true, Some(&emb), 5).unwrap();
+        let embedder = FixedVecEmbedder(emb);
+
+        // No session project known (neither `project` nor `cwd` given) --
+        // no memory is down-weighted, so equally relevant hits keep equal
+        // scores exactly as before this penalty existed.
+        let resp = search_hits(&conn, &embedder, "widgets", 5, false, false, 0.0, &now, None, None, None).unwrap();
+        assert_eq!(resp.hits.len(), 2);
+        assert!((resp.hits[0].score - resp.hits[1].score).abs() < 0.0001);
     }
 
     #[test]
@@ -7910,6 +9476,104 @@ mod tests {
         let packed = pack_to_budget(resp, budget);
         assert_eq!(packed.project_card, Some(small_card));
         assert_eq!(packed.hits.len(), 3, "a small card must not crowd out any of the three hits");
+    }
+
+    /// Records one `mach kb improve` outcome memory the same way
+    /// `record_improve_outcome` does, so `check_improve` tests exercise the
+    /// real memory shape (source prefix, project, content) rather than a
+    /// hand-rolled approximation.
+    fn insert_improve_outcome(conn: &Connection, outcome: &improve::Outcome, now: &str) -> i64 {
+        store::insert(conn, &outcome.memory_text(), Some(&outcome.memory_source(now)), Some(improve::OUTCOME_PROJECT), true, None, improve::OUTCOME_IMPORTANCE).unwrap()
+    }
+
+    #[test]
+    fn check_improve_names_uncommitted_targets_since_the_streak_started() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        store::mark_improve_completed(&conn, &now).unwrap();
+        let dirty1 = improve::uncommitted_targets_reason(&[PathBuf::from("/home/u/.claude/skills")]);
+        let dirty2 = improve::uncommitted_targets_reason(&[PathBuf::from("/home/u/.claude/skills"), PathBuf::from("/home/u/.claude/CLAUDE.md")]);
+        let first = insert_improve_outcome(&conn, &improve::Outcome::Failed { reason: dirty1 }, "2026-09-20T08:00:00Z");
+        insert_improve_outcome(&conn, &improve::Outcome::Failed { reason: dirty2.clone() }, "2026-09-21T09:00:00Z");
+        insert_improve_outcome(&conn, &improve::Outcome::Failed { reason: dirty2 }, "2026-09-22T10:00:00Z");
+        // `store::insert`'s `created_at` is the real wall clock, not the
+        // `now` passed to `memory_source` (that only tags `source`) -- read
+        // the oldest outcome's actual timestamp back rather than assume it.
+        let first_created_at = store::get(&conn, first).unwrap().unwrap().created_at;
+
+        let check = check_improve(&Ok(conn));
+        assert!(!check.ok, "three consecutive failures must still fail the check");
+        assert_eq!(
+            check.detail,
+            format!("blocked since {} — uncommitted: /home/u/.claude/skills, /home/u/.claude/CLAUDE.md", first_created_at)
+        );
+
+        // Prove this actually reaches `mach kb health`'s printed report --
+        // `check_improve` is one of `cmd_health`'s assembled checks, and
+        // `health::format_report` is exactly what `cmd_health` prints.
+        let report = health::format_report(&[check]);
+        assert_eq!(
+            report,
+            format!("[FAIL] improve: blocked since {} — uncommitted: /home/u/.claude/skills, /home/u/.claude/CLAUDE.md\n", first_created_at)
+        );
+    }
+
+    #[test]
+    fn check_improve_names_pre_run_drift_targets_since_the_streak_started() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        store::mark_improve_completed(&conn, &now).unwrap();
+        let drift1 = improve::pre_run_drift_reason(&[PathBuf::from("/home/u/.claude/CLAUDE.md")]);
+        let drift2 = improve::pre_run_drift_reason(&[PathBuf::from("/home/u/.claude/CLAUDE.md"), PathBuf::from("/home/u/.claude/settings.json")]);
+        let first = insert_improve_outcome(&conn, &improve::Outcome::Failed { reason: drift1 }, "2026-09-20T08:00:00Z");
+        insert_improve_outcome(&conn, &improve::Outcome::Failed { reason: drift2.clone() }, "2026-09-21T09:00:00Z");
+        insert_improve_outcome(&conn, &improve::Outcome::Failed { reason: drift2 }, "2026-09-22T10:00:00Z");
+        let first_created_at = store::get(&conn, first).unwrap().unwrap().created_at;
+
+        let check = check_improve(&Ok(conn));
+        assert!(!check.ok, "three consecutive failures must still fail the check");
+        assert_eq!(
+            check.detail,
+            format!(
+                "blocked since {} — targets differ from chezmoi source: /home/u/.claude/CLAUDE.md, /home/u/.claude/settings.json",
+                first_created_at
+            )
+        );
+
+        let report = health::format_report(&[check]);
+        assert_eq!(
+            report,
+            format!(
+                "[FAIL] improve: blocked since {} — targets differ from chezmoi source: /home/u/.claude/CLAUDE.md, /home/u/.claude/settings.json\n",
+                first_created_at
+            )
+        );
+    }
+
+    #[test]
+    fn check_improve_keeps_the_generic_message_for_a_non_uncommitted_streak() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        store::mark_improve_completed(&conn, &now).unwrap();
+        for _ in 0..3 {
+            insert_improve_outcome(&conn, &improve::Outcome::Failed { reason: "claude: timed out".into() }, &now);
+        }
+        let check = check_improve(&Ok(conn));
+        assert!(!check.ok);
+        assert!(check.detail.contains("consecutive failures since"), "{}", check.detail);
+        assert!(!check.detail.contains("uncommitted"), "{}", check.detail);
+    }
+
+    #[test]
+    fn check_improve_ignores_a_single_uncommitted_failure_under_the_streak_threshold() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        store::mark_improve_completed(&conn, &now).unwrap();
+        insert_improve_outcome(&conn, &improve::Outcome::Applied { result: improve::ImproveResult { action: improve::Action::None, files: vec![], rationale: "r".into(), evidence: "none".into() }, sha: "abc".into() }, &now);
+        insert_improve_outcome(&conn, &improve::Outcome::Failed { reason: improve::uncommitted_targets_reason(&[PathBuf::from("/home/u/.claude/CLAUDE.md")]) }, &now);
+        let check = check_improve(&Ok(conn));
+        assert!(check.ok, "one failure after a success is not a streak: {}", check.detail);
+        assert!(check.detail.starts_with("last completed"), "{}", check.detail);
     }
 
     #[test]
@@ -8105,6 +9769,761 @@ mod tests {
         assert!(store::graph_extraction_candidates(&conn, 10).unwrap().is_empty(), "backlog drained");
     }
 
+    // --- reflect_working_set: oldest/newest backlog split (Task 2) ---
+
+    fn insert_n(conn: &Connection, n: usize, tag: &str) -> Vec<i64> {
+        (0..n).map(|i| store::insert(conn, &format!("{} {}", tag, i), None, None, true, None, 5).unwrap()).collect()
+    }
+
+    #[test]
+    fn reflect_working_set_splits_100_unreflected_into_40_oldest_and_20_newest() {
+        let conn = mem_conn();
+        let ids = insert_n(&conn, 100, "backlog row");
+
+        let working = reflect_working_set(&conn, REFLECT_WORKING_SET_CAP, REFLECT_NEWEST_SLICE).unwrap();
+        assert_eq!(working.len(), 60);
+
+        let got: Vec<i64> = working.iter().map(|m| m.id).collect();
+        let mut expected: Vec<i64> = ids[0..40].to_vec(); // 40 oldest
+        expected.extend(&ids[80..100]); // 20 newest
+        expected.sort_unstable();
+        assert_eq!(got, expected, "deterministic: oldest 40 + newest 20, sorted ascending");
+    }
+
+    #[test]
+    fn reflect_working_set_with_10_unreflected_returns_all_10() {
+        let conn = mem_conn();
+        let ids = insert_n(&conn, 10, "small backlog");
+
+        let working = reflect_working_set(&conn, REFLECT_WORKING_SET_CAP, REFLECT_NEWEST_SLICE).unwrap();
+        let got: Vec<i64> = working.iter().map(|m| m.id).collect();
+        let mut expected = ids.clone();
+        expected.sort_unstable();
+        assert_eq!(got, expected, "fewer than the cap -- everything comes back, no duplicates");
+    }
+
+    #[test]
+    fn reflect_working_set_moves_forward_after_marking_the_previous_run_reflected() {
+        let conn = mem_conn();
+        let ids = insert_n(&conn, 100, "moving backlog");
+
+        let first = reflect_working_set(&conn, REFLECT_WORKING_SET_CAP, REFLECT_NEWEST_SLICE).unwrap();
+        let first_ids: Vec<i64> = first.iter().map(|m| m.id).collect();
+        store::mark_memories_reflected(&conn, &first_ids, &store::now_rfc3339()).unwrap();
+
+        // 40 remain (ids 40..80, the untouched middle), all under the cap.
+        assert_eq!(store::unreflected_active_count(&conn).unwrap(), 40);
+        let second = reflect_working_set(&conn, REFLECT_WORKING_SET_CAP, REFLECT_NEWEST_SLICE).unwrap();
+        let second_ids: Vec<i64> = second.iter().map(|m| m.id).collect();
+        assert_eq!(second_ids.len(), 40);
+        assert!(
+            second_ids.iter().all(|id| !first_ids.contains(id)),
+            "the second run's set must not repeat anything the first run already reflected"
+        );
+        let mut expected_middle: Vec<i64> = ids[40..80].to_vec();
+        expected_middle.sort_unstable();
+        assert_eq!(second_ids, expected_middle);
+    }
+
+    // --- run_insight_stage: failure isolation (Task 1 + fix round 1) ---
+
+    /// A `ReflectLlm` test double that replays a fixed sequence of replies,
+    /// one per call, in order -- for tests that need to distinguish
+    /// stage-1's call from stage-2's from re-verification's (all "haiku" or
+    /// "sonnet" by model name alone, which isn't enough to tell them apart
+    /// -- `run_insight_stage` calls them in a fixed order: stage-1, then
+    /// stage-2 per question, then re-verification per due insight). Panics
+    /// if called more times than it has scripted replies, so a test asserts
+    /// its own assumption about exactly how many calls should happen.
+    struct ScriptedSequenceLlm {
+        replies: std::cell::RefCell<std::collections::VecDeque<Result<&'static str, &'static str>>>,
+    }
+
+    impl ScriptedSequenceLlm {
+        fn new(replies: Vec<Result<&'static str, &'static str>>) -> Self {
+            ScriptedSequenceLlm { replies: std::cell::RefCell::new(replies.into_iter().collect()) }
+        }
+    }
+
+    impl ReflectLlm for ScriptedSequenceLlm {
+        fn call(&self, _model: &str, _prompt: &str, _timeout: std::time::Duration) -> Result<String, String> {
+            match self.replies.borrow_mut().pop_front() {
+                Some(Ok(s)) => Ok(s.to_string()),
+                Some(Err(e)) => Err(e.to_string()),
+                None => panic!("ScriptedSequenceLlm: called more times than it has scripted replies"),
+            }
+        }
+    }
+
+    /// Inserts `n` memories all sharing one simple embedding, so
+    /// `store::top_similar_active` reliably returns them together as
+    /// mutual evidence (stage-2's `evidence.len() >= 2` floor, and
+    /// re-verification's own candidate search) -- unlike `insert_n`, whose
+    /// rows have no embedding at all and so never satisfy either.
+    fn insert_n_with_shared_embedding(conn: &Connection, n: usize, tag: &str) -> Vec<i64> {
+        let emb = unit_vec(4, 0);
+        (0..n)
+            .map(|i| store::insert(conn, &format!("{} {}", tag, i), None, None, true, Some(&emb), 5).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn run_insight_stage_marks_the_working_set_reflected_when_the_stage_succeeds() {
+        let conn = mem_conn();
+        let ids = insert_n(&conn, 5, "insight stage success");
+        let llm = FixedReflectLlm { reply: Ok("what does the user prefer?") };
+        let now = store::now_rfc3339();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, &[], &now).unwrap();
+
+        assert_eq!(outcome.examined, 5);
+        assert!(!outcome.stage_failed);
+        assert!(!outcome.any_failed);
+        assert_eq!(outcome.reflected, 5);
+        assert_eq!(outcome.max_reflected_id, ids.iter().max().copied());
+        assert_eq!(store::unreflected_active_count(&conn).unwrap(), 0, "the whole working set was marked reflected");
+    }
+
+    #[test]
+    fn run_insight_stage_marks_nothing_when_stage_1_itself_fails() {
+        let conn = mem_conn();
+        let n_before = 5;
+        insert_n(&conn, n_before, "insight stage failure");
+        // Stage 1's own haiku call fails outright.
+        let llm = FixedReflectLlm { reply: Err("'claude' exited with Some(1) (no stderr)") };
+        let now = store::now_rfc3339();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, &[], &now).unwrap();
+
+        assert_eq!(outcome.examined, 5, "the working set was still selected and examined");
+        assert!(outcome.stage_failed);
+        assert!(outcome.any_failed);
+        assert_eq!(outcome.reflected, 0, "a failure in stage 1 itself marks nothing");
+        assert_eq!(outcome.max_reflected_id, None);
+        assert_eq!(
+            store::unreflected_active_count(&conn).unwrap(),
+            n_before as i64,
+            "every row in the working set stays due for the next run"
+        );
+    }
+
+    #[test]
+    fn run_insight_stage_marks_nothing_when_stage_2_fails_even_though_stage_1_succeeded() {
+        let conn = mem_conn();
+        insert_n_with_shared_embedding(&conn, 5, "stage 2 failure");
+        // Stage 1 succeeds with one question; stage 2's own sonnet call
+        // then fails for it.
+        let llm = ScriptedSequenceLlm::new(vec![Ok("what pattern holds here?"), Err("'claude' exited with Some(1)")]);
+        let now = store::now_rfc3339();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, &[], &now).unwrap();
+
+        assert_eq!(outcome.questions, 1, "stage 1 succeeded and produced one question");
+        assert!(outcome.stage_failed, "stage 2's own call failure must still gate reflected_at");
+        assert!(outcome.any_failed);
+        assert_eq!(outcome.reflected, 0, "nothing marked -- stage 2 failed");
+    }
+
+    #[test]
+    fn run_insight_stage_marks_nothing_when_the_embedder_fails_in_stage_2() {
+        let conn = mem_conn();
+        insert_n(&conn, 5, "embedder failure in stage 2");
+        // Stage 1 succeeds; the embedder then fails for the question stage
+        // 2 needs embedded before it can even look for evidence -- this is
+        // a failure of this stage's own machinery, not "insufficient
+        // evidence", and must gate reflected_at exactly like a failed
+        // `claude` call does.
+        struct AlwaysFailingEmbedder;
+        impl Embedder for AlwaysFailingEmbedder {
+            fn embed(&self, _text: &str) -> Result<Vec<f32>, KbError> {
+                Err(KbError::Other("ollama unreachable".to_string()))
+            }
+        }
+        let llm = FixedReflectLlm { reply: Ok("what does the evidence show?") };
+        let now = store::now_rfc3339();
+        let outcome = run_insight_stage(&conn, &AlwaysFailingEmbedder, &llm, &[], &now).unwrap();
+
+        assert_eq!(outcome.questions, 1);
+        assert!(outcome.stage_failed, "an embedding-provider error in stage 2 must set stage_failed");
+        assert!(outcome.any_failed);
+        assert_eq!(outcome.reflected, 0, "nothing marked -- the embedder failed");
+    }
+
+    #[test]
+    fn run_insight_stage_drops_a_question_with_fewer_than_2_evidence_rows_without_failing() {
+        // The `evidence.len() < 2` floor is a legitimate outcome (the
+        // query succeeded and just found too little), never a failure --
+        // must NOT set stage_failed, unlike the embedder/evidence-query
+        // error cases above. With no embeddings on any memory,
+        // `top_similar_active` returns nothing for the question, so the
+        // floor is never cleared and the sonnet call is never even placed
+        // -- if this incorrectly set stage_failed, reflected would be 0.
+        let conn = mem_conn();
+        insert_n(&conn, 5, "too little evidence");
+        let llm = FixedReflectLlm { reply: Ok("a question nothing backs") };
+        let now = store::now_rfc3339();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, &[], &now).unwrap();
+
+        assert!(!outcome.stage_failed, "insufficient evidence is not a failure");
+        assert!(!outcome.any_failed);
+        assert_eq!(outcome.reflected, 5, "the working set is still marked reflected");
+    }
+
+    #[test]
+    fn run_insight_stage_marks_the_60_rows_even_when_a_verification_call_fails() {
+        // The exact scenario the fix-round controller ruling names: stage
+        // 1 and stage 2 both succeed; a re-verification call fails. The
+        // working set must still be marked reflected in full, and the
+        // verification failure must surface only via `any_failed`.
+        let conn = mem_conn();
+        let ids = insert_n_with_shared_embedding(&conn, 60, "verification failure isolation");
+        let cite_a = ids[0].to_string();
+        let cite_b = ids[1].to_string();
+        let due_insight_id =
+            store::insert_insight(&conn, "a belief due for re-verification", 0.6, &[cite_a, cite_b], Some(&unit_vec(4, 0)))
+                .unwrap();
+        let due = store::get_insight(&conn, due_insight_id).unwrap().unwrap();
+
+        // Call order: stage-1 (haiku, one question) -> stage-2 (sonnet,
+        // "NONE" -- a successful call that simply declines to synthesize
+        // anything, which is fine; only the CALL failing would matter) ->
+        // re-verification (haiku, fails).
+        let llm = ScriptedSequenceLlm::new(vec![
+            Ok("what does this working set suggest?"),
+            Ok("NONE"),
+            Err("'claude' exited with Some(1) (no stderr)"),
+        ]);
+        let now = store::now_rfc3339();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+
+        assert_eq!(outcome.examined, 60);
+        assert!(!outcome.stage_failed, "stage 1 and stage 2 both succeeded");
+        assert!(outcome.any_failed, "the verification failure still shows up here, for reporting");
+        assert_eq!(outcome.reflected, 60, "the 60 rows ARE marked despite the verification failure");
+        assert_eq!(store::unreflected_active_count(&conn).unwrap(), 0);
+        // And the insight itself is untouched -- still due, stays due.
+        let after = store::get_insight(&conn, due_insight_id).unwrap().unwrap();
+        assert!(!after.is_flagged());
+        assert_eq!(after.last_verified_at, due.last_verified_at, "a failed check must not be credited");
+    }
+
+    #[test]
+    fn run_insight_stage_with_an_empty_backlog_still_runs_verification_and_marks_nothing() {
+        let conn = mem_conn();
+        // No memory backlog at all -- only a stale insight due for
+        // re-verification. should_mark_reflected must see "no working set"
+        // and mark nothing, regardless of whether verification succeeds.
+        let ins_id =
+            store::insert_insight(&conn, "a durable belief", 0.6, &["1".to_string(), "2".to_string()], None).unwrap();
+        let stale = store::get_insight(&conn, ins_id).unwrap().unwrap();
+        let llm = FixedReflectLlm { reply: Ok("NONE") };
+        let now = store::now_rfc3339();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&stale), &now).unwrap();
+
+        assert_eq!(outcome.examined, 0);
+        assert_eq!(outcome.reflected, 0);
+        assert_eq!(outcome.max_reflected_id, None);
+    }
+
+    // --- run_insight_stage: verification revises insight text (Task 3) ---
+
+    #[test]
+    fn run_insight_stage_revises_a_contradicted_insight_when_the_judge_says_revise() {
+        let conn = mem_conn();
+        // Real, active citations -- otherwise the broken-citation check
+        // (weaken, not contradiction) fires first and this never reaches
+        // the contradiction/revise machinery at all.
+        let m1 = store::insert(&conn, "shipped mid-week this sprint", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        let m2 = store::insert(&conn, "shipped again mid-week", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        assert_eq!((m1, m2), (1, 2), "sanity: fresh :memory: db, ids are deterministic");
+        // Keep the memory working set empty so only re-verification's own
+        // calls consume the scripted LLM replies below.
+        store::mark_memories_reflected(&conn, &[m1, m2], "1970-01-01T00:00:00Z").unwrap();
+        let ins_id = store::insert_insight(
+            &conn,
+            "the user always ships on Fridays",
+            0.6,
+            &[m1.to_string(), m2.to_string()],
+            Some(&unit_vec(4, 0)),
+        )
+        .unwrap();
+        let due = store::get_insight(&conn, ins_id).unwrap().unwrap();
+
+        // No memory backlog for the insight stage itself (empty working
+        // set) -- so the only two calls made are re-verification's own:
+        // the contradiction check (haiku) -> "YES 1", then the revise/
+        // drop/keep judge (sonnet) -> "REVISE: ..." citing both evidence
+        // rows (m1=1, m2=2) the contradiction check itself was shown.
+        let llm = ScriptedSequenceLlm::new(vec![
+            Ok("YES 1"),
+            Ok("REVISE: the user ships mid-week, not on Fridays (because of: 1, 2)"),
+        ]);
+        let now = store::now_rfc3339();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+
+        assert_eq!(outcome.revised, 1);
+        assert_eq!(outcome.flagged, 0);
+        assert_eq!(outcome.verified, 0);
+        assert!(!outcome.any_failed);
+
+        let after = store::get_insight(&conn, ins_id).unwrap().unwrap();
+        assert_eq!(after.text, "the user ships mid-week, not on Fridays");
+        assert_eq!(after.prev_text.as_deref(), Some("the user always ships on Fridays"));
+        assert_eq!(after.revised_at.as_deref(), Some(now.as_str()));
+        assert!(!after.is_flagged(), "a REVISE verdict must clear any prior flag");
+        assert_eq!(
+            after.confidence,
+            0.6 - store::INSIGHT_CONFIDENCE_STEP,
+            "a REVISE lowers confidence by one step (fix-list item 3)"
+        );
+        assert_eq!(
+            after.source_ids,
+            vec![m1.to_string(), m2.to_string()],
+            "both cited ids were already source_ids -- deduped, not duplicated"
+        );
+    }
+
+    #[test]
+    fn run_insight_stage_flags_a_contradicted_insight_when_the_judge_says_drop() {
+        let conn = mem_conn();
+        let m1 = store::insert(&conn, "no longer true", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        let m2 = store::insert(&conn, "also no longer true", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        store::mark_memories_reflected(&conn, &[m1, m2], "1970-01-01T00:00:00Z").unwrap();
+        let ins_id = store::insert_insight(
+            &conn,
+            "a belief the evidence no longer supports at all",
+            0.6,
+            &[m1.to_string(), m2.to_string()],
+            Some(&unit_vec(4, 0)),
+        )
+        .unwrap();
+        let due = store::get_insight(&conn, ins_id).unwrap().unwrap();
+
+        let llm = ScriptedSequenceLlm::new(vec![Ok("YES 1"), Ok("DROP")]);
+        let now = store::now_rfc3339();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+
+        assert_eq!(outcome.flagged, 1);
+        assert_eq!(outcome.revised, 0);
+        assert!(!outcome.any_failed);
+        let after = store::get_insight(&conn, ins_id).unwrap().unwrap();
+        assert!(after.is_flagged());
+        assert!(after.revised_at.is_none());
+        assert_eq!(after.text, "a belief the evidence no longer supports at all", "DROP must never touch the text");
+    }
+
+    #[test]
+    fn run_insight_stage_verifies_a_contradicted_insight_when_the_judge_says_keep() {
+        let conn = mem_conn();
+        let m1 = store::insert(&conn, "ambiguous evidence", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        let m2 = store::insert(&conn, "more ambiguous evidence", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        store::mark_memories_reflected(&conn, &[m1, m2], "1970-01-01T00:00:00Z").unwrap();
+        let ins_id = store::insert_insight(
+            &conn,
+            "a belief the second judge says still holds",
+            0.6,
+            &[m1.to_string(), m2.to_string()],
+            Some(&unit_vec(4, 0)),
+        )
+        .unwrap();
+        let due = store::get_insight(&conn, ins_id).unwrap().unwrap();
+
+        // The first (haiku) judge flags a contradiction; the second
+        // (sonnet) revise/drop/keep judge disagrees -- treated as a clean
+        // verification, not a flag.
+        let llm = ScriptedSequenceLlm::new(vec![Ok("YES 1"), Ok("KEEP")]);
+        let now = store::now_rfc3339();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+
+        assert_eq!(outcome.verified, 1);
+        assert_eq!(outcome.flagged, 0);
+        assert_eq!(outcome.revised, 0);
+        assert!(!outcome.any_failed);
+        let after = store::get_insight(&conn, ins_id).unwrap().unwrap();
+        assert!(!after.is_flagged());
+        assert_eq!(after.text, "a belief the second judge says still holds");
+    }
+
+    #[test]
+    fn run_insight_stage_flags_on_an_unparseable_revise_reply_never_revising() {
+        let conn = mem_conn();
+        let m1 = store::insert(&conn, "some fact", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        let m2 = store::insert(&conn, "another fact", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        store::mark_memories_reflected(&conn, &[m1, m2], "1970-01-01T00:00:00Z").unwrap();
+        let ins_id = store::insert_insight(
+            &conn,
+            "a belief whose judge reply is garbage",
+            0.6,
+            &[m1.to_string(), m2.to_string()],
+            Some(&unit_vec(4, 0)),
+        )
+        .unwrap();
+        let due = store::get_insight(&conn, ins_id).unwrap().unwrap();
+
+        let llm = ScriptedSequenceLlm::new(vec![Ok("YES 1"), Ok("uh, not sure?")]);
+        let now = store::now_rfc3339();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+
+        assert_eq!(outcome.flagged, 1, "an unparseable reply falls back to the pre-existing flag behavior");
+        assert_eq!(outcome.revised, 0);
+        assert!(outcome.any_failed, "a bad reply is still visible in the degraded-run report");
+        let after = store::get_insight(&conn, ins_id).unwrap().unwrap();
+        assert!(after.is_flagged());
+        assert_eq!(after.text, "a belief whose judge reply is garbage", "a parse failure must never revise the text");
+    }
+
+    #[test]
+    fn run_insight_stage_flags_when_the_revise_call_itself_fails() {
+        let conn = mem_conn();
+        let m1 = store::insert(&conn, "some fact", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        let m2 = store::insert(&conn, "another fact", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        store::mark_memories_reflected(&conn, &[m1, m2], "1970-01-01T00:00:00Z").unwrap();
+        let ins_id = store::insert_insight(
+            &conn,
+            "a belief whose revise call fails outright",
+            0.6,
+            &[m1.to_string(), m2.to_string()],
+            Some(&unit_vec(4, 0)),
+        )
+        .unwrap();
+        let due = store::get_insight(&conn, ins_id).unwrap().unwrap();
+
+        let llm = ScriptedSequenceLlm::new(vec![Ok("YES 1"), Err("'claude' exited with Some(1) (no stderr)")]);
+        let now = store::now_rfc3339();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+
+        assert_eq!(outcome.flagged, 1, "the contradiction is already established -- a failed second call falls back to flagging");
+        assert_eq!(outcome.revised, 0);
+        assert!(outcome.any_failed);
+        let after = store::get_insight(&conn, ins_id).unwrap().unwrap();
+        assert!(after.is_flagged());
+    }
+
+    // --- run_insight_stage: final-fix-list items 1-3, 5 ---
+
+    #[test]
+    fn run_insight_stage_applies_revise_as_drop_when_citations_are_insufficient() {
+        // Mirrors reflect::parse_revise_without_two_valid_citations_is_applied_as_drop
+        // through the real verification loop: a REVISE with no (or bad)
+        // citations must be applied exactly like an explicit DROP -- flagged,
+        // never revised, and NOT counted as a failure (it's a legitimate,
+        // fully-parsed verdict that just failed the evidence floor).
+        let conn = mem_conn();
+        let m1 = store::insert(&conn, "shipped mid-week this sprint", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        let m2 = store::insert(&conn, "shipped again mid-week", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        store::mark_memories_reflected(&conn, &[m1, m2], "1970-01-01T00:00:00Z").unwrap();
+        let ins_id = store::insert_insight(
+            &conn,
+            "the user always ships on Fridays",
+            0.6,
+            &[m1.to_string(), m2.to_string()],
+            Some(&unit_vec(4, 0)),
+        )
+        .unwrap();
+        let due = store::get_insight(&conn, ins_id).unwrap().unwrap();
+
+        // Only one cited id, and it isn't among the evidence rows shown --
+        // fails the >= 2-among-evidence floor either way.
+        let llm = ScriptedSequenceLlm::new(vec![
+            Ok("YES 1"),
+            Ok("REVISE: the user ships mid-week, not on Fridays (because of: 99)"),
+        ]);
+        let now = store::now_rfc3339();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+
+        assert_eq!(outcome.flagged, 1, "an under-cited REVISE is applied as DROP");
+        assert_eq!(outcome.revised, 0);
+        assert!(!outcome.any_failed, "an under-cited REVISE is a legitimate verdict, not a call/parse failure");
+        let after = store::get_insight(&conn, ins_id).unwrap().unwrap();
+        assert!(after.is_flagged());
+        assert_eq!(after.text, "the user always ships on Fridays", "an applied-as-DROP verdict must never touch the text");
+    }
+
+    #[test]
+    fn run_insight_stage_never_revises_a_level_2_theme() {
+        let conn = mem_conn();
+        let m1 = store::insert(&conn, "some fact", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        let m2 = store::insert(&conn, "another fact", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        store::mark_memories_reflected(&conn, &[m1, m2], "1970-01-01T00:00:00Z").unwrap();
+        let theme_id = store::insert_theme(
+            &conn,
+            "a theme the evidence has turned against",
+            0.6,
+            &[m1.to_string(), m2.to_string()],
+            Some(&unit_vec(4, 0)),
+        )
+        .unwrap();
+        let due = store::get_insight(&conn, theme_id).unwrap().unwrap();
+        assert_eq!(due.level, 2, "sanity: insert_theme must produce a level-2 row");
+
+        // Only ONE scripted reply -- the contradiction check (haiku). If the
+        // revise/drop/keep (sonnet) call were made for a theme,
+        // ScriptedSequenceLlm would panic ("called more times than it has
+        // scripted replies").
+        let llm = ScriptedSequenceLlm::new(vec![Ok("YES 1")]);
+        let now = store::now_rfc3339();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+
+        assert_eq!(outcome.flagged, 1, "a contradicted theme is flagged directly, never revised");
+        assert_eq!(outcome.revised, 0);
+        assert!(!outcome.any_failed, "the old flag path is not a failure");
+        let after = store::get_insight(&conn, theme_id).unwrap().unwrap();
+        assert!(after.is_flagged());
+        assert_eq!(after.text, "a theme the evidence has turned against", "flagging must never touch the text");
+    }
+
+    #[test]
+    fn run_insight_stage_applies_revise_as_drop_when_the_insight_was_revised_within_14_days() {
+        let conn = mem_conn();
+        let m1 = store::insert(&conn, "shipped mid-week this sprint", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        let m2 = store::insert(&conn, "shipped again mid-week", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        store::mark_memories_reflected(&conn, &[m1, m2], "1970-01-01T00:00:00Z").unwrap();
+        let ins_id = store::insert_insight(
+            &conn,
+            "the user ships on Tuesdays now",
+            0.6,
+            &[m1.to_string(), m2.to_string()],
+            Some(&unit_vec(4, 0)),
+        )
+        .unwrap();
+        // A prior REVISE 5 days ago -- inside the 14-day flip-flop window.
+        let five_days_ago = store::now_rfc3339_from_secs(store::now_secs() - 5 * 86400);
+        store::revise_insight(
+            &conn,
+            ins_id,
+            "the user ships on Tuesdays now",
+            Some(&unit_vec(4, 0)),
+            &[],
+            &five_days_ago,
+        )
+        .unwrap();
+        let due = store::get_insight(&conn, ins_id).unwrap().unwrap();
+        assert!(due.revised_at.is_some(), "sanity: the insight was already revised recently");
+
+        let llm = ScriptedSequenceLlm::new(vec![
+            Ok("YES 1"),
+            Ok("REVISE: the user ships mid-week, not on Tuesdays (because of: 1, 2)"),
+        ]);
+        let now = store::now_rfc3339();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+
+        assert_eq!(outcome.flagged, 1, "a REVISE within 14 days of the last revision is applied as DROP");
+        assert_eq!(outcome.revised, 0);
+        assert!(!outcome.any_failed, "this is a deliberate policy application, not a failure");
+        let after = store::get_insight(&conn, ins_id).unwrap().unwrap();
+        assert!(after.is_flagged());
+        assert_eq!(after.text, "the user ships on Tuesdays now", "a suppressed REVISE must never touch the text");
+    }
+
+    #[test]
+    fn run_insight_stage_revises_normally_when_the_last_revision_was_over_14_days_ago() {
+        let conn = mem_conn();
+        let m1 = store::insert(&conn, "shipped mid-week this sprint", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        let m2 = store::insert(&conn, "shipped again mid-week", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        store::mark_memories_reflected(&conn, &[m1, m2], "1970-01-01T00:00:00Z").unwrap();
+        let ins_id = store::insert_insight(
+            &conn,
+            "the user ships on Tuesdays now",
+            0.6,
+            &[m1.to_string(), m2.to_string()],
+            Some(&unit_vec(4, 0)),
+        )
+        .unwrap();
+        // A prior REVISE 15 days ago -- OUTSIDE the 14-day flip-flop window.
+        let fifteen_days_ago = store::now_rfc3339_from_secs(store::now_secs() - 15 * 86400);
+        store::revise_insight(
+            &conn,
+            ins_id,
+            "the user ships on Tuesdays now",
+            Some(&unit_vec(4, 0)),
+            &[],
+            &fifteen_days_ago,
+        )
+        .unwrap();
+        let due = store::get_insight(&conn, ins_id).unwrap().unwrap();
+        let confidence_before = due.confidence;
+
+        let llm = ScriptedSequenceLlm::new(vec![
+            Ok("YES 1"),
+            Ok("REVISE: the user ships mid-week, not on Tuesdays (because of: 1, 2)"),
+        ]);
+        let now = store::now_rfc3339();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+
+        assert_eq!(outcome.revised, 1, "past the 14-day window, REVISE proceeds normally");
+        assert_eq!(outcome.flagged, 0);
+        assert!(!outcome.any_failed);
+        let after = store::get_insight(&conn, ins_id).unwrap().unwrap();
+        assert_eq!(after.text, "the user ships mid-week, not on Tuesdays");
+        assert_eq!(after.confidence, confidence_before - store::INSIGHT_CONFIDENCE_STEP);
+    }
+
+    #[test]
+    fn run_insight_stage_skips_the_revise_and_reports_any_failed_when_the_embedder_fails() {
+        let conn = mem_conn();
+        let m1 = store::insert(&conn, "shipped mid-week this sprint", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        let m2 = store::insert(&conn, "shipped again mid-week", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        store::mark_memories_reflected(&conn, &[m1, m2], "1970-01-01T00:00:00Z").unwrap();
+        let ins_id = store::insert_insight(
+            &conn,
+            "the user always ships on Fridays",
+            0.6,
+            &[m1.to_string(), m2.to_string()],
+            Some(&unit_vec(4, 0)),
+        )
+        .unwrap();
+        let due = store::get_insight(&conn, ins_id).unwrap().unwrap();
+
+        // Succeeds embedding the insight's OWN text (needed for the
+        // contradiction check's candidate search), fails only on the new
+        // corrected text -- isolating the fix-list item 5 code path.
+        struct FailsOnThisText(&'static str);
+        impl Embedder for FailsOnThisText {
+            fn embed(&self, text: &str) -> Result<Vec<f32>, KbError> {
+                if text == self.0 {
+                    Err(KbError::Other("ollama unreachable".to_string()))
+                } else {
+                    Ok(text.bytes().map(|b| b as f32).collect())
+                }
+            }
+        }
+        let new_text = "the user ships mid-week, not on Fridays";
+        let embedder = FailsOnThisText(new_text);
+
+        let llm = ScriptedSequenceLlm::new(vec![
+            Ok("YES 1"),
+            Ok("REVISE: the user ships mid-week, not on Fridays (because of: 1, 2)"),
+        ]);
+        let now = store::now_rfc3339();
+        let outcome = run_insight_stage(&conn, &embedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+
+        assert_eq!(outcome.revised, 0, "an embed failure must skip the revise entirely");
+        assert_eq!(outcome.flagged, 0, "and must NOT fall back to flagging either -- left unchanged, due again");
+        assert_eq!(outcome.verified, 0);
+        assert!(outcome.any_failed, "the failure must still be visible in the degraded-run report");
+
+        let after = store::get_insight(&conn, ins_id).unwrap().unwrap();
+        assert!(!after.is_flagged());
+        assert!(after.revised_at.is_none());
+        assert_eq!(after.text, "the user always ships on Fridays", "text must be completely untouched");
+        assert_eq!(after.confidence, 0.6, "confidence must be completely untouched too");
+    }
+
+    /// The behavioral counterpart to `reflect::should_mark_reflected`'s own
+    /// pure-predicate tests: a pass this function never runs (graph
+    /// extraction, entity cards, dedupe, ...) has no code path into
+    /// `run_insight_stage` at all, so its failure literally cannot affect
+    /// `outcome.stage_failed` -- this test documents that by driving the
+    /// stage to success and confirming the working set is marked reflected
+    /// exactly as it would be on a fully clean run, i.e. nothing about
+    /// "some other pass elsewhere in this same `mach kb reflect`
+    /// invocation is about to fail" changes this function's own behavior.
+    #[test]
+    fn run_insight_stage_succeeds_independently_of_any_other_pass() {
+        let conn = mem_conn();
+        insert_n(&conn, 3, "isolated from graph extraction's own failures");
+        let llm = FixedReflectLlm { reply: Ok("what pattern holds here?") };
+        let now = store::now_rfc3339();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, &[], &now).unwrap();
+        assert!(!outcome.stage_failed);
+        assert!(!outcome.any_failed);
+        assert_eq!(outcome.reflected, 3);
+    }
+
+    // --- cap_stage1_prompt: stage-1 prompt size cap (fix round 1, item 3) ---
+
+    #[test]
+    fn cap_stage1_prompt_shrinks_the_oldest_slice_to_fit_the_char_cap_keeping_all_newest_rows() {
+        let conn = mem_conn();
+        // 5 oldest rows, each large enough that all 5 together blow past a
+        // small cap; 3 "newest" rows, small, always kept.
+        let big = "x".repeat(2000);
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            ids.push(store::insert(&conn, &format!("{} {}", big, i), None, None, true, None, 5).unwrap());
+        }
+        let mut newest_ids = Vec::new();
+        for i in 0..3 {
+            newest_ids.push(store::insert(&conn, &format!("small newest {}", i), None, None, true, None, 5).unwrap());
+        }
+        ids.extend(&newest_ids);
+
+        let working_vec = reflect_working_set(&conn, 8, 3).unwrap();
+        assert_eq!(working_vec.len(), 8, "sanity: nothing capped yet at the selection stage");
+
+        let cap = 3_000usize; // small enough to force trimming
+        let capped = cap_stage1_prompt(working_vec, 3, cap);
+
+        let lines: Vec<(i64, String)> = capped.iter().map(|m| (m.id, m.content.clone())).collect();
+        let prompt_len = reflect::build_questions_prompt(&lines).chars().count();
+        assert!(prompt_len <= cap, "prompt is {} chars, over the {} cap", prompt_len, cap);
+
+        let capped_ids: std::collections::HashSet<i64> = capped.iter().map(|m| m.id).collect();
+        for id in &newest_ids {
+            assert!(capped_ids.contains(id), "the newest slice must never be trimmed");
+        }
+        assert!(capped.len() < 8, "at least one oldest-slice row must have been dropped to fit");
+
+        // The working set really is exactly the rows in the (now-fitting)
+        // prompt -- nothing extra, nothing missing.
+        assert_eq!(capped_ids.len(), capped.len());
+    }
+
+    #[test]
+    fn cap_stage1_prompt_is_a_noop_when_it_already_fits() {
+        let conn = mem_conn();
+        let ids = insert_n(&conn, 10, "small enough to fit");
+        let working_vec = reflect_working_set(&conn, 10, 5).unwrap();
+        let capped = cap_stage1_prompt(working_vec, 5, REFLECT_STAGE1_PROMPT_CHAR_CAP);
+        assert_eq!(capped.iter().map(|m| m.id).collect::<Vec<_>>(), ids);
+    }
+
+    #[test]
+    fn cap_stage1_prompt_never_trims_when_everything_is_within_the_newest_slice() {
+        let conn = mem_conn();
+        let big = "y".repeat(50_000); // one row alone would blow the cap
+        let id = store::insert(&conn, &big, None, None, true, None, 5).unwrap();
+        let working_vec = reflect_working_set(&conn, 60, 20).unwrap();
+        // The single row is entirely within the newest slice (1 <= 20), so
+        // there is no oldest part to trim -- per the controller ruling,
+        // the newest slice is never shrunk even if still oversized.
+        let capped = cap_stage1_prompt(working_vec, 20, 100);
+        assert_eq!(capped.iter().map(|m| m.id).collect::<Vec<_>>(), vec![id]);
+    }
+
+    /// The literal cap from the controller ruling (20,000 chars), exercised
+    /// end to end through `reflect_working_set` + `cap_stage1_prompt`
+    /// together, the same composition `run_insight_stage` itself uses.
+    #[test]
+    fn cap_stage1_prompt_enforces_the_real_20k_char_cap_on_an_oversized_oldest_slice() {
+        let conn = mem_conn();
+        let big = "z".repeat(600); // 40 oldest rows * ~600 chars each > 20k
+        let mut oldest_ids = Vec::new();
+        for i in 0..40 {
+            oldest_ids.push(store::insert(&conn, &format!("{} {}", big, i), None, None, true, None, 5).unwrap());
+        }
+        let mut newest_ids = Vec::new();
+        for i in 0..20 {
+            newest_ids.push(store::insert(&conn, &format!("newest {}", i), None, None, true, None, 5).unwrap());
+        }
+
+        let working_vec = reflect_working_set(&conn, REFLECT_WORKING_SET_CAP, REFLECT_NEWEST_SLICE).unwrap();
+        assert_eq!(working_vec.len(), 60);
+        let full_prompt_len = {
+            let lines: Vec<(i64, String)> = working_vec.iter().map(|m| (m.id, m.content.clone())).collect();
+            reflect::build_questions_prompt(&lines).chars().count()
+        };
+        assert!(full_prompt_len > REFLECT_STAGE1_PROMPT_CHAR_CAP, "sanity: the uncapped prompt really is oversized");
+
+        let capped = cap_stage1_prompt(working_vec, REFLECT_NEWEST_SLICE, REFLECT_STAGE1_PROMPT_CHAR_CAP);
+        let lines: Vec<(i64, String)> = capped.iter().map(|m| (m.id, m.content.clone())).collect();
+        assert!(reflect::build_questions_prompt(&lines).chars().count() <= REFLECT_STAGE1_PROMPT_CHAR_CAP);
+
+        let capped_ids: std::collections::HashSet<i64> = capped.iter().map(|m| m.id).collect();
+        for id in &newest_ids {
+            assert!(capped_ids.contains(id), "all 20 newest rows must survive");
+        }
+        assert!(capped.len() < 60, "some oldest-slice rows were dropped to fit");
+        let _ = oldest_ids;
+    }
+
     // --- search enrichment: entity connections ---
 
     #[test]
@@ -8117,7 +10536,7 @@ mod tests {
         store::insert_relation(&conn, moses, "boss-of", user, Some(mem_id), Some(0.9), &store::now_rfc3339()).unwrap();
 
         let embedder = FixedVecEmbedder(q);
-        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &store::now_rfc3339(), None)
+        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &store::now_rfc3339(), None, None, None)
             .unwrap();
         assert_eq!(resp.connections.len(), 1);
         assert_eq!(resp.connections[0].src_name, "Moses");
@@ -8133,7 +10552,7 @@ mod tests {
         store::insert_entity(&conn, "Moses", Some("person"), Some(&unit_vec(4, 1))).unwrap();
         let embedder = FixedVecEmbedder(unit_vec(4, 0));
         let resp =
-            search_hits(&conn, &embedder, "anything", 10, false, false, 0.0, &store::now_rfc3339(), None).unwrap();
+            search_hits(&conn, &embedder, "anything", 10, false, false, 0.0, &store::now_rfc3339(), None, None, None).unwrap();
         assert!(resp.connections.is_empty());
     }
 
@@ -8153,7 +10572,7 @@ mod tests {
         store::insert_relation(&conn, user, "works-on", umoja, Some(mem2), Some(0.8), &now).unwrap();
 
         let embedder = FixedVecEmbedder(q);
-        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &now, None).unwrap();
+        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &now, None, None, None).unwrap();
         assert_eq!(resp.connections.len(), 2, "one hop-1 edge plus one hop-2 chain through it");
 
         let hop1 = &resp.connections[0];
@@ -8183,7 +10602,7 @@ mod tests {
         let embedder = FixedVecEmbedder(q);
         // min_score above what recency alone earns, so the orthogonal row is
         // NOT a direct hit and has to arrive over the entity link.
-        let resp = search_hits(&conn, &embedder, "who wants ownership", 10, false, false, 0.3, &now, None).unwrap();
+        let resp = search_hits(&conn, &embedder, "who wants ownership", 10, false, false, 0.3, &now, None, None, None).unwrap();
         let d = resp.hits.iter().find(|h| h.id == direct).expect("direct hit");
         let h = resp.hits.iter().find(|h| h.id == hop).expect("hop hit");
         assert!(d.via_assoc.is_none());
@@ -8230,6 +10649,22 @@ mod tests {
     }
 
     #[test]
+    fn why_report_shows_pin_state_only_when_pinned() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let unpinned = store::insert(&conn, "never pinned", None, None, true, None, 5).unwrap();
+        let r = why_report(&conn, WhyTarget::Memory(unpinned), None, None).unwrap();
+        assert!(!r.contains("pinned:"), "an unpinned row must not print a pinned line: {}", r);
+
+        let old_id = store::insert(&conn, "old fact", None, None, true, None, 5).unwrap();
+        let new_id = store::insert(&conn, "new fact", None, None, true, None, 5).unwrap();
+        assert!(store::supersede(&conn, old_id, new_id, &now).unwrap());
+        assert!(store::restore(&conn, old_id, &now).unwrap());
+        let r2 = why_report(&conn, WhyTarget::Memory(old_id), None, None).unwrap();
+        assert!(r2.contains(&format!("pinned: {}", now)), "{}", r2);
+    }
+
+    #[test]
     fn parse_why_target_accepts_the_three_spellings() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         assert_eq!(parse_why_target(&s(&["214"])), Some(WhyTarget::Memory(214)));
@@ -8271,7 +10706,7 @@ mod tests {
         store::insert_relation(&conn, dash, "deployed-to", site, None, Some(0.9), &now).unwrap();
 
         let embedder = FixedVecEmbedder(q);
-        let resp = search_hits(&conn, &embedder, "remosspace.com", 5, false, false, 0.0, &now, None).unwrap();
+        let resp = search_hits(&conn, &embedder, "remosspace.com", 5, false, false, 0.0, &now, None, None, None).unwrap();
         let ones: Vec<&ConnectionHit> = resp.connections.iter().filter(|c| c.hops == 1).collect();
         assert_eq!(ones.len(), 2, "one line per distinct claim: {:?}", ones.iter().map(|c| (&c.src_name, &c.predicate, &c.dst_name)).collect::<Vec<_>>());
         assert_eq!(ones.iter().filter(|c| c.predicate.eq_ignore_ascii_case("deploys-to")).count(), 1);
@@ -8293,7 +10728,7 @@ mod tests {
         store::insert_relation(&conn, user, "intends-to-build", tools, None, Some(0.9), &now).unwrap();
 
         let embedder = FixedVecEmbedder(q);
-        let resp = search_hits(&conn, &embedder, "what runs on the site", 10, false, false, 0.0, &now, None).unwrap();
+        let resp = search_hits(&conn, &embedder, "what runs on the site", 10, false, false, 0.0, &now, None, None, None).unwrap();
         assert_eq!(resp.connections.len(), 2);
 
         let hop1 = &resp.connections[0];
@@ -8320,7 +10755,7 @@ mod tests {
         store::insert_relation(&conn, user, "works-on", umoja, None, Some(0.9), &now).unwrap();
 
         let embedder = FixedVecEmbedder(q);
-        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &now, None).unwrap();
+        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &now, None, None, None).unwrap();
         assert_eq!(resp.connections.len(), 1, "a low-confidence hop-1 edge must not seed a hop-2 walk");
         assert_eq!(resp.connections[0].hops, 1);
     }
@@ -8343,7 +10778,7 @@ mod tests {
         store::insert_relation(&conn, user, "frustrated-by", moses, None, Some(0.9), &now).unwrap();
 
         let embedder = FixedVecEmbedder(q);
-        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &now, None).unwrap();
+        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &now, None, None, None).unwrap();
         assert_eq!(resp.connections.len(), 2, "both direct edges between Moses and user are hop-1 connections");
         assert!(resp.connections.iter().all(|c| c.hops == 1), "neither edge must be re-surfaced as a spurious hop-2 walk");
     }
@@ -8362,7 +10797,7 @@ mod tests {
         }
 
         let embedder = FixedVecEmbedder(q);
-        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &now, None).unwrap();
+        let resp = search_hits(&conn, &embedder, "who is the user's boss", 10, false, false, 0.0, &now, None, None, None).unwrap();
         // 1 hop-1 edge + at most 2 hop-2 edges through the one neighbor.
         assert_eq!(resp.connections.len(), 3);
         assert_eq!(resp.connections.iter().filter(|c| c.hops == 2).count(), 2);
@@ -8380,7 +10815,7 @@ mod tests {
         }
 
         let embedder = FixedVecEmbedder(q);
-        let resp = search_hits(&conn, &embedder, "who does Moses know", 10, false, false, 0.0, &now, None).unwrap();
+        let resp = search_hits(&conn, &embedder, "who does Moses know", 10, false, false, 0.0, &now, None, None, None).unwrap();
         assert_eq!(resp.connections.len(), 5, "6 direct edges must still cap at the overall limit");
         assert!(resp.connections.iter().all(|c| c.hops == 1), "hop-1 edges fill the cap before any hop-2 walk runs");
     }
@@ -8541,6 +10976,241 @@ mod tests {
         assert!(descs.is_empty());
         assert!(failed);
         assert!(store::get_relation(&conn, edge).unwrap().unwrap().is_active(), "never destructive on a failed call");
+    }
+
+    // --- mach kb audit-supersessions ---
+
+    /// Seeds one tombstoned old/new pair with distinct content so the
+    /// prompt/parser and the pass's own db writes have something real to
+    /// check against. Returns `(old_id, new_id, now)`.
+    fn seed_one_supersession(conn: &Connection) -> (i64, i64, String) {
+        let old_id = store::insert(conn, "old fact", None, None, true, None, 5).unwrap();
+        let new_id = store::insert(conn, "new fact", None, None, true, None, 5).unwrap();
+        let now = store::now_rfc3339();
+        assert!(store::supersede(conn, old_id, new_id, &now).unwrap());
+        (old_id, new_id, now)
+    }
+
+    #[test]
+    fn run_supersession_audit_dry_run_records_verdicts_but_changes_nothing() {
+        let conn = mem_conn();
+        let (old_id, new_id, now) = seed_one_supersession(&conn);
+        let llm = OwnedReplyLlm { reply: format!("{} LOSSY dropped a dated fact", old_id) };
+
+        let result = run_supersession_audit(&conn, &llm, &now, None, false, false).unwrap();
+        assert_eq!(result.audited, 1);
+        assert_eq!(result.lossy, 1);
+        assert_eq!(result.ok, 0);
+        assert_eq!(result.no_verdict, 0);
+        assert!(!result.llm_failed);
+        assert_eq!(result.lossy_rows.len(), 1);
+        assert_eq!(result.lossy_rows[0].old_id, old_id);
+        assert_eq!(result.lossy_rows[0].new_id, new_id);
+        assert!(!result.lossy_rows[0].restored, "dry run must never restore");
+
+        // The row is still tombstoned -- a dry run changes nothing about
+        // the memories themselves.
+        let old = store::get(&conn, old_id).unwrap().unwrap();
+        assert!(old.is_superseded());
+        assert!(!store::is_pinned(&conn, old_id).unwrap());
+
+        // The verdict IS durably recorded, though, so a rerun won't re-ask.
+        let row = store::get_supersession_audit(&conn, old_id).unwrap().unwrap();
+        assert_eq!(row.verdict, "LOSSY");
+        assert_eq!(row.reason, "dropped a dated fact");
+    }
+
+    #[test]
+    fn run_supersession_audit_apply_restores_and_pins_only_lossy_rows() {
+        let conn = mem_conn();
+        let (lossy_old, lossy_new, now) = seed_one_supersession(&conn);
+        let ok_old = store::insert(&conn, "old ok fact", None, None, true, None, 5).unwrap();
+        let ok_new = store::insert(&conn, "new fact restates it", None, None, true, None, 5).unwrap();
+        assert!(store::supersede(&conn, ok_old, ok_new, &now).unwrap());
+
+        let llm = OwnedReplyLlm {
+            reply: format!("{} LOSSY dropped a dated fact\n{} OK fully restated", lossy_old, ok_old),
+        };
+        let result = run_supersession_audit(&conn, &llm, &now, None, true, false).unwrap();
+        assert_eq!(result.audited, 2);
+        assert_eq!(result.lossy, 1);
+        assert_eq!(result.ok, 1);
+        assert_eq!(result.lossy_rows.len(), 1);
+        assert!(result.lossy_rows[0].restored);
+
+        // Only the LOSSY row was restored and pinned.
+        let restored = store::get(&conn, lossy_old).unwrap().unwrap();
+        assert!(!restored.is_superseded());
+        assert!(store::is_pinned(&conn, lossy_old).unwrap());
+
+        // The OK row stays exactly as it was: still tombstoned, never pinned.
+        let still_tombstoned = store::get(&conn, ok_old).unwrap().unwrap();
+        assert!(still_tombstoned.is_superseded());
+        assert!(!store::is_pinned(&conn, ok_old).unwrap());
+
+        assert_eq!(store::get_supersession_audit(&conn, lossy_old).unwrap().unwrap().verdict, "LOSSY");
+        assert_eq!(store::get_supersession_audit(&conn, ok_old).unwrap().unwrap().verdict, "OK");
+        let _ = lossy_new;
+    }
+
+    #[test]
+    fn run_supersession_audit_unaddressed_pair_gets_no_verdict_and_is_never_restored() {
+        let conn = mem_conn();
+        let (old_id, _new_id, now) = seed_one_supersession(&conn);
+        let llm = FixedReflectLlm { reply: Ok("garbled reply with no verdict lines") };
+
+        let result = run_supersession_audit(&conn, &llm, &now, None, true, false).unwrap();
+        assert_eq!(result.audited, 0);
+        assert_eq!(result.no_verdict, 1);
+        assert!(result.lossy_rows.is_empty());
+        assert!(!result.llm_failed, "the call itself succeeded -- only its content was unaddressed");
+
+        assert!(store::get(&conn, old_id).unwrap().unwrap().is_superseded(), "never restore on no verdict");
+        assert!(store::get_supersession_audit(&conn, old_id).unwrap().is_none(), "unaddressed pairs are retried, not recorded");
+    }
+
+    #[test]
+    fn run_supersession_audit_failed_batch_call_never_restores_or_records() {
+        let conn = mem_conn();
+        let (old_id, _new_id, now) = seed_one_supersession(&conn);
+        let llm = FixedReflectLlm { reply: Err("offline") };
+
+        let result = run_supersession_audit(&conn, &llm, &now, None, true, false).unwrap();
+        assert_eq!(result.no_verdict, 1);
+        assert!(result.llm_failed);
+        assert!(store::get(&conn, old_id).unwrap().unwrap().is_superseded());
+        assert!(store::get_supersession_audit(&conn, old_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn run_supersession_audit_already_audited_rows_are_skipped_unless_reaudit() {
+        let conn = mem_conn();
+        let (old_id, new_id, now) = seed_one_supersession(&conn);
+        store::record_supersession_audit(&conn, old_id, new_id, "OK", "already judged", &now).unwrap();
+
+        struct PanicLlm;
+        impl ReflectLlm for PanicLlm {
+            fn call(&self, _model: &str, _prompt: &str, _timeout: std::time::Duration) -> Result<String, String> {
+                panic!("must never be called when every candidate is already audited");
+            }
+        }
+        let result = run_supersession_audit(&conn, &PanicLlm, &now, None, false, false).unwrap();
+        assert_eq!(result.audited, 0);
+        assert_eq!(result.lossy, 0);
+        assert_eq!(result.ok, 0);
+        assert_eq!(result.no_verdict, 0);
+
+        // --reaudit re-examines it.
+        let llm = OwnedReplyLlm { reply: format!("{} LOSSY re-examined and found lossy", old_id) };
+        let result = run_supersession_audit(&conn, &llm, &now, None, false, true).unwrap();
+        assert_eq!(result.audited, 1);
+        assert_eq!(result.lossy, 1);
+        assert_eq!(store::get_supersession_audit(&conn, old_id).unwrap().unwrap().verdict, "LOSSY", "reaudit overwrites the prior verdict");
+    }
+
+    #[test]
+    fn audit_supersessions_apply_never_undoes_a_newer_manual_supersede() {
+        // Regression test for "audit --apply can undo a manual supersede":
+        // the original restore filter checked only "is this row still
+        // tombstoned", so a LOSSY verdict recorded against an old hop
+        // (A -> B) could restore A even after a human had since manually
+        // re-superseded A to a completely different, later row (A -> D)
+        // via `mach kb supersede A D` -- silently reverting a manual
+        // decision the guard must never touch. Fixed by (a) restoring only
+        // when the memory's CURRENT superseded_by still equals the
+        // recorded new_id, and (b) treating a candidate as already-audited
+        // only when the recorded new_id equals the CURRENT new_id, so the
+        // fresh A -> D hop is judged again rather than silently skipped.
+        let conn = mem_conn();
+        let (a, b, now) = seed_one_supersession(&conn); // A -> B
+
+        // A dry run finds and records A -> B as LOSSY (never restores).
+        let dry_llm = OwnedReplyLlm { reply: format!("{} LOSSY dropped context", a) };
+        let dry = run_supersession_audit(&conn, &dry_llm, &now, None, false, false).unwrap();
+        assert_eq!(dry.lossy, 1);
+
+        // The row is restored (e.g. by a prior --apply run, or `mach kb
+        // restore` by hand).
+        assert!(store::restore(&conn, a, &now).unwrap());
+        assert!(!store::get(&conn, a).unwrap().unwrap().is_superseded());
+
+        // A human manually supersedes A to a brand-new row D -- a fresh
+        // decision the stale A -> B audit record knows nothing about.
+        let d = store::insert(&conn, "even newer fact D", None, None, true, None, 5).unwrap();
+        assert!(store::supersede(&conn, a, d, &now).unwrap());
+
+        // The new A -> D hop must be sent to the judge as a fresh
+        // candidate -- not silently skipped as "already audited" just
+        // because A was audited before (part b of the fix). Judge it OK
+        // so this test isolates the restore-filter behavior (part a) from
+        // the audit's own verdict content.
+        let fresh_llm = OwnedReplyLlm { reply: format!("{} OK fully restated in D", a) };
+        let result = run_supersession_audit(&conn, &fresh_llm, &now, None, true, false).unwrap();
+        assert_eq!(result.audited, 1, "A->D must be judged fresh, not skipped as already-audited");
+        assert_eq!(result.ok, 1);
+
+        // Crucially (part a of the fix): --apply must NOT restore A over
+        // this newer manual supersede, even though a LOSSY verdict for A
+        // is still on record in supersession_audit (against the old B,
+        // not the current D).
+        let still = store::get(&conn, a).unwrap().unwrap();
+        assert!(still.is_superseded(), "A must stay tombstoned -- a stale A->B LOSSY verdict must never restore over a newer manual A->D supersede");
+        assert_eq!(still.superseded_by, Some(d));
+        let _ = b;
+    }
+
+    #[test]
+    fn run_supersession_audit_apply_restores_a_previously_recorded_lossy_row_without_reasking_the_judge() {
+        // The bug this closes: a dry run finds and records a LOSSY verdict
+        // but (by definition) never restores it. A LATER `--apply` run
+        // must still restore that row even though the pair is now
+        // already-audited and so never goes back to the judge -- the
+        // real evalhome run hit exactly this: 93 LOSSY rows recorded by a
+        // dry run stayed tombstoned forever because a naive `--apply`
+        // only restored pairs it freshly judged in that same call.
+        let conn = mem_conn();
+        let (old_id, _new_id, now) = seed_one_supersession(&conn);
+
+        let dry_llm = OwnedReplyLlm { reply: format!("{} LOSSY dropped a dated fact", old_id) };
+        let dry = run_supersession_audit(&conn, &dry_llm, &now, None, false, false).unwrap();
+        assert_eq!(dry.lossy, 1);
+        assert!(store::get(&conn, old_id).unwrap().unwrap().is_superseded(), "dry run must not restore");
+
+        struct PanicLlm;
+        impl ReflectLlm for PanicLlm {
+            fn call(&self, _model: &str, _prompt: &str, _timeout: std::time::Duration) -> Result<String, String> {
+                panic!("must never re-ask a pair already recorded in supersession_audit");
+            }
+        }
+        let apply_result = run_supersession_audit(&conn, &PanicLlm, &now, None, true, false).unwrap();
+        assert_eq!(apply_result.audited, 0, "nothing new to judge -- the pair was already recorded");
+        assert_eq!(apply_result.lossy_rows.len(), 1);
+        assert!(apply_result.lossy_rows[0].restored);
+        assert_eq!(apply_result.lossy_rows[0].old_id, old_id);
+
+        let restored = store::get(&conn, old_id).unwrap().unwrap();
+        assert!(!restored.is_superseded());
+        assert!(store::is_pinned(&conn, old_id).unwrap());
+
+        // A third run (dry or apply) reports nothing further to do -- the
+        // row is no longer tombstoned, so it drops out of the repair queue.
+        let again = run_supersession_audit(&conn, &PanicLlm, &now, None, true, false).unwrap();
+        assert!(again.lossy_rows.is_empty(), "an already-restored row is not reported again");
+    }
+
+    #[test]
+    fn run_supersession_audit_limit_caps_candidates_oldest_first() {
+        let conn = mem_conn();
+        let (old_a, _new_a, now) = seed_one_supersession(&conn);
+        let old_b = store::insert(&conn, "old fact b", None, None, true, None, 5).unwrap();
+        let new_b = store::insert(&conn, "new fact b", None, None, true, None, 5).unwrap();
+        assert!(store::supersede(&conn, old_b, new_b, &now).unwrap());
+
+        // old_a was inserted (and tombstoned) first, so it is the older
+        // candidate even when both share a timestamp -- id breaks the tie.
+        let llm = OwnedReplyLlm { reply: format!("{} OK fine", old_a) };
+        let result = run_supersession_audit(&conn, &llm, &now, Some(1), false, false).unwrap();
+        assert_eq!(result.audited, 1, "--limit 1 sends only the oldest candidate");
     }
 
     // --- recall enrichment: dormant evidence excluded, never tombstoned ---
@@ -8726,13 +11396,13 @@ mod tests {
         let strangler = store::insert(&conn, "strangler pattern", None, None, true, Some(&e.embed("strangler").unwrap()), 5).unwrap();
         let _lonely = store::insert(&conn, "lonely", None, None, true, Some(&e.embed("lonely").unwrap()), 5).unwrap();
 
-        let before = search_hits(&conn, &e, "audit hub endpoints", 5, false, false, 0.5, &now, None).unwrap();
+        let before = search_hits(&conn, &e, "audit hub endpoints", 5, false, false, 0.5, &now, None, None, None).unwrap();
         assert!(before.hits.iter().all(|h| h.via_assoc.is_none()));
         assert!(!before.hits.iter().any(|h| h.id == strangler), "no edge yet: strangler is not near the query");
 
         store::reinforce_assoc(&conn, &[hub, strangler], &now).unwrap();
         store::reinforce_assoc(&conn, &[hub, strangler], &now).unwrap();
-        let after = search_hits(&conn, &e, "audit hub endpoints", 5, false, false, 0.3, &now, None).unwrap();
+        let after = search_hits(&conn, &e, "audit hub endpoints", 5, false, false, 0.3, &now, None, None, None).unwrap();
         let assoc = after.hits.iter().find(|h| h.id == strangler).expect("strangler pulled in by association");
         assert_eq!(assoc.via_assoc, Some(hub));
         let src = after.hits.iter().find(|h| h.id == hub).unwrap();
@@ -8780,6 +11450,52 @@ mod tests {
         let (renamed, retagged) = refresh_one_project(&conn, "git:xyz", "new-name", "/tmp/new-name", None, &now).unwrap();
         assert!(renamed, "a rename happened even though there was nothing to retag");
         assert_eq!(retagged, 0, "no memories existed yet, so nothing was retagged");
+    }
+
+    // --- recall-stats formatter (pure: no db, no clock) ---
+
+    #[test]
+    fn format_recall_stats_empty_window_prints_an_explanatory_line() {
+        let lines = format_recall_stats(&[]);
+        assert_eq!(lines, vec!["mach kb recall-stats: no judged sessions in this window".to_string()]);
+    }
+
+    #[test]
+    fn format_recall_stats_one_session_reports_its_own_precision_and_the_overall_line() {
+        let rows = vec![store::RecallStatsRow { session_id: "abcdef1234567890".to_string(), shown: 4, engaged: 3 }];
+        let lines = format_recall_stats(&rows);
+        assert_eq!(lines.len(), 2, "one session row plus the overall line");
+        assert!(lines[0].starts_with("abcdef12"), "session id is truncated to 8 chars: {:?}", lines[0]);
+        assert!(!lines[0].contains("567890"), "must not leak past the 8-char truncation: {:?}", lines[0]);
+        assert!(lines[0].contains('4'), "shown count present: {:?}", lines[0]);
+        assert!(lines[0].contains('3'), "engaged count present: {:?}", lines[0]);
+        assert!(lines[0].contains("75%"), "3/4 = 75%: {:?}", lines[0]);
+        assert!(lines[1].starts_with("OVERALL"));
+        assert!(lines[1].contains("75%"), "single session -> overall matches it: {:?}", lines[1]);
+    }
+
+    #[test]
+    fn format_recall_stats_overall_line_aggregates_across_sessions() {
+        let rows = vec![
+            store::RecallStatsRow { session_id: "session1".to_string(), shown: 2, engaged: 2 }, // 100%
+            store::RecallStatsRow { session_id: "session2".to_string(), shown: 2, engaged: 0 }, // 0%
+        ];
+        let lines = format_recall_stats(&rows);
+        assert_eq!(lines.len(), 3);
+        let overall = lines.last().unwrap();
+        assert!(overall.starts_with("OVERALL"));
+        assert!(overall.contains('4'), "total shown = 4: {:?}", overall);
+        assert!(overall.contains('2'), "total engaged = 2: {:?}", overall);
+        assert!(overall.contains("50%"), "2/4 = 50% blended, not averaged per-session: {:?}", overall);
+    }
+
+    #[test]
+    fn format_recall_stats_short_session_id_is_not_truncated_further() {
+        // A session id shorter than 8 chars (shouldn't happen in practice,
+        // but the formatter must not panic slicing past the string's end).
+        let rows = vec![store::RecallStatsRow { session_id: "abc".to_string(), shown: 1, engaged: 1 }];
+        let lines = format_recall_stats(&rows);
+        assert!(lines[0].starts_with("abc"));
     }
 }
 
@@ -8854,11 +11570,17 @@ mod improve_run_tests {
     #[derive(Default)]
     struct FakeVcs {
         managed: HashSet<PathBuf>,
+        status_before: Vec<PathBuf>,
         status_after: Vec<PathBuf>,
+        dirty: Vec<PathBuf>,
         added: RefCell<Vec<PathBuf>>,
         forgotten: RefCell<Vec<PathBuf>>,
         forced: RefCell<Vec<PathBuf>>,
         commits: RefCell<Vec<String>>,
+        // argv capture: every `targets` slice `commit` was actually called
+        // with, so a test can assert it is exactly the four write targets
+        // and never anything else (a dirty unrelated path in particular).
+        commit_targets: RefCell<Vec<Vec<PathBuf>>>,
         calls: RefCell<u32>,
     }
     impl FakeVcs {
@@ -8871,13 +11593,14 @@ mod improve_run_tests {
             Ok(self.managed.clone())
         }
         fn status(&self) -> Result<Vec<PathBuf>, String> {
-            // first call is the pre-run status (clean), later calls are post-run
+            // first call is the pre-run status (`status_before`, empty/clean
+            // by default), later calls are post-run (`status_after`)
             let mut c = self.calls.borrow_mut();
             *c += 1;
-            Ok(if *c == 1 { Vec::new() } else { self.status_after.clone() })
+            Ok(if *c == 1 { self.status_before.clone() } else { self.status_after.clone() })
         }
-        fn source_clean(&self) -> Result<bool, String> {
-            Ok(true)
+        fn dirty_targets(&self, targets: &[&Path]) -> Result<Vec<PathBuf>, String> {
+            Ok(targets.iter().map(|p| p.to_path_buf()).filter(|p| self.dirty.contains(p)).collect())
         }
         fn add(&self, path: &Path) -> Result<(), String> {
             self.added.borrow_mut().push(path.to_path_buf());
@@ -8891,8 +11614,9 @@ mod improve_run_tests {
             self.forced.borrow_mut().push(path.to_path_buf());
             Ok(())
         }
-        fn commit(&self, message: &str) -> Result<String, String> {
+        fn commit(&self, message: &str, targets: &[&Path]) -> Result<String, String> {
             self.commits.borrow_mut().push(message.to_string());
+            self.commit_targets.borrow_mut().push(targets.iter().map(|p| p.to_path_buf()).collect());
             Ok("abc1234".to_string())
         }
     }
@@ -8956,6 +11680,17 @@ mod improve_run_tests {
         assert!(commits[0].starts_with("improve: create "), "{}", commits[0]);
         assert!(commits[0].contains("no-debug-logging/SKILL.md"));
         assert!(commits[0].contains("CLAUDE.md"));
+        // The commit call is scoped to exactly the four write targets --
+        // never the changed-file list (which would still be safe here, but
+        // would NOT be if a stray change sat outside the targets) and never
+        // "whatever else happens to be dirty in the source repo".
+        let commit_targets = vcs.commit_targets.borrow();
+        assert_eq!(commit_targets.len(), 1);
+        let mut got: Vec<PathBuf> = commit_targets[0].clone();
+        got.sort();
+        let mut want: Vec<PathBuf> = t.roots().iter().map(|p| p.to_path_buf()).collect();
+        want.sort();
+        assert_eq!(got, want, "commit must be pathspec-scoped to exactly the write targets");
 
         let o = outcomes(&conn);
         assert_eq!(o.len(), 1);
@@ -9026,5 +11761,78 @@ mod improve_run_tests {
         let ImproveRun::Done(improve::Outcome::Failed { reason }) = run else { panic!("{:?}", run) };
         assert!(reason.contains("not chezmoi-managed"), "{}", reason);
         assert_eq!(std::fs::read_to_string(&t.claude_md).unwrap(), "# Global Rules\n\nrule one\nrule two\n", "llm never ran");
+    }
+
+    #[test]
+    fn dirty_unrelated_source_path_does_not_block() {
+        // A path the fake vcs was never told is dirty -- standing in for a
+        // real chezmoi source repo with unrelated WIP elsewhere (e.g.
+        // dot_config/mach) -- must not stop the run.
+        let (s, t, conn) = setup("dirty-unrelated");
+        let llm = FakeLlm {
+            writes: vec![(".claude/CLAUDE.md".into(), "# Global Rules\n\nrule one\nrule two\nrule three\n".into())],
+            reply: "IMPROVE-RESULT\naction: edit\nfiles: x\nrationale: r\nevidence: m1\n".into(),
+        };
+        let vcs = FakeVcs::managing(&t); // dirty: vec![] by default
+        let run = go(&conn, &llm, &vcs, &t, &s.0.join("snap"), false);
+        assert!(matches!(run, ImproveRun::Done(improve::Outcome::Applied { .. })), "{:?}", run);
+    }
+
+    #[test]
+    fn dirty_write_target_blocks_with_the_path_named() {
+        let (s, t, conn) = setup("dirty-target");
+        let llm = FakeLlm { writes: vec![], reply: String::new() };
+        let vcs = FakeVcs { dirty: vec![t.claude_md.clone()], ..FakeVcs::managing(&t) };
+        let run = go(&conn, &llm, &vcs, &t, &s.0.join("snap"), false);
+        let ImproveRun::Done(improve::Outcome::Failed { reason }) = run else { panic!("{:?}", run) };
+        assert!(reason.contains("uncommitted changes in write targets"), "{}", reason);
+        assert!(reason.contains(&t.claude_md.display().to_string()), "{}", reason);
+        assert!(!reason.contains(&t.skills_dir.display().to_string()), "only the dirty target is named: {}", reason);
+        assert!(vcs.commits.borrow().is_empty(), "llm never ran");
+    }
+
+    // --- fix-list item 7: pre-run chezmoi drift (`pre_status`), distinct
+    // --- from the git-dirty-source-repo guard above ---
+
+    #[test]
+    fn drift_unrelated_path_does_not_block() {
+        // A path `chezmoi status` reports before the run, but that isn't one
+        // of `improve`'s own write targets -- standing in for chezmoi
+        // tracking some other file outside anything this pass ever touches
+        // -- must not stop the run.
+        let (s, t, conn) = setup("drift-unrelated");
+        let llm = FakeLlm {
+            writes: vec![(".claude/CLAUDE.md".into(), "# Global Rules\n\nrule one\nrule two\nrule three\n".into())],
+            reply: "IMPROVE-RESULT\naction: edit\nfiles: x\nrationale: r\nevidence: m1\n".into(),
+        };
+        let vcs =
+            FakeVcs { status_before: vec![PathBuf::from("/home/u/.config/mach/some-unrelated-file")], ..FakeVcs::managing(&t) };
+        let run = go(&conn, &llm, &vcs, &t, &s.0.join("snap"), false);
+        assert!(matches!(run, ImproveRun::Done(improve::Outcome::Applied { .. })), "{:?}", run);
+    }
+
+    #[test]
+    fn drift_write_target_blocks_with_the_path_named() {
+        let (s, t, conn) = setup("drift-target");
+        let llm = FakeLlm { writes: vec![], reply: String::new() };
+        let vcs = FakeVcs { status_before: vec![t.claude_md.clone()], ..FakeVcs::managing(&t) };
+        let run = go(&conn, &llm, &vcs, &t, &s.0.join("snap"), false);
+        let ImproveRun::Done(improve::Outcome::Failed { reason }) = run else { panic!("{:?}", run) };
+        assert!(reason.contains("drifted from write targets before the run"), "{}", reason);
+        assert!(reason.contains(&t.claude_md.display().to_string()), "{}", reason);
+        assert!(!reason.contains(&t.skills_dir.display().to_string()), "only the drifted target is named: {}", reason);
+        assert!(vcs.commits.borrow().is_empty(), "llm never ran");
+    }
+
+    #[test]
+    fn drift_multiple_write_targets_are_all_named() {
+        let (s, t, conn) = setup("drift-multi");
+        let llm = FakeLlm { writes: vec![], reply: String::new() };
+        let vcs =
+            FakeVcs { status_before: vec![t.claude_md.clone(), t.skills_dir.clone()], ..FakeVcs::managing(&t) };
+        let run = go(&conn, &llm, &vcs, &t, &s.0.join("snap"), false);
+        let ImproveRun::Done(improve::Outcome::Failed { reason }) = run else { panic!("{:?}", run) };
+        assert!(reason.contains(&t.claude_md.display().to_string()), "{}", reason);
+        assert!(reason.contains(&t.skills_dir.display().to_string()), "{}", reason);
     }
 }

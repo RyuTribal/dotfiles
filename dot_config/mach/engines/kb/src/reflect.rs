@@ -13,6 +13,7 @@
 //! `classify::Classifier`. `ProcessReflectLlm` is the real implementation,
 //! reusing `classify::run_claude` (same invocation flags, same
 //! `MACH_KB_DIGEST=1` recursion guard).
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -34,15 +35,81 @@ pub trait ReflectLlm {
     fn call(&self, model: &str, prompt: &str, timeout: Duration) -> Result<String, String>;
 }
 
+/// How long `ProcessReflectLlm::call` waits before its one retry of a
+/// non-timeout failure. Real-world default; tests use
+/// `ProcessReflectLlm::with_bin_and_delay` with a short delay so a retry
+/// test doesn't cost 5 real seconds.
+pub const RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// After this many consecutive "retried, still failed" outcomes, `call`
+/// stops attempting the retry at all for the rest of the process — a
+/// deterministic slab where `claude` itself is broken (not merely flaky)
+/// would otherwise double the wait on every single call for no benefit.
+/// "Consecutive" resets to 0 the moment any call (first attempt or retry)
+/// succeeds; it never resets on its own with time, only on a success or
+/// process exit.
+pub const RETRY_CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
+
 pub struct ProcessReflectLlm {
     claude_bin: String,
+    retry_delay: Duration,
+    /// Opt-in: only `mach kb reflect` sets this true (`with_retry(true)`).
+    /// Off by default so `mach kb ask`/`cards`/`graph audit`/
+    /// `audit-supersessions`/`ingest-sessions`/`eval-ask` — every other
+    /// caller of `ProcessReflectLlm::new()` — never wait an extra
+    /// `retry_delay` on a failed call; those commands are interactive or
+    /// timer-driven on a much tighter cadence than reflect's own ~3h
+    /// window, where the extra wait buys little and costs latency the user
+    /// (for `ask`) or a shorter-interval timer (for the others) feels
+    /// directly.
+    retry_transient: bool,
+    /// Circuit-breaker counter (interior mutability: `ReflectLlm::call`
+    /// takes `&self`, and this needs to persist across calls on the same
+    /// instance within one process). `Cell`, not `Mutex`/`Atomic*`: this
+    /// codebase's reflect pipeline is single-threaded, so the simplest
+    /// interior-mutability primitive is the right one.
+    consecutive_retry_failures: Cell<u32>,
 }
 
 impl ProcessReflectLlm {
     /// Uses `CLAUDE_BIN` if set (same env var `kb-capture.sh`/`classify`
-    /// honor), otherwise plain `claude` from `PATH`.
+    /// honor), otherwise plain `claude` from `PATH`. Retry is off by
+    /// default — see `with_retry`.
     pub fn new() -> Self {
-        ProcessReflectLlm { claude_bin: std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string()) }
+        ProcessReflectLlm {
+            claude_bin: std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string()),
+            retry_delay: RETRY_DELAY,
+            retry_transient: false,
+            consecutive_retry_failures: Cell::new(0),
+        }
+    }
+
+    /// Opts into (or explicitly out of) the one-retry-on-a-transient-failure
+    /// behavior documented on `ReflectLlm for ProcessReflectLlm`. `mach kb
+    /// reflect` is the only caller that passes `true` (see `cli::cmd_reflect`).
+    pub fn with_retry(mut self, enabled: bool) -> Self {
+        self.retry_transient = enabled;
+        self
+    }
+
+    /// Test-only constructor: an explicit binary and retry delay (retry
+    /// enabled), so a fake-`claude` script and a short delay can stand in
+    /// for the real `CLAUDE_BIN` env var and the real 5s wait.
+    #[cfg(test)]
+    pub fn with_bin_and_delay(bin: &str, retry_delay: Duration) -> Self {
+        Self::with_bin_delay_and_retry(bin, retry_delay, true)
+    }
+
+    /// Test-only constructor exposing `retry_transient` explicitly, for
+    /// testing the opt-in default and the circuit breaker.
+    #[cfg(test)]
+    pub fn with_bin_delay_and_retry(bin: &str, retry_delay: Duration, retry_transient: bool) -> Self {
+        ProcessReflectLlm {
+            claude_bin: bin.to_string(),
+            retry_delay,
+            retry_transient,
+            consecutive_retry_failures: Cell::new(0),
+        }
     }
 }
 
@@ -52,9 +119,89 @@ impl Default for ProcessReflectLlm {
     }
 }
 
+/// Whether a `run_claude` failure is worth retrying: a timeout already
+/// gave the model the full budget it was allotted, so trying again with
+/// the same timeout is unlikely to help and just doubles the wait --
+/// everything else (`exited with ...`, a spawn error) is treated as
+/// transient (the `claude` CLI's own flakiness measured at 13-55% per pass
+/// in the reflection-usage evidence report, not a content problem) and
+/// gets one retry.
+fn is_retryable_failure(err: &str) -> bool {
+    !err.contains("timed out")
+}
+
+/// `ProcessReflectLlm::call` (`retry_transient` opt-in, `mach kb reflect`
+/// only — see that field's own doc comment): on a non-timeout failure
+/// (`'claude' exited with ...`, a spawn error), waits `retry_delay` and
+/// tries once more before giving up, UNLESS the per-process circuit
+/// breaker (`RETRY_CIRCUIT_BREAKER_THRESHOLD` consecutive "retried, still
+/// failed" outcomes) has already tripped, in which case it returns the
+/// first failure immediately with no retry attempt at all. A timeout is
+/// never retried regardless (`is_retryable_failure`). `LoggedLlm` wraps
+/// this whole call, so a retried (successful or not) call still produces
+/// exactly one `judge_log` row.
 impl ReflectLlm for ProcessReflectLlm {
     fn call(&self, model: &str, prompt: &str, timeout: Duration) -> Result<String, String> {
-        run_claude(&self.claude_bin, model, timeout, prompt)
+        let first = run_claude(&self.claude_bin, model, timeout, prompt);
+        let err = match first {
+            Ok(out) => return Ok(out),
+            Err(e) => e,
+        };
+        if !self.retry_transient
+            || !is_retryable_failure(&err)
+            || self.consecutive_retry_failures.get() >= RETRY_CIRCUIT_BREAKER_THRESHOLD
+        {
+            return Err(err);
+        }
+        std::thread::sleep(self.retry_delay);
+        match run_claude(&self.claude_bin, model, timeout, prompt) {
+            Ok(out) => {
+                self.consecutive_retry_failures.set(0);
+                Ok(out)
+            }
+            Err(retry_err) => {
+                self.consecutive_retry_failures.set(self.consecutive_retry_failures.get() + 1);
+                Err(format!("{} (retried, still failed: {})", err, retry_err))
+            }
+        }
+    }
+}
+
+/// Decorator that records every call in `judge_log` (see
+/// `store::migrate_v25_to_v26` for why) and returns the wrapped client's
+/// result unchanged. A failed log insert only warns: the log is
+/// observability for a later model evaluation and must never change what a
+/// pass does or make a run look failed.
+pub struct LoggedLlm<'a, L: ReflectLlm> {
+    conn: &'a rusqlite::Connection,
+    pass: &'static str,
+    inner: &'a L,
+}
+
+impl<'a, L: ReflectLlm> LoggedLlm<'a, L> {
+    pub fn new(conn: &'a rusqlite::Connection, pass: &'static str, inner: &'a L) -> Self {
+        LoggedLlm { conn, pass, inner }
+    }
+}
+
+impl<L: ReflectLlm> ReflectLlm for LoggedLlm<'_, L> {
+    fn call(&self, model: &str, prompt: &str, timeout: Duration) -> Result<String, String> {
+        let started = std::time::Instant::now();
+        let result = self.inner.call(model, prompt, timeout);
+        let latency_ms = started.elapsed().as_millis() as u64;
+        let outcome = result.as_deref().map_err(|e| e.as_str());
+        if let Err(e) = crate::store::log_judge_call(
+            self.conn,
+            self.pass,
+            model,
+            prompt,
+            outcome,
+            latency_ms,
+            &crate::store::now_rfc3339(),
+        ) {
+            eprintln!("mach kb: judge_log write failed for pass '{}': {}", self.pass, e);
+        }
+        result
     }
 }
 
@@ -68,7 +215,7 @@ pub fn build_questions_prompt(working_set: &[(i64, String)]) -> String {
     let mut s = String::new();
     s.push_str(
         "You are analyzing a personal knowledge bank to find deeper patterns. \
-         Here are recent statements from a personal knowledge bank (id: content):\n\n",
+         Here are statements from a personal knowledge bank (id: content):\n\n",
     );
     for (id, content) in working_set {
         s.push_str(&format!("{}: {}\n", id, content));
@@ -320,6 +467,141 @@ pub fn parse_contradiction(output: &str) -> Option<i64> {
             if let Some(id) = rest.trim().trim_start_matches('#').split_whitespace().next().and_then(|t| t.parse().ok())
             {
                 return Some(id);
+            }
+        }
+    }
+    None
+}
+
+// --- re-verification: revise/drop/keep ---
+
+/// Builds the one-sonnet-call revise/drop/keep check, run only after
+/// `parse_contradiction` has already found the insight's evidence turned
+/// against it (`cli::run_insight_stage`'s verification loop). Before this
+/// call existed, a contradicted insight had exactly one fate: flagged
+/// forever at whatever wording it was minted with, going stale in the
+/// session-start mental model the moment its evidence moved on. This gives
+/// the model a chance to correct the wording instead of only doubting it.
+///
+/// `evidence` is the SAME current-evidence candidate rows the contradiction
+/// check itself just used (a fresh top-N similarity search over the
+/// insight's own text, not its original citations) — the whole point is to
+/// judge the belief against what the bank says NOW, not against the
+/// evidence it was minted from.
+pub fn build_revise_prompt(insight_text: &str, evidence: &[(i64, String)]) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "A derived insight in a personal knowledge bank no longer matches its evidence. \
+         Decide what should happen to it.\n\n",
+    );
+    s.push_str("Insight:\n");
+    s.push_str(insight_text);
+    s.push_str("\n\nCurrent evidence:\n");
+    for (id, content) in evidence {
+        s.push_str(&format!("[{}] {}\n", id, content));
+    }
+    s.push_str(
+        "\nDoes the current evidence support a CORRECTED version of this insight, no longer \
+         support it at all, or does the original insight actually still hold? Reply with \
+         exactly one line and nothing else:\n\
+         \"KEEP\" if the original insight still holds as written,\n\
+         \"DROP\" if the evidence no longer supports this belief in any form,\n\
+         or \"REVISE: <corrected single-sentence belief> (because of: <id>, <id>)\" if a \
+         corrected version is directly supported by at least two of the evidence rows above, \
+         citing their ids.\n\
+         Do not put memory ids or a (because of: ...) note inside the new text itself.\n\
+         A belief anchored to a date or period is history: do not revise it into a statement \
+         about the present; reply KEEP or DROP.\n\
+         Prefer KEEP when the evidence is mixed.\n",
+    );
+    s
+}
+
+/// What the revise/drop/keep judge decided about a contradicted insight —
+/// `cli::run_insight_stage`'s verification loop acts on this instead of
+/// unconditionally flagging.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReviseVerdict {
+    /// The evidence supports a corrected belief, cited to `>= 2` of the
+    /// evidence rows the judge was shown (`.1`, the parsed `(because of:
+    /// ...)` ids — already validated against the evidence set by
+    /// `parse_revise`, never a hallucinated id). The caller re-embeds `.0`,
+    /// calls `store::revise_insight` with `.1` so they get folded into
+    /// `source_ids`, and lowers confidence by one `INSIGHT_CONFIDENCE_STEP`
+    /// (same floor as a flag) — a REVISE means the ORIGINAL wording didn't
+    /// hold, so it's not a free confidence pass, just not as severe as a
+    /// full contradiction. The stale flag (if any) is cleared.
+    Revise(String, Vec<i64>),
+    /// The evidence no longer supports this belief in any form — handled
+    /// exactly like the pre-existing "contradicted, no revision available"
+    /// outcome: `store::flag_insight`. Also the fallback for a `REVISE:`
+    /// reply that failed the citation floor (fewer than 2 ids, or an id not
+    /// among the evidence rows shown) — an uncited "correction" is not
+    /// trusted any more than no correction at all.
+    Drop,
+    /// The original insight still holds despite the contradiction check's
+    /// own candidate search turning something up — `store::mark_insight_verified`.
+    Keep,
+}
+
+/// Parses the revise/drop/keep judge's reply. Scans line by line
+/// (tolerating leading chatter, like every other judge parser in this
+/// module) for `DROP`, `KEEP`, or a `REVISE:`-prefixed line carrying the
+/// corrected text plus a trailing `(because of: <id>, <id>[, ...])`
+/// citation list, parsed with the same `parse_citations` every other
+/// citation list in this module uses. `evidence_ids` is the set of raw
+/// memory ids the judge was actually shown (`cli::run_insight_stage`'s
+/// `evidence_pairs`) — a `REVISE` reply is only honored (returns
+/// `ReviseVerdict::Revise`) when it cites `>= 2` ids that are ALL members
+/// of that set; anything short of that (no citation clause, fewer than 2
+/// ids, malformed tokens, or an id outside the evidence shown) is applied
+/// as `ReviseVerdict::Drop` rather than treated as a parse failure — an
+/// uncited "correction" gets the same fate as no correction, not a silent
+/// pass. `None` on an empty reply or a `REVISE:` line with nothing before
+/// the citation clause (or no text at all) — the caller (`cli::
+/// run_insight_stage`) treats THAT exactly like the sonnet call itself
+/// failing: flag the insight and mark the run degraded, never silently
+/// revise text the model didn't actually provide.
+pub fn parse_revise(output: &str, evidence_ids: &[i64]) -> Option<ReviseVerdict> {
+    let marker = "(because of:";
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.eq_ignore_ascii_case("DROP") {
+            return Some(ReviseVerdict::Drop);
+        }
+        if line.eq_ignore_ascii_case("KEEP") {
+            return Some(ReviseVerdict::Keep);
+        }
+        if let Some(prefix) = line.get(..7) {
+            if prefix.eq_ignore_ascii_case("REVISE:") {
+                let rest = line[7..].trim();
+                if rest.is_empty() {
+                    return None;
+                }
+                if !rest.ends_with(')') {
+                    // No citation clause at all -- fails the floor outright.
+                    return Some(ReviseVerdict::Drop);
+                }
+                let open = match find_ignore_case(rest, marker) {
+                    Some(i) => i,
+                    None => return Some(ReviseVerdict::Drop),
+                };
+                let text = rest[..open].trim().trim_matches('`').trim();
+                if text.is_empty() {
+                    return None;
+                }
+                let inner = &rest[open + marker.len()..rest.len() - 1];
+                let ids = match parse_citations(inner) {
+                    Ok((_insight_refs, memory_ids)) => memory_ids,
+                    Err(_) => return Some(ReviseVerdict::Drop),
+                };
+                if ids.len() < 2 || !ids.iter().all(|id| evidence_ids.contains(id)) {
+                    return Some(ReviseVerdict::Drop);
+                }
+                return Some(ReviseVerdict::Revise(text.to_string(), ids));
             }
         }
     }
@@ -741,18 +1023,33 @@ pub fn claude_reachable() -> bool {
     }
 }
 
-/// Whether `mach kb reflect` should advance its watermark (`last_run_at` +
-/// `last_memory_id`) this run: never when there was nothing new to
-/// examine in the first place (unchanged, long-standing rule — a
-/// `--meta`-only invocation must never clobber it back to NULL), and never
-/// when any `claude` call failed partway through this run (offline mid-run,
-/// a spawn error, a timeout) — a partial run leaves some of this run's new
-/// material, or a dedupe/verification candidate, unexamined, and the
-/// watermark must not claim otherwise. Both fields move together or not at
-/// all: an offline or degraded run must be fully retry-able next time, not
-/// have some of its queues silently orphaned behind an advanced watermark.
-pub fn should_advance_watermark(has_new: bool, llm_failed: bool) -> bool {
-    has_new && !llm_failed
+/// Whether `mach kb reflect`'s insight stage should mark its working set
+/// reflected (`memories.reflected_at`, schema v30) this run.
+///
+/// Replaces the old all-or-nothing `should_advance_watermark`, which
+/// required the ENTIRE run -- dedupe, contradiction, curation, strength
+/// review, graph extraction, graph hygiene, dormancy, insight dedupe,
+/// entity cards, meta, all of it -- to finish with zero `claude` call
+/// failures before `reflect_state.last_memory_id` moved at all. Per-pass
+/// error rates of 13-55% (`judge_log`) made a fully clean run across 10+
+/// passes statistically rare, and it happened on 0 of 43 runs over 7 days
+/// in the live bank, freezing the watermark for two weeks while the bank
+/// kept growing.
+///
+/// Failure isolation now means what it says: a failure in graph extraction,
+/// entity cards, or any other pass has no bearing on this decision at all
+/// -- each of those passes tracks its own progress and retries its own
+/// failures independently (their own `*_seen` tables, `graph_extracted_at`,
+/// etc.). Only two things matter here: whether the insight stage actually
+/// had a working set to examine in the first place (`has_working_set` --
+/// a `--meta`-only invocation with nothing due must never mark anything),
+/// and whether the insight stage ITSELF failed -- stage-1 questions,
+/// stage-2 insight synthesis, or insight re-verification, the three
+/// LLM-touching steps `cli::run_insight_stage` runs (`insight_stage_failed`).
+/// A row is never marked reflected on the strength of a check that never
+/// actually happened.
+pub fn should_mark_reflected(has_working_set: bool, insight_stage_failed: bool) -> bool {
+    has_working_set && !insight_stage_failed
 }
 
 // --- nightly dedupe pass ---
@@ -1601,6 +1898,26 @@ pub const GRAPH_EXTRACTION_BATCH_SIZE: usize = 12;
 /// needs more headroom than a single-fact call's `TIMEOUT_HAIKU`.
 pub const TIMEOUT_HAIKU_BATCH: Duration = Duration::from_secs(60);
 
+/// Timeout for `cli::run_graph_extraction_pass`'s own batched calls (the
+/// per-batch extraction call and `resolve_pending_conflicts`'s end-of-run
+/// edge-conflict call -- both tagged `graph_extraction` in `judge_log`),
+/// raised from `TIMEOUT_HAIKU_BATCH` (60s) after measuring the live bank's
+/// `judge_log` (`pass = 'graph_extraction'`, `length(prompt)` grouped by
+/// outcome): every timeout hit the 60s ceiling exactly (60060-60082ms) at
+/// prompt sizes from 5189 to 10024 chars, while SUCCESSFUL calls at
+/// comparable or larger sizes (8861, 9549, 10279 chars) completed in
+/// 18.5s-57.9s -- close enough to the ceiling that most observed timeouts
+/// read as near-misses on latency variance, not a size a smaller batch
+/// would avoid. Halving `GRAPH_EXTRACTION_BATCH_SIZE` was rejected: the
+/// smallest timed-out prompt (5189 chars) is already roughly half of the
+/// largest (10024 chars) and still timed out, and four "other" failures
+/// logged at a uniform 1201ms (a spawn/connectivity failure, not a slow
+/// reply) would be untouched by any batch-size change either way. Applies
+/// only to this pass -- `TIMEOUT_HAIKU_BATCH` itself is unchanged for the
+/// other passes that share it (entity cards, insight dedupe, entity merge,
+/// `ask`, graph audit), none of which showed this pattern.
+pub const TIMEOUT_GRAPH_EXTRACTION: Duration = Duration::from_secs(120);
+
 /// Builds the graph-extraction judge's one-call prompt for a whole batch of
 /// memories at once: each fact is numbered, and the model is required to
 /// address every number in its reply (either relation lines or an explicit
@@ -2134,6 +2451,110 @@ pub fn parse_batch_graph_audit_verdicts(output: &str, num_edges: usize) -> HashM
     out
 }
 
+// --- supersession audit: was a tombstone lossy? ---
+
+/// Batch size for `mach kb audit-supersessions`: one call per 8 old/new
+/// pairs, per the task spec -- small enough that the sonnet judge can
+/// actually weigh each pair's full content rather than skimming a wall of
+/// text, matching `TIMEOUT_SONNET`'s own "up to 8 evidence rows" budget.
+pub const SUPERSESSION_AUDIT_BATCH_SIZE: usize = 8;
+
+/// Builds one batch's prompt: every pair as `OLD #<old_id>: ...` /
+/// `NEW #<new_id>: ...`, asking whether the tombstone lost information.
+/// Keyed on the real memory ids (not a 1-based batch position, unlike the
+/// other batched judges here) because the reply must name `old_id`
+/// directly -- the caller has no positional index to fall back on once
+/// results are merged back into `supersession_audit`.
+///
+/// The dated-history rule is spelled out explicitly: a fact scoped to a
+/// date ("on 2026-09-07", "as of last Tuesday") is a historical record, and
+/// losing that specific dated statement is LOSSY even when NEW's general
+/// claim is otherwise a fair description of OLD -- same reasoning
+/// `build_contradiction_pass_prompt`'s BOTH_HOLD carve-out and `restore`'s
+/// doc comment already rest on for dated snapshots.
+pub fn build_supersession_audit_prompt(pairs: &[(i64, &str, i64, &str)]) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "You are auditing automatic supersessions in a personal knowledge bank. Each pair below \
+         shows a memory that was tombstoned (OLD) and the memory that replaced it (NEW). For each \
+         pair, decide: is every fact stated in OLD either still stated in NEW, or replaced by NEW \
+         with a newer value for the SAME attribute of the SAME subject?\n\n\
+         A dated fact in OLD -- anything scoped with \"on <date>\", \"as of <date>\", or similar -- \
+         is a historical record, not a claim NEW merely needs to agree with. If NEW does not carry \
+         that same dated statement, the supersession is LOSSY even when NEW's general claim is \
+         otherwise consistent with OLD: a newer snapshot does not make an older, differently-dated \
+         one wrong to have said.\n\n\
+         OK means nothing OLD said is missing from NEW: either NEW restates it, or NEW correctly \
+         updates the same attribute of the same subject to a newer value.\n\
+         LOSSY means OLD said something -- a fact, a qualification, a dated statement -- that NEW \
+         does not carry at all, so tombstoning OLD threw that information away.\n\n",
+    );
+    for (old_id, old_content, new_id, new_content) in pairs {
+        s.push_str(&format!("OLD #{}: {}\nNEW #{}: {}\n\n", old_id, old_content, new_id, new_content));
+    }
+    s.push_str(
+        "For each pair, reply with exactly one line, using OLD's id, and nothing else:\n\
+         <old_id> OK <short reason>\n\
+         or\n\
+         <old_id> LOSSY <short reason>\n",
+    );
+    s
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupersessionAuditVerdict {
+    Ok,
+    Lossy,
+}
+
+/// One pair's parsed verdict plus the judge's short reason (verbatim,
+/// whitespace-collapsed by line parsing -- never re-derived, since the
+/// dry-run report and `supersession_audit.reason` both need the judge's
+/// own words, not a paraphrase).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupersessionAuditResult {
+    pub verdict: SupersessionAuditVerdict,
+    pub reason: String,
+}
+
+/// Parses a batch reply into `old_id -> result`, tolerant like the other
+/// batched judges: leading chatter is ignored, a `#` before the id is
+/// stripped, extra whitespace between fields is fine, and a missing reason
+/// after the verdict token just leaves it empty rather than failing the
+/// line. An id not present in `expected_ids` (hallucinated, or naming
+/// NEW's id instead of OLD's) is dropped rather than trusted. An id from
+/// `expected_ids` that never appears in a valid line is simply absent from
+/// the map -- the caller's contract is "no verdict = never restore",
+/// mirroring the unaddressed-pair handling of every other batched judge in
+/// this module.
+pub fn parse_supersession_audit_verdicts(output: &str, expected_ids: &[i64]) -> HashMap<i64, SupersessionAuditResult> {
+    let allowed: HashSet<i64> = expected_ids.iter().copied().collect();
+    let mut out = HashMap::new();
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((id_tok, after_id)) = line.split_once(char::is_whitespace) else { continue };
+        let Ok(id) = id_tok.trim().trim_start_matches('#').trim_end_matches(':').parse::<i64>() else { continue };
+        if !allowed.contains(&id) {
+            continue;
+        }
+        let rest = after_id.trim_start();
+        let (verdict_tok, reason) = match rest.split_once(char::is_whitespace) {
+            Some((v, r)) => (v, r.trim()),
+            None => (rest, ""),
+        };
+        let verdict = match verdict_tok.trim().to_uppercase().as_str() {
+            "OK" => SupersessionAuditVerdict::Ok,
+            "LOSSY" => SupersessionAuditVerdict::Lossy,
+            _ => continue,
+        };
+        out.insert(id, SupersessionAuditResult { verdict, reason: reason.to_string() });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2363,6 +2784,121 @@ mod tests {
         assert_eq!(parse_contradiction(""), None);
         assert_eq!(parse_contradiction("maybe?"), None);
         assert_eq!(parse_contradiction("YES"), None); // missing id
+    }
+
+    // --- revise/drop/keep ---
+
+    #[test]
+    fn parse_revise_extracts_the_corrected_text_and_cited_ids() {
+        assert_eq!(
+            parse_revise("REVISE: the user ships mid-week, not on Fridays (because of: 4, 7)", &[4, 7]),
+            Some(ReviseVerdict::Revise("the user ships mid-week, not on Fridays".to_string(), vec![4, 7]))
+        );
+        // case-insensitive prefix, like every other judge token in this module
+        assert_eq!(
+            parse_revise("revise: lowercase prefix still works (because of: 1, 2)", &[1, 2]),
+            Some(ReviseVerdict::Revise("lowercase prefix still works".to_string(), vec![1, 2]))
+        );
+    }
+
+    #[test]
+    fn parse_revise_drop_and_keep() {
+        assert_eq!(parse_revise("DROP", &[]), Some(ReviseVerdict::Drop));
+        assert_eq!(parse_revise("drop\n", &[]), Some(ReviseVerdict::Drop));
+        assert_eq!(parse_revise("KEEP", &[]), Some(ReviseVerdict::Keep));
+        assert_eq!(parse_revise("keep", &[]), Some(ReviseVerdict::Keep));
+    }
+
+    #[test]
+    fn parse_revise_scans_past_leading_chatter() {
+        assert_eq!(
+            parse_revise("Let me think about this.\nDROP", &[]),
+            Some(ReviseVerdict::Drop),
+            "must tolerate preamble before the verdict line, like the other judge parsers"
+        );
+    }
+
+    #[test]
+    fn parse_revise_malformed_or_empty_revise_text_returns_none() {
+        assert_eq!(parse_revise("", &[1, 2]), None);
+        assert_eq!(parse_revise("maybe?", &[1, 2]), None);
+        assert_eq!(parse_revise("REVISE:", &[1, 2]), None, "no text after the colon must not fabricate a revision");
+        assert_eq!(
+            parse_revise("REVISE:   ", &[1, 2]),
+            None,
+            "whitespace-only text after the colon must not fabricate one either"
+        );
+        assert_eq!(
+            parse_revise("REVISE: (because of: 1, 2)", &[1, 2]),
+            None,
+            "citations with no actual belief text must not fabricate one either"
+        );
+    }
+
+    #[test]
+    fn parse_revise_without_two_valid_citations_is_applied_as_drop() {
+        // No citation clause at all.
+        assert_eq!(
+            parse_revise("REVISE: the user ships mid-week now", &[1, 2]),
+            Some(ReviseVerdict::Drop),
+            "a REVISE with no (because of: ...) clause fails the citation floor"
+        );
+        // Only one id cited.
+        assert_eq!(
+            parse_revise("REVISE: the user ships mid-week now (because of: 1)", &[1, 2]),
+            Some(ReviseVerdict::Drop),
+            "fewer than 2 cited ids fails the floor"
+        );
+        // Cited ids not among the evidence actually shown.
+        assert_eq!(
+            parse_revise("REVISE: the user ships mid-week now (because of: 8, 9)", &[1, 2]),
+            Some(ReviseVerdict::Drop),
+            "ids outside the evidence shown must not be trusted"
+        );
+        // One valid id, one hallucinated id.
+        assert_eq!(
+            parse_revise("REVISE: the user ships mid-week now (because of: 1, 9)", &[1, 2]),
+            Some(ReviseVerdict::Drop),
+            "every cited id must be among the evidence shown, not just one of them"
+        );
+        // Malformed citation tokens.
+        assert_eq!(
+            parse_revise("REVISE: the user ships mid-week now (because of: not-an-id, 2)", &[1, 2]),
+            Some(ReviseVerdict::Drop),
+            "unparseable citation tokens fail the floor too, same fallback as too few ids"
+        );
+    }
+
+    #[test]
+    fn build_revise_prompt_includes_insight_and_evidence() {
+        let p = build_revise_prompt(
+            "the user always ships on Fridays",
+            &[(4, "shipped mid-week again this sprint".to_string())],
+        );
+        assert!(p.contains("the user always ships on Fridays"));
+        assert!(p.contains("[4] shipped mid-week again this sprint"));
+        assert!(p.contains("REVISE"));
+        assert!(p.contains("DROP"));
+        assert!(p.contains("KEEP"));
+        assert!(p.contains("because of:"));
+        assert!(
+            p.contains("Do not put memory ids or a (because of: ...) note inside the new text itself."),
+            "verbatim instruction sentence must be present"
+        );
+        assert!(
+            p.contains(
+                "A belief anchored to a date or period is history: do not revise it into a statement about the \
+                 present; reply KEEP or DROP."
+            ),
+            "verbatim instruction sentence must be present"
+        );
+        assert!(p.contains("Prefer KEEP when the evidence is mixed."));
+        // KEEP is listed before DROP, which is listed before REVISE.
+        let keep_pos = p.find("\"KEEP\"").expect("KEEP option present");
+        let drop_pos = p.find("\"DROP\"").expect("DROP option present");
+        let revise_pos = p.find("\"REVISE:").expect("REVISE option present");
+        assert!(keep_pos < drop_pos, "KEEP must be listed first");
+        assert!(drop_pos < revise_pos, "DROP must be listed before REVISE");
     }
 
     // --- confidence ---
@@ -2627,21 +3163,34 @@ mod tests {
         }
     }
 
-    // --- opportunistic scheduling: watermark-advance predicate ---
+    // --- insight stage: should_mark_reflected predicate ---
 
     #[test]
-    fn should_advance_watermark_requires_new_material() {
-        assert!(!should_advance_watermark(false, false), "nothing new -- never advance, even if nothing failed");
+    fn should_mark_reflected_requires_a_working_set() {
+        assert!(!should_mark_reflected(false, false), "nothing due -- never mark, even if nothing failed");
     }
 
     #[test]
-    fn should_advance_watermark_frozen_when_any_llm_call_failed() {
-        assert!(!should_advance_watermark(true, true), "offline/degraded mid-run -- must stay retry-able");
+    fn should_mark_reflected_false_when_the_insight_stage_itself_failed() {
+        assert!(!should_mark_reflected(true, true), "a failure in the insight stage itself marks nothing");
     }
 
     #[test]
-    fn should_advance_watermark_true_only_when_new_and_nothing_failed() {
-        assert!(should_advance_watermark(true, false));
+    fn should_mark_reflected_true_only_when_a_working_set_existed_and_the_insight_stage_did_not_fail() {
+        assert!(should_mark_reflected(true, false));
+    }
+
+    #[test]
+    fn should_mark_reflected_true_when_only_a_later_unrelated_pass_like_graph_extraction_failed() {
+        // should_mark_reflected takes only the insight stage's own failure
+        // flag as its second argument -- a caller that folds a later pass's
+        // failure (graph extraction, entity cards, ...) into some other,
+        // broader "did anything fail this run" flag and passes THAT in by
+        // mistake would defeat failure isolation. This test documents the
+        // contract at the type level: passing `false` here (insight stage
+        // itself did not fail) always marks the working set reflected,
+        // regardless of what happened in any other pass this same run.
+        assert!(should_mark_reflected(true, false), "graph extraction's own failure must never reach this call");
     }
 
     // --- nightly dedupe pass: candidate selection ---
@@ -3385,6 +3934,63 @@ banana: SAME
         assert_eq!(verdicts.len(), 1);
         assert_eq!(verdicts[&1], GraphAuditVerdict::Poisoned);
     }
+
+    // --- supersession audit ---
+
+    #[test]
+    fn build_supersession_audit_prompt_contains_each_pair_and_the_dated_history_rule() {
+        let p = build_supersession_audit_prompt(&[
+            (130, "action items from the 2026-09-07 meeting: rotate the token, ping ops", 1064, "meeting action items were tracked and resolved"),
+            (7, "the user drinks tea", 8, "the user drinks green tea"),
+        ]);
+        assert!(p.contains("OLD #130: action items from the 2026-09-07 meeting"));
+        assert!(p.contains("NEW #1064: meeting action items were tracked and resolved"));
+        assert!(p.contains("OLD #7: the user drinks tea"));
+        assert!(p.contains("NEW #8: the user drinks green tea"));
+        assert!(p.to_lowercase().contains("as of <date>") || p.to_lowercase().contains("on <date>"), "dated-history rule must be stated");
+        assert!(p.contains("historical record"), "must tell the judge a dated fact is history, not a stale claim");
+        assert!(p.contains("OK"));
+        assert!(p.contains("LOSSY"));
+    }
+
+    #[test]
+    fn parse_supersession_audit_verdicts_accepts_ok_and_lossy_with_reasons() {
+        let out = "130 LOSSY dropped the 2026-09-07 action items\n7 OK green tea is a newer value for the same fact";
+        let verdicts = parse_supersession_audit_verdicts(out, &[130, 7]);
+        assert_eq!(
+            verdicts[&130],
+            SupersessionAuditResult { verdict: SupersessionAuditVerdict::Lossy, reason: "dropped the 2026-09-07 action items".to_string() }
+        );
+        assert_eq!(
+            verdicts[&7],
+            SupersessionAuditResult { verdict: SupersessionAuditVerdict::Ok, reason: "green tea is a newer value for the same fact".to_string() }
+        );
+    }
+
+    #[test]
+    fn parse_supersession_audit_verdicts_missing_id_is_absent() {
+        let out = "130 LOSSY dropped the action items";
+        let verdicts = parse_supersession_audit_verdicts(out, &[130, 7]);
+        assert!(verdicts.contains_key(&130));
+        assert!(!verdicts.contains_key(&7), "an unaddressed id has no verdict -- caller must never restore on this");
+    }
+
+    #[test]
+    fn parse_supersession_audit_verdicts_ignores_garbage_and_ids_outside_the_batch() {
+        let out = "Sure, here goes:\n130 LOSSY good reason\n999 LOSSY hallucinated id\nbanana OK nonsense\n7";
+        let verdicts = parse_supersession_audit_verdicts(out, &[130, 7]);
+        assert_eq!(verdicts.len(), 1, "999 is outside the batch, banana isn't a number, and a bare id with no verdict token doesn't parse");
+        assert_eq!(verdicts[&130].verdict, SupersessionAuditVerdict::Lossy);
+    }
+
+    #[test]
+    fn parse_supersession_audit_verdicts_tolerates_hash_prefix_and_extra_whitespace() {
+        let out = "#130   LOSSY   extra   spaces  in  the reason";
+        let verdicts = parse_supersession_audit_verdicts(out, &[130]);
+        assert_eq!(verdicts[&130].verdict, SupersessionAuditVerdict::Lossy);
+        assert_eq!(verdicts[&130].reason, "extra   spaces  in  the reason");
+    }
+
     #[test]
     fn the_extraction_prompt_pins_the_causal_vocabulary() {
         let p = build_batch_extraction_prompt(&["a fact"]);
@@ -3404,4 +4010,282 @@ banana: SAME
         }
     }
 
+    struct ScriptedLlm {
+        reply: Result<&'static str, &'static str>,
+    }
+
+    impl ReflectLlm for ScriptedLlm {
+        fn call(&self, _model: &str, _prompt: &str, _timeout: Duration) -> Result<String, String> {
+            self.reply.map(|s| s.to_string()).map_err(|e| e.to_string())
+        }
+    }
+
+    fn judge_rows(conn: &rusqlite::Connection) -> Vec<(String, String, String, Option<String>, Option<String>)> {
+        let mut stmt = conn.prepare("SELECT pass, model, prompt, reply, error FROM judge_log ORDER BY id").unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn logged_llm_passes_reply_through_and_logs_it() {
+        let conn = crate::store::open_with_path(std::path::Path::new(":memory:")).unwrap();
+        let inner = ScriptedLlm { reply: Ok("DISTINCT") };
+        let llm = LoggedLlm::new(&conn, "dedupe", &inner);
+        assert_eq!(llm.call("haiku", "P", TIMEOUT_HAIKU).unwrap(), "DISTINCT");
+        assert_eq!(judge_rows(&conn), vec![("dedupe".into(), "haiku".into(), "P".into(), Some("DISTINCT".into()), None)]);
+    }
+
+    #[test]
+    fn logged_llm_passes_error_through_and_logs_it() {
+        let conn = crate::store::open_with_path(std::path::Path::new(":memory:")).unwrap();
+        let inner = ScriptedLlm { reply: Err("offline") };
+        let llm = LoggedLlm::new(&conn, "contradiction", &inner);
+        assert_eq!(llm.call("haiku", "P", TIMEOUT_HAIKU).unwrap_err(), "offline");
+        assert_eq!(judge_rows(&conn), vec![("contradiction".into(), "haiku".into(), "P".into(), None, Some("offline".into()))]);
+    }
+
+    #[test]
+    fn logged_llm_returns_inner_result_when_logging_fails() {
+        let conn = crate::store::open_with_path(std::path::Path::new(":memory:")).unwrap();
+        conn.execute_batch("DROP TABLE judge_log;").unwrap();
+        let inner = ScriptedLlm { reply: Ok("KEEP 1") };
+        let llm = LoggedLlm::new(&conn, "dedupe", &inner);
+        assert_eq!(llm.call("haiku", "P", TIMEOUT_HAIKU).unwrap(), "KEEP 1");
+    }
+
+    // --- ProcessReflectLlm: transient-failure retry ---
+
+    #[test]
+    fn is_retryable_failure_excludes_only_timeouts() {
+        assert!(!is_retryable_failure("'claude' timed out after 30s"));
+        assert!(is_retryable_failure("'claude' exited with Some(1) (no stderr)"));
+        assert!(is_retryable_failure("'claude' exited with Some(1): some stderr tail"));
+        assert!(is_retryable_failure("failed to spawn 'claude': No such file or directory"));
+    }
+
+    /// A scratch dir + a small `#!/bin/sh` fixture script standing in for
+    /// `CLAUDE_BIN`, same convention `improve.rs`'s and `cli.rs`'s own
+    /// process-spawning tests already use (`std::env::temp_dir()` plus a
+    /// pid-and-tag-qualified name, no `tempfile` crate). `script` counts
+    /// its own invocations in a state file so a test can assert exactly how
+    /// many times the fake `claude` process actually ran.
+    struct FakeClaudeScript {
+        dir: std::path::PathBuf,
+        script: std::path::PathBuf,
+        state_file: std::path::PathBuf,
+    }
+
+    impl FakeClaudeScript {
+        fn new(tag: &str, body: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!(
+                    "mach-kb-reflect-retry-test-{}-{}-{}",
+                    std::process::id(),
+                    tag,
+                    crate::store::now_rfc3339().replace([':', '-'], "")
+                ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let state_file = dir.join("calls");
+            std::fs::write(&state_file, "0").unwrap();
+            let script = dir.join("fake-claude.sh");
+            std::fs::write(&script, body.replace("__STATE__", state_file.to_str().unwrap())).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&script).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&script, perms).unwrap();
+            }
+            FakeClaudeScript { dir, script, state_file }
+        }
+
+        fn calls(&self) -> u32 {
+            std::fs::read_to_string(&self.state_file).unwrap().trim().parse().unwrap()
+        }
+    }
+
+    impl Drop for FakeClaudeScript {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn process_reflect_llm_retries_once_on_a_non_timeout_failure_then_succeeds() {
+        // Fails (exit 1) on its first invocation, succeeds on its second --
+        // the "fake LLM failing once then succeeding" scenario.
+        let fixture = FakeClaudeScript::new(
+            "retry-then-succeed",
+            "#!/bin/sh\n\
+             n=$(cat __STATE__); n=$((n+1)); echo $n > __STATE__\n\
+             cat >/dev/null\n\
+             if [ \"$n\" = \"1\" ]; then echo boom >&2; exit 1; fi\n\
+             echo ok\n",
+        );
+        let llm = ProcessReflectLlm::with_bin_and_delay(fixture.script.to_str().unwrap(), Duration::from_millis(10));
+        let result = llm.call("haiku", "prompt", Duration::from_secs(10));
+        assert_eq!(result.unwrap().trim(), "ok");
+        assert_eq!(fixture.calls(), 2, "exactly one retry, i.e. two total process invocations");
+    }
+
+    #[test]
+    fn process_reflect_llm_error_mentions_retried_when_the_retry_also_fails() {
+        let fixture = FakeClaudeScript::new(
+            "retry-then-fail",
+            "#!/bin/sh\n\
+             n=$(cat __STATE__); n=$((n+1)); echo $n > __STATE__\n\
+             cat >/dev/null\n\
+             echo boom >&2\n\
+             exit 1\n",
+        );
+        let llm = ProcessReflectLlm::with_bin_and_delay(fixture.script.to_str().unwrap(), Duration::from_millis(10));
+        let err = llm.call("haiku", "prompt", Duration::from_secs(10)).unwrap_err();
+        assert!(err.contains("retried"), "error was: {}", err);
+        assert_eq!(fixture.calls(), 2, "still only one retry, not a retry loop");
+    }
+
+    #[test]
+    fn process_reflect_llm_does_not_retry_a_timeout() {
+        let fixture = FakeClaudeScript::new(
+            "timeout-no-retry",
+            "#!/bin/sh\n\
+             n=$(cat __STATE__); n=$((n+1)); echo $n > __STATE__\n\
+             cat >/dev/null\n\
+             sleep 5\n",
+        );
+        let llm = ProcessReflectLlm::with_bin_and_delay(fixture.script.to_str().unwrap(), Duration::from_millis(10));
+        let err = llm.call("haiku", "prompt", Duration::from_millis(200)).unwrap_err();
+        assert!(err.contains("timed out"), "error was: {}", err);
+        assert!(!err.contains("retried"));
+        assert_eq!(fixture.calls(), 1, "a timeout must never be retried");
+    }
+
+    #[test]
+    fn logged_llm_records_exactly_one_row_for_a_retried_process_reflect_llm_call() {
+        // LoggedLlm times/logs the OUTER `ReflectLlm::call` -- ProcessReflectLlm's
+        // retry happens inside that one call, so a retried (and still-failing)
+        // call must still produce exactly one judge_log row, not two.
+        let fixture = FakeClaudeScript::new(
+            "logged-retry",
+            "#!/bin/sh\n\
+             n=$(cat __STATE__); n=$((n+1)); echo $n > __STATE__\n\
+             cat >/dev/null\n\
+             echo boom >&2\n\
+             exit 1\n",
+        );
+        let conn = crate::store::open_with_path(std::path::Path::new(":memory:")).unwrap();
+        let inner = ProcessReflectLlm::with_bin_and_delay(fixture.script.to_str().unwrap(), Duration::from_millis(10));
+        let llm = LoggedLlm::new(&conn, "insights", &inner);
+        let _ = llm.call("haiku", "prompt", Duration::from_secs(10));
+        let rows = judge_rows(&conn);
+        assert_eq!(rows.len(), 1, "one outer call, one judge_log row, even though the process ran twice");
+        assert!(rows[0].4.as_deref().unwrap().contains("retried"));
+        assert_eq!(fixture.calls(), 2);
+    }
+
+    #[test]
+    fn retry_is_off_by_default_so_a_plain_new_never_retries() {
+        // `ProcessReflectLlm::new()` (what every caller except cmd_reflect
+        // uses) must never wait retry_delay: `with_bin_delay_and_retry`
+        // with `retry_transient: false` mirrors that default.
+        let fixture = FakeClaudeScript::new(
+            "retry-opt-out",
+            "#!/bin/sh\n\
+             n=$(cat __STATE__); n=$((n+1)); echo $n > __STATE__\n\
+             cat >/dev/null\n\
+             echo boom >&2\n\
+             exit 1\n",
+        );
+        let llm = ProcessReflectLlm::with_bin_delay_and_retry(
+            fixture.script.to_str().unwrap(),
+            Duration::from_millis(10),
+            false,
+        );
+        let err = llm.call("haiku", "prompt", Duration::from_secs(10)).unwrap_err();
+        assert!(!err.contains("retried"), "error was: {}", err);
+        assert_eq!(fixture.calls(), 1, "opted out -- exactly one attempt, no retry");
+    }
+
+    #[test]
+    fn with_retry_true_turns_retry_on_explicitly() {
+        let fixture = FakeClaudeScript::new(
+            "retry-opt-in-explicit",
+            "#!/bin/sh\n\
+             n=$(cat __STATE__); n=$((n+1)); echo $n > __STATE__\n\
+             cat >/dev/null\n\
+             if [ \"$n\" = \"1\" ]; then echo boom >&2; exit 1; fi\n\
+             echo ok\n",
+        );
+        let llm = ProcessReflectLlm::with_bin_delay_and_retry(
+            fixture.script.to_str().unwrap(),
+            Duration::from_millis(10),
+            true,
+        );
+        let result = llm.call("haiku", "prompt", Duration::from_secs(10));
+        assert_eq!(result.unwrap().trim(), "ok");
+        assert_eq!(fixture.calls(), 2);
+    }
+
+    #[test]
+    fn retry_circuit_breaker_stops_retrying_after_three_consecutive_still_failed_results() {
+        // A script that always fails -- every call is a "retried, still
+        // failed" outcome until the breaker trips.
+        let fixture = FakeClaudeScript::new(
+            "circuit-breaker",
+            "#!/bin/sh\n\
+             n=$(cat __STATE__); n=$((n+1)); echo $n > __STATE__\n\
+             cat >/dev/null\n\
+             echo boom >&2\n\
+             exit 1\n",
+        );
+        let llm = ProcessReflectLlm::with_bin_and_delay(fixture.script.to_str().unwrap(), Duration::from_millis(10));
+
+        for i in 1..=RETRY_CIRCUIT_BREAKER_THRESHOLD {
+            let err = llm.call("haiku", "prompt", Duration::from_secs(10)).unwrap_err();
+            assert!(err.contains("retried"), "call {} should still have retried: {}", i, err);
+        }
+        assert_eq!(
+            fixture.calls(),
+            2 * RETRY_CIRCUIT_BREAKER_THRESHOLD,
+            "each of the first {} calls attempted exactly twice",
+            RETRY_CIRCUIT_BREAKER_THRESHOLD
+        );
+
+        // The breaker has now seen RETRY_CIRCUIT_BREAKER_THRESHOLD
+        // consecutive still-failed retries -- the next call must skip the
+        // retry entirely: exactly one more process invocation, and no
+        // "retried" text (there was nothing to retry).
+        let calls_before = fixture.calls();
+        let err = llm.call("haiku", "prompt", Duration::from_secs(10)).unwrap_err();
+        assert!(!err.contains("retried"), "breaker should have suppressed the retry: {}", err);
+        assert_eq!(fixture.calls(), calls_before + 1, "tripped breaker -- only the first attempt, no retry");
+
+        // And it stays tripped: one more call, still no retry.
+        let calls_before = fixture.calls();
+        let _ = llm.call("haiku", "prompt", Duration::from_secs(10));
+        assert_eq!(fixture.calls(), calls_before + 1, "breaker stays tripped for the rest of the process");
+    }
+
+    #[test]
+    fn retry_circuit_breaker_resets_on_a_successful_retry() {
+        // Fails on every odd invocation, succeeds on every even one -- so a
+        // clean `.call()` from a fresh state always retries-and-succeeds,
+        // which must reset the consecutive-failure counter each time and
+        // never trip the breaker no matter how many times it's called.
+        let fixture = FakeClaudeScript::new(
+            "circuit-breaker-reset",
+            "#!/bin/sh\n\
+             n=$(cat __STATE__); n=$((n+1)); echo $n > __STATE__\n\
+             cat >/dev/null\n\
+             if [ $((n % 2)) = \"1\" ]; then echo boom >&2; exit 1; fi\n\
+             echo ok\n",
+        );
+        let llm = ProcessReflectLlm::with_bin_and_delay(fixture.script.to_str().unwrap(), Duration::from_millis(10));
+        for _ in 0..(RETRY_CIRCUIT_BREAKER_THRESHOLD + 2) {
+            let result = llm.call("haiku", "prompt", Duration::from_secs(10));
+            assert_eq!(result.unwrap().trim(), "ok", "a successful retry must reset the breaker, never trip it");
+        }
+    }
 }

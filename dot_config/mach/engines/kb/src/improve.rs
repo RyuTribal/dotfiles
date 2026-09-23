@@ -883,12 +883,146 @@ impl ImproveLlm for ProcessImproveLlm {
 pub trait Vcs {
     fn managed(&self) -> Result<HashSet<PathBuf>, String>;
     fn status(&self) -> Result<Vec<PathBuf>, String>;
-    fn source_clean(&self) -> Result<bool, String>;
+    /// Which of `targets` (destination paths -- e.g. `Targets::roots()`)
+    /// have uncommitted changes in the chezmoi source repo, scoped to
+    /// exactly those paths. Each target is mapped to its chezmoi source
+    /// path (`chezmoi source-path <target>`, the same mechanism `commit`
+    /// already relies on to find the source root, so a `private_`/`dot_`
+    /// attribute prefix or any other chezmoi naming rule is handled the
+    /// same way chezmoi itself would), then `git status --porcelain --
+    /// <those source paths>` in the source repo. Returns the destination
+    /// paths (a subset of `targets`) whose source subtree has any dirty
+    /// file; empty means clean. A dirty path elsewhere in the source repo
+    /// -- unrelated to anything `improve` may touch -- never appears here.
+    fn dirty_targets(&self, targets: &[&Path]) -> Result<Vec<PathBuf>, String>;
     fn add(&self, path: &Path) -> Result<(), String>;
     fn forget(&self, path: &Path) -> Result<(), String>;
     fn apply_force(&self, path: &Path) -> Result<(), String>;
-    /// Commits everything staged in the source repo; returns the short sha.
-    fn commit(&self, message: &str) -> Result<String, String>;
+    /// Stages and commits, in the source repo, ONLY the chezmoi source paths
+    /// of `targets` -- never a bare `git add -A`/`git commit` over the whole
+    /// repo, which would sweep in any unrelated dirty file elsewhere in the
+    /// same chezmoi source repo (e.g. WIP under `dot_config/mach`, sitting
+    /// right alongside `dot_claude/**` in the same git history). The
+    /// preflight (`dirty_targets`) already guarantees these particular
+    /// targets are clean-or-`improve`'s-own-edits going in; this pathspec
+    /// keeps the commit itself just as narrow. Returns the short sha.
+    fn commit(&self, message: &str, targets: &[&Path]) -> Result<String, String>;
+}
+
+/// The `git status --porcelain -- <paths>` reason prefix `run_improve` uses
+/// when `Vcs::dirty_targets` finds any of `improve`'s own write targets
+/// dirty in the chezmoi source repo. `mach kb health` matches on this exact
+/// prefix (`is_uncommitted_targets_outcome`) to tell this specific block
+/// apart from any other failure reason and name the paths again.
+pub const UNCOMMITTED_TARGETS_PREFIX: &str = "chezmoi source has uncommitted changes in write targets: ";
+
+/// Builds the `run_improve` failure reason for a nonempty `Vcs::dirty_targets`
+/// result.
+pub fn uncommitted_targets_reason(paths: &[PathBuf]) -> String {
+    let list: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    format!("{}{}", UNCOMMITTED_TARGETS_PREFIX, list.join(", "))
+}
+
+/// The reverse of `uncommitted_targets_reason`: recovers the path list from
+/// any text containing it (an outcome memory's content, which wraps the
+/// reason in a longer sentence). `None` when the prefix is absent.
+pub fn parse_uncommitted_targets(text: &str) -> Option<Vec<String>> {
+    let idx = text.find(UNCOMMITTED_TARGETS_PREFIX)?;
+    let rest = &text[idx + UNCOMMITTED_TARGETS_PREFIX.len()..];
+    let rest = rest.lines().next().unwrap_or(rest).trim_end_matches('.');
+    let list: Vec<String> = rest.split(", ").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    if list.is_empty() {
+        None
+    } else {
+        Some(list)
+    }
+}
+
+/// Whether `m` is one of this pass's outcome records that failed
+/// specifically because a write target's chezmoi source had uncommitted
+/// changes -- the condition `mach kb health` names by path instead of
+/// folding into its generic consecutive-failures message.
+pub fn is_uncommitted_targets_outcome(m: &Memory) -> bool {
+    is_failed_outcome(m) && m.content.contains(UNCOMMITTED_TARGETS_PREFIX)
+}
+
+/// The reason prefix `run_improve` uses when `chezmoi status` (via
+/// `Vcs::status`, called as `pre_status`) reports a write target already
+/// differing from its chezmoi source BEFORE the run even starts -- distinct
+/// from `UNCOMMITTED_TARGETS_PREFIX` (a `git status` check on the chezmoi
+/// SOURCE repo): this one is chezmoi's own destination-vs-source diff, e.g.
+/// someone hand-editing `~/.claude/CLAUDE.md` directly instead of through
+/// chezmoi. `mach kb health` matches on this exact prefix
+/// (`is_pre_run_drift_outcome`) the same way it matches
+/// `UNCOMMITTED_TARGETS_PREFIX`, to name the paths again instead of folding
+/// into the generic streak message.
+pub const PRE_RUN_DRIFT_PREFIX: &str = "chezmoi source drifted from write targets before the run (human edit in progress?): ";
+
+/// Builds the `run_improve` failure reason for a nonempty pre-run drift set
+/// -- every write target `pre_status` reports as differing from its
+/// chezmoi source, not just the first one found.
+pub fn pre_run_drift_reason(paths: &[PathBuf]) -> String {
+    let list: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    format!("{}{}", PRE_RUN_DRIFT_PREFIX, list.join(", "))
+}
+
+/// The reverse of `pre_run_drift_reason`: recovers the path list from any
+/// text containing it (an outcome memory's content, which wraps the reason
+/// in a longer sentence). `None` when the prefix is absent.
+pub fn parse_pre_run_drift(text: &str) -> Option<Vec<String>> {
+    let idx = text.find(PRE_RUN_DRIFT_PREFIX)?;
+    let rest = &text[idx + PRE_RUN_DRIFT_PREFIX.len()..];
+    let rest = rest.lines().next().unwrap_or(rest).trim_end_matches('.');
+    let list: Vec<String> = rest.split(", ").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    if list.is_empty() {
+        None
+    } else {
+        Some(list)
+    }
+}
+
+/// Whether `m` is one of this pass's outcome records that failed
+/// specifically because a write target had already drifted from its
+/// chezmoi source before the run started.
+pub fn is_pre_run_drift_outcome(m: &Memory) -> bool {
+    is_failed_outcome(m) && m.content.contains(PRE_RUN_DRIFT_PREFIX)
+}
+
+/// `mach kb health`'s special-cased detail line for a failure streak that is
+/// one of `run_improve`'s two chezmoi preflight guards rather than an
+/// ordinary `claude`/parse failure: every outcome in
+/// `streak_newest_first` (newest first) is EITHER the uncommitted-write-
+/// targets guard (`is_uncommitted_targets_outcome` -- `git status` on the
+/// chezmoi SOURCE repo) OR the pre-run chezmoi-drift guard
+/// (`is_pre_run_drift_outcome` -- `chezmoi status` on the live destination
+/// files), never a mix of the two or of either with some other failure.
+/// `None` when the streak is empty or mixes failure kinds, so the caller
+/// falls back to its generic streak message.
+///
+/// The "since" timestamp is the OLDEST outcome in the streak (when this
+/// block began, uninterrupted); the named paths come from the NEWEST (what
+/// is dirty/drifted right now) -- the two can differ when the affected set
+/// changed between failures without ever going clean. For the drift case, a
+/// newest-outcome whose content the parser can't recover a path list from
+/// (should not happen for anything `pre_run_drift_reason` itself produced,
+/// but kept as a defensive fallback for hand-edited/foreign memory content)
+/// names no path and instead says what to do about it.
+pub fn uncommitted_block_detail(streak_newest_first: &[&Memory]) -> Option<String> {
+    if streak_newest_first.is_empty() {
+        return None;
+    }
+    let newest = streak_newest_first.first()?;
+    let oldest = streak_newest_first.last()?;
+    if streak_newest_first.iter().all(|m| is_uncommitted_targets_outcome(m)) {
+        let paths = parse_uncommitted_targets(&newest.content)?;
+        return Some(format!("blocked since {} — uncommitted: {}", oldest.created_at, paths.join(", ")));
+    }
+    if streak_newest_first.iter().all(|m| is_pre_run_drift_outcome(m)) {
+        let paths = parse_pre_run_drift(&newest.content)
+            .unwrap_or_else(|| vec!["run chezmoi add on the edited targets".to_string()]);
+        return Some(format!("blocked since {} — targets differ from chezmoi source: {}", oldest.created_at, paths.join(", ")));
+    }
+    None
 }
 
 pub struct ProcessChezmoi;
@@ -907,9 +1041,96 @@ fn run_ok(cmd: &mut Command) -> Result<String, String> {
     }
 }
 
+/// Parses `git status --porcelain -- <paths>` output (`XY path` per line,
+/// paths relative to the repo root passed via `-C`) into that relative path
+/// list. A rename (`old -> new`) keeps the new path, since that is the one
+/// presently dirty. Mirrors `parse_chezmoi_status`'s tolerant `XY<space>`
+/// stripping; git's porcelain v1 format is the same shape.
+pub fn parse_git_status_paths(out: &str) -> Vec<PathBuf> {
+    out.lines()
+        .filter_map(|l| {
+            let l = l.trim_end();
+            if l.len() < 4 {
+                return None;
+            }
+            let rest = l[2..].trim();
+            if rest.is_empty() {
+                return None;
+            }
+            let path = rest.rsplit(" -> ").next().unwrap_or(rest);
+            Some(PathBuf::from(path.trim_matches('"')))
+        })
+        .collect()
+}
+
+/// Which of `targets` (destination path, its chezmoi source path) have any
+/// dirty source path under them, given the repo-root-relative dirty paths
+/// git reported (`parse_git_status_paths`) and the source repo's root. A
+/// directory target (skills_dir, hooks_dir) is dirty when any path beneath
+/// its source root is dirty; a single-file target (claude_md, settings_json)
+/// when its own source path is (or, in principle, a path beneath it, which
+/// cannot happen for a file but costs nothing to allow uniformly).
+pub fn dirty_target_paths(targets: &[(PathBuf, PathBuf)], src_root: &Path, dirty_relative: &[PathBuf]) -> Vec<PathBuf> {
+    let dirty_abs: Vec<PathBuf> = dirty_relative.iter().map(|r| src_root.join(r)).collect();
+    targets
+        .iter()
+        .filter(|(_, source)| dirty_abs.iter().any(|d| d == source || d.starts_with(source)))
+        .map(|(dest, _)| dest.clone())
+        .collect()
+}
+
+/// The argv `ProcessChezmoi::commit` passes to `git add`, given the source
+/// repo root and the write targets' own chezmoi source paths -- pulled out
+/// as a pure function so a test can assert the pathspec is exactly these
+/// paths and nothing else (no unrelated dirty file, no bare unscoped
+/// `-A`), without spawning `git`. `source_paths` empty is refused by the
+/// caller before this is built (see `commit`), never silently turned into
+/// an unscoped `-A`.
+pub fn git_add_argv(src_root: &Path, source_paths: &[PathBuf]) -> Vec<String> {
+    let mut argv = vec!["-C".to_string(), src_root.display().to_string(), "add".to_string(), "-A".to_string(), "--".to_string()];
+    argv.extend(source_paths.iter().map(|p| p.display().to_string()));
+    argv
+}
+
+/// The argv `ProcessChezmoi::commit` passes to `git commit` -- same
+/// scoping rationale as `git_add_argv`. The trailing pathspec means the
+/// commit only ever covers these paths even if something else were
+/// already staged in the source repo from outside this run.
+pub fn git_commit_argv(src_root: &Path, message: &str, source_paths: &[PathBuf]) -> Vec<String> {
+    let mut argv =
+        vec!["-C".to_string(), src_root.display().to_string(), "commit".to_string(), "-q".to_string(), "-m".to_string(), message.to_string(), "--".to_string()];
+    argv.extend(source_paths.iter().map(|p| p.display().to_string()));
+    argv
+}
+
 impl ProcessChezmoi {
-    fn source_path(&self) -> Result<PathBuf, String> {
-        run_ok(Command::new("chezmoi").arg("source-path")).map(|s| PathBuf::from(s.trim()))
+    /// The source path of `target` (a destination path), or the source root
+    /// when `target` is `None` -- both `chezmoi source-path [target]`.
+    /// Called once per target rather than batched: chezmoi does not
+    /// preserve argument order across multiple targets in one call (it
+    /// returns them sorted), which would silently mismatch a target to the
+    /// wrong source path.
+    fn source_path(&self, target: Option<&Path>) -> Result<PathBuf, String> {
+        let mut cmd = Command::new("chezmoi");
+        cmd.arg("source-path");
+        if let Some(t) = target {
+            cmd.arg(t);
+        }
+        run_ok(&mut cmd).map(|s| PathBuf::from(s.trim()))
+    }
+
+    /// The source repo root plus each of `targets`' own chezmoi source path,
+    /// in the same order as `targets` (each target asked for separately --
+    /// see `source_path`'s doc comment on why `chezmoi source-path` cannot
+    /// be batched here). Shared by `dirty_targets` and `commit` so both stay
+    /// scoped to exactly the same paths.
+    fn target_source_paths(&self, targets: &[&Path]) -> Result<(PathBuf, Vec<PathBuf>), String> {
+        let src_root = self.source_path(None)?;
+        let mut source_paths = Vec::with_capacity(targets.len());
+        for t in targets {
+            source_paths.push(self.source_path(Some(t))?);
+        }
+        Ok((src_root, source_paths))
     }
 }
 
@@ -920,9 +1141,20 @@ impl Vcs for ProcessChezmoi {
     fn status(&self) -> Result<Vec<PathBuf>, String> {
         run_ok(Command::new("chezmoi").args(["status", "--path-style", "absolute"])).map(|o| parse_chezmoi_status(&o))
     }
-    fn source_clean(&self) -> Result<bool, String> {
-        let src = self.source_path()?;
-        run_ok(Command::new("git").arg("-C").arg(&src).args(["status", "--porcelain"])).map(|o| o.trim().is_empty())
+    fn dirty_targets(&self, targets: &[&Path]) -> Result<Vec<PathBuf>, String> {
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (src_root, source_paths) = self.target_source_paths(targets)?;
+        let pairs: Vec<(PathBuf, PathBuf)> = targets.iter().map(|t| t.to_path_buf()).zip(source_paths.iter().cloned()).collect();
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(&src_root).args(["status", "--porcelain", "--"]);
+        for sp in &source_paths {
+            cmd.arg(sp);
+        }
+        let out = run_ok(&mut cmd)?;
+        let dirty_relative = parse_git_status_paths(&out);
+        Ok(dirty_target_paths(&pairs, &src_root, &dirty_relative))
     }
     fn add(&self, path: &Path) -> Result<(), String> {
         run_ok(Command::new("chezmoi").arg("add").arg(path)).map(|_| ())
@@ -933,11 +1165,18 @@ impl Vcs for ProcessChezmoi {
     fn apply_force(&self, path: &Path) -> Result<(), String> {
         run_ok(Command::new("chezmoi").args(["apply", "--force"]).arg(path)).map(|_| ())
     }
-    fn commit(&self, message: &str) -> Result<String, String> {
-        let src = self.source_path()?;
-        run_ok(Command::new("git").arg("-C").arg(&src).args(["add", "-A"]))?;
-        run_ok(Command::new("git").arg("-C").arg(&src).args(["commit", "-q", "-m", message]))?;
-        run_ok(Command::new("git").arg("-C").arg(&src).args(["rev-parse", "--short", "HEAD"])).map(|s| s.trim().to_string())
+    fn commit(&self, message: &str, targets: &[&Path]) -> Result<String, String> {
+        if targets.is_empty() {
+            // An empty pathspec is not "commit nothing" to git -- `-- ` with
+            // no paths after it is indistinguishable from no pathspec at
+            // all, which would fall back to the whole repo. Refuse instead
+            // of ever risking an unscoped add/commit.
+            return Err("commit: no targets given (refusing an unscoped commit)".to_string());
+        }
+        let (src_root, source_paths) = self.target_source_paths(targets)?;
+        run_ok(Command::new("git").args(git_add_argv(&src_root, &source_paths)))?;
+        run_ok(Command::new("git").args(git_commit_argv(&src_root, message, &source_paths)))?;
+        run_ok(Command::new("git").arg("-C").arg(&src_root).args(["rev-parse", "--short", "HEAD"])).map(|s| s.trim().to_string())
     }
 }
 
@@ -1115,6 +1354,288 @@ mod tests {
 
         let st = parse_chezmoi_status(" M /h/.claude/CLAUDE.md\n R /h/install-daemons.sh\n\n");
         assert_eq!(st, vec![PathBuf::from("/h/.claude/CLAUDE.md"), PathBuf::from("/h/install-daemons.sh")]);
+    }
+
+    #[test]
+    fn parse_git_status_paths_reads_porcelain_and_follows_renames() {
+        let out = " M dot_config/mach/engines/kb/src/store.rs\n M dot_config/mach/executable_install.sh\nR  dot_claude/skills/old/SKILL.md -> dot_claude/skills/new/SKILL.md\n\n";
+        let paths = parse_git_status_paths(out);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("dot_config/mach/engines/kb/src/store.rs"),
+                PathBuf::from("dot_config/mach/executable_install.sh"),
+                PathBuf::from("dot_claude/skills/new/SKILL.md"),
+            ]
+        );
+        assert!(parse_git_status_paths("").is_empty());
+    }
+
+    #[test]
+    fn dirty_target_paths_scopes_to_targets_only() {
+        let src = Path::new("/src");
+        let pairs = vec![
+            (PathBuf::from("/h/.claude/skills"), src.join("dot_claude/skills")),
+            (PathBuf::from("/h/.claude/CLAUDE.md"), src.join("dot_claude/CLAUDE.md")),
+            (PathBuf::from("/h/.claude/settings.json"), src.join("dot_claude/private_settings.json")),
+            (PathBuf::from("/h/.config/claude-hooks"), src.join("dot_config/claude-hooks")),
+        ];
+
+        // A dirty path entirely outside the write targets (real repo shape:
+        // unrelated mach source under dot_config/mach) must never block.
+        let unrelated = vec![PathBuf::from("dot_config/mach/engines/kb/src/store.rs")];
+        assert!(dirty_target_paths(&pairs, src, &unrelated).is_empty());
+
+        // A dirty file nested under a directory target (skills_dir) must
+        // name that target's destination root, even though the dirty git
+        // path is several levels deeper than the mapped source path.
+        let nested = vec![PathBuf::from("dot_claude/skills/kb/SKILL.md")];
+        assert_eq!(dirty_target_paths(&pairs, src, &nested), vec![PathBuf::from("/h/.claude/skills")]);
+
+        // The single-file settings.json target, mapped through chezmoi's
+        // `private_` attribute prefix (private_settings.json in source).
+        let settings = vec![PathBuf::from("dot_claude/private_settings.json")];
+        assert_eq!(dirty_target_paths(&pairs, src, &settings), vec![PathBuf::from("/h/.claude/settings.json")]);
+
+        // Both a target and an unrelated path dirty at once: only the
+        // target is named.
+        let mixed = vec![PathBuf::from("dot_claude/CLAUDE.md"), PathBuf::from("dot_config/mach/executable_install.sh")];
+        assert_eq!(dirty_target_paths(&pairs, src, &mixed), vec![PathBuf::from("/h/.claude/CLAUDE.md")]);
+
+        assert!(dirty_target_paths(&pairs, src, &[]).is_empty());
+    }
+
+    #[test]
+    fn commit_argv_is_pathspec_scoped_to_exactly_the_given_source_paths() {
+        // The "process layer" `ProcessChezmoi::commit` builds these argv
+        // from: only the four write targets' own chezmoi source paths ever
+        // appear, never a bare `-A` with no pathspec, and never a path this
+        // function was not handed (standing in for "a dirty unrelated file
+        // elsewhere in the source repo, e.g. dot_config/mach/**").
+        let src = Path::new("/home/u/.local/share/chezmoi");
+        let source_paths = vec![
+            PathBuf::from("/home/u/.local/share/chezmoi/dot_claude/skills"),
+            PathBuf::from("/home/u/.local/share/chezmoi/dot_claude/CLAUDE.md"),
+            PathBuf::from("/home/u/.local/share/chezmoi/dot_claude/private_settings.json"),
+            PathBuf::from("/home/u/.local/share/chezmoi/dot_config/claude-hooks"),
+        ];
+        let unrelated = "/home/u/.local/share/chezmoi/dot_config/mach/engines/kb/src/store.rs";
+
+        let add_argv = git_add_argv(src, &source_paths);
+        assert_eq!(
+            add_argv,
+            vec![
+                "-C", "/home/u/.local/share/chezmoi",
+                "add", "-A", "--",
+                "/home/u/.local/share/chezmoi/dot_claude/skills",
+                "/home/u/.local/share/chezmoi/dot_claude/CLAUDE.md",
+                "/home/u/.local/share/chezmoi/dot_claude/private_settings.json",
+                "/home/u/.local/share/chezmoi/dot_config/claude-hooks",
+            ]
+        );
+        assert!(!add_argv.contains(&unrelated.to_string()), "an unrelated dirty path must never reach `git add`");
+        assert!(add_argv.iter().any(|a| a == "--"), "the pathspec separator must always be present, even with paths given");
+
+        let commit_argv = git_commit_argv(src, "improve: edit CLAUDE.md", &source_paths);
+        assert_eq!(
+            commit_argv,
+            vec![
+                "-C", "/home/u/.local/share/chezmoi",
+                "commit", "-q", "-m", "improve: edit CLAUDE.md", "--",
+                "/home/u/.local/share/chezmoi/dot_claude/skills",
+                "/home/u/.local/share/chezmoi/dot_claude/CLAUDE.md",
+                "/home/u/.local/share/chezmoi/dot_claude/private_settings.json",
+                "/home/u/.local/share/chezmoi/dot_config/claude-hooks",
+            ]
+        );
+        assert!(!commit_argv.contains(&unrelated.to_string()), "an unrelated dirty path must never reach `git commit`");
+
+        // An empty pathspec would mean "no restriction" to git, not "commit
+        // nothing" -- ProcessChezmoi::commit refuses this case before ever
+        // building argv from it (covered by
+        // `process_chezmoi_commit_refuses_an_empty_target_list` below), but
+        // the argv builders themselves are exercised with a real pathspec
+        // everywhere they're called, never an empty one.
+        assert!(!source_paths.is_empty());
+    }
+
+    #[test]
+    fn process_chezmoi_commit_refuses_an_empty_target_list() {
+        let vcs = ProcessChezmoi;
+        let err = vcs.commit("msg", &[]).unwrap_err();
+        assert!(err.contains("no targets given"), "{}", err);
+    }
+
+    #[test]
+    fn uncommitted_targets_reason_round_trips_through_an_outcome_memory() {
+        let dirty = vec![PathBuf::from("/h/.claude/skills"), PathBuf::from("/h/.claude/CLAUDE.md")];
+        let reason = uncommitted_targets_reason(&dirty);
+        assert_eq!(reason, "chezmoi source has uncommitted changes in write targets: /h/.claude/skills, /h/.claude/CLAUDE.md");
+
+        let outcome = Outcome::Failed { reason };
+        let text = outcome.memory_text();
+        assert!(text.starts_with("Improve run failed and was rolled back: chezmoi source has uncommitted changes"));
+
+        let parsed = parse_uncommitted_targets(&text).unwrap();
+        assert_eq!(parsed, vec!["/h/.claude/skills".to_string(), "/h/.claude/CLAUDE.md".to_string()]);
+
+        assert!(parse_uncommitted_targets("Improve run failed and was rolled back: claude: timed out").is_none());
+    }
+
+    fn outcome_memory(id: i64, content: &str, source: &str, created_at: &str) -> Memory {
+        Memory {
+            id,
+            content: content.to_string(),
+            source: Some(source.to_string()),
+            project: Some(OUTCOME_PROJECT.to_string()),
+            created_at: created_at.to_string(),
+            reviewed: true,
+            embedding: None,
+            importance: OUTCOME_IMPORTANCE,
+            stability: None,
+            access_count: 0,
+            first_accessed_at: None,
+            last_accessed_at: None,
+            valid_from: created_at.to_string(),
+            invalidated_at: None,
+            superseded_by: None,
+            dormant_at: None,
+            last_verified_at: None,
+            graph_extracted_at: None,
+            basis: None,
+            occurred_from: None,
+            occurred_to: None,
+            pinned_at: None,
+        }
+    }
+
+    #[test]
+    fn is_uncommitted_targets_outcome_only_matches_this_specific_failure() {
+        let dirty_reason = uncommitted_targets_reason(&[PathBuf::from("/h/.claude/CLAUDE.md")]);
+        let this_kind = outcome_memory(1, &Outcome::Failed { reason: dirty_reason }.memory_text(), "improve t failed", "2026-09-20T00:00:00Z");
+        assert!(is_uncommitted_targets_outcome(&this_kind));
+
+        let other_failure =
+            outcome_memory(2, &Outcome::Failed { reason: "claude: timed out".into() }.memory_text(), "improve t failed", "2026-09-20T00:00:00Z");
+        assert!(!is_uncommitted_targets_outcome(&other_failure));
+
+        let applied = outcome_memory(
+            3,
+            &Outcome::Applied { result: ImproveResult { action: Action::Edit, files: vec![], rationale: "r".into(), evidence: "none".into() }, sha: "abc".into() }
+                .memory_text(),
+            "improve t abc",
+            "2026-09-20T00:00:00Z",
+        );
+        assert!(!is_uncommitted_targets_outcome(&applied));
+    }
+
+    #[test]
+    fn uncommitted_block_detail_only_fires_when_the_whole_streak_is_this_failure() {
+        let dirty1 = uncommitted_targets_reason(&[PathBuf::from("/h/.claude/skills")]);
+        let dirty2 = uncommitted_targets_reason(&[PathBuf::from("/h/.claude/skills"), PathBuf::from("/h/.claude/CLAUDE.md")]);
+        let oldest = outcome_memory(1, &Outcome::Failed { reason: dirty1 }.memory_text(), "improve t1 failed", "2026-09-20T08:00:00Z");
+        let newest = outcome_memory(2, &Outcome::Failed { reason: dirty2 }.memory_text(), "improve t2 failed", "2026-09-21T09:00:00Z");
+
+        // newest-first, as `check_improve` passes it
+        let detail = uncommitted_block_detail(&[&newest, &oldest]).unwrap();
+        assert_eq!(
+            detail,
+            "blocked since 2026-09-20T08:00:00Z — uncommitted: /h/.claude/skills, /h/.claude/CLAUDE.md"
+        );
+
+        // Any non-uncommitted failure in the streak falls back to `None` so
+        // the caller uses its generic message instead.
+        let other = outcome_memory(3, &Outcome::Failed { reason: "claude: timed out".into() }.memory_text(), "improve t3 failed", "2026-09-21T10:00:00Z");
+        assert!(uncommitted_block_detail(&[&other, &oldest]).is_none());
+        assert!(uncommitted_block_detail(&[]).is_none());
+    }
+
+    // --- fix-list item 7: pre-run chezmoi drift on the destination files ---
+
+    #[test]
+    fn pre_run_drift_reason_round_trips_through_an_outcome_memory() {
+        let drifted = vec![PathBuf::from("/h/.claude/CLAUDE.md"), PathBuf::from("/h/.claude/settings.json")];
+        let reason = pre_run_drift_reason(&drifted);
+        assert_eq!(
+            reason,
+            "chezmoi source drifted from write targets before the run (human edit in progress?): \
+             /h/.claude/CLAUDE.md, /h/.claude/settings.json"
+        );
+
+        let outcome = Outcome::Failed { reason };
+        let text = outcome.memory_text();
+        assert!(text.starts_with("Improve run failed and was rolled back: chezmoi source drifted"));
+
+        let parsed = parse_pre_run_drift(&text).unwrap();
+        assert_eq!(parsed, vec!["/h/.claude/CLAUDE.md".to_string(), "/h/.claude/settings.json".to_string()]);
+
+        assert!(parse_pre_run_drift("Improve run failed and was rolled back: claude: timed out").is_none());
+    }
+
+    #[test]
+    fn is_pre_run_drift_outcome_only_matches_this_specific_failure() {
+        let drift_reason = pre_run_drift_reason(&[PathBuf::from("/h/.claude/CLAUDE.md")]);
+        let this_kind =
+            outcome_memory(1, &Outcome::Failed { reason: drift_reason }.memory_text(), "improve t failed", "2026-09-20T00:00:00Z");
+        assert!(is_pre_run_drift_outcome(&this_kind));
+        // The two preflight guards must never be confused for each other.
+        assert!(!is_uncommitted_targets_outcome(&this_kind));
+
+        let uncommitted_kind = outcome_memory(
+            2,
+            &Outcome::Failed { reason: uncommitted_targets_reason(&[PathBuf::from("/h/.claude/CLAUDE.md")]) }.memory_text(),
+            "improve t failed",
+            "2026-09-20T00:00:00Z",
+        );
+        assert!(!is_pre_run_drift_outcome(&uncommitted_kind));
+
+        let other_failure =
+            outcome_memory(3, &Outcome::Failed { reason: "claude: timed out".into() }.memory_text(), "improve t failed", "2026-09-20T00:00:00Z");
+        assert!(!is_pre_run_drift_outcome(&other_failure));
+    }
+
+    #[test]
+    fn uncommitted_block_detail_names_a_pre_run_drift_streak_too() {
+        let drift1 = pre_run_drift_reason(&[PathBuf::from("/h/.claude/CLAUDE.md")]);
+        let drift2 = pre_run_drift_reason(&[PathBuf::from("/h/.claude/CLAUDE.md"), PathBuf::from("/h/.claude/settings.json")]);
+        let oldest = outcome_memory(1, &Outcome::Failed { reason: drift1 }.memory_text(), "improve t1 failed", "2026-09-20T08:00:00Z");
+        let newest = outcome_memory(2, &Outcome::Failed { reason: drift2 }.memory_text(), "improve t2 failed", "2026-09-21T09:00:00Z");
+
+        let detail = uncommitted_block_detail(&[&newest, &oldest]).unwrap();
+        assert_eq!(
+            detail,
+            "blocked since 2026-09-20T08:00:00Z — targets differ from chezmoi source: \
+             /h/.claude/CLAUDE.md, /h/.claude/settings.json"
+        );
+    }
+
+    #[test]
+    fn uncommitted_block_detail_falls_back_to_generic_advice_when_paths_cant_be_recovered() {
+        // A drift outcome whose content the parser can't extract a path list
+        // from (defensive case -- not producible by `pre_run_drift_reason`
+        // itself, but the fallback text still has to exist for foreign or
+        // hand-edited memory content carrying the same prefix with nothing
+        // after it).
+        let empty = outcome_memory(
+            1,
+            &format!("Improve run failed and was rolled back: {}", PRE_RUN_DRIFT_PREFIX),
+            "improve t1 failed",
+            "2026-09-20T08:00:00Z",
+        );
+        let detail = uncommitted_block_detail(&[&empty]).unwrap();
+        assert_eq!(detail, "blocked since 2026-09-20T08:00:00Z — targets differ from chezmoi source: run chezmoi add on the edited targets");
+    }
+
+    #[test]
+    fn uncommitted_block_detail_does_not_mix_the_two_preflight_guards() {
+        // A streak that is one failure of each kind must fall back to the
+        // generic message -- naming paths from a mixed streak would imply a
+        // consistent cause that isn't there.
+        let uncommitted =
+            outcome_memory(1, &Outcome::Failed { reason: uncommitted_targets_reason(&[PathBuf::from("/h/.claude/CLAUDE.md")]) }.memory_text(), "improve t1 failed", "2026-09-20T08:00:00Z");
+        let drift =
+            outcome_memory(2, &Outcome::Failed { reason: pre_run_drift_reason(&[PathBuf::from("/h/.claude/CLAUDE.md")]) }.memory_text(), "improve t2 failed", "2026-09-21T09:00:00Z");
+        assert!(uncommitted_block_detail(&[&drift, &uncommitted]).is_none());
     }
 
     #[test]

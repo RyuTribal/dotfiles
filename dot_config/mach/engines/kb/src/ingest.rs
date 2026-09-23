@@ -156,7 +156,17 @@ pub fn build_engagement_prompt(dialogue: &str, memories: &[(i64, String)]) -> St
 /// (blank lines, leading chatter, a malformed id or token) is silently
 /// skipped rather than treated as disqualifying on its own — only a
 /// genuinely unresolvable or incomplete verdict set falls back to all-SHOWN.
-pub fn parse_engagement_verdicts(output: &str, known_ids: &[i64]) -> BTreeMap<i64, EngagementVerdict> {
+///
+/// Returns `(verdicts, is_fallback)`: `is_fallback` is `true` exactly when
+/// the returned map is the all-`Shown` fallback because the reply itself
+/// was rejected (a hallucinated id, a conflict, or a missing id), rather
+/// than a genuine judge verdict that happened to say SHOWN for everything.
+/// The caller uses this to keep a rejected reply from being written to the
+/// durable `mach kb recall-stats` history as if the judge had actually
+/// reviewed it (see `record_engagement`'s call site) — the existing
+/// touch/reinforce behavior is unaffected either way, since a fallback map
+/// never contains an `Engaged` verdict to begin with.
+pub fn parse_engagement_verdicts(output: &str, known_ids: &[i64]) -> (BTreeMap<i64, EngagementVerdict>, bool) {
     let all_shown = || known_ids.iter().map(|&id| (id, EngagementVerdict::Shown)).collect();
 
     let mut found: BTreeMap<i64, EngagementVerdict> = BTreeMap::new();
@@ -188,10 +198,10 @@ pub fn parse_engagement_verdicts(output: &str, known_ids: &[i64]) -> BTreeMap<i6
         };
         if !known_ids.contains(&id) {
             // A hallucinated or stale id -- the whole reply can't be trusted.
-            return all_shown();
+            return (all_shown(), true);
         }
         match found.get(&id) {
-            Some(existing) if *existing != verdict => return all_shown(), // conflicting verdicts for the same id
+            Some(existing) if *existing != verdict => return (all_shown(), true), // conflicting verdicts for the same id
             _ => {
                 found.insert(id, verdict);
             }
@@ -199,9 +209,9 @@ pub fn parse_engagement_verdicts(output: &str, known_ids: &[i64]) -> BTreeMap<i6
     }
 
     if known_ids.iter().all(|id| found.contains_key(id)) {
-        found
+        (found, false)
     } else {
-        all_shown() // missing at least one id -- fail closed
+        (all_shown(), true) // missing at least one id -- fail closed
     }
 }
 
@@ -564,62 +574,70 @@ mod tests {
     #[test]
     fn parse_engagement_verdicts_accepts_a_clean_reply() {
         let out = "1 ENGAGED\n2 SHOWN\n";
-        let v = parse_engagement_verdicts(out, &[1, 2]);
+        let (v, is_fallback) = parse_engagement_verdicts(out, &[1, 2]);
         assert_eq!(v.get(&1), Some(&EngagementVerdict::Engaged));
         assert_eq!(v.get(&2), Some(&EngagementVerdict::Shown));
+        assert!(!is_fallback, "a clean, complete reply is a genuine verdict, not the fallback");
     }
 
     #[test]
     fn parse_engagement_verdicts_tolerates_hash_prefix_and_case() {
         let out = "#1 engaged\n#2 shown\n";
-        let v = parse_engagement_verdicts(out, &[1, 2]);
+        let (v, is_fallback) = parse_engagement_verdicts(out, &[1, 2]);
         assert_eq!(v.get(&1), Some(&EngagementVerdict::Engaged));
         assert_eq!(v.get(&2), Some(&EngagementVerdict::Shown));
+        assert!(!is_fallback);
     }
 
     #[test]
     fn parse_engagement_verdicts_tolerates_leading_chatter() {
         let out = "Sure, here's my answer:\n1 ENGAGED\n2 SHOWN\n";
-        let v = parse_engagement_verdicts(out, &[1, 2]);
+        let (v, is_fallback) = parse_engagement_verdicts(out, &[1, 2]);
         assert_eq!(v.get(&1), Some(&EngagementVerdict::Engaged));
         assert_eq!(v.get(&2), Some(&EngagementVerdict::Shown));
+        assert!(!is_fallback);
     }
 
     #[test]
     fn parse_engagement_verdicts_missing_id_falls_back_to_all_shown() {
         let out = "1 ENGAGED\n"; // id 2 never shows up
-        let v = parse_engagement_verdicts(out, &[1, 2]);
+        let (v, is_fallback) = parse_engagement_verdicts(out, &[1, 2]);
         assert_eq!(v.get(&1), Some(&EngagementVerdict::Shown), "fails closed: no reinforcement on doubt");
         assert_eq!(v.get(&2), Some(&EngagementVerdict::Shown));
+        assert!(is_fallback, "an incomplete reply must be flagged as the rejected fallback");
     }
 
     #[test]
     fn parse_engagement_verdicts_conflicting_verdicts_for_same_id_falls_back_to_all_shown() {
         let out = "1 ENGAGED\n1 SHOWN\n2 ENGAGED\n";
-        let v = parse_engagement_verdicts(out, &[1, 2]);
+        let (v, is_fallback) = parse_engagement_verdicts(out, &[1, 2]);
         assert_eq!(v.get(&1), Some(&EngagementVerdict::Shown));
         assert_eq!(v.get(&2), Some(&EngagementVerdict::Shown));
+        assert!(is_fallback);
     }
 
     #[test]
     fn parse_engagement_verdicts_unknown_id_falls_back_to_all_shown() {
         let out = "1 ENGAGED\n99 SHOWN\n"; // 99 was never one of the injected ids
-        let v = parse_engagement_verdicts(out, &[1]);
+        let (v, is_fallback) = parse_engagement_verdicts(out, &[1]);
         assert_eq!(v.get(&1), Some(&EngagementVerdict::Shown));
+        assert!(is_fallback);
     }
 
     #[test]
     fn parse_engagement_verdicts_empty_reply_falls_back_to_all_shown() {
-        let v = parse_engagement_verdicts("", &[1, 2, 3]);
+        let (v, is_fallback) = parse_engagement_verdicts("", &[1, 2, 3]);
         assert_eq!(v.len(), 3);
         assert!(v.values().all(|verdict| *verdict == EngagementVerdict::Shown));
+        assert!(is_fallback);
     }
 
     #[test]
     fn parse_engagement_verdicts_duplicate_agreeing_lines_are_fine() {
         let out = "1 ENGAGED\n1 ENGAGED\n";
-        let v = parse_engagement_verdicts(out, &[1]);
+        let (v, is_fallback) = parse_engagement_verdicts(out, &[1]);
         assert_eq!(v.get(&1), Some(&EngagementVerdict::Engaged));
+        assert!(!is_fallback, "duplicate agreeing lines are not an ambiguity, so this is a genuine verdict");
     }
 
     // --- fact digest ---

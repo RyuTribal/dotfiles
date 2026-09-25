@@ -332,14 +332,17 @@ also needs at least one matched term rarer than the query's own median
 term-df to count, a FULL match (every query term present) is always
 exempt.
 
-## Stated vs inferred vs experience (basis)
+## Stated vs inferred vs experience vs derived (basis)
 
 Every memory carries a `basis`, its ground for being believed: **stated**
 (the user or a named person said it in so many words: `mach kb add`, `mach
 note`, a decision cue, a digest line tagged STATED), **inferred** (deduced
-from behavior, code, or context), or **experience** (what Claude itself did
+from behavior, code, or context), **experience** (what Claude itself did
 in a session and how the user responded: what you proposed, built, got
-wrong, or were corrected on). An experience memory renders as "I did this in
+wrong, or were corrected on), or **derived** (written entirely by code,
+never from a session — currently just the code index's own module/repo
+summaries, mirrored into `memories` by `store::upsert_index_memory`; see
+"The code index" below). An experience memory renders as "I did this in
 a session" and is the most useful kind for not repeating a mistake. Rows written before 2026-09-08
 and channels that do not classify (meeting facts, consolidation) have no
 basis and render with the older source-only phrase. Recall shows it in the
@@ -513,10 +516,10 @@ hook, not a manual search you run yourself; reinforcement is interval-aware
 grows stability, while a touch after a gap at least as long as the
 memory's current stability earns the full 30% gain.
 
-## Hard questions: `mach kb ask` (since 2026-09-09)
+## Hard questions: `mach kb ask` (since 2026-09-09; code-aware since 2026-09-23)
 
 ```
-mach kb ask "<question>" [--rounds N] [--json] [--verbose]
+mach kb ask "<question>" [--project P] [--rounds N] [--json] [--verbose]
 ```
 
 Iterative agentic recall, for the questions a single ranked pass cannot
@@ -544,6 +547,103 @@ searches the raw conversation logs rather than the distilled facts. Use
 is an exact name, number or phrase that no one would have distilled into a
 memory. Transcript passages come back verbatim and carry no memory id, so
 they are never citable as bank rows and never reach the recall hook.
+
+### The code-aware path: `--project` (since 2026-09-23)
+
+When `--project` names a registered project, or the current directory
+resolves to one via `store::project_for_path`, AND `mach kb index` has put
+at least one chunk in that project's code index, `ask` switches to a
+different loop entirely (`code_index::ask::run_code_ask`, cli.rs only
+routes and prints): a bounded agentic loop, up to 4 rounds, one sonnet call
+per round (`judge_log` tag `ask`, same tag the memory-only path already
+used), where the model itself drives six tools rather than a fixed
+search-then-judge shape:
+
+- `overview {"path": ...}` — the LLM-written file/module/repo summary for
+  `path` (a file path, `"dir/"` for a module, `"/"` for the whole repo; a
+  bare directory name without the trailing slash is also accepted). Missing
+  exact path → the nearest existing ancestor's summary, with a note that the
+  exact path had none. The prompt recommends starting here (`overview
+  {"path": "/"}`) for "how does X work" / architecture questions before
+  drilling into `search`/`read`. Never subject to `read`'s refusal rules —
+  a summary is generated prose about a unit of the codebase, never the
+  file's own text.
+- `search {"query": "<text>"}` — hybrid search over the project's code
+  chunks (top 8: `path:start-end@sha7`, symbol, header, first 30 lines), its
+  file/module/repo summaries (top 3, leading the result: level, path, first
+  60 words), and its memories (top 4, via `search_hits` with the project's
+  own root as `cwd` — a real identity claim, so other-project memories are
+  actually down-weighted, not just guessed at by basename).
+- `read {"path": ..., "start": N, "end": N}` — exact source lines at the
+  indexed commit (`git cat-file blob <sha>:<path>` — never `git show`,
+  which parsed a path like `..stash@{0}` as a range and read other refs),
+  capped at 300 lines and 40,000 characters regardless of the range asked
+  for. Refused outright: any path with `..`, `:`, `@{` or a leading `/`;
+  secret-pattern paths; files whose directory is scoped
+  vendored/generated/assets/build-output; files recorded `skipped`;
+  gitignored or binary files; and any file whose content carries a secret
+  marker.
+- `symbol {"name": "<symbol or enclosing scope>"}` — up to 8 symbol-graph
+  definitions of `name` (`path:start-end@sha7`, qualified name, kind); for
+  the first definition, also its callers (up to 15: src `path:line`, src
+  qualified name), then "possible callers" — unresolved `calls` edges
+  that name it (by name or qualified name; labelled unconfirmed, since
+  resolution leaves ambiguous calls NULL rather than guess) — and callees
+  (up to 15: dst name, resolved `path:line` when known). Falls back to the phase-1 chunk `symbol`/`scope` match
+  (exact, then prefix, top 8) when `name` has no symbol-graph definition —
+  a project indexed before the symbol graph existed, or a language
+  `extract_refs` doesn't cover.
+- `refs {"name": "<name>", "kind": "calls|includes|imports|inherits"}` —
+  every `code_edges` row of that kind whose target is exactly `name` —
+  as written, or (includes/imports) the resolved repo path — up to 25,
+  each with its source location (`path:line@sha7`). `kind` is
+  validated at parse time; an unrecognised kind is treated as a malformed
+  tool call (falls through to being the answer), same as any other bad
+  `TOOL` line.
+- `history {}` / `history {"month": "YYYY-MM"}` / `history {"path": ...}` —
+  the code-history layer (since 2026-09-23): with no arguments, the 6
+  newest months' commit-history summaries (`code_history`, one row per
+  project per calendar month, written by the nightly `index_history` LLM
+  pass) — each month row is the summary paragraph plus a `Files:` line
+  of its top-churn paths as `path@<last7>`; with `month`, that one
+  month's summary; with `path`, the last 15 commits touching that path
+  (read-only `git --literal-pathspecs log --name-only -- <path>`, same
+  path validation as `read` plus glob characters `*?[` refused), each
+  with up to 10 of its touched files under the path as `path@<commit7>`,
+  plus the summaries of the months those commits fall in. The `path`
+  output is run through the history secret redactor (commit subjects are
+  free text); a git failure comes back as `history failed: …`, never an
+  aborted ask. Every `history` result is capped at 12,000 chars. History
+  answers cite `path@sha7` of the commit — a file-level `path@sha7`
+  citation counts (for `eval-code` scoring too) when its path is an
+  indexed path.
+
+The loop's `claude -p` calls have no built-in tools at all (see "Model
+subcalls have no tools" below), so the prompt says so ("You have no
+callable functions. Write TOOL lines as plain text."); an `ANSWER` that
+contains "No such tool" (the model tried a native call and narrated the
+refusal) is treated as a malformed round and re-asked once per ask, in
+the same round.
+
+`--rounds N` is honored on this path too (clamped to 1..4; the last
+allowed round is the forced-answer round); a non-numeric `--rounds`, or a
+`--project` naming no registered project, is an error rather than a silent
+fallback. Every round appends the tool's result to the transcript the next
+round's prompt carries; after round 4 the prompt demands `ANSWER:` and, if the
+model still calls a tool anyway, its raw reply becomes the answer verbatim
+rather than being discarded. The final answer MUST cite every location as
+`path:line@sha7` (the 7-char commit `code_indexed_head` was set to, or the
+repo's current `HEAD` when a project has chunks but hasn't finished a full
+index run yet) — citations are extracted from the answer text and printed
+after it, the same shape the memory-only path prints memory ids in. A bare
+basename citation that uniquely matches one indexed path is rewritten to
+the full path — whole citation tokens only (never a substring inside a
+longer path) — and the citation list is deduplicated.
+
+A registered project with no code index yet (or an unregistered directory)
+falls straight through to the memory-only path above, unchanged — the
+`--project`-less, no-code-index behavior of `ask` is byte-for-byte what it
+was before this existed.
 
 ## The transcript index: `mach kb index-transcripts` (since 2026-09-09)
 
@@ -590,6 +690,406 @@ and `ask` call runs as `claude -p` and leaves a session file, and those were
 49% of the corpus — phrased in the vocabulary of the knowledge bank, so they
 matched precisely the questions asked *about* the bank.
 
+### Model subcalls have no tools (since 2026-09-24)
+
+Every chore `claude -p` mach spawns through `classify::run_claude`
+(classifier, every reflect/index/ask/audit pass, `mach note`'s text
+classifier, `engines/meet`'s summarizer) runs with `--tools ""` — no
+built-in tools at all — plus the old `--disallowedTools` denylist and
+`--strict-mcp-config` with an empty config. Before this, Read/Grep/Glob
+were still enabled, so a model fed prompt-injected memory/code text could
+read any file the user can, secrets included. The one exception that
+needs a tool is `mach note`'s image description (`note::vision_command`,
+also used by the telegram bridge): `--tools Read` only, working
+directory pinned to the image's own directory plus `--add-dir` of that
+same directory (Read is granted only inside the working dirs with
+prompts off), no MCP. `mach kb improve` is deliberately unchanged: it
+edits files by design with its own `--allowedTools` allowlist.
+
+Separately (since 2026-09-24), every one of these spawns — including
+`improve` — also passes `--setting-sources=` (load no user/project/local
+settings.json): without it these chore calls still load the user's own
+Claude Code hooks, and a style/behavior hook there (e.g. a terse-speech
+hook) reshapes the model's output before it's stored as a memory, note,
+or file edit; `MACH_KB_DIGEST=1` only guards this repo's own hooks, not
+others the user has configured. OAuth login still works with no settings
+loaded.
+
+## The code index: `mach kb index` (since 2026-09-23)
+
+```
+mach kb index [--project P] [--budget N] [--path-prefix P] [--history-only] [--dry-run]
+mach kb index status [--project P]
+mach kb index scope <project> [--set <dir>=<category>]...
+```
+
+A separate index from the two above — over the *source code* of every
+registered project whose root is a git repo (13 of 17 as of this writing;
+the rest — `cyber-ivan`, `mach`, `portfolio_webbsite`, `tabs` — have no
+`.git` and are reported "skipped", never touched). This is what lets you
+answer detailed code questions about a project directly, without an agent
+having hand-indexed it first — the old `index-project` skill's job, now a
+scheduled `mach kb index` run instead of something an agent decides to do.
+
+What gets indexed, per project: a one-time-ish **scope pass** (one LLM
+call, re-run only when a NEW top-level directory appears; a directory that
+disappears just has its `llm` scope rows deleted, `user` rows are kept)
+classifies every directory as `product`/`tests`/`docs` (indexed),
+`vendored` (one memory recorded, no chunks), or
+`generated`/`assets`/`build-output` (skipped outright). In-scope files are
+split into syntax-aware chunks (tree-sitter — one per function, method,
+class, struct, enum, etc., plus a markdown heading split for docs), each
+chunk gets a short LLM-written context header situating it in the file and
+project, and an embedding. Incremental by blob: the file list is the
+committed tree at `HEAD` (`git ls-tree -r`, never the staging index), and a
+file is (re)chunked only when its blob differs from its `code_files` row
+(or it has no row) — an unchanged blob is never re-chunked, whatever the
+watermark says, so a budget-limited run always converges instead of
+re-heading the same files. `git diff code_indexed_head HEAD` is used only
+to detect pure renames (rows moved, headers kept), and only when that sha
+is still a commit in the repo. A directory recategorized back into scope
+is picked up on the next run without any git change. Override a
+directory's category by hand with
+`mach kb index scope <project> --set <dir>=<category>` — a manual
+(`"user"`) decision the scope pass never overwrites; `--set` errors unless
+`<dir>` is a directory with tracked files at `HEAD` and `<category>` is one
+of the seven known ones. If the scope pass's LLM call fails (or the budget
+is already spent when one is needed), that project is skipped for the run
+rather than indexed under a default-`product` guess.
+
+**Secrets are never indexed.** Before anything is chunked or sent, a file
+whose path matches `.env`, `.env.*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`,
+`id_rsa*`, `id_ed25519*`, `*.kdbx`, `*.keystore`, or has a path component
+containing `credentials`/`secret`, or whose content carries a
+high-confidence marker (PEM private key, `ghp_`/`gho_`/`github_pat_`,
+`sk-…`, `xox[baprs]-`, `AKIA…`, `AIza…`, a JWT), is recorded `skipped`
+with only the pattern name as its reason (`code_files.lang` holds it for
+skipped rows) — no chunks, no header call, nothing in `judge_log`. The
+same filter drops README/LICENSE excerpts from the scope prompt, refuses
+`ask`'s `read`, and each run sweeps already-stored rows/chunks (e.g. from
+an older binary) into `skipped`. Code: `code_index/secrets.rs`.
+
+Each run pings the embedder once first; if it is unreachable, no header
+call is made that run (chunking still happens) so no header is paid for
+without its embedding, and at the end up to 1,000 chunks with a missing
+embedding on finalized files are backfilled (free — no LLM budget). An
+error in one project (e.g. a repo with no commits) is reported on that
+project's line and the run moves on to the next one; only a `--project`
+run exits non-zero for it.
+
+`--budget N` (default 300; non-numeric is an error) caps `claude -p` calls
+for the whole run (scope + header calls; embeddings are free) and stops
+cleanly once spent — whatever is left `dirty` picks up again next run, same
+as any per-file LLM failure. At ~11s per haiku header call, a full 300-call
+run is about an hour. Every call's outcome is recorded: after 5 failed
+calls in a row (timeout, spawn error, non-zero exit) the run stops early
+("stopped after 5 failed calls in a row") instead of spending the rest of
+the budget on an outage — failed files stay `dirty`, nothing is written.
+Index calls time out at 120s (haiku) / 180s (sonnet). Observed 2026-09-25:
+after roughly an hour of steady calls, `claude -p` index calls can stall
+for 1–1.5h (timeouts, or exit 1 with the CLI's error on stdout, which the
+error message now includes) while reflect calls keep working — cause
+unconfirmed; retry later rather than re-running immediately. Free-text
+module/history replies that narrate tool calls (`**Tool: bash**` + JSON;
+index calls have no tools) are discarded and retried, never stored.
+`mach kb index` takes `~/.local/share/mach/kb-job.lock` itself (printing a
+"waiting" line if reflect or another index run holds it), so a manual run
+never overlaps the nightly one; `mach-index.service` is therefore not
+wrapped in `flock(1)` (a wrapper plus the in-process lock would deadlock). `--dry-run` prints the plan (files per project,
+stale module summaries, changed history months, calls needed — with
+`--history-only`, just the months) and touches nothing — safe to run any time. `mach kb index status`
+shows, per project, the indexed commit vs current `HEAD`, file counts by
+status (`indexed`/`fallback`/`dirty`/`skipped`), the skip reasons with
+counts (pattern names only, e.g. `secret-path(.env)=1`), chunk count,
+embedded percentage, and the symbol graph's `symbols=`/`edges=` row counts
+plus `edges_resolved=<pct>` (see the symbol-graph paragraph below). A real
+`index` run's own per-project output line ends the same way, plus
+`months=` (commit-history months attempted this run — always `0` on a
+`--path-prefix` run, see below): `chunked=… headers=… headers-failed=…
+months=… months-failed=… symbols=… edges=…` (plus `summaries-failed=` when
+non-zero). `headers=`/`months=` count calls attempted; the `-failed`
+counts say how many of those wrote nothing. The run's last lines report
+`N of M call(s) failed (last: <error>)` whenever any call failed. `symbols=`/`edges=` `symbols=`/`edges=` are current totals, not just this
+run's delta, so a run's own output tells you whether the graph grew
+without a separate `index status` call. An unknown `--project` is an
+error for `index`, `index status` and `ask`.
+
+`--path-prefix P` (requires `--project`) limits changed-file detection,
+and the leftover `dirty`-file and file-summary backlog, to that subtree (`P`
+itself, or anything under `P/`) and **never** advances the project's
+`code_indexed_head` watermark, even when the run finishes clean — the
+next unscoped run still diffs from the last full-repo watermark, not from
+wherever a `--path-prefix` run left off. A trailing slash on `P` is
+accepted and stripped automatically (`--path-prefix helios-picking/` and
+`--path-prefix helios-picking` match the same files); a `P` that matches
+no tracked file at all in the repo is a loud error (non-zero exit), not a
+silent no-op — but a valid `P` with nothing new to do (everything under it
+is already indexed) is not an error, it just does nothing.
+
+Raw code chunks are derived state (droppable/rebuildable from the repo at
+any time), never a `memories` row — the same relationship `code_scope` and
+`code_files` have to `memories` as `transcript_chunks` does above. Once a
+project has chunks, `mach kb ask --project P` (or `ask` run from inside
+that project's directory) reaches for them — see "The code-aware path:
+`--project`" above. Phase 3 (symbol graph: `code_symbols`/`code_edges`,
+schema v35; monthly `code_history` summaries; and the `symbol`/`refs`/
+`history` tools built on top of them) has landed — see the tool list
+above, updated in place rather than kept as a separate section
+(`docs/superpowers/specs/2026-09-23-code-index-design.md`).
+
+**The symbol graph (`code_symbols`/`code_edges`, schema v35) is free — no
+LLM call.** Every in-scope file, the moment it's (re)chunked, also gets
+tree-sitter-based reference extraction (`code_index::chunk::extract_refs`):
+`code_symbols` gets one row per function/method/class/struct/enum/etc.
+(qualified name, kind, `path:start-end`), `code_edges` one row per
+`calls`/`includes`/`imports`/`inherits` reference the parser can see (the
+calling `path:line`, the referenced name). `store::resolve_edges` then
+runs once per project per run (after chunking and any symbol backfill) and
+fills in whatever it can: `dst_symbol_id` for a `calls`/`inherits` edge
+whose target matches exactly one definition, or `dst_path` (the unique
+tracked file; `dst_name` stays as written) for `includes`/`imports`.
+Resolution is set-based in one transaction (unique qualified match, else a
+leaf-name fallback — only for an unqualified call, or when the candidate's
+qualified name ends with the full written name on a `::`/`.` boundary, so
+`std::find` never resolves to a project `find`; template/generic arguments
+are stripped at extraction, so `add_event<picking::HoverEnter>` is
+`add_event`). It is a full pass on a project's first run or when the
+backfill ran, otherwise incremental over what changed (`code_graph_pending`:
+names/sources/files touched since the last pass, queued in the same
+transaction as the change) — a run with no changes examines zero edges.
+The symbol backfill is keyed on `code_files.refs_blob` (the blob last
+extracted), so a file that defines nothing is backfilled once, not forever. Most edges never resolve, by
+design, not a bug — a call into the standard library, a third-party
+header, or a project function this text-based extractor can't match stays
+unresolved. Measured on `helios-picking/` (2026-09-24, real run): 20
+symbols, 78 edges, 18% resolved — the unresolved 82% is almost entirely
+`std::`/ECS calls and external `#include`s, while every resolvable
+project-internal edge DID resolve (verified by hand against the real
+source for 10 sampled edges: 3 calls into a private `contains()` helper,
+one call each to `PointerState::is_pressed`/`is_hovered`, four `#include`
+edges, and two intentionally-unresolved edges — a call into Bevy-style ECS
+scheduling and an external `<glm/glm.hpp>` include — all exactly right).
+`symbol`/`refs` (tool list above) read this layer directly.
+
+**Monthly commit-history summaries (`index_history`, sonnet) are the last
+stage of a normal run**, right after module/repo summaries, budgeted and
+resumable like everything else. ONE cheap `git log --format=%H%x1f%cI`
+pass lists every `YYYY-MM` committer month reachable from `HEAD` (newest
+first) with its shas; a month is regenerated only when it is new, its
+digest changed (sha256 of a version salt + the month's sorted commit shas —
+changes on a rebase even if the text would read the same), or it has no
+mirror yet — the body+numstat read (`git log --no-walk --stdin`, shas on
+stdin) runs only for those months, so an unchanged month costs no numstat.
+Every commit field is redacted first (`code_index::secrets::content_reason`
+per line, a whole PEM private-key block at a time — only the leaking lines
+go, never the whole month), THEN the month text (per commit: date, author,
+subject, first 20 body lines, top 15 changed files by churn) is capped at
+20,000 chars (file lists then bodies dropped lowest-churn first with an
+omission note; if subjects alone overflow, a middle run becomes `[N commits
+omitted]` — the newest commit always survives) and summarized by sonnet as
+one paragraph with no headings. **`code_history.text` is that summary
+reply** (with the month's top-churn paths in `code_history.files`), never
+the raw log; the digest (written last, after the mirror) is what the next
+run compares. The summary's lead (first ~600 chars across paragraphs, cut
+at a sentence end) is mirrored into `memories` with `source =
+code-history:<project>:<YYYY-MM>`, `basis = derived`, and
+`occurred_from`/`occurred_to` set to the month's calendar bounds —
+`code-history:` is treated exactly like `code-index:` everywhere an
+index-owned row must be excluded (supersession guard both sides,
+dedupe/contradiction/strength-review/graph-extraction/audit/`top_similar`/
+`improve` evidence, `reflected_at` set at insert) via the same shared
+`store::is_index_owned`/`not_index_owned_sql` helper, never a duplicated
+literal. Unlike a module/repo summary, a month that regenerates a second
+time updates the SAME memory row in place — content and embedding —
+(`code_history.memory_id` persists) rather than superseding into a new
+one; a month no longer reachable from `HEAD` (history rewrite) has its row
+deleted and its mirror invalidated. A history memory is
+**dated history, never superseded by anything except the history job
+regenerating that same month**. `history {}`/`{"month"}`/`{"path"}` (tool
+list above) read it. A `--path-prefix` run skips this stage entirely — a
+partial file view has no meaningful month to report on.
+
+**`mach kb index --project P --history-only` (2026-09-24)** does the
+opposite of `--path-prefix`: it skips the scope/chunk/header/summary
+stages entirely and runs ONLY the commit-history stage, still against
+`--budget`. Requires `--project` (a history-only run always targets one
+repo) and is rejected together with `--path-prefix` (the two skip history
+for opposite, contradictory reasons, so combining them is an error, not a
+no-op). Useful to backfill every month of a project's history without
+paying for a full scope/chunk/header pass first, or to catch a project's
+history up on its own schedule independent of the nightly file-level run.
+Measured on `helios` (2026-09-24, real `claude -p` calls against a bank
+copy): 9 distinct months existed (`2023-03` through `2026-08`);
+`--history-only --budget 12` regenerated all 9 in one run — 9 calls, 0
+errors, ~10s/call average — and every summary's stated commit count,
+author, and date matched `git log` exactly on manual cross-check.
+Estimating the same backfill across every registered git repo (13 of 17;
+counted the same way, per-project, on 2026-09-24): **129 calls total** for
+a first fill of every project's ENTIRE commit history — cheap next to the
+~11,300-call file-level first fill above, and a reasonable thing to run
+once per project ahead of (or independent of) that.
+
+**Phase 2 (file/module/repo summaries) storage landed 2026-09-24** (schema
+v33, `code_summaries` + `code_summaries_fts`, same explicit
+insert-and-delete FTS sync as `code_chunks_fts`). A summary's `path` is a
+file path for `level = "file"`, `"<dir>/"` for a module, `"/"` for the
+repo. File summaries stay entirely inside `code_summaries`, exactly like
+raw chunks — never a `memories` row.
+
+**File-level summary generation landed the same day.** The nightly job's
+per-file header call (`index_header`) now asks for a file summary too, in
+the same haiku reply that carries the chunk headers (one call, one budget
+unit, per the design's "combine cheaply"). When that reply's `SUMMARY:`
+line is missing or blank — a flaky reply, or a file whose blob hasn't
+changed since before this feature existed — the file still finalizes on
+its headers alone (those are the phase-1 contract), and once every dirty
+file in the project is done, a second per-project pass (`index_summary`,
+also haiku) picks up every `indexed`/`fallback` file still missing a
+matching-`source_digest` summary and asks for just the summary, one call
+each, same budget — but only up to `code_files.summary_attempts` (schema
+v34, reset whenever the file's blob changes) reaching 2: a file whose
+summary call keeps succeeding with no parseable `SUMMARY:` line then
+stops being queued (status stays `indexed`/`fallback`; `index status`
+counts these as `summaries_given_up`) instead of being retried forever.
+Either call's success marks the file's ancestor module paths and the
+repo root `stale` in `code_summaries` (depth-1 and depth-2 directory
+prefixes only, e.g. `"a/b/c/x.cpp"` stales `"a/"` and `"a/b/"`, never
+`"a/b/c/"`, plus `"/"`); a rename that crosses a directory boundary
+stales BOTH the old and new parent's ancestor paths the same way (a
+same-directory rename changes no module's children, so it stales
+nothing). A deleted, renamed, or
+recategorized-out-of-scope file's summary is deleted (or, for a pure
+same-blob rename, moved to the new path) right alongside its
+`code_files`/`code_chunks` rows. Secret-skipped files are never
+summarised — `mark_skipped` (the one choke point every secret path goes
+through) drops any summary a file had the moment it's marked `skipped`.
+Module and repo summaries are ALSO mirrored into `memories`
+(`store::upsert_index_memory`) so plain session recall and the mental
+model surface them, with `source = "code-index:<project>:<dir>/"` (`.../:/`
+for the repo), `basis = "derived"` (a fourth value alongside
+stated/inferred/experience — see "Stated vs inferred vs experience" below),
+`importance 6`, `reviewed = true`, and `reflected_at` set immediately so
+the reflect insight stage never queues one. These rows are **index-owned**:
+regenerating a summary supersedes EVERY active row with that source (a
+restored, pinned older generation included; `store::supersede`, so the
+audit trail still shows in `mach kb list --superseded`) and records the
+new id on the summary row in the same transaction
+(`upsert_index_memory_for_summary`), but no OTHER pass may ever
+tombstone one, nor may one ever tombstone a user memory —
+`store::supersession_guard` blocks with `index-owned` whenever EITHER
+row's source starts with `code-index:` (loser or winner; checked first,
+ahead of the date and coverage guards, in `run_dedupe_pass`'s Keep
+branch, `apply_contradiction_verdict`'s Conflict/ConflictRetro, and
+`apply_verdict`'s Supersede alike — a winning index row would otherwise
+swallow a user fact into text the indexer replaces). Index-owned rows are
+also kept out of every candidate pool in the first place: dedupe,
+contradiction, strength review, graph extraction (and both mention-link
+scans), the save-time classifier's k-NN (`top_similar`, so a NOOP can
+never drop a user fact as a "duplicate" of one), `audit-supersessions`,
+improve's new-memory evidence, and the reflect insight working set.
+The mirror's content is only the summary's LEAD — first paragraph, ≤600
+chars, cut at a sentence end — plus `(full: mach kb ask --project <p> …
+overview <path>)`; the full text lives only in `code_summaries`, and
+`ask`'s `search` drops these mirrors from its memory hits (the summaries
+section already shows them). Treat one of these in recall the same as any derived fact, just
+one you now know came from the indexer rather than a session.
+
+**Module/repo summary generation landed 2026-09-24**
+(`code_index::summary::run_module_summary_pass`, called once per project
+right after that project's own file-level summary pass, same shared
+budget counter). A module is every directory at depth 1 or 2 with at
+least one `indexed`/`fallback` file recursively under it, plus the repo
+root `"/"`; deepest first (depth 2, then depth 1, then `/`) it regenerates
+every stale-or-missing one whose children (depth-2: file summaries under
+it; depth-1: its depth-2 modules' summaries plus files directly in it;
+repo: every root-level file's summary PLUS every depth-1 module's
+summary, always — a mixed repo's root files count too) are all fresh — or, once it's sat
+stale 7+ days, using whatever children currently exist rather than
+waiting forever on one stuck child. A file child that gave up on its own
+summary (the `summaries_given_up` cap above) counts as "fresh" for this
+check too — it contributes nothing, but never blocks its module; and a
+module/repo that has never had a row at all gets an empty placeholder row
+(`store::code_summary_seed_placeholder`, stale from the moment it's first
+seen) purely so the 7-day override has a `stale_since` to measure against
+— without it, a module whose children keep failing forever would never
+regenerate at all. Placeholder rows (`text = ''`) are never gathered as children, never
+embedded/backfilled, never search hits, and `overview` skips them to the
+nearest ancestor that has text; a module whose ready children have no
+text at all (all gave up) makes NO call and stays a cleared, non-stale
+placeholder (an existing real row is cleared and its mirror invalidated).
+A stale module whose children digest is unchanged just has `stale`
+cleared, no call. When a file gives up (2nd unparseable attempt) its
+leftover old-blob summary is deleted and its ancestors staled; when a
+previously summarised file turns secret, every ancestor module/repo row
+is placeholder-ized on the spot and its mirrors invalidated, so text
+derived from it stops being served before any regeneration. A
+`--path-prefix` run regenerates only modules under the prefix and never
+the repo `/` level (no repo mirror is written). The summary embedding
+backfill skips a row the embedder rejects and continues. The end-of-run embedding
+backfill (`code_summaries_missing_embedding`) is `--project`-scoped the
+same way the chunk backfill is, so a scoped run's small per-run limit
+can't be spent entirely on another project's rows. One `sonnet` call
+(`index_summary` tag, `TIMEOUT_SONNET`; ≤250 words for a module, ≤350 for the repo,
+child summaries prefixed by path and capped at 30,000 combined chars,
+dropping the longest child first if over) produces the text, stored with
+`source_digest` = sha256 of its children's own sorted `path:digest`
+lines — stable under reordering, and exactly what makes a later child
+change mark it stale again. A module whose directory has zero indexed
+files left (every file under it deleted, recategorized, or secret-swept)
+is pruned outright: its `code_summaries` row deleted and every active
+mirror with its source (`store::invalidate_index_memories_by_source`)
+tombstoned with no successor via `store::invalidate_memory`
+(mirrors `store::invalidate_relation`'s same shape one level up) — added
+because nothing existing fit tombstoning a derived row that has no
+replacement, only a removal. `mach kb why`'s `provenance_phrase` and its
+verbose `basis:` line render `derived` as "derived by the code index" /
+"derived" respectively, instead of falling through to "you told me" /
+"unknown".
+
+Scheduled nightly via `mach-index.timer` (`OnCalendar=03:30`,
+`Persistent=true` for catch-up after sleep/off) — but `install.sh` installs
+the timer WITHOUT enabling it: do a manual first run (`--dry-run`, then a
+real run, then `index status`) and enable it by hand with
+`systemctl --user enable --now mach-index.timer`. The first fill of every
+registered git project was estimated at ~10,500 calls — about 35 nights at
+the default 300 (an upper bound: the scope pass will classify part of that
+as vendored/generated and skip it). That figure is `--dry-run`'s own
+count, which is file-level only (scope pass + headers) — it does not (and
+cannot; dry-run does no chunking) estimate module/repo summary calls,
+since which directories need one depends on what's actually dirty when a
+real run happens. Measured on a bank copy against `helios-picking/` alone
+(2026-09-24, real `claude -p` calls, schema v34): 9 files → 9 header calls
++ 1 scope call + **3** summary calls (2 module: `helios-picking/` and its
+one depth-2 child `helios-picking/src/`, plus 1 repo `/`) — the module/repo
+stage added 30% on top of that small a slice's 10 file-level calls, and both module summaries
+and the repo summary were already complete after a single run (a second,
+identical invocation made 0 further calls). Extrapolated the same way
+across a directory tree — count of in-scope depth-1 dirs + in-scope
+depth-2 dirs + 1, added to the file-level estimate — a same-day
+`--dry-run` of the whole `helios` repo (which already has a scope pass
+from the run above) estimated 768 file-level calls against 58 depth-1/2
+in-scope module directories (+1 repo), i.e. **≈827 calls, not 1,536** — the
+module/repo stage is additive on top of file-level work, never a second
+full pass over it. The same day's `--dry-run` across all 17 registered
+projects (13 git repos) estimated 10,493 file-level calls; scaling the
+helios ratio (~7.7% overhead) as a rough upper bound puts a phase-2-aware
+first fill at **≈11,300 calls total**, not double — exact per-project
+module counts need each project's own scope pass first, which hasn't run
+yet outside helios in this measurement. Mutual exclusion with reflect is a
+`flock` on `~/.local/share/mach/kb-job.lock`: `mach-index.service`'s
+`ExecStart` and every kb-writing command of `mach-reflect.service`
+(`ingest-sessions`, `index-transcripts`, `projects refresh`, `meet process`,
+`reflect`, `improve`) run under it, so the two never write kb.db at the
+same time — whichever starts second blocks until the lock frees (the old
+poll-for-an-hour wait loop is gone). A reflect step can wait up to ~1h
+behind an index run. A hand-run `mach kb index` does not take the lock
+by itself; wrap it (`flock ~/.local/share/mach/kb-job.lock mach kb index
+...`) if a nightly job might be running. Run `mach kb index --project P` by hand only when a
+project needs to be searchable before the next scheduled run, a file is
+stuck `dirty` across more than one run, or a scope directory needs
+correcting with `--set` — see the index-project skill for the full
+by-hand cases; routine manual runs just pre-empt the nightly budget.
+
 ## When memory maintenance is silently doing nothing
 
 `mach kb health` includes a `thresholds` check, and it exists because the
@@ -613,20 +1113,42 @@ duplicate short strings do.
 ## Judge log (since 2026-09-23)
 
 Every LLM call that `mach kb reflect`, `mach kb graph audit`,
-`mach kb audit-supersessions` and `mach kb ingest-sessions` make is
-recorded in the `judge_log` table of `kb.db`: pass tag, model, the exact
+`mach kb audit-supersessions`, `mach kb ingest-sessions` and the code-aware
+half of `mach kb ask` (`--project`, once a project has a code index) make
+is recorded in the `judge_log` table of `kb.db`: pass tag, model, the exact
 prompt, the raw reply (or the error), and latency. Pass tags: `insights`,
 `dedupe`, `contradiction`, `curation`, `strength_review`,
 `graph_extraction`, `graph_hygiene`, `dormancy`, `insight_dedupe`,
-`entity_cards`, `meta`, `graph_audit`, `supersession_audit`, `ingest`.
+`entity_cards`, `meta`, `graph_audit`, `supersession_audit`, `ingest`,
+`ask`, `index_scope`, `index_header`, `index_summary` (both the file-level
+summary-only fallback AND the module/repo stage, see "File-level summary
+generation" and "Module/repo summary generation" above — same 2,000-char
+prompt truncation as `index_header`, full reply kept).
 
 One tag can hold several prompt shapes; tell them apart by prompt text.
 `insights` holds the question, insight, insight re-verification
 (contradiction), and insight revise/drop/keep prompts. `graph_extraction`
 also holds the entity-alias and edge-conflict judges. `graph_hygiene` is
 the entity-merge judge. `ingest` holds the engagement judge and the
-digest. `contradiction` holds only the memory-pair contradiction
-patrol.
+digest. `ask` holds only the code-aware loop's per-round tool-or-answer
+prompts (`code_index::ask::run_code_ask`) — the older memory-only `ask`
+path's search-judge and synthesis calls are not logged at all, unchanged
+from before this tag existed. `index_scope` is `mach kb index`'s one
+directory-classification call per repo (`code_index::scope::run_scope_pass`,
+sonnet); `index_header` is its one per-dirty-file combined
+context-header-plus-file-summary call (`code_index::job::finalize_dirty_file`,
+haiku, `TIMEOUT_HAIKU_BATCH`; its prompt — up to 24k chars of source — is
+stored truncated to the first 2,000 chars, the reply in full); `index_summary`
+is two prompt shapes sharing one tag — the per-project summary-only
+fallback for a file whose combined call didn't leave a matching-digest
+`code_summaries` row (`code_index::job::run_summary_pass`, haiku, same
+truncation), and the bottom-up module/repo call
+(`code_index::summary::run_module_summary_pass`, sonnet,
+`TIMEOUT_SONNET`, same truncation) — told apart by prompt text
+(`File:` vs `Module:`) the same way every other multi-shape tag here is.
+All wrap the raw LLM in `reflect::LoggedLlm` internally, same as every
+other tagged pass. `contradiction` holds only the memory-pair
+contradiction patrol.
 
 It exists because the `*_seen` tables keep only negative verdicts and
 `superseded_by` does not record why a row was superseded. The log is the
@@ -860,8 +1382,16 @@ merging or tombstoning; `mach kb add`'s classifier path falls back to a
 plain `ADD`. Every block is also logged to stderr: `mach kb: supersession
 blocked (<reason>) #loser -> #winner`.
 
-Two checks, gated by which pass is asking (`store::GuardKind`):
+Three checks, gated by which pass is asking (`store::GuardKind`):
 
+- **Index-owned guard** (every pass, checked first): blocks with
+  `index-owned` when EITHER row's `source` (loser or winner) starts with
+  `code-index:` — a code-index summary memory (module/repo, since
+  2026-09-24 — see "The code index" below) is regenerated and superseded
+  ONLY by the indexer itself, never by dedupe, contradiction, or the
+  add-time classifier, and it may never win over (and so tombstone) a
+  user memory either. Those passes also leave index-owned rows out of
+  their candidate pools entirely, so the guard is the second line.
 - **Date guard** (every pass): blocks with `dated fact` when the losing row
   is scoped to a specific date (`occurred_from` set, or its own text names
   an ISO date via `iso_dates_in`) that the winner does not also state,
@@ -925,6 +1455,35 @@ gathers it is a retrieval bug, and the fixes live in different places.
 
 Expect run-to-run variance of roughly one question — the loop makes LLM
 calls, so a single run is not a measurement. Compare two.
+
+## Measuring the code-aware `ask`: `mach kb eval-code` (since 2026-09-23)
+
+```
+mach kb eval-code [--file F] [--project X] [--json] [--verbose]
+```
+
+Scores `ask --project`'s actual contract rather than a substring match: a
+question passes when one of its `expect_paths` is the path component of a
+`path:line@sha7` citation the loop's final answer actually gave
+(`code_index::ask::score_eval_code`). Question set:
+`~/.local/share/mach/eval/code-questions.jsonl` — one JSON object per line,
+`{id, project, query, expect_paths}`. A question naming a project this
+bank hasn't registered is reported and scored a fail rather than aborting
+the run.
+
+The shipped set has 15 questions against `helios`, 8 of them about
+`helios-picking` (the pointer/hit-test interaction core: hit-backend
+registration, the per-frame sort/hover-diff/press-edge walk, 2D coordinate
+conversion, the `Hittable` blocking/hoverable flags, drag-off/camera-loss
+edge cases, the four pointer events, cross-domain backend priority) and 7
+across other modules (physics/Jolt, audio/SoLoud, the CoreCLR script host
+and its hot-reload sequence, ECS `Entity`/`Schedule`, the render graph's
+parallel-scheduling and culling-exemption logic) — every `expect_paths`
+entry verified against `git ls-files` in the real `helios` checkout before
+being written, not guessed at. Like `eval-ask`, this needs a real code
+index (`mach kb index --project helios`) and real `claude -p` calls to
+produce a meaningful score; nothing in this repo's own test suite runs it
+against live data.
 
 ## The association graph — what you associate things with
 

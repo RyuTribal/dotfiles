@@ -146,6 +146,14 @@ pub fn run_claude(claude_bin: &str, model: &str, timeout: Duration, prompt: &str
         .arg(model)
         .arg("--permission-prompts")
         .arg("none")
+        // No built-in tools at all. Every caller passes its material in
+        // the prompt; none needs to touch the filesystem. `--disallowedTools`
+        // alone left Read/Grep/Glob enabled, so a prompt-injected model
+        // (these prompts embed memories, transcripts and code) could read
+        // any file the user can, secrets included.
+        .arg("--tools")
+        .arg("")
+        // Kept as defence in depth (harmless next to `--tools ""`).
         .arg("--disallowedTools")
         .arg("Bash Edit Write NotebookEdit WebFetch WebSearch Agent")
         // No MCP servers. Every tool is already disallowed above, so a
@@ -158,6 +166,21 @@ pub fn run_claude(claude_bin: &str, model: &str, timeout: Duration, prompt: &str
         .arg("--strict-mcp-config")
         .arg("--mcp-config")
         .arg("{\"mcpServers\":{}}")
+        // Load no user/project/local settings.json at all. Without this,
+        // the CLI still loads the user's own Claude Code settings for a
+        // spawned `-p` call -- including hooks -- and a hook there (a
+        // "caveman" terse-speech style hook, in this user's case) rewrites
+        // the model's replies into telegraphic fragments before they ever
+        // reach us. That corrupts every stored answer (memories, note
+        // descriptions, digests): the classifier/reflect/note text this
+        // function returns gets saved verbatim. Hooks are already skipped
+        // via `MACH_KB_DIGEST=1` below as a second guard, but that only
+        // covers *this repo's own* hooks -- it does nothing about other
+        // style/behavior hooks the user has configured, which is exactly
+        // what bit us. OAuth login still works with no settings loaded
+        // (verified with real calls), so this costs nothing but the
+        // inherited hooks/permissions/env the settings files would add.
+        .arg("--setting-sources=")
         // Read by the kb hooks (kb-recall, kb-model, kb-capture,
         // kb-checkpoint, kb-decision, kb-pretool-recall), which all exit
         // early on it: a chore subprocess must not be handed recalled
@@ -253,6 +276,36 @@ impl Classifier for ProcessClassifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Security (final-review item 6): every `run_claude` subcall must run
+    /// with NO built-in tools (`--tools ""`) -- Read/Grep/Glob would
+    /// otherwise let a prompt-injected model read any file, secrets
+    /// included. Captured from the real spawned argv via a stand-in
+    /// `claude` script (no LLM involved).
+    #[test]
+    fn run_claude_spawns_with_no_builtin_tools() {
+        let dir = std::env::temp_dir().join(format!("kb-argv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let argv_file = dir.join("argv");
+        let script = dir.join("fake-claude");
+        std::fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat >/dev/null\necho ok\n", argv_file.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let out = run_claude(script.to_str().unwrap(), "haiku", Duration::from_secs(10), "prompt").unwrap();
+        assert_eq!(out.trim(), "ok");
+        let argv: Vec<String> = std::fs::read_to_string(&argv_file).unwrap().lines().map(str::to_string).collect();
+        let i = argv.iter().position(|a| a == "--tools").expect("--tools flag present");
+        assert_eq!(argv[i + 1], "", "--tools must be given the empty list");
+        assert!(argv.iter().any(|a| a == "--disallowedTools"), "the denylist stays as defence in depth");
+        assert!(argv.iter().any(|a| a == "--strict-mcp-config"));
+        assert!(
+            argv.iter().any(|a| a == "--setting-sources="),
+            "must load no user/project/local settings -- otherwise the user's own hooks (e.g. a \
+             terse-speech style hook) reshape stored text"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parses_add() {

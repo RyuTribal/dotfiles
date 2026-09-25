@@ -1,0 +1,18 @@
+[Unit]
+Description=Run mach kb index periodically
+
+# Nightly anchor, ahead of mach-reflect.timer's own 04:00 anchor/10min-boot
+# window — the two schedules are independent (this one is not ordered by
+# mach-reflect.timer in any way), so the shared flock on
+# ~/.local/share/mach/kb-job.lock (taken by `mach kb index` itself and by
+# flock(1) around mach-reflect's commands) is what keeps them from writing to kb.db at once when
+# jitter or an OnUnitInactiveSec re-arm makes them land close together.
+# Persistent=true gives the same catch-up-after-sleep guarantee
+# mach-reflect.timer/mach-kb-backup.timer already rely on for a laptop
+# that's off or suspended at 03:30.
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

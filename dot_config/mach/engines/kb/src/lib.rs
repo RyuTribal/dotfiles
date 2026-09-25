@@ -26,6 +26,7 @@
 pub mod ask;
 pub mod classify;
 pub mod cli;
+pub mod code_index;
 pub mod embed;
 pub mod eval;
 pub mod export;

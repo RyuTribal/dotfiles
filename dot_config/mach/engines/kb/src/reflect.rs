@@ -167,6 +167,10 @@ impl ReflectLlm for ProcessReflectLlm {
     }
 }
 
+/// `judge_log` keeps at most this many characters of an `index_header`,
+/// `index_summary`, or `index_history` prompt (see `LoggedLlm::call`).
+pub const JUDGE_LOG_HEADER_PROMPT_CHARS: usize = 2_000;
+
 /// Decorator that records every call in `judge_log` (see
 /// `store::migrate_v25_to_v26` for why) and returns the wrapped client's
 /// result unchanged. A failed log insert only warns: the log is
@@ -190,11 +194,26 @@ impl<L: ReflectLlm> ReflectLlm for LoggedLlm<'_, L> {
         let result = self.inner.call(model, prompt, timeout);
         let latency_ms = started.elapsed().as_millis() as u64;
         let outcome = result.as_deref().map_err(|e| e.as_str());
+        // Header (`index_header`), summary-only (`index_summary`), and
+        // monthly commit-history (`index_history`) prompts all carry a large
+        // chunk of source/log text per call -- storing them whole would make
+        // judge_log grow with the code index. The first 2,000 chars (project,
+        // path/month, start of the text) are enough to label the reply; the
+        // reply is kept in full.
+        let truncated_pass = self.pass == "index_header" || self.pass == "index_summary" || self.pass == "index_history";
+        let logged_prompt: std::borrow::Cow<str> = if truncated_pass {
+            match prompt.char_indices().nth(JUDGE_LOG_HEADER_PROMPT_CHARS) {
+                Some((cut, _)) => std::borrow::Cow::Borrowed(&prompt[..cut]),
+                None => std::borrow::Cow::Borrowed(prompt),
+            }
+        } else {
+            std::borrow::Cow::Borrowed(prompt)
+        };
         if let Err(e) = crate::store::log_judge_call(
             self.conn,
             self.pass,
             model,
-            prompt,
+            &logged_prompt,
             outcome,
             latency_ms,
             &crate::store::now_rfc3339(),
@@ -4044,6 +4063,33 @@ banana: SAME
         let llm = LoggedLlm::new(&conn, "contradiction", &inner);
         assert_eq!(llm.call("haiku", "P", TIMEOUT_HAIKU).unwrap_err(), "offline");
         assert_eq!(judge_rows(&conn), vec![("contradiction".into(), "haiku".into(), "P".into(), None, Some("offline".into()))]);
+    }
+
+    #[test]
+    fn logged_llm_truncates_index_header_prompts_to_2000_chars_but_keeps_the_reply() {
+        let conn = crate::store::open_with_path(std::path::Path::new(":memory:")).unwrap();
+        let inner = ScriptedLlm { reply: Ok("#1: a header") };
+        let long_prompt = "\u{e9}".repeat(5_000);
+        LoggedLlm::new(&conn, "index_header", &inner).call("haiku", &long_prompt, TIMEOUT_HAIKU).unwrap();
+        LoggedLlm::new(&conn, "index_scope", &inner).call("sonnet", &long_prompt, TIMEOUT_HAIKU).unwrap();
+        let rows = judge_rows(&conn);
+        assert_eq!(rows[0].2.chars().count(), 2_000, "index_header prompt stored truncated");
+        assert_eq!(rows[0].3.as_deref(), Some("#1: a header"), "reply stored in full");
+        assert_eq!(rows[1].2.chars().count(), 5_000, "other passes keep the full prompt");
+    }
+
+    #[test]
+    fn logged_llm_truncates_index_summary_prompts_to_2000_chars_too() {
+        // Same cap, same rationale, extended to the summary-only pass (see
+        // constraints.md: "apply the existing index_header 2,000-char
+        // truncation to index_summary too").
+        let conn = crate::store::open_with_path(std::path::Path::new(":memory:")).unwrap();
+        let inner = ScriptedLlm { reply: Ok("SUMMARY: a file summary") };
+        let long_prompt = "\u{e9}".repeat(5_000);
+        LoggedLlm::new(&conn, "index_summary", &inner).call("haiku", &long_prompt, TIMEOUT_HAIKU).unwrap();
+        let rows = judge_rows(&conn);
+        assert_eq!(rows[0].2.chars().count(), 2_000, "index_summary prompt stored truncated");
+        assert_eq!(rows[0].3.as_deref(), Some("SUMMARY: a file summary"), "reply stored in full");
     }
 
     #[test]

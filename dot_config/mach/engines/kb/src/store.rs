@@ -1006,6 +1006,1683 @@ pub fn search_transcripts(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------
+// Code index (schema 32, `migrate_v31_to_v32`; see `crate::code_index`).
+//
+// Same rationale as `transcript_chunks`/`transcript_chunks_fts` above: a
+// chunk is derived state parsed out of a git blob, not a fact, so it lives
+// in its own tables rather than `memories` and is droppable/rebuildable
+// from the indexed repo at any time. `code_chunks_fts` is external-content
+// (`content='code_chunks'`) and kept in sync the same way
+// `transcript_chunks_fts` is -- explicit `INSERT ... 'delete'` + insert
+// around every write, no triggers.
+// ---------------------------------------------------------------------
+
+/// One directory's category decision in `code_scope`. `source` is
+/// `"llm"` (the scope pass's own guess) or `"user"` (a manual override,
+/// which `code_scope_set` never lets an `"llm"` write clobber).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopeRow {
+    pub project_id: i64,
+    pub dir: String,
+    pub category: String,
+    pub source: String,
+    pub decided_at: String,
+}
+
+/// One row of `code_files`: a project-relative path's indexing state.
+/// `blob` is the git blob sha this row was indexed at (not the file
+/// content); `status` is one of `indexed`/`dirty`/`fallback`/`skipped`.
+/// `summary_attempts` (schema 34) counts unparseable-summary attempts for
+/// THIS blob -- `code_file_upsert` resets it to 0 whenever `blob` changes,
+/// so it always reflects "how many times has the current blob's summary
+/// call succeeded but produced nothing parseable" (see
+/// `code_file_increment_summary_attempts`, `code_index::job::run_summary_pass`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodeFileRow {
+    pub project_id: i64,
+    pub path: String,
+    pub blob: String,
+    pub lang: Option<String>,
+    pub lines: i64,
+    pub status: String,
+    pub indexed_at: String,
+    pub summary_attempts: i64,
+}
+
+/// A chunk to insert via `replace_code_chunks`. No `id` (SQLite assigns
+/// it) and no `project_id`/`path` (given once for the whole file being
+/// replaced) -- just the per-chunk fields the chunker (a later task)
+/// produces.
+#[derive(Debug, Clone, Default)]
+pub struct NewCodeChunk {
+    pub symbol: Option<String>,
+    pub kind: String,
+    pub scope: Option<String>,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub text: String,
+    pub header: Option<String>,
+    pub embedding: Option<Vec<f32>>,
+    pub content_hash: String,
+}
+
+/// One ranked hit from `search_code_chunks`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodeHit {
+    pub id: i64,
+    pub project_id: i64,
+    pub path: String,
+    pub symbol: Option<String>,
+    pub kind: String,
+    pub scope: Option<String>,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub text: String,
+    pub header: Option<String>,
+    /// Fused relevance, higher is better -- see `search_code_chunks`.
+    pub score: f32,
+}
+
+/// Every scope decision recorded for a project, one row per directory.
+pub fn code_scope_get(conn: &Connection, project_id: i64) -> Result<Vec<ScopeRow>, KbError> {
+    let mut stmt = conn
+        .prepare("SELECT project_id, dir, category, source, decided_at FROM code_scope WHERE project_id = ?1 ORDER BY dir")?;
+    let rows = stmt.query_map(params![project_id], |r| {
+        Ok(ScopeRow { project_id: r.get(0)?, dir: r.get(1)?, category: r.get(2)?, source: r.get(3)?, decided_at: r.get(4)? })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Records a directory's category decision. A `"user"` row is a manual
+/// override and is never overwritten by a `source == "llm"` write -- the
+/// scope pass re-runs periodically (see the design doc) and must not
+/// silently undo a decision the user made by hand.
+pub fn code_scope_set(conn: &Connection, project_id: i64, dir: &str, category: &str, source: &str, now: &str) -> Result<(), KbError> {
+    let existing_source: Option<String> = conn
+        .query_row("SELECT source FROM code_scope WHERE project_id = ?1 AND dir = ?2", params![project_id, dir], |r| r.get(0))
+        .optional()?;
+    if existing_source.as_deref() == Some("user") && source == "llm" {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO code_scope (project_id, dir, category, source, decided_at) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(project_id, dir) DO UPDATE SET
+             category = excluded.category, source = excluded.source, decided_at = excluded.decided_at",
+        params![project_id, dir, category, source, now],
+    )?;
+    Ok(())
+}
+
+fn row_to_code_file(r: &rusqlite::Row) -> rusqlite::Result<CodeFileRow> {
+    Ok(CodeFileRow {
+        project_id: r.get(0)?,
+        path: r.get(1)?,
+        blob: r.get(2)?,
+        lang: r.get(3)?,
+        lines: r.get(4)?,
+        status: r.get(5)?,
+        indexed_at: r.get(6)?,
+        summary_attempts: r.get(7)?,
+    })
+}
+
+const CODE_FILE_COLUMNS: &str = "project_id, path, blob, lang, lines, status, indexed_at, summary_attempts";
+
+/// One file's indexing state, if it has ever been indexed.
+pub fn code_file_get(conn: &Connection, project_id: i64, path: &str) -> Result<Option<CodeFileRow>, KbError> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT {CODE_FILE_COLUMNS} FROM code_files WHERE project_id = ?1 AND path = ?2"),
+            params![project_id, path],
+            row_to_code_file,
+        )
+        .optional()?)
+}
+
+/// Inserts or updates one file's indexing state. `summary_attempts` starts
+/// at 0 for a brand-new row and is reset to 0 whenever the blob actually
+/// changes (a new blob means the previous blob's give-up count is
+/// irrelevant -- the file gets a fresh 2 tries at a summary for its new
+/// content); an upsert that leaves the blob unchanged (e.g. `mark_skipped`
+/// re-recording the same skip) preserves whatever count was already there.
+pub fn code_file_upsert(
+    conn: &Connection,
+    project_id: i64,
+    path: &str,
+    blob: &str,
+    lang: Option<&str>,
+    lines: i64,
+    status: &str,
+    now: &str,
+) -> Result<(), KbError> {
+    conn.execute(
+        "INSERT INTO code_files (project_id, path, blob, lang, lines, status, indexed_at, summary_attempts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
+         ON CONFLICT(project_id, path) DO UPDATE SET
+             blob = excluded.blob, lang = excluded.lang, lines = excluded.lines,
+             status = excluded.status, indexed_at = excluded.indexed_at,
+             summary_attempts = CASE WHEN code_files.blob = excluded.blob THEN code_files.summary_attempts ELSE 0 END",
+        params![project_id, path, blob, lang, lines, status, now],
+    )?;
+    Ok(())
+}
+
+/// Records one more unparseable-summary attempt for `path`'s CURRENT blob
+/// (a combined or summary-only call that succeeded but produced no usable
+/// `SUMMARY:` line) and returns the new count -- `code_index::job` gives up
+/// queuing further summary-only calls for a file once this reaches
+/// `job::SUMMARY_GIVE_UP_ATTEMPTS`. A no-op returning 0 if `path` has no
+/// `code_files` row (defensive; every real caller already holds one).
+pub fn code_file_increment_summary_attempts(conn: &Connection, project_id: i64, path: &str) -> Result<i64, KbError> {
+    conn.execute(
+        "UPDATE code_files SET summary_attempts = summary_attempts + 1 WHERE project_id = ?1 AND path = ?2",
+        params![project_id, path],
+    )?;
+    Ok(conn
+        .query_row(
+            "SELECT summary_attempts FROM code_files WHERE project_id = ?1 AND path = ?2",
+            params![project_id, path],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+
+/// Drops a file's indexing state along with every chunk parsed from it
+/// (kept in sync with `code_chunks_fts`) -- the store-layer half of "a
+/// deleted file's chunks are removed" (the other half, noticing the
+/// deletion, is the nightly job's diff).
+pub fn code_file_delete(conn: &Connection, project_id: i64, path: &str) -> Result<(), KbError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO code_chunks_fts(code_chunks_fts, rowid, header, text, symbol)
+         SELECT 'delete', id, header, text, symbol FROM code_chunks WHERE project_id = ?1 AND path = ?2",
+        params![project_id, path],
+    )?;
+    tx.execute("DELETE FROM code_chunks WHERE project_id = ?1 AND path = ?2", params![project_id, path])?;
+    tx.execute("DELETE FROM code_files WHERE project_id = ?1 AND path = ?2", params![project_id, path])?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Updates only a file's status (e.g. marking it `dirty` after a failed
+/// header/embed pass, without disturbing `indexed_at` or the blob it was
+/// last successfully indexed at).
+pub fn code_file_set_status(conn: &Connection, project_id: i64, path: &str, status: &str) -> Result<(), KbError> {
+    conn.execute("UPDATE code_files SET status = ?1 WHERE project_id = ?2 AND path = ?3", params![status, project_id, path])?;
+    Ok(())
+}
+
+/// Every file of a project currently at a given status, e.g. `"dirty"` for
+/// the nightly job's retry list.
+pub fn code_files_with_status(conn: &Connection, project_id: i64, status: &str) -> Result<Vec<CodeFileRow>, KbError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {CODE_FILE_COLUMNS} FROM code_files WHERE project_id = ?1 AND status = ?2 ORDER BY path"
+    ))?;
+    let rows = stmt.query_map(params![project_id, status], row_to_code_file)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Replaces every chunk of one file and returns the new rows' ids, in the
+/// same order as `chunks` -- a later header/embed pass addresses a chunk
+/// by this id (see `set_code_chunk_header`, `set_code_chunk_embedding`).
+/// Delete-then-insert in one transaction, same shape as
+/// `replace_transcript_chunks`: a re-chunk (the file changed) must not
+/// leave the previous pass's rows behind as duplicates.
+pub fn replace_code_chunks(conn: &Connection, project_id: i64, path: &str, chunks: &[NewCodeChunk]) -> Result<Vec<i64>, KbError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO code_chunks_fts(code_chunks_fts, rowid, header, text, symbol)
+         SELECT 'delete', id, header, text, symbol FROM code_chunks WHERE project_id = ?1 AND path = ?2",
+        params![project_id, path],
+    )?;
+    tx.execute("DELETE FROM code_chunks WHERE project_id = ?1 AND path = ?2", params![project_id, path])?;
+    let mut ids = Vec::with_capacity(chunks.len());
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO code_chunks (project_id, path, symbol, kind, scope, start_line, end_line, text, header, embedding, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        )?;
+        let mut fts = tx.prepare("INSERT INTO code_chunks_fts(rowid, header, text, symbol) VALUES (?1, ?2, ?3, ?4)")?;
+        for c in chunks {
+            let emb = c.embedding.as_ref().map(|v| encode_embedding(v));
+            stmt.execute(params![
+                project_id,
+                path,
+                c.symbol,
+                c.kind,
+                c.scope,
+                c.start_line,
+                c.end_line,
+                c.text,
+                c.header,
+                emb,
+                c.content_hash
+            ])?;
+            let id = tx.last_insert_rowid();
+            fts.execute(params![id, c.header, c.text, c.symbol])?;
+            ids.push(id);
+        }
+    }
+    tx.commit()?;
+    Ok(ids)
+}
+
+/// Attaches a contextual header to one already-inserted chunk, keeping
+/// `code_chunks_fts` in step (header is an indexed column, so this is a
+/// delete-old-row + insert-new-row around the external-content table, not
+/// a plain `UPDATE`).
+pub fn set_code_chunk_header(conn: &Connection, id: i64, header: &str) -> Result<(), KbError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO code_chunks_fts(code_chunks_fts, rowid, header, text, symbol)
+         SELECT 'delete', id, header, text, symbol FROM code_chunks WHERE id = ?1",
+        params![id],
+    )?;
+    tx.execute("UPDATE code_chunks SET header = ?1 WHERE id = ?2", params![header, id])?;
+    tx.execute(
+        "INSERT INTO code_chunks_fts(rowid, header, text, symbol) SELECT id, header, text, symbol FROM code_chunks WHERE id = ?1",
+        params![id],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Attaches an embedding to one already-inserted chunk. Not an FTS
+/// column, so a plain `UPDATE`.
+pub fn set_code_chunk_embedding(conn: &Connection, id: i64, embedding: &[f32]) -> Result<(), KbError> {
+    conn.execute("UPDATE code_chunks SET embedding = ?1 WHERE id = ?2", params![encode_embedding(embedding), id])?;
+    Ok(())
+}
+
+/// Chunks still waiting on an embedding, oldest-id-first, capped at
+/// `limit` -- same shape and same reason as
+/// `transcript_chunks_missing_embedding`: lets an embedder-down gap be
+/// closed by a separate pass without a full re-chunk.
+pub fn code_chunks_missing_embedding(conn: &Connection, limit: usize) -> Result<Vec<(i64, String)>, KbError> {
+    let mut stmt = conn.prepare("SELECT id, text FROM code_chunks WHERE embedding IS NULL ORDER BY id ASC LIMIT ?1")?;
+    let rows = stmt.query_map(params![limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+fn row_to_code_hit(r: &rusqlite::Row) -> rusqlite::Result<CodeHit> {
+    Ok(CodeHit {
+        id: r.get(0)?,
+        project_id: r.get(1)?,
+        path: r.get(2)?,
+        symbol: r.get(3)?,
+        kind: r.get(4)?,
+        scope: r.get(5)?,
+        start_line: r.get(6)?,
+        end_line: r.get(7)?,
+        text: r.get(8)?,
+        header: r.get(9)?,
+        score: 0.0,
+    })
+}
+
+const CODE_HIT_COLUMNS: &str = "id, project_id, path, symbol, kind, scope, start_line, end_line, text, header";
+
+/// Hybrid search over indexed code chunks, optionally scoped to one
+/// project (`None` searches every project).
+///
+/// Two channels, fused the same way `search_hybrid`'s `Fusion::Max`
+/// branch and `search_transcripts` both fuse theirs: lexical and semantic
+/// are scored independently, then combined as `max(sim, LEXICAL_WEIGHT *
+/// lex)` -- the stronger channel wins, never summed, so a chunk that
+/// matches both is not double-counted.
+///
+/// - **Lexical**: BM25 over `code_chunks_fts`, normalized against this
+///   result set's own best match so it shares a scale with cosine (same
+///   normalization `search_transcripts` uses). The `bm25()` column
+///   weights are `(header=1.0, text=1.0, symbol=10.0)` -- heavily biased
+///   toward the `symbol` column so a chunk whose *symbol name* matches the
+///   query outranks one that merely mentions the same token in its body,
+///   which is what makes an exact symbol-name query resolve to its
+///   definition first.
+/// - **Semantic**: cosine over `embedding`, floored at `SIM_NOISE_FLOOR`
+///   (unrelated text still scores 0.4-0.55 under this embedder — see that
+///   constant's doc comment), same brute-force linear scan as every other
+///   cosine search in this store.
+pub fn search_code_chunks(
+    conn: &Connection,
+    project_id: Option<i64>,
+    query: &str,
+    query_emb: Option<&[f32]>,
+    limit: usize,
+) -> Result<Vec<CodeHit>, KbError> {
+    let mut scored: HashMap<i64, (CodeHit, f32, f32)> = HashMap::new();
+
+    if let Some(cleaned) = fts_query(query) {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT c.id, c.project_id, c.path, c.symbol, c.kind, c.scope, c.start_line, c.end_line, c.text, c.header,
+                    bm25(code_chunks_fts, 1.0, 1.0, 10.0)
+             FROM code_chunks_fts f JOIN code_chunks c ON c.id = f.rowid
+             WHERE code_chunks_fts MATCH ?1 AND (?2 IS NULL OR c.project_id = ?2)
+             ORDER BY bm25(code_chunks_fts, 1.0, 1.0, 10.0) LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(params![cleaned, project_id, (limit * 4) as i64], |r| {
+            Ok((row_to_code_hit(r)?, -r.get::<_, f64>(10)? as f32))
+        })?;
+        let mut raw = Vec::new();
+        for r in rows {
+            raw.push(r?);
+        }
+        let best = raw.iter().map(|(_, b)| *b).fold(0.0f32, f32::max);
+        for (hit, bm) in raw {
+            let lex = if best > 0.0 { bm / best } else { 0.0 };
+            scored.insert(hit.id, (hit, lex, 0.0));
+        }
+    }
+
+    if let Some(q) = query_emb {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CODE_HIT_COLUMNS}, embedding FROM code_chunks WHERE embedding IS NOT NULL AND (?1 IS NULL OR project_id = ?1)"
+        ))?;
+        let rows = stmt.query_map(params![project_id], |r| Ok((row_to_code_hit(r)?, r.get::<_, Vec<u8>>(10)?)))?;
+        let mut sims: Vec<(f32, CodeHit)> = Vec::new();
+        for r in rows {
+            let (hit, blob) = r?;
+            let v = decode_embedding(&blob);
+            let sim = cosine(q, &v);
+            if sim > SIM_NOISE_FLOOR {
+                sims.push((sim, hit));
+            }
+        }
+        sims.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        for (sim, hit) in sims.into_iter().take(limit * 4) {
+            scored.entry(hit.id).and_modify(|e| e.2 = sim).or_insert((hit, 0.0, sim));
+        }
+    }
+
+    let mut out: Vec<CodeHit> = scored
+        .into_values()
+        .map(|(mut hit, lex, sim)| {
+            hit.score = sim.max(LEXICAL_WEIGHT * lex);
+            hit
+        })
+        .collect();
+    out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    out.truncate(limit);
+    Ok(out)
+}
+
+/// Records the commit a project's code index is now current with.
+pub fn set_code_indexed_head(conn: &Connection, project_id: i64, sha: &str, now: &str) -> Result<(), KbError> {
+    conn.execute("UPDATE projects SET code_indexed_head = ?1, code_indexed_at = ?2 WHERE id = ?3", params![sha, now, project_id])?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Code summaries (schema 33, `migrate_v32_to_v33`; see `crate::code_index`
+// and the design doc's "Summaries (phase 2) — revised 2026-09-24" section).
+//
+// One row per (project_id, path) -- a file path for `level = "file"`,
+// `"<dir>/"` for a module, `"/"` for the repo -- holding the LLM-produced
+// summary text for that unit. Kept FTS-searchable the same explicit
+// insert-and-delete way as `code_chunks_fts` above, off SQLite's implicit
+// `rowid` rather than a declared id column (see `migrate_v32_to_v33`'s own
+// doc comment for why that's safe here).
+//
+// Module and repo summaries are ALSO mirrored into `memories` as
+// index-owned rows via `upsert_index_memory`, so plain session recall
+// surfaces them; file summaries never are (see the design doc).
+// ---------------------------------------------------------------------
+
+/// One row of `code_summaries`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodeSummaryRow {
+    pub project_id: i64,
+    pub path: String,
+    pub level: String,
+    pub text: String,
+    pub embedding: Option<Vec<f32>>,
+    pub source_digest: String,
+    pub stale: bool,
+    pub stale_since: Option<String>,
+    pub memory_id: Option<i64>,
+    pub updated_at: String,
+}
+
+/// One ranked hit from `search_code_summaries`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SummaryHit {
+    pub project_id: i64,
+    pub path: String,
+    pub level: String,
+    pub text: String,
+    pub stale: bool,
+    /// Fused relevance, higher is better -- same fusion `search_code_chunks`
+    /// uses.
+    pub score: f32,
+}
+
+const CODE_SUMMARY_COLUMNS: &str =
+    "project_id, path, level, text, embedding, source_digest, stale, stale_since, memory_id, updated_at";
+
+fn row_to_code_summary(r: &rusqlite::Row) -> rusqlite::Result<CodeSummaryRow> {
+    let blob: Option<Vec<u8>> = r.get(4)?;
+    let stale_int: i64 = r.get(6)?;
+    Ok(CodeSummaryRow {
+        project_id: r.get(0)?,
+        path: r.get(1)?,
+        level: r.get(2)?,
+        text: r.get(3)?,
+        embedding: blob.map(|b| decode_embedding(&b)),
+        source_digest: r.get(5)?,
+        stale: stale_int != 0,
+        stale_since: r.get(7)?,
+        memory_id: r.get(8)?,
+        updated_at: r.get(9)?,
+    })
+}
+
+/// One project/path's summary, if it has ever been generated.
+pub fn code_summary_get(conn: &Connection, project_id: i64, path: &str) -> Result<Option<CodeSummaryRow>, KbError> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT {CODE_SUMMARY_COLUMNS} FROM code_summaries WHERE project_id = ?1 AND path = ?2"),
+            params![project_id, path],
+            row_to_code_summary,
+        )
+        .optional()?)
+}
+
+/// Inserts or regenerates a file/module/repo summary, clearing `stale`
+/// (`stale = 0`, `stale_since = NULL`) since fresh text just replaced
+/// whatever was stale about the old one. Also clears any previous
+/// `embedding` -- text and its embedding must never drift apart, so a
+/// regenerated summary always needs a fresh embedding, which
+/// `code_summaries_missing_embedding` then picks up the same way an
+/// embedder-down gap is closed for `code_chunks`. `memory_id` is left
+/// untouched: it is set separately, once the module/repo mirror memory
+/// exists (see `set_code_summary_memory_id`, `upsert_index_memory`), not by
+/// this call.
+///
+/// Delete-then-insert around `code_summaries_fts` in one transaction, same
+/// external-content-table dance `replace_code_chunks`/`set_code_chunk_header`
+/// use: the 'delete' command must run first, against whatever `text`/`path`
+/// are still live in `code_summaries` before the upsert overwrites them.
+pub fn code_summary_upsert(
+    conn: &Connection,
+    project_id: i64,
+    path: &str,
+    level: &str,
+    text: &str,
+    source_digest: &str,
+    now: &str,
+) -> Result<(), KbError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO code_summaries_fts(code_summaries_fts, rowid, text, path)
+         SELECT 'delete', rowid, text, path FROM code_summaries WHERE project_id = ?1 AND path = ?2",
+        params![project_id, path],
+    )?;
+    tx.execute(
+        "INSERT INTO code_summaries (project_id, path, level, text, source_digest, stale, stale_since, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, NULL, ?6)
+         ON CONFLICT(project_id, path) DO UPDATE SET
+             level = excluded.level, text = excluded.text, source_digest = excluded.source_digest,
+             embedding = NULL, stale = 0, stale_since = NULL, updated_at = excluded.updated_at",
+        params![project_id, path, level, text, source_digest, now],
+    )?;
+    tx.execute(
+        "INSERT INTO code_summaries_fts(rowid, text, path)
+         SELECT rowid, text, path FROM code_summaries WHERE project_id = ?1 AND path = ?2",
+        params![project_id, path],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Attaches an embedding to one already-inserted summary. Not an FTS
+/// column, so a plain `UPDATE`.
+pub fn set_code_summary_embedding(conn: &Connection, project_id: i64, path: &str, embedding: &[f32]) -> Result<(), KbError> {
+    conn.execute(
+        "UPDATE code_summaries SET embedding = ?1 WHERE project_id = ?2 AND path = ?3",
+        params![encode_embedding(embedding), project_id, path],
+    )?;
+    Ok(())
+}
+
+/// Records which mirrored `memories` row (from `upsert_index_memory`)
+/// corresponds to a module/repo summary. Never called for `level = "file"`
+/// rows -- file summaries have no mirror (see the design doc).
+pub fn set_code_summary_memory_id(conn: &Connection, project_id: i64, path: &str, memory_id: i64) -> Result<(), KbError> {
+    conn.execute(
+        "UPDATE code_summaries SET memory_id = ?1 WHERE project_id = ?2 AND path = ?3",
+        params![memory_id, project_id, path],
+    )?;
+    Ok(())
+}
+
+/// Deletes one summary row along with its FTS entry -- e.g. a file/dir that
+/// dropped out of scope, or was removed from the repo entirely. Does NOT
+/// touch the mirrored `memories` row a module/repo summary may have
+/// (`memory_id`); a later task's job code is responsible for superseding
+/// that separately if the directory itself is gone, the same way
+/// `code_file_delete` doesn't reach outside `code_files`/`code_chunks`.
+pub fn code_summary_delete(conn: &Connection, project_id: i64, path: &str) -> Result<(), KbError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO code_summaries_fts(code_summaries_fts, rowid, text, path)
+         SELECT 'delete', rowid, text, path FROM code_summaries WHERE project_id = ?1 AND path = ?2",
+        params![project_id, path],
+    )?;
+    tx.execute("DELETE FROM code_summaries WHERE project_id = ?1 AND path = ?2", params![project_id, path])?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Marks each of `paths` stale (`stale = 1`), setting `stale_since` only if
+/// it is still NULL -- a summary already stale keeps the timestamp of when
+/// it FIRST went stale, so this never resets the "how long has this been
+/// stale" clock just because another child changed too (the design doc's
+/// 7-day stale-regen-anyway rule depends on that first timestamp holding
+/// still). Returns the number of rows actually touched.
+pub fn mark_code_summaries_stale(conn: &Connection, project_id: i64, paths: &[String], now: &str) -> Result<usize, KbError> {
+    if paths.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.unchecked_transaction()?;
+    let mut updated = 0usize;
+    {
+        let mut stmt = tx.prepare(
+            "UPDATE code_summaries SET stale = 1, stale_since = COALESCE(stale_since, ?1)
+             WHERE project_id = ?2 AND path = ?3",
+        )?;
+        for path in paths {
+            updated += stmt.execute(params![now, project_id, path])?;
+        }
+    }
+    tx.commit()?;
+    Ok(updated)
+}
+
+/// Every stale summary of a project, path ascending -- the nightly job's
+/// own "what needs regenerating" list.
+pub fn stale_code_summaries(conn: &Connection, project_id: i64) -> Result<Vec<CodeSummaryRow>, KbError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {CODE_SUMMARY_COLUMNS} FROM code_summaries WHERE project_id = ?1 AND stale = 1 ORDER BY path"
+    ))?;
+    let rows = stmt.query_map(params![project_id], row_to_code_summary)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Summaries still waiting on an embedding, ordered `project_id, path`,
+/// optionally scoped to one `project_id` -- same shape and same reason as
+/// `code_chunks_missing_embedding`: lets an embedder-down gap be closed by a
+/// separate pass without regenerating the summary text itself.
+/// `(project_id, path, text)` since, unlike a chunk, a summary has no
+/// surrogate integer id to address it by. The `project_id` filter (fix-list
+/// item 3) is what lets `code_index::job::backfill_summary_embeddings` scope
+/// a `--project`-limited run to that project alone, instead of a `limit`-
+/// sized backfill spending its whole budget on another project's rows
+/// first.
+pub fn code_summaries_missing_embedding(conn: &Connection, project_id: Option<i64>, limit: usize) -> Result<Vec<(i64, String, String)>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT project_id, path, text FROM code_summaries
+         WHERE embedding IS NULL AND text != '' AND (?1 IS NULL OR project_id = ?1)
+         ORDER BY project_id ASC, path ASC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![project_id, limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Inserts an empty, already-stale placeholder `code_summaries` row for a
+/// module/repo that has never been summarised -- recording `now` as its
+/// `stale_since` (fix-list item 4). Without this, a module missing a row
+/// entirely (as opposed to one whose real row later went stale) has no
+/// timestamp for `code_index::summary::is_ready`'s 7-day override to
+/// measure, so if its children never all become fresh (e.g. every one of
+/// them gave up on its own summary, see `code_file_increment_summary_attempts`)
+/// it would never regenerate at all. A no-op if a row already exists at
+/// `path` (real or an earlier placeholder) -- `stale_since` must never move
+/// once set, same invariant `mark_code_summaries_stale` protects. The next
+/// real regeneration (`code_summary_upsert`) overwrites the placeholder
+/// exactly like any other stale row.
+pub fn code_summary_seed_placeholder(conn: &Connection, project_id: i64, path: &str, level: &str, now: &str) -> Result<(), KbError> {
+    let tx = conn.unchecked_transaction()?;
+    let inserted = tx.execute(
+        "INSERT INTO code_summaries (project_id, path, level, text, source_digest, stale, stale_since, updated_at)
+         VALUES (?1, ?2, ?3, '', '', 1, ?4, ?4)
+         ON CONFLICT(project_id, path) DO NOTHING",
+        params![project_id, path, level, now],
+    )?;
+    if inserted > 0 {
+        tx.execute(
+            "INSERT INTO code_summaries_fts(rowid, text, path)
+             SELECT rowid, text, path FROM code_summaries WHERE project_id = ?1 AND path = ?2",
+            params![project_id, path],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Clears `stale` (and `stale_since`) on one summary row and records
+/// `source_digest` -- for a module/repo whose children digest is
+/// unchanged, or that has nothing to summarise from (a placeholder), so no
+/// regeneration call is needed. Text, embedding and `memory_id` untouched.
+pub fn code_summary_clear_stale(conn: &Connection, project_id: i64, path: &str, source_digest: &str) -> Result<(), KbError> {
+    conn.execute(
+        "UPDATE code_summaries SET stale = 0, stale_since = NULL, source_digest = ?1 WHERE project_id = ?2 AND path = ?3",
+        params![source_digest, project_id, path],
+    )?;
+    Ok(())
+}
+
+/// Turns an existing module/repo summary back into a placeholder: text and
+/// digest cleared, embedding and `memory_id` dropped, marked stale (keeping
+/// an existing `stale_since`), FTS entry rewritten -- so it regenerates
+/// from its CURRENT children on a later run and meanwhile shows nothing.
+/// Used when a descendant file turned out to be secret (final-review item
+/// 13): the old text may have been generated from it. Returns the mirrored
+/// memory id the row pointed at (the caller invalidates it), or `None` if
+/// there is no row at `path`.
+pub fn code_summary_placeholderize(conn: &Connection, project_id: i64, path: &str, now: &str) -> Result<Option<i64>, KbError> {
+    let Some(row) = code_summary_get(conn, project_id, path)? else {
+        return Ok(None);
+    };
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO code_summaries_fts(code_summaries_fts, rowid, text, path)
+         SELECT 'delete', rowid, text, path FROM code_summaries WHERE project_id = ?1 AND path = ?2",
+        params![project_id, path],
+    )?;
+    tx.execute(
+        "UPDATE code_summaries SET text = '', source_digest = '', embedding = NULL, memory_id = NULL,
+             stale = 1, stale_since = COALESCE(stale_since, ?1), updated_at = ?1
+         WHERE project_id = ?2 AND path = ?3",
+        params![now, project_id, path],
+    )?;
+    tx.execute(
+        "INSERT INTO code_summaries_fts(rowid, text, path)
+         SELECT rowid, text, path FROM code_summaries WHERE project_id = ?1 AND path = ?2",
+        params![project_id, path],
+    )?;
+    tx.commit()?;
+    Ok(row.memory_id)
+}
+
+fn row_to_summary_hit(r: &rusqlite::Row) -> rusqlite::Result<SummaryHit> {
+    let stale_int: i64 = r.get(4)?;
+    Ok(SummaryHit { project_id: r.get(0)?, path: r.get(1)?, level: r.get(2)?, text: r.get(3)?, stale: stale_int != 0, score: 0.0 })
+}
+
+const SUMMARY_HIT_COLUMNS: &str = "project_id, path, level, text, stale";
+
+/// Hybrid search over generated code summaries, optionally scoped to one
+/// project (`None` searches every project) -- same fusion
+/// `search_code_chunks` uses: lexical (BM25 over `code_summaries_fts`,
+/// normalized against this result set's own best match) and semantic
+/// (cosine over `embedding`, floored at `SIM_NOISE_FLOOR`), combined as
+/// `max(sim, LEXICAL_WEIGHT * lex)`. `code_summaries_fts`'s two columns
+/// (`text`, `path`) are weighted evenly (`1.0, 1.0`) -- unlike
+/// `search_code_chunks`'s heavy `symbol` weighting, a summary has no single
+/// column that identifies it the way an exact symbol name identifies a
+/// chunk, so there is no equivalent column to bias toward.
+pub fn search_code_summaries(
+    conn: &Connection,
+    project_id: Option<i64>,
+    query: &str,
+    query_emb: Option<&[f32]>,
+    limit: usize,
+) -> Result<Vec<SummaryHit>, KbError> {
+    let mut scored: HashMap<(i64, String), (SummaryHit, f32, f32)> = HashMap::new();
+
+    if let Some(cleaned) = fts_query(query) {
+        let mut stmt = conn.prepare(
+            "SELECT c.project_id, c.path, c.level, c.text, c.stale, bm25(code_summaries_fts, 1.0, 1.0)
+             FROM code_summaries_fts f JOIN code_summaries c ON c.rowid = f.rowid
+             WHERE code_summaries_fts MATCH ?1 AND (?2 IS NULL OR c.project_id = ?2) AND c.text != ''
+             ORDER BY bm25(code_summaries_fts, 1.0, 1.0) LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![cleaned, project_id, (limit * 4) as i64], |r| {
+            Ok((row_to_summary_hit(r)?, -r.get::<_, f64>(5)? as f32))
+        })?;
+        let mut raw = Vec::new();
+        for r in rows {
+            raw.push(r?);
+        }
+        let best = raw.iter().map(|(_, b)| *b).fold(0.0f32, f32::max);
+        for (hit, bm) in raw {
+            let lex = if best > 0.0 { bm / best } else { 0.0 };
+            scored.insert((hit.project_id, hit.path.clone()), (hit, lex, 0.0));
+        }
+    }
+
+    if let Some(q) = query_emb {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {SUMMARY_HIT_COLUMNS}, embedding FROM code_summaries WHERE embedding IS NOT NULL AND text != '' AND (?1 IS NULL OR project_id = ?1)"
+        ))?;
+        let rows = stmt.query_map(params![project_id], |r| Ok((row_to_summary_hit(r)?, r.get::<_, Vec<u8>>(5)?)))?;
+        let mut sims: Vec<(f32, SummaryHit)> = Vec::new();
+        for r in rows {
+            let (hit, blob) = r?;
+            let v = decode_embedding(&blob);
+            let sim = cosine(q, &v);
+            if sim > SIM_NOISE_FLOOR {
+                sims.push((sim, hit));
+            }
+        }
+        sims.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        for (sim, hit) in sims.into_iter().take(limit * 4) {
+            let key = (hit.project_id, hit.path.clone());
+            scored.entry(key).and_modify(|e| e.2 = sim).or_insert((hit, 0.0, sim));
+        }
+    }
+
+    let mut out: Vec<SummaryHit> = scored
+        .into_values()
+        .map(|(mut hit, lex, sim)| {
+            hit.score = sim.max(LEXICAL_WEIGHT * lex);
+            hit
+        })
+        .collect();
+    out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    out.truncate(limit);
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------
+// Code symbol graph (schema 35, `migrate_v34_to_v35`; see
+// `code_index::chunk::extract_refs`). `code_symbols` is one row per
+// definition, `code_edges` one row per reference (call/include/import/
+// inherits) -- both derived state, parsed out of a file's current text,
+// droppable and rebuildable the same way `code_chunks` is. `code_history`
+// (month-by-month repo history text) is declared here too but is Task 3's
+// to write; only `code_history_get`/`code_history_upsert`/
+// `code_history_set_memory_id`/`code_history_list` live here for now.
+// ---------------------------------------------------------------------
+
+/// A definition to insert via `replace_file_symbols`. No `id` (SQLite
+/// assigns it) and no `project_id`/`path` (given once for the whole file
+/// being replaced), matching `NewCodeChunk`'s own shape.
+#[derive(Debug, Clone, Default)]
+pub struct NewSymbol {
+    pub name: String,
+    pub qualified: String,
+    pub kind: String,
+    pub start_line: i64,
+    pub end_line: i64,
+}
+
+/// A reference to insert via `replace_file_symbols`. `src_symbol_id` is
+/// deliberately absent -- `replace_file_symbols` resolves it itself, from
+/// `src_line` and the line ranges of the symbols inserted alongside it (the
+/// brief's "enclosing definition by line range" rule) -- and
+/// `dst_symbol_id` always starts NULL, resolved later by `resolve_edges`.
+#[derive(Debug, Clone)]
+pub struct NewEdge {
+    pub src_line: i64,
+    pub dst_name: String,
+    /// One of `"calls"`, `"includes"`, `"imports"`, `"inherits"` --
+    /// `code_edges.kind`'s own CHECK constraint enforces this at the SQL
+    /// level, so a typo here surfaces immediately as an insert error
+    /// rather than a silently-orphaned row.
+    pub kind: String,
+}
+
+/// One row of `code_symbols`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SymbolRow {
+    pub id: i64,
+    pub project_id: i64,
+    pub path: String,
+    pub name: String,
+    pub qualified: String,
+    pub kind: String,
+    pub start_line: i64,
+    pub end_line: i64,
+}
+
+const SYMBOL_COLUMNS: &str = "id, project_id, path, name, qualified, kind, start_line, end_line";
+
+fn row_to_symbol(r: &rusqlite::Row) -> rusqlite::Result<SymbolRow> {
+    Ok(SymbolRow {
+        id: r.get(0)?,
+        project_id: r.get(1)?,
+        path: r.get(2)?,
+        name: r.get(3)?,
+        qualified: r.get(4)?,
+        kind: r.get(5)?,
+        start_line: r.get(6)?,
+        end_line: r.get(7)?,
+    })
+}
+
+/// One row of `code_edges`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgeRow {
+    pub project_id: i64,
+    pub src_symbol_id: Option<i64>,
+    pub src_path: String,
+    pub src_line: i64,
+    /// The target exactly as written at the reference site (never
+    /// rewritten by resolution -- an `includes` edge's resolved file lives
+    /// in `dst_path`).
+    pub dst_name: String,
+    pub dst_symbol_id: Option<i64>,
+    pub kind: String,
+    /// `includes`/`imports` only: the unique tracked repo-relative path
+    /// `dst_name` resolved to, once `resolve_edges*` found one.
+    pub dst_path: Option<String>,
+}
+
+pub(crate) const EDGE_COLUMNS: &str = "project_id, src_symbol_id, src_path, src_line, dst_name, dst_symbol_id, kind, dst_path";
+
+pub(crate) fn row_to_edge(r: &rusqlite::Row) -> rusqlite::Result<EdgeRow> {
+    Ok(EdgeRow {
+        project_id: r.get(0)?,
+        src_symbol_id: r.get(1)?,
+        src_path: r.get(2)?,
+        src_line: r.get(3)?,
+        dst_name: r.get(4)?,
+        dst_symbol_id: r.get(5)?,
+        kind: r.get(6)?,
+        dst_path: r.get(7)?,
+    })
+}
+
+/// Queues `value` (a symbol name, a source path, or a file path) for the
+/// next incremental `resolve_edges_incremental` pass. `INSERT OR IGNORE`:
+/// the queue is a set.
+fn pend(conn: &Connection, project_id: i64, kind: &str, value: &str) -> Result<(), KbError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO code_graph_pending (project_id, kind, value) VALUES (?1, ?2, ?3)",
+        params![project_id, kind, value],
+    )?;
+    Ok(())
+}
+
+/// Queues every symbol name currently defined in `path` -- called just
+/// before those symbols are deleted, since a removed definition can turn a
+/// previously ambiguous name unique (and its incoming edges were just
+/// nulled and need re-resolving).
+fn pend_names_in_file(conn: &Connection, project_id: i64, path: &str) -> Result<(), KbError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO code_graph_pending (project_id, kind, value)
+         SELECT DISTINCT project_id, 'name', name FROM code_symbols WHERE project_id = ?1 AND path = ?2",
+        params![project_id, path],
+    )?;
+    Ok(())
+}
+
+/// Nulls `dst_symbol_id` on every edge pointing at one of `path`'s symbols
+/// (they are about to be deleted). Served by `ix_code_edges_dst_symbol`
+/// (`project_id, dst_symbol_id`) -- see the EXPLAIN test
+/// `null_out_incoming_edges_uses_the_dst_symbol_index`; without it this
+/// was a full scan of the project's edges per replaced file.
+const NULL_INCOMING_SQL: &str = "UPDATE code_edges SET dst_symbol_id = NULL
+     WHERE project_id = ?1 AND dst_symbol_id IN (SELECT id FROM code_symbols WHERE project_id = ?1 AND path = ?2)";
+
+/// Replaces every symbol and outgoing edge of one file in a single
+/// transaction, returning the new symbols' ids in the same order as
+/// `symbols` (same contract as `replace_code_chunks`). "Outgoing" edges are
+/// every `code_edges` row with `src_path = path`, regardless of whether
+/// they ended up resolved to a symbol -- a file's edges are keyed by where
+/// the reference is written, not by whether it resolved.
+///
+/// Order of operations, all inside one transaction so a re-chunk (the file
+/// changed) never leaves a half-updated graph visible to a concurrent
+/// reader: queue the file's old symbol names for re-resolution; null out
+/// `dst_symbol_id` on any OTHER file's edges that point at one of this
+/// file's about-to-be-deleted symbols (otherwise they'd dangle); delete this
+/// file's old symbols and outgoing edges; insert the new symbols, capturing
+/// each new id alongside its line range; insert the new edges, resolving
+/// each one's `src_symbol_id` to whichever just-inserted symbol's
+/// `[start_line, end_line]` most tightly contains `src_line` -- `None` if no
+/// symbol in this file encloses that line; finally queue the new names, the
+/// path as a changed source, and the path as a changed file (an include
+/// target). `dst_symbol_id`/`dst_path` always start NULL; `resolve_edges*`
+/// fills them in later.
+pub fn replace_file_symbols(conn: &Connection, project_id: i64, path: &str, symbols: &[NewSymbol], edges: &[NewEdge]) -> Result<Vec<i64>, KbError> {
+    replace_file_symbols_inner(conn, project_id, path, None, symbols, edges)
+}
+
+/// [`replace_file_symbols`], also recording `blob` as the file's
+/// `code_files.refs_blob` in the same transaction -- what every indexing
+/// call site uses, so the symbol backfill (`refs_blob IS NULL OR refs_blob
+/// != blob`) never re-selects a file whose current blob was already
+/// extracted, even one that yielded zero symbols. A no-op on `refs_blob`
+/// when `path` has no `code_files` row yet.
+pub fn replace_file_symbols_for_blob(
+    conn: &Connection,
+    project_id: i64,
+    path: &str,
+    blob: &str,
+    symbols: &[NewSymbol],
+    edges: &[NewEdge],
+) -> Result<Vec<i64>, KbError> {
+    replace_file_symbols_inner(conn, project_id, path, Some(blob), symbols, edges)
+}
+
+fn replace_file_symbols_inner(
+    conn: &Connection,
+    project_id: i64,
+    path: &str,
+    blob: Option<&str>,
+    symbols: &[NewSymbol],
+    edges: &[NewEdge],
+) -> Result<Vec<i64>, KbError> {
+    let tx = conn.unchecked_transaction()?;
+    pend_names_in_file(&tx, project_id, path)?;
+    tx.execute(NULL_INCOMING_SQL, params![project_id, path])?;
+    tx.execute("DELETE FROM code_edges WHERE project_id = ?1 AND src_path = ?2", params![project_id, path])?;
+    tx.execute("DELETE FROM code_symbols WHERE project_id = ?1 AND path = ?2", params![project_id, path])?;
+
+    let mut ids = Vec::with_capacity(symbols.len());
+    let mut ranges: Vec<(i64, i64, i64)> = Vec::with_capacity(symbols.len());
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO code_symbols (project_id, path, name, qualified, kind, start_line, end_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        for s in symbols {
+            stmt.execute(params![project_id, path, s.name, s.qualified, s.kind, s.start_line, s.end_line])?;
+            let id = tx.last_insert_rowid();
+            ids.push(id);
+            ranges.push((id, s.start_line, s.end_line));
+        }
+    }
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO code_edges (project_id, src_symbol_id, src_path, src_line, dst_name, dst_symbol_id, kind, dst_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL)",
+        )?;
+        for e in edges {
+            let src_symbol_id = ranges
+                .iter()
+                .filter(|(_, start, end)| *start <= e.src_line && e.src_line <= *end)
+                .min_by_key(|(_, start, end)| end - start)
+                .map(|(id, _, _)| *id);
+            stmt.execute(params![project_id, src_symbol_id, path, e.src_line, e.dst_name, e.kind])?;
+        }
+    }
+    pend_names_in_file(&tx, project_id, path)?;
+    pend(&tx, project_id, "src", path)?;
+    pend(&tx, project_id, "file", path)?;
+    if let Some(b) = blob {
+        tx.execute("UPDATE code_files SET refs_blob = ?1 WHERE project_id = ?2 AND path = ?3", params![b, project_id, path])?;
+    }
+    tx.commit()?;
+    Ok(ids)
+}
+
+/// Deletes every symbol and outgoing edge of a file (a file removed from
+/// the repo, or recategorized out of scope) -- same queue-null-delete order
+/// as `replace_file_symbols`, so incoming edges from OTHER files never
+/// dangle on a `dst_symbol_id` that no longer exists; their `dst_name`
+/// (and everything else about them) is left untouched, so a later
+/// `resolve_edges*` can re-resolve them if a same-named symbol reappears
+/// elsewhere. Include edges whose `dst_path` was this file are nulled too
+/// (the file is gone as a target) and the path is queued as a changed file.
+pub fn delete_file_symbols(conn: &Connection, project_id: i64, path: &str) -> Result<(), KbError> {
+    let tx = conn.unchecked_transaction()?;
+    pend_names_in_file(&tx, project_id, path)?;
+    tx.execute(NULL_INCOMING_SQL, params![project_id, path])?;
+    tx.execute("DELETE FROM code_edges WHERE project_id = ?1 AND src_path = ?2", params![project_id, path])?;
+    tx.execute("DELETE FROM code_symbols WHERE project_id = ?1 AND path = ?2", params![project_id, path])?;
+    tx.execute("UPDATE code_edges SET dst_path = NULL WHERE project_id = ?1 AND dst_path = ?2", params![project_id, path])?;
+    pend(&tx, project_id, "file", path)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Moves every `code_symbols`/`code_edges` row of `from` to `to` in
+/// place -- the rename-with-unchanged-blob case (mirrors
+/// `code_index::job::move_code_rows`'s handling of `code_files`/
+/// `code_chunks`). No id, name or line-range changes: only the path
+/// columns move, so every existing `dst_symbol_id` resolution (this file's
+/// symbols as someone else's callee) survives the rename untouched. An
+/// include edge that resolved to `from` is un-resolved (its written
+/// `dst_name` may or may not still match `to`) and both paths are queued as
+/// changed files, so the next pass re-resolves it against the new layout.
+pub fn move_file_symbols(conn: &Connection, project_id: i64, from: &str, to: &str) -> Result<(), KbError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("UPDATE code_symbols SET path = ?1 WHERE project_id = ?2 AND path = ?3", params![to, project_id, from])?;
+    tx.execute("UPDATE code_edges SET src_path = ?1 WHERE project_id = ?2 AND src_path = ?3", params![to, project_id, from])?;
+    tx.execute("UPDATE code_edges SET dst_path = NULL WHERE project_id = ?1 AND dst_path = ?2", params![project_id, from])?;
+    pend(&tx, project_id, "file", from)?;
+    pend(&tx, project_id, "file", to)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The text after the last `"::"` or `"."` in `dst_name` (whichever comes
+/// later), or the whole string if it has neither. Generic/template
+/// arguments are stripped at extraction (`chunk::strip_generic_args`), so
+/// a `::` inside `<...>` can no longer be mistaken for the last path
+/// separator here.
+pub(crate) fn last_path_segment(dst_name: &str) -> &str {
+    let cc = dst_name.rfind("::").map(|i| i + 2);
+    let dot = dst_name.rfind('.').map(|i| i + 1);
+    match cc.max(dot) {
+        Some(i) => &dst_name[i..],
+        None => dst_name,
+    }
+}
+
+/// `dst_name` with the path prefixes that only say "relative to here"
+/// removed (`::x`, `crate::`/`self::`/`super::` chains) and `Self::x`
+/// reduced to the bare `x` (the enclosing impl's type isn't known at the
+/// call site) -- so such calls resolve the way the old leaf fallback let
+/// them, while `std::find` stays qualified and never falls back to a
+/// project `find`.
+fn normalize_call_target(dst_name: &str) -> &str {
+    let mut s = dst_name.strip_prefix("::").unwrap_or(dst_name);
+    loop {
+        if let Some(rest) = s.strip_prefix("crate::").or_else(|| s.strip_prefix("self::")).or_else(|| s.strip_prefix("super::")) {
+            s = rest;
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("Self::") {
+            if !rest.contains("::") {
+                return rest;
+            }
+        }
+        return s;
+    }
+}
+
+/// Whether repo-relative `path` is (or ends with a `/`-bounded suffix
+/// equal to) `target` -- `target` being an `#include`/import's own written
+/// form, e.g. `"local/thing.h"` or `"thing.h"`. Deliberately boundary-aware
+/// (never a bare substring match): `"foo.h".ends_with("h.h")` would
+/// otherwise false-positive, and a suffix match must land on a path
+/// separator, not the middle of a component.
+fn path_matches_include_target(path: &str, target: &str) -> bool {
+    path == target || path.ends_with(&format!("/{target}"))
+}
+
+/// The last `/`-separated component of a path or include target.
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// What one `resolve_edges*` pass did: `examined` edges were candidates
+/// (unresolved and in scope of the pass), `resolved` of them got a
+/// `dst_symbol_id` (calls/inherits) or a `dst_path` (includes/imports).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResolveStats {
+    pub examined: usize,
+    pub resolved: usize,
+}
+
+/// Full, project-wide resolution of every unresolved edge; returns how many
+/// were resolved. Also clears the project's `code_graph_pending` queue (a
+/// full pass covers everything queued). Used on a project's first index
+/// run and whenever the symbol backfill ran; nightly incremental runs use
+/// [`resolve_edges_incremental`]. Idempotent: resolved edges are excluded
+/// by the `dst_symbol_id IS NULL` / `dst_path IS NULL` filters, so a second
+/// pass returns 0.
+///
+/// Rules, applied set-based in one transaction (see `resolve_pending`):
+/// - `calls`/`inherits`: exactly one project symbol whose `qualified`
+///   equals `dst_name` (after `normalize_call_target`); else a leaf-name
+///   fallback -- for an UNQUALIFIED `dst_name`, exactly one symbol whose
+///   `name` equals it; for a qualified one, exactly one symbol whose `name`
+///   is the leaf AND whose `qualified` equals or ends with the full
+///   `dst_name` on a `::`/`.` boundary (`std::find` never resolves to a
+///   project `find`; `picking::add_event` does resolve to
+///   `helios::picking::add_event`). Ambiguous (0 or 2+) stays NULL.
+/// - `includes`/`imports`: `dst_symbol_id` stays NULL always (these
+///   resolve to a FILE); if exactly one tracked `code_files.path` matches
+///   `dst_name` per `path_matches_include_target` (candidates found via a
+///   basename -> paths map, not a scan per edge), `dst_path` is set to it.
+///   `dst_name` is never rewritten.
+pub fn resolve_edges(conn: &Connection, project_id: i64) -> Result<usize, KbError> {
+    Ok(resolve_edges_all(conn, project_id)?.resolved)
+}
+
+/// [`resolve_edges`] returning the full [`ResolveStats`] (`examined` = every
+/// unresolved edge of the project).
+pub fn resolve_edges_all(conn: &Connection, project_id: i64) -> Result<ResolveStats, KbError> {
+    resolve_pending(conn, project_id, None)
+}
+
+/// Incremental resolution: only unresolved edges whose source file was
+/// replaced since the last pass, whose target leaf name matches a symbol
+/// name added or removed since then, or (for includes/imports) whose
+/// target basename matches a file added/moved/removed since then -- all
+/// read from `code_graph_pending`, which the symbol mutations fill in the
+/// same transaction as their own writes. An empty queue examines nothing
+/// and returns `ResolveStats::default()` without scanning `code_edges` at
+/// all. Clears the queue.
+pub fn resolve_edges_incremental(conn: &Connection, project_id: i64) -> Result<ResolveStats, KbError> {
+    let mut names: HashSet<String> = HashSet::new();
+    let mut srcs: HashSet<String> = HashSet::new();
+    let mut file_bases: HashSet<String> = HashSet::new();
+    {
+        let mut stmt = conn.prepare("SELECT kind, value FROM code_graph_pending WHERE project_id = ?1")?;
+        let rows = stmt.query_map(params![project_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for r in rows {
+            let (kind, value) = r?;
+            match kind.as_str() {
+                "name" => {
+                    names.insert(value);
+                }
+                "src" => {
+                    srcs.insert(value);
+                }
+                _ => {
+                    file_bases.insert(basename(&value).to_string());
+                }
+            }
+        }
+    }
+    if names.is_empty() && srcs.is_empty() && file_bases.is_empty() {
+        return Ok(ResolveStats::default());
+    }
+    resolve_pending(conn, project_id, Some(&PendingFilter { names, srcs, file_bases }))
+}
+
+/// Which unresolved edges an incremental pass considers.
+struct PendingFilter {
+    names: HashSet<String>,
+    srcs: HashSet<String>,
+    file_bases: HashSet<String>,
+}
+
+fn resolve_pending(conn: &Connection, project_id: i64, filter: Option<&PendingFilter>) -> Result<ResolveStats, KbError> {
+    let tx = conn.unchecked_transaction()?;
+    let mut stats = ResolveStats::default();
+
+    // -- calls / inherits: candidate edges into a temp table ------------
+    tx.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS kb_resolve_calls (
+             rid INTEGER PRIMARY KEY, dst_name TEXT NOT NULL, leaf TEXT NOT NULL, qualified_form INTEGER NOT NULL);
+         DELETE FROM temp.kb_resolve_calls;",
+    )?;
+    {
+        let mut sel = tx.prepare(
+            "SELECT rowid, src_path, dst_name FROM code_edges
+             WHERE project_id = ?1 AND dst_symbol_id IS NULL AND kind IN ('calls','inherits')",
+        )?;
+        let mut ins = tx.prepare("INSERT INTO temp.kb_resolve_calls (rid, dst_name, leaf, qualified_form) VALUES (?1, ?2, ?3, ?4)")?;
+        let rows = sel.query_map(params![project_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+        for r in rows {
+            let (rid, src_path, dst_name) = r?;
+            let target = normalize_call_target(&dst_name);
+            let leaf = last_path_segment(target);
+            if let Some(f) = filter {
+                if !f.srcs.contains(&src_path) && !f.names.contains(leaf) {
+                    continue;
+                }
+            }
+            let qualified_form = i64::from(leaf.len() != target.len());
+            ins.execute(params![rid, target, leaf, qualified_form])?;
+            stats.examined += 1;
+        }
+    }
+    // Pass 1: unique exact `qualified` match (ix_code_symbols_qualified).
+    stats.resolved += tx.execute(
+        "UPDATE code_edges SET dst_symbol_id = r.sid
+         FROM (SELECT p.rid AS rid, MIN(s.id) AS sid
+               FROM temp.kb_resolve_calls p
+               JOIN code_symbols s ON s.project_id = ?1 AND s.qualified = p.dst_name
+               GROUP BY p.rid HAVING COUNT(*) = 1) AS r
+         WHERE code_edges.rowid = r.rid",
+        params![project_id],
+    )?;
+    // Pass 2: leaf-name fallback (ix_code_symbols_name), boundary-checked
+    // for a qualified `dst_name`; ambiguity counts every candidate.
+    stats.resolved += tx.execute(
+        "UPDATE code_edges SET dst_symbol_id = r.sid
+         FROM (SELECT p.rid AS rid, MIN(s.id) AS sid
+               FROM temp.kb_resolve_calls p
+               JOIN code_symbols s ON s.project_id = ?1 AND s.name = p.leaf
+               WHERE p.qualified_form = 0
+                  OR s.qualified = p.dst_name
+                  OR substr(s.qualified, -(length(p.dst_name) + 2)) = '::' || p.dst_name
+                  OR substr(s.qualified, -(length(p.dst_name) + 1)) = '.' || p.dst_name
+               GROUP BY p.rid HAVING COUNT(*) = 1) AS r
+         WHERE code_edges.rowid = r.rid AND code_edges.dst_symbol_id IS NULL",
+        params![project_id],
+    )?;
+    tx.execute("DELETE FROM temp.kb_resolve_calls", [])?;
+
+    // -- includes / imports: basename -> paths map ------------------------
+    let mut pending_files: Vec<(i64, String)> = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT rowid, src_path, dst_name FROM code_edges
+             WHERE project_id = ?1 AND dst_path IS NULL AND kind IN ('includes','imports')",
+        )?;
+        let rows = stmt.query_map(params![project_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+        for r in rows {
+            let (rid, src_path, dst_name) = r?;
+            if let Some(f) = filter {
+                if !f.srcs.contains(&src_path) && !f.file_bases.contains(basename(&dst_name)) {
+                    continue;
+                }
+            }
+            pending_files.push((rid, dst_name));
+        }
+    }
+    stats.examined += pending_files.len();
+    if !pending_files.is_empty() {
+        let mut by_base: HashMap<String, Vec<String>> = HashMap::new();
+        {
+            let mut stmt = tx.prepare("SELECT path FROM code_files WHERE project_id = ?1")?;
+            let rows = stmt.query_map(params![project_id], |r| r.get::<_, String>(0))?;
+            for r in rows {
+                let p = r?;
+                by_base.entry(basename(&p).to_string()).or_default().push(p);
+            }
+        }
+        let mut upd = tx.prepare("UPDATE code_edges SET dst_path = ?1 WHERE rowid = ?2")?;
+        for (rid, dst_name) in pending_files {
+            let Some(cands) = by_base.get(basename(&dst_name)) else { continue };
+            let mut matches = cands.iter().filter(|p| path_matches_include_target(p, &dst_name));
+            if let (Some(only), None) = (matches.next(), matches.next()) {
+                upd.execute(params![only, rid])?;
+                stats.resolved += 1;
+            }
+        }
+    }
+
+    tx.execute("DELETE FROM code_graph_pending WHERE project_id = ?1", params![project_id])?;
+    tx.commit()?;
+    Ok(stats)
+}
+
+/// Definitions named `name` in a project: an exact `name` match if any
+/// exist, else every symbol whose `qualified` ends with `"::" + name` or
+/// `"." + name` (a caller who only knows the leaf name still finds a
+/// scoped definition). Never both -- an exact-name hit is always the more
+/// specific answer, so the suffix fallback only runs when that first query
+/// comes back empty.
+pub fn symbol_definitions(conn: &Connection, project_id: i64, name: &str) -> Result<Vec<SymbolRow>, KbError> {
+    let mut stmt = conn.prepare(&format!("SELECT {SYMBOL_COLUMNS} FROM code_symbols WHERE project_id = ?1 AND name = ?2 ORDER BY path, start_line"))?;
+    let rows = stmt.query_map(params![project_id, name], row_to_symbol)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    if !out.is_empty() {
+        return Ok(out);
+    }
+
+    let suffix_cc = format!("%::{name}");
+    let suffix_dot = format!("%.{name}");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SYMBOL_COLUMNS} FROM code_symbols WHERE project_id = ?1 AND (qualified LIKE ?2 OR qualified LIKE ?3) ORDER BY path, start_line"
+    ))?;
+    let rows = stmt.query_map(params![project_id, suffix_cc, suffix_dot], row_to_symbol)?;
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// How `callers_of` is asked to identify its target symbol: a resolved
+/// `code_symbols.id`, or a bare name matched against `code_edges.dst_name`
+/// directly (so a caller can ask "who calls `foo`" even before/without
+/// `resolve_edges` ever running).
+#[derive(Debug, Clone, Copy)]
+pub enum SymbolLookup<'a> {
+    Id(i64),
+    Name(&'a str),
+}
+
+/// Every `calls` edge targeting `target`, `src_path`/`src_line` ascending,
+/// capped at `limit`. `SymbolLookup::Id` matches the resolved
+/// `dst_symbol_id`; `SymbolLookup::Name` matches the literal `dst_name`
+/// regardless of resolution state (resolving never rewrites `dst_name` for
+/// `calls`/`inherits`, only sets `dst_symbol_id` alongside it -- see
+/// `resolve_edges`).
+pub fn callers_of(conn: &Connection, project_id: i64, target: SymbolLookup, limit: usize) -> Result<Vec<EdgeRow>, KbError> {
+    let mut out = Vec::new();
+    match target {
+        SymbolLookup::Id(id) => {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {EDGE_COLUMNS} FROM code_edges WHERE project_id = ?1 AND kind = 'calls' AND dst_symbol_id = ?2
+                 ORDER BY src_path, src_line LIMIT ?3"
+            ))?;
+            let rows = stmt.query_map(params![project_id, id, limit as i64], row_to_edge)?;
+            for r in rows {
+                out.push(r?);
+            }
+        }
+        SymbolLookup::Name(name) => {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {EDGE_COLUMNS} FROM code_edges WHERE project_id = ?1 AND kind = 'calls' AND dst_name = ?2
+                 ORDER BY src_path, src_line LIMIT ?3"
+            ))?;
+            let rows = stmt.query_map(params![project_id, name, limit as i64], row_to_edge)?;
+            for r in rows {
+                out.push(r?);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Every `calls` edge whose enclosing definition (`src_symbol_id`) is
+/// `symbol_id`, `src_line` ascending, capped at `limit` -- the reverse of
+/// `callers_of`. Unlike callers, callees are only ever asked of a specific
+/// resolved symbol (there's no "by name" sense of "what does `foo`
+/// call" when several definitions share that name).
+pub fn callees_of(conn: &Connection, project_id: i64, symbol_id: i64, limit: usize) -> Result<Vec<EdgeRow>, KbError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {EDGE_COLUMNS} FROM code_edges WHERE project_id = ?1 AND kind = 'calls' AND src_symbol_id = ?2 ORDER BY src_line LIMIT ?3"
+    ))?;
+    let rows = stmt.query_map(params![project_id, symbol_id, limit as i64], row_to_edge)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// One row of `code_history`: one project's one calendar month
+/// (`"YYYY-MM"`) of commit-log-derived narrative text -- see the
+/// constraints doc's history-memory rules and Task 3's job. `memory_id` is
+/// the mirrored `memories` row's id once one exists (set by
+/// `code_history_set_memory_id`, never by `code_history_upsert` itself,
+/// same split as `code_summaries.memory_id`/`set_code_summary_memory_id`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodeHistoryRow {
+    pub project_id: i64,
+    pub month: String,
+    pub text: String,
+    pub commits: i64,
+    pub last_sha: String,
+    pub digest: String,
+    pub memory_id: Option<i64>,
+    pub updated_at: String,
+    /// Newline-separated top-churn paths of the month (schema v35
+    /// fix-wave column; NULL on a row written before it existed).
+    pub files: Option<String>,
+}
+
+const CODE_HISTORY_COLUMNS: &str = "project_id, month, text, commits, last_sha, digest, memory_id, updated_at, files";
+
+fn row_to_code_history(r: &rusqlite::Row) -> rusqlite::Result<CodeHistoryRow> {
+    Ok(CodeHistoryRow {
+        project_id: r.get(0)?,
+        month: r.get(1)?,
+        text: r.get(2)?,
+        commits: r.get(3)?,
+        last_sha: r.get(4)?,
+        digest: r.get(5)?,
+        memory_id: r.get(6)?,
+        updated_at: r.get(7)?,
+        files: r.get(8)?,
+    })
+}
+
+/// One project/month's history row, if it has ever been generated.
+pub fn code_history_get(conn: &Connection, project_id: i64, month: &str) -> Result<Option<CodeHistoryRow>, KbError> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT {CODE_HISTORY_COLUMNS} FROM code_history WHERE project_id = ?1 AND month = ?2"),
+            params![project_id, month],
+            row_to_code_history,
+        )
+        .optional()?)
+}
+
+/// Inserts or regenerates one project/month's history row. `memory_id` is
+/// deliberately left alone on conflict (excluded from the `DO UPDATE SET`
+/// list) -- regenerating the same month's text (the only thing allowed to
+/// supersede a history memory, per the constraints doc) must keep pointing
+/// at the same mirrored `memories` row so Task 3 can update it in place
+/// rather than mint a new one.
+///
+/// `text` is the month's SUMMARY (the model's reply), never the raw log.
+/// The history job passes an empty `digest` here and writes the real one
+/// last via [`code_history_set_digest`], once the mirror is in place -- a
+/// run that dies in between leaves a digest that never matches, so the
+/// month regenerates instead of being skipped with a missing mirror.
+#[allow(clippy::too_many_arguments)]
+pub fn code_history_upsert(
+    conn: &Connection,
+    project_id: i64,
+    month: &str,
+    text: &str,
+    commits: i64,
+    last_sha: &str,
+    digest: &str,
+    files: Option<&str>,
+    now: &str,
+) -> Result<(), KbError> {
+    conn.execute(
+        "INSERT INTO code_history (project_id, month, text, commits, last_sha, digest, memory_id, updated_at, files)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8)
+         ON CONFLICT(project_id, month) DO UPDATE SET
+             text = excluded.text, commits = excluded.commits, last_sha = excluded.last_sha,
+             digest = excluded.digest, updated_at = excluded.updated_at, files = excluded.files",
+        params![project_id, month, text, commits, last_sha, digest, now, files],
+    )?;
+    Ok(())
+}
+
+/// Records a month's digest -- the history job's LAST write for a month.
+pub fn code_history_set_digest(conn: &Connection, project_id: i64, month: &str, digest: &str) -> Result<(), KbError> {
+    conn.execute("UPDATE code_history SET digest = ?1 WHERE project_id = ?2 AND month = ?3", params![digest, project_id, month])?;
+    Ok(())
+}
+
+/// Deletes one month's history row (a month no longer reachable from
+/// `HEAD`, e.g. after a history rewrite). The caller invalidates its mirror.
+pub fn code_history_delete(conn: &Connection, project_id: i64, month: &str) -> Result<(), KbError> {
+    conn.execute("DELETE FROM code_history WHERE project_id = ?1 AND month = ?2", params![project_id, month])?;
+    Ok(())
+}
+
+/// Records which mirrored `memories` row corresponds to a month's history
+/// text -- same split as `set_code_summary_memory_id`.
+pub fn code_history_set_memory_id(conn: &Connection, project_id: i64, month: &str, memory_id: i64) -> Result<(), KbError> {
+    conn.execute("UPDATE code_history SET memory_id = ?1 WHERE project_id = ?2 AND month = ?3", params![memory_id, project_id, month])?;
+    Ok(())
+}
+
+/// Every history row of a project, month ascending.
+pub fn code_history_list(conn: &Connection, project_id: i64) -> Result<Vec<CodeHistoryRow>, KbError> {
+    let mut stmt = conn.prepare(&format!("SELECT {CODE_HISTORY_COLUMNS} FROM code_history WHERE project_id = ?1 ORDER BY month"))?;
+    let rows = stmt.query_map(params![project_id], row_to_code_history)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Prefix every index-owned `memories.source` carries (`code-index:...`,
+/// e.g. `code-index:<project>:<dir>/`) -- shared by `supersession_guard`'s
+/// "index-owned" block, `upsert_index_memory`, and the reflect insight
+/// working set's exclusion filter (`cli::reflect_working_set`). Also used,
+/// pre-phase-2, by `code_index::scope`'s vendored-directory memories,
+/// which is why this is a prefix check (`starts_with`) and not an exact
+/// match against one fixed string.
+pub const INDEX_OWNED_SOURCE_PREFIX: &str = "code-index:";
+
+/// Second prefix that must be treated exactly like `INDEX_OWNED_SOURCE_PREFIX`
+/// everywhere: the monthly commit-history mirror the history job
+/// (`code_index::history`) writes, `code-history:<project>:<YYYY-MM>`. Kept
+/// as its own constant (not folded into `INDEX_OWNED_SOURCE_PREFIX`) because
+/// the two rows come from different producers with different regeneration
+/// rules -- a history row is superseded only by the history job re-running
+/// the same month, never by `upsert_index_memory` -- but every *filter* that
+/// must exclude index-owned rows has to exclude both prefixes identically.
+/// `is_index_owned_source`/`is_index_owned`/`not_index_owned_sql` are the one
+/// place that combination is spelled out; every guard below goes through one
+/// of them instead of repeating the two literals.
+pub const CODE_HISTORY_SOURCE_PREFIX: &str = "code-history:";
+
+/// Whether `source` (a raw `memories.source` value, already unwrapped from
+/// `Option`) is owned by the code index or the code-history job -- starts
+/// with `INDEX_OWNED_SOURCE_PREFIX` ("code-index:") or
+/// `CODE_HISTORY_SOURCE_PREFIX` ("code-history:"). The `&str` twin of
+/// `is_index_owned`, for call sites that only have the source string (e.g.
+/// `Option<&str>` from a lighter row type than `Memory`).
+pub fn is_index_owned_source(source: &str) -> bool {
+    source.starts_with(INDEX_OWNED_SOURCE_PREFIX) || source.starts_with(CODE_HISTORY_SOURCE_PREFIX)
+}
+
+/// Whether `m` is an index-owned row (`source` starts with
+/// `INDEX_OWNED_SOURCE_PREFIX` or `CODE_HISTORY_SOURCE_PREFIX`). Every
+/// automatic pass that pools memories for judging (dedupe, contradiction,
+/// strength review, graph extraction, supersession audit, improve evidence)
+/// filters these out, and `supersession_guard` blocks on either side being
+/// one.
+pub fn is_index_owned(m: &Memory) -> bool {
+    m.source.as_deref().is_some_and(is_index_owned_source)
+}
+
+/// SQL boolean fragment excluding both index- and history-owned rows, to be
+/// spliced into a `WHERE` clause via `format!`. `col` is the source-column
+/// reference already in scope at the call site (`"source"`, `"m.source"`,
+/// `"s.source"`, ...) -- callers differ on aliasing, so this takes the
+/// column expression as a parameter rather than being a single fixed
+/// string. Mirrors `is_index_owned_source` exactly; every raw-SQL filter
+/// that used to hardcode `NOT LIKE 'code-index:%'` calls this instead, so a
+/// third owned prefix, if one is ever added, only has to change here and in
+/// `is_index_owned_source`.
+pub fn not_index_owned_sql(col: &str) -> String {
+    format!("({col} IS NULL OR ({col} NOT LIKE '{INDEX_OWNED_SOURCE_PREFIX}%' AND {col} NOT LIKE '{CODE_HISTORY_SOURCE_PREFIX}%'))")
+}
+
+/// Writes (or regenerates) a module/repo summary's mirror row in
+/// `memories`, per the design doc: "Module and repo summaries are ALSO
+/// written as memories ... They are index-owned: inserted with
+/// `reflected_at` set, excluded from every automatic supersession path
+/// ... and replaced by the index itself via `store::supersede` when
+/// regenerated."
+///
+/// `source` is the exact index-owned source string (e.g.
+/// `code-index:<project>:<dir>/`, `code-index:<project>:/` for the repo).
+/// Every ACTIVE memory with that exact source (normally one; more if an
+/// older generation was restored) is superseded (`store::supersede`) in
+/// favor of a freshly inserted row -- never edited in place -- so the
+/// audit trail (`mach kb list --superseded`) shows the summary's history
+/// the same way any other supersession does. If none exists (first run, or
+/// the previous one was already superseded by something else), this is a
+/// plain insert.
+///
+/// The new row always gets: `basis = "derived"` (`BASIS_DERIVED` -- this is
+/// code output, not a session claim), `importance = 6`, `reviewed = true`
+/// (a deterministic summary needs no human review gate), `project` set to
+/// `project`, and `reflected_at` set to `now` immediately -- an index-owned
+/// memory must never sit in the reflect insight stage's unreflected
+/// backlog; the reflect working set additionally excludes it by source
+/// prefix as a second line of defense (see `cli::reflect_working_set`).
+///
+/// Returns the new memory's id.
+pub fn upsert_index_memory(
+    conn: &Connection,
+    project: &str,
+    source: &str,
+    content: &str,
+    embedding: Option<&[f32]>,
+    now: &str,
+) -> Result<i64, KbError> {
+    upsert_index_memory_inner(conn, None, project, source, content, embedding, now)
+}
+
+/// [`upsert_index_memory`] for a module/repo summary's mirror: also records
+/// the new memory id on the `code_summaries` row (`project_id`, `path`) in
+/// the SAME transaction, so a crash can never leave the summary pointing at
+/// a superseded memory (or at none while an active mirror exists).
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_index_memory_for_summary(
+    conn: &Connection,
+    project_id: i64,
+    path: &str,
+    project: &str,
+    source: &str,
+    content: &str,
+    embedding: Option<&[f32]>,
+    now: &str,
+) -> Result<i64, KbError> {
+    upsert_index_memory_inner(conn, Some((project_id, path)), project, source, content, embedding, now)
+}
+
+fn upsert_index_memory_inner(
+    conn: &Connection,
+    summary_key: Option<(i64, &str)>,
+    project: &str,
+    source: &str,
+    content: &str,
+    embedding: Option<&[f32]>,
+    now: &str,
+) -> Result<i64, KbError> {
+    let tx = conn.unchecked_transaction()?;
+    // EVERY active row with this source, not just the newest: a restored
+    // (and so pinned) older generation would otherwise stay active forever
+    // beside the new one. The index owns these rows outright, so a pin
+    // (which guards against *automatic judges*) does not apply here.
+    let existing_ids: Vec<i64> = {
+        let mut stmt = tx.prepare("SELECT id FROM memories WHERE source = ?1 AND invalidated_at IS NULL ORDER BY id")?;
+        let ids = stmt.query_map(params![source], |r| r.get(0))?.collect::<Result<Vec<i64>, _>>()?;
+        ids
+    };
+
+    let stability = 6i64 as f64 * 7.0;
+    let blob = embedding.map(encode_embedding);
+    tx.execute(
+        "INSERT INTO memories
+            (content, source, project, created_at, reviewed, embedding, importance, stability, valid_from, basis, reflected_at)
+         VALUES (?1, ?2, ?3, ?4, 1, ?5, 6, ?6, ?4, ?7, ?4)",
+        params![content, source, project, now, blob, stability, BASIS_DERIVED],
+    )?;
+    let new_id = tx.last_insert_rowid();
+    // No mention linking (final-review item 7): an index row is derived
+    // prose about code, and linking it would pull it into the entity graph
+    // (cards, graph hygiene, evidence-death) that exists for session facts.
+    // Occurrence dating is still applied, as for any other row.
+    let dates = iso_dates_in(content);
+    if let (Some(from), Some(to)) = (dates.first(), dates.last()) {
+        let _ = tx.execute("UPDATE memories SET occurred_from = ?1, occurred_to = ?2 WHERE id = ?3", params![from, to, new_id]);
+    }
+
+    for old_id in existing_ids {
+        supersede(&tx, old_id, new_id, now)?;
+    }
+    if let Some((project_id, path)) = summary_key {
+        set_code_summary_memory_id(&tx, project_id, path, new_id)?;
+    }
+    tx.commit()?;
+    Ok(new_id)
+}
+
+/// Tombstones (no successor) every ACTIVE memory whose `source` is exactly
+/// `source` -- the orphan-cleanup counterpart of `upsert_index_memory`'s
+/// "supersede all by source": a module that no longer exists must not
+/// leave a restored older generation of its mirror active. Returns how
+/// many rows were invalidated.
+pub fn invalidate_index_memories_by_source(conn: &Connection, source: &str, now: &str) -> Result<usize, KbError> {
+    let n = conn.execute(
+        "UPDATE memories SET invalidated_at = ?1 WHERE source = ?2 AND invalidated_at IS NULL",
+        params![now, source],
+    )?;
+    Ok(n)
+}
+
 /// Schema 24: judged name-to-entity verdicts, which are both a cache and
 /// an alias table.
 ///
@@ -1257,6 +2934,219 @@ fn migrate_v30_to_v31(conn: &Connection) -> Result<(), KbError> {
     add_column_if_missing(conn, "insights", "revised_at", "TEXT")?;
     add_column_if_missing(conn, "insights", "prev_text", "TEXT")?;
     conn.execute("PRAGMA user_version = 31", [])?;
+    Ok(())
+}
+
+/// Schema 32: the code index (`crate::code_index`; design doc
+/// `docs/superpowers/specs/2026-09-23-code-index-design.md`). Additive
+/// only: two columns on `projects` recording the last commit the index is
+/// current with, plus the per-directory scope table, per-file indexing
+/// state, and the chunks themselves with an FTS5 index over them -- the
+/// code analogue of `transcript_chunks`/`transcript_chunks_fts` (schema
+/// 22-23) above, and kept in sync the same explicit-insert-and-delete way,
+/// no triggers (see the "Code index" section preceding `migrate_v23_to_v24`).
+fn migrate_v31_to_v32(conn: &Connection) -> Result<(), KbError> {
+    add_column_if_missing(conn, "projects", "code_indexed_head", "TEXT")?;
+    add_column_if_missing(conn, "projects", "code_indexed_at", "TEXT")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS code_scope (
+            project_id INTEGER NOT NULL,
+            dir TEXT NOT NULL,
+            category TEXT NOT NULL,
+            source TEXT NOT NULL CHECK (source IN ('llm','user')),
+            decided_at TEXT NOT NULL,
+            PRIMARY KEY (project_id, dir)
+        );
+        CREATE TABLE IF NOT EXISTS code_files (
+            project_id INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            blob TEXT NOT NULL,
+            lang TEXT,
+            lines INTEGER NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('indexed','dirty','fallback','skipped')),
+            indexed_at TEXT NOT NULL,
+            PRIMARY KEY (project_id, path)
+        );
+        CREATE TABLE IF NOT EXISTS code_chunks (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            symbol TEXT,
+            kind TEXT NOT NULL,
+            scope TEXT,
+            start_line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            header TEXT,
+            embedding BLOB,
+            content_hash TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ix_code_chunks_file ON code_chunks (project_id, path);
+        CREATE VIRTUAL TABLE IF NOT EXISTS code_chunks_fts USING fts5(
+            header, text, symbol, content='code_chunks', content_rowid='id'
+        );",
+    )?;
+    conn.execute("PRAGMA user_version = 32", [])?;
+    Ok(())
+}
+
+/// Schema 33: code-index summaries (phase 2; design doc's "Summaries
+/// (phase 2) — revised 2026-09-24" section, `crate::code_index`).
+/// Additive only: one new table, `code_summaries`, holding file/module/repo
+/// summary text for a project, plus an FTS5 index over it, kept in sync the
+/// same explicit-insert-and-delete way as `code_chunks_fts` (no triggers).
+///
+/// Unlike `code_chunks`, this table has no surrogate integer id -- its
+/// natural key IS the app-level identity (`project_id`, `path`: a file path
+/// for `level = 'file'`, `"dir/"` for a module, `"/"` for the repo), so
+/// `code_summaries_fts` indexes off SQLite's implicit `rowid` instead of a
+/// declared column, exactly the way any ordinary rowid table can be an
+/// FTS5 `content` table without naming that column itself.
+///
+/// `stale`/`stale_since` track a summary whose inputs (a child file/module,
+/// or the file's own blob) changed since it was last generated -- see
+/// `mark_code_summaries_stale`. `memory_id` is set only for module/repo
+/// summaries, which are additionally mirrored into `memories` as
+/// index-owned rows (`upsert_index_memory`); file summaries never get one
+/// (per the design doc, "File summaries never become memories").
+fn migrate_v32_to_v33(conn: &Connection) -> Result<(), KbError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS code_summaries (
+            project_id INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            level TEXT NOT NULL CHECK (level IN ('file','module','repo')),
+            text TEXT NOT NULL,
+            embedding BLOB,
+            source_digest TEXT NOT NULL,
+            stale INTEGER NOT NULL DEFAULT 0,
+            stale_since TEXT,
+            memory_id INTEGER,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (project_id, path)
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS code_summaries_fts USING fts5(
+            text, path, content='code_summaries', content_rowid='rowid'
+        );",
+    )?;
+    conn.execute("PRAGMA user_version = 33", [])?;
+    Ok(())
+}
+
+/// Schema 34: fix-list items 1 and 4 (phase 2 pre-run fixes, see
+/// `docs/superpowers/plans/2026-09-24-code-index-phase2.md`'s fix wave).
+/// Additive only: `code_files.summary_attempts` counts unparseable-summary
+/// attempts for a file's CURRENT blob (`code_file_upsert` resets it to 0
+/// whenever the blob changes) so `code_index::job::run_summary_pass` can
+/// stop queuing a file after `SUMMARY_GIVE_UP_ATTEMPTS` (2) straight
+/// successes-with-no-`SUMMARY:`-line, without retrying it forever (fix 1).
+/// No corresponding column is needed on `code_summaries` for fix 4's
+/// "first seen" tracking -- a module/repo that has never had a row uses a
+/// placeholder row instead (`code_summary_seed_placeholder`), reusing the
+/// existing `stale`/`stale_since` columns rather than adding a new one.
+fn migrate_v33_to_v34(conn: &Connection) -> Result<(), KbError> {
+    add_column_if_missing(conn, "code_files", "summary_attempts", "INTEGER NOT NULL DEFAULT 0")?;
+    conn.execute("PRAGMA user_version = 34", [])?;
+    Ok(())
+}
+
+/// Schema 35: phase 3 of the code index -- the symbol graph (design doc's
+/// task-1 brief, `docs/superpowers/plans/2026-09-24-code-index-phase3.md`).
+/// Additive only, three new tables:
+///
+/// - `code_symbols`: one row per definition `code_index::chunk::extract_refs`
+///   finds (it reuses `chunk_file`'s own parse and scope logic -- see that
+///   function's doc comment -- so there is exactly one grammar/scope pass
+///   for both chunking and the symbol graph, not two drifting apart).
+///   `qualified` is `scope` + the language's separator + `name`, matching
+///   what a human would write to reference the symbol from outside its
+///   scope (`Foo::bar`, `mod.Class.method`).
+/// - `code_edges`: one row per reference (call/include/import/inherits)
+///   the same extraction pass finds. `src_symbol_id` is resolved
+///   immediately by `replace_file_symbols` (the enclosing definition by
+///   line range, within the same file being replaced); `dst_symbol_id`
+///   starts NULL and is resolved separately, after a batch of files
+///   reindexes, by `resolve_edges` -- a callee can live in a file this
+///   pass never touched. `kind`'s CHECK constraint is the same enum the
+///   brief specifies; nothing else in this schema enforces vocabulary this
+///   tightly, but a stray edge kind would silently break every consumer
+///   that matches on the four literal strings.
+/// - `code_history`: created here so the schema is ready, but not written
+///   to until Task 3's monthly history job -- see `code_history_get`/
+///   `code_history_upsert`/`code_history_list` below.
+///
+/// Amended in place by the phase-3 final-review fix wave (v35 was never
+/// live outside scratch copies), so it stays idempotent and additive:
+/// `migrate` re-runs it on every open of a v35 database (`version <= 35`),
+/// and every addition below is `IF NOT EXISTS` / `add_column_if_missing`,
+/// so a scratch copy created by the first v35 cut upgrades in place.
+/// - indexes `code_symbols(project_id, qualified)`, `code_edges(project_id,
+///   dst_symbol_id)`, `code_edges(project_id, src_symbol_id)`,
+///   `code_edges(project_id, dst_path)` -- `resolve_edges`'s qualified
+///   lookup, the null-out-incoming-edges update on replace/delete, the
+///   callees query, and the include-target null-out on delete/move.
+/// - `code_files.refs_blob`: the blob `extract_refs` last ran over for this
+///   path (set by `replace_file_symbols_for_blob`). The symbol backfill
+///   selects `refs_blob IS NULL OR refs_blob != blob`, so a file that
+///   legitimately yields zero symbols is backfilled exactly once.
+/// - `code_edges.dst_path`: the resolved repo-relative path of an
+///   `includes`/`imports` edge; `dst_name` stays exactly as written.
+/// - `code_history.files`: newline-separated top-churn paths of the month,
+///   rendered by the ask `history` tool as `path@<last7>`.
+/// - `code_graph_pending`: names / source paths / file paths touched since
+///   the last `resolve_edges*` pass, written inside the same transaction as
+///   the symbol/edge mutation -- what makes resolution incremental (and
+///   crash-safe: a run that dies before resolving leaves the work queued).
+fn migrate_v34_to_v35(conn: &Connection) -> Result<(), KbError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS code_symbols (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            name TEXT NOT NULL,
+            qualified TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            start_line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ix_code_symbols_name ON code_symbols (project_id, name);
+        CREATE INDEX IF NOT EXISTS ix_code_symbols_file ON code_symbols (project_id, path);
+        CREATE TABLE IF NOT EXISTS code_edges (
+            project_id INTEGER NOT NULL,
+            src_symbol_id INTEGER,
+            src_path TEXT NOT NULL,
+            src_line INTEGER NOT NULL,
+            dst_name TEXT NOT NULL,
+            dst_symbol_id INTEGER,
+            kind TEXT NOT NULL CHECK (kind IN ('calls','includes','imports','inherits'))
+        );
+        CREATE INDEX IF NOT EXISTS ix_code_edges_dst ON code_edges (project_id, dst_name);
+        CREATE INDEX IF NOT EXISTS ix_code_edges_src ON code_edges (project_id, src_path);
+        CREATE TABLE IF NOT EXISTS code_history (
+            project_id INTEGER NOT NULL,
+            month TEXT NOT NULL,
+            text TEXT NOT NULL,
+            commits INTEGER NOT NULL,
+            last_sha TEXT NOT NULL,
+            digest TEXT NOT NULL,
+            memory_id INTEGER,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (project_id, month)
+        );
+        CREATE INDEX IF NOT EXISTS ix_code_symbols_qualified ON code_symbols (project_id, qualified);
+        CREATE INDEX IF NOT EXISTS ix_code_edges_dst_symbol ON code_edges (project_id, dst_symbol_id);
+        CREATE INDEX IF NOT EXISTS ix_code_edges_src_symbol ON code_edges (project_id, src_symbol_id);
+        CREATE TABLE IF NOT EXISTS code_graph_pending (
+            project_id INTEGER NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('name','src','file')),
+            value TEXT NOT NULL,
+            PRIMARY KEY (project_id, kind, value)
+        ) WITHOUT ROWID;",
+    )?;
+    add_column_if_missing(conn, "code_files", "refs_blob", "TEXT")?;
+    add_column_if_missing(conn, "code_edges", "dst_path", "TEXT")?;
+    add_column_if_missing(conn, "code_history", "files", "TEXT")?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS ix_code_edges_dst_path ON code_edges (project_id, dst_path);")?;
+    conn.execute("PRAGMA user_version = 35", [])?;
     Ok(())
 }
 
@@ -1877,7 +3767,7 @@ const MEMORY_COLUMNS: &[(&str, &str)] = &[
 /// against this rather than a literal: every schema addition used to
 /// require hunting down a dozen hard-coded version numbers across the
 /// migration tests, which is busywork that also invites getting one wrong.
-pub const SCHEMA_VERSION: i64 = 31;
+pub const SCHEMA_VERSION: i64 = 35;
 
 fn ensure_memory_columns(conn: &Connection) -> Result<(), KbError> {
     if !table_exists(conn, "memories")? {
@@ -1986,6 +3876,22 @@ fn migrate(conn: &Connection) -> Result<(), KbError> {
     }
     if version < 31 {
         migrate_v30_to_v31(conn)?;
+    }
+    if version < 32 {
+        migrate_v31_to_v32(conn)?;
+    }
+    if version < 33 {
+        migrate_v32_to_v33(conn)?;
+    }
+    if version < 34 {
+        migrate_v33_to_v34(conn)?;
+    }
+    // `<=`, not `<`: v35 was amended in place (final-review fix wave) and
+    // is idempotent, so a database already at 35 re-runs it to pick up the
+    // added columns/indexes/table. Cheap: every statement is IF NOT EXISTS
+    // or an ALTER that no-ops on "duplicate column name".
+    if version <= 35 {
+        migrate_v34_to_v35(conn)?;
     }
     Ok(())
 }
@@ -2226,9 +4132,16 @@ pub const BASIS_INFERRED: &str = "inferred";
 /// distinct GROUND for holding a belief, alongside "the user said it" and
 /// "I deduced it", so it belongs on the same axis.
 pub const BASIS_EXPERIENCE: &str = "experience";
+/// Written entirely by code, never from a session: the code index's own
+/// file/module/repo summaries, mirrored into `memories` for module/repo
+/// levels by `upsert_index_memory`. Neither "the user said it" nor "I
+/// deduced it from behavior" nor "I watched myself do it" -- it's derived
+/// mechanically from parsed source, so it gets a basis distinct from all
+/// three human-facing ones.
+pub const BASIS_DERIVED: &str = "derived";
 
 pub fn is_valid_basis(b: &str) -> bool {
-    b == BASIS_STATED || b == BASIS_INFERRED || b == BASIS_EXPERIENCE
+    b == BASIS_STATED || b == BASIS_INFERRED || b == BASIS_EXPERIENCE || b == BASIS_DERIVED
 }
 
 /// `insert` plus an explicit `basis` (see `Memory::basis`). `None` leaves
@@ -2247,7 +4160,7 @@ pub fn insert_with_basis(
 ) -> Result<i64, KbError> {
     if let Some(b) = basis {
         if !is_valid_basis(b) {
-            return Err(KbError::Other(format!("invalid basis {:?} (expected stated|inferred)", b)));
+            return Err(KbError::Other(format!("invalid basis {:?} (expected stated|inferred|experience|derived)", b)));
         }
     }
     let created_at = now_rfc3339();
@@ -2300,7 +4213,7 @@ pub fn set_occurrence(conn: &Connection, id: i64, from: &str, to: &str) -> Resul
 /// insert time). Same validation as `insert_with_basis`.
 pub fn set_basis(conn: &Connection, id: i64, basis: &str) -> Result<(), KbError> {
     if !is_valid_basis(basis) {
-        return Err(KbError::Other(format!("invalid basis {:?} (expected stated|inferred)", basis)));
+        return Err(KbError::Other(format!("invalid basis {:?} (expected stated|inferred|experience|derived)", basis)));
     }
     conn.execute("UPDATE memories SET basis = ?1 WHERE id = ?2", params![basis, id])?;
     Ok(())
@@ -2628,6 +4541,22 @@ pub fn restore(conn: &Connection, id: i64, now: &str) -> Result<bool, KbError> {
     Ok(n > 0)
 }
 
+/// Tombstones `id` on its own, `superseded_by` left NULL -- for a derived
+/// row that has no successor to name, only a removal. So far the one
+/// caller is `code_index::summary`'s orphan cleanup: a module/repo
+/// summary's mirrored memory (`code_summaries.memory_id`, written by
+/// `upsert_index_memory`) when that module's directory no longer has any
+/// indexed file -- there is nothing new replacing it, so `supersede`
+/// (which always names a winner) doesn't fit. Modeled on
+/// `invalidate_relation`, the same shape one level up for `relations`.
+/// Never deletes; the row stays as an audit trail like every other
+/// tombstone in this store. Returns `false` (no-op) if `id` doesn't exist
+/// or is already invalidated.
+pub fn invalidate_memory(conn: &Connection, id: i64, now: &str) -> Result<bool, KbError> {
+    let n = conn.execute("UPDATE memories SET invalidated_at = ?1 WHERE id = ?2 AND invalidated_at IS NULL", params![now, id])?;
+    Ok(n > 0)
+}
+
 /// Whether `id` is currently pinned (set by `restore`, cleared by `unpin`).
 /// A missing id reports `false` rather than erroring — every caller of
 /// this is a fail-safe skip check ("don't tombstone this automatically"),
@@ -2671,13 +4600,18 @@ pub struct SupersessionCandidate {
 /// nothing deletes rows) is skipped: there is nothing to compare the old
 /// content against.
 pub fn supersession_candidates(conn: &Connection) -> Result<Vec<SupersessionCandidate>, KbError> {
-    let mut stmt = conn.prepare(
+    let sql = format!(
         "SELECT m.id, m.content, s.id, s.content
          FROM memories m
          JOIN memories s ON s.id = m.superseded_by
          WHERE m.superseded_by IS NOT NULL
+           AND {}
+           AND {}
          ORDER BY m.created_at ASC, m.id ASC",
-    )?;
+        not_index_owned_sql("m.source"),
+        not_index_owned_sql("s.source"),
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| {
         Ok(SupersessionCandidate { old_id: r.get(0)?, old_content: r.get(1)?, new_id: r.get(2)?, new_content: r.get(3)? })
     })?;
@@ -3793,7 +5727,25 @@ pub enum GuardKind {
 ///   SUPERSEDE rather than UPDATE, a stronger signal than a dedupe KEEP. A
 ///   `winner_term_coverage` query failure fails safe as zero coverage
 ///   (blocked), consistent with "when unsure, keep both rows".
+/// - **Index-owned guard** (every `kind`): blocks with `"index-owned"` when
+///   EITHER `loser.source` or `winner.source` starts with
+///   `INDEX_OWNED_SOURCE_PREFIX` (a winning index row would otherwise
+///   tombstone a user memory into text the indexer later replaces)
+///   (`"code-index:"`) -- a code-index summary memory is regenerated and
+///   superseded ONLY by the indexer itself (`upsert_index_memory`), never by
+///   dedupe, contradiction, or the add-time classifier. Checked first,
+///   before the date/coverage guards even run, since no amount of date or
+///   term-coverage agreement makes it correct for a different pass to
+///   tombstone one of these rows.
 pub fn supersession_guard(conn: &Connection, loser: &Memory, winner: &Memory, kind: GuardKind) -> Option<&'static str> {
+    // Both sides: an index-owned row must neither be tombstoned by a
+    // non-index pass (loser) nor tombstone a user memory by winning one
+    // (winner) -- the index's own text is regenerated and replaced
+    // wholesale, so a user fact merged "into" it would vanish with the
+    // next regeneration.
+    if is_index_owned(loser) || is_index_owned(winner) {
+        return Some("index-owned");
+    }
     if let Some(from) = &loser.occurred_from {
         // `occurred_from` can be set from a relative phrase ("last
         // Tuesday") with no literal ISO date anywhere in the text, so this
@@ -3857,8 +5809,12 @@ pub fn search_substring(
 /// whether a new fact is close enough to an existing one to ask the
 /// classifier about it.
 pub fn top_similar(conn: &Connection, query_embedding: &[f32], limit: usize) -> Result<Vec<(Memory, f32)>, KbError> {
+    // Index-owned rows are never save-time classifier candidates: a NOOP
+    // ("duplicate of #N") against one would drop the user's fact in favour
+    // of text the indexer replaces on its next regeneration.
     let mut scored: Vec<(Memory, f32)> = candidates(conn, false, false)?
         .into_iter()
+        .filter(|m| !is_index_owned(m))
         .filter_map(|m| {
             let score = match &m.embedding {
                 Some(e) if !e.is_empty() => cosine(query_embedding, e).clamp(0.0, 1.0),
@@ -5426,7 +7382,9 @@ pub fn downstream_of_memory(conn: &Connection, memory_id: i64) -> Result<Vec<i64
 pub fn memories_due_for_strength_review(conn: &Connection, limit: usize, min_importance: i64) -> Result<Vec<Memory>, KbError> {
     let sql = format!(
         "SELECT * FROM memories WHERE invalidated_at IS NULL AND dormant_at IS NULL AND importance >= ?1
+           AND {}
          ORDER BY last_verified_at ASC, id ASC LIMIT {}",
+        not_index_owned_sql("source"),
         limit
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -5960,7 +7918,13 @@ pub fn link_mentions_by_name_scan(conn: &Connection, memory_id: i64, content: &s
 /// mentions `name`. Called when graph extraction mints an entity, so older
 /// memories that named it before it existed as a node are linked too.
 pub fn link_entity_mentions_by_name_scan(conn: &Connection, entity_id: i64, name: &str, now: &str) -> Result<usize, KbError> {
-    let mut stmt = conn.prepare("SELECT id, content FROM memories WHERE invalidated_at IS NULL")?;
+    // Index-owned rows never join the mention graph (see
+    // `upsert_index_memory`).
+    let sql = format!(
+        "SELECT id, content FROM memories WHERE invalidated_at IS NULL AND {}",
+        not_index_owned_sql("source"),
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let mems: Vec<(i64, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
     let mut n = 0;
     for (mid, content) in &mems {
@@ -6628,7 +8592,9 @@ pub fn relations_conflicting_with(conn: &Connection, src: i64, predicate: &str, 
 pub fn graph_extraction_candidates(conn: &Connection, cap: usize) -> Result<Vec<Memory>, KbError> {
     let sql = format!(
         "SELECT * FROM memories WHERE graph_extracted_at IS NULL AND invalidated_at IS NULL AND dormant_at IS NULL \
+           AND {} \
          ORDER BY id ASC LIMIT {}",
+        not_index_owned_sql("source"),
         cap
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -6647,11 +8613,12 @@ pub fn graph_extraction_candidates(conn: &Connection, cap: usize) -> Result<Vec<
 /// graph-extraction pass when it has an unprocessed backlog (e.g. this
 /// feature's own one-time backfill).
 pub fn has_graph_extraction_candidates(conn: &Connection) -> Result<bool, KbError> {
-    let n: i64 = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM memories WHERE graph_extracted_at IS NULL AND invalidated_at IS NULL AND dormant_at IS NULL)",
-        [],
-        |r| r.get(0),
-    )?;
+    let sql = format!(
+        "SELECT EXISTS(SELECT 1 FROM memories WHERE graph_extracted_at IS NULL AND invalidated_at IS NULL AND dormant_at IS NULL \
+           AND {})",
+        not_index_owned_sql("source"),
+    );
+    let n: i64 = conn.query_row(&sql, [], |r| r.get(0))?;
     Ok(n != 0)
 }
 
@@ -8922,6 +10889,29 @@ mod tests {
         assert!(old.superseded_by.is_none());
     }
 
+    #[test]
+    fn apply_verdict_supersede_of_index_owned_loser_adds_instead() {
+        // Fix-list item 6: same fail-safe shape as the pinned-row and
+        // date-guard tests above, but for an index-owned loser -- the
+        // classifier's SUPERSEDE verdict must never tombstone a code-index
+        // summary's mirrored memory.
+        let conn = mem_conn();
+        let old_id = upsert_index_memory(&conn, "helios", "code-index:helios:src/", "src/ handles picking", None, "2026-09-24T00:00:00Z").unwrap();
+        let now = now_rfc3339();
+        let outcome = apply_verdict(
+            &conn, Verdict::Supersede(old_id), "src/ handles picking and rendering now", None, None, true,
+            &fake_embed("src/ handles picking and rendering now"), 5, &now, Some(old_id),
+        )
+        .unwrap();
+        match outcome {
+            AddOutcome::Added { id } => assert!(get(&conn, id).unwrap().is_some()),
+            _ => panic!("expected a plain Added fallback, not a tombstone of the index-owned loser"),
+        }
+        let old = get(&conn, old_id).unwrap().unwrap();
+        assert!(old.invalidated_at.is_none(), "the index-owned loser must stay active");
+        assert!(old.superseded_by.is_none());
+    }
+
     // --- supersession_guard ---
 
     #[test]
@@ -10745,6 +12735,48 @@ mod tests {
     }
 
     #[test]
+    fn index_owned_rows_are_excluded_from_graph_extraction_strength_review_and_supersession_audit() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let user = insert(&conn, "a user fact", None, None, true, None, 7).unwrap();
+        let idx1 = upsert_index_memory(&conn, "helios", "code-index:helios:src/", "src/ v1", None, &now).unwrap();
+        let idx2 = upsert_index_memory(&conn, "helios", "code-index:helios:src/", "src/ v2", None, &now).unwrap();
+        assert!(get(&conn, idx1).unwrap().unwrap().is_superseded(), "precondition: an index->index supersession exists");
+
+        let g: Vec<i64> = graph_extraction_candidates(&conn, 10).unwrap().iter().map(|m| m.id).collect();
+        assert_eq!(g, vec![user]);
+        let sr: Vec<i64> = memories_due_for_strength_review(&conn, 10, 1).unwrap().iter().map(|m| m.id).collect();
+        assert_eq!(sr, vec![user]);
+        mark_graph_extracted(&conn, user, &now).unwrap();
+        assert!(!has_graph_extraction_candidates(&conn).unwrap(), "an index row alone is no graph backlog");
+
+        let audit: Vec<(i64, i64)> = supersession_candidates(&conn).unwrap().iter().map(|c| (c.old_id, c.new_id)).collect();
+        assert!(!audit.contains(&(idx1, idx2)), "index regenerations are never audited as lossy supersessions");
+    }
+
+    #[test]
+    fn code_history_owned_rows_are_also_excluded_from_graph_extraction_strength_review_and_supersession_audit() {
+        // Task-3 extension of the test above: `code-history:` must be
+        // covered by the exact same shared helper as `code-index:`.
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let user = insert(&conn, "a user fact", None, None, true, None, 7).unwrap();
+        let h1 = upsert_index_memory(&conn, "helios", "code-history:helios:2026-08", "helios 2026-08: v1", None, &now).unwrap();
+        let h2 = upsert_index_memory(&conn, "helios", "code-history:helios:2026-08", "helios 2026-08: v2", None, &now).unwrap();
+        assert!(get(&conn, h1).unwrap().unwrap().is_superseded(), "precondition: a history->history regeneration exists");
+
+        let g: Vec<i64> = graph_extraction_candidates(&conn, 10).unwrap().iter().map(|m| m.id).collect();
+        assert_eq!(g, vec![user]);
+        let sr: Vec<i64> = memories_due_for_strength_review(&conn, 10, 1).unwrap().iter().map(|m| m.id).collect();
+        assert_eq!(sr, vec![user]);
+        mark_graph_extracted(&conn, user, &now).unwrap();
+        assert!(!has_graph_extraction_candidates(&conn).unwrap(), "a history row alone is no graph backlog");
+
+        let audit: Vec<(i64, i64)> = supersession_candidates(&conn).unwrap().iter().map(|c| (c.old_id, c.new_id)).collect();
+        assert!(!audit.contains(&(h1, h2)), "history regenerations are never audited as lossy supersessions");
+    }
+
+    #[test]
     fn has_graph_extraction_candidates_is_false_once_everything_is_marked() {
         let conn = mem_conn();
         let now = now_rfc3339();
@@ -11411,6 +13443,81 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_open_lands_on_v32_with_the_code_index_tables_and_columns() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION, "a fresh open lands on the latest schema, past v31");
+
+        for table in ["code_scope", "code_files", "code_chunks", "code_chunks_fts"] {
+            let exists: i64 = conn
+                .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table','view') AND name = ?1", params![table], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(exists, 1, "{table} must exist after a fresh open");
+        }
+
+        let mut stmt = conn.prepare("PRAGMA table_info(projects)").unwrap();
+        let cols: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert!(cols.iter().any(|c| c == "code_indexed_head"), "projects.code_indexed_head must exist");
+        assert!(cols.iter().any(|c| c == "code_indexed_at"), "projects.code_indexed_at must exist");
+    }
+
+    #[test]
+    fn migrate_v31_to_v32_is_idempotent() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        migrate_v31_to_v32(&conn).unwrap();
+        migrate_v31_to_v32(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 32);
+    }
+
+    #[test]
+    fn a_fresh_open_lands_on_v33_with_the_code_summaries_tables() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION, "a fresh open lands on the latest schema, past v32");
+
+        for table in ["code_summaries", "code_summaries_fts"] {
+            let exists: i64 = conn
+                .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table','view') AND name = ?1", params![table], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(exists, 1, "{table} must exist after a fresh open");
+        }
+    }
+
+    #[test]
+    fn migrate_v32_to_v33_is_idempotent() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        migrate_v32_to_v33(&conn).unwrap();
+        migrate_v32_to_v33(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 33);
+    }
+
+    #[test]
+    fn a_fresh_open_lands_on_v34_with_summary_attempts_and_seedable_placeholders() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION, "a fresh open lands on the latest schema, past v33");
+
+        let mut stmt = conn.prepare("PRAGMA table_info(code_files)").unwrap();
+        let cols: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert!(cols.iter().any(|c| c == "summary_attempts"), "code_files.summary_attempts must exist");
+    }
+
+    #[test]
+    fn migrate_v33_to_v34_is_idempotent() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        migrate_v33_to_v34(&conn).unwrap();
+        migrate_v33_to_v34(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 34);
+    }
+
+    #[test]
     fn backfill_reflected_at_marks_ids_at_or_below_the_frozen_watermark() {
         let conn = mem_conn();
         let below = insert(&conn, "below the old watermark", None, None, true, None, 5).unwrap();
@@ -11716,5 +13823,1271 @@ mod tests {
 
         let audit_count: i64 = conn.query_row("SELECT COUNT(*) FROM supersession_audit", [], |r| r.get(0)).unwrap();
         assert_eq!(audit_count, 1, "supersession_audit is a permanent record and must never be pruned");
+    }
+
+    // -------------------------------------------------------------
+    // Code index
+    // -------------------------------------------------------------
+
+    fn new_project(conn: &Connection, name: &str) -> i64 {
+        upsert_project(conn, &format!("fp-{name}"), name, &format!("/repo/{name}"), "2026-09-23T00:00:00Z").unwrap().0
+    }
+
+    fn a_chunk(symbol: &str, text: &str) -> NewCodeChunk {
+        NewCodeChunk {
+            symbol: Some(symbol.to_string()),
+            kind: "function".to_string(),
+            scope: None,
+            start_line: 1,
+            end_line: 10,
+            text: text.to_string(),
+            header: None,
+            embedding: None,
+            content_hash: format!("hash-{symbol}"),
+        }
+    }
+
+    #[test]
+    fn code_scope_set_never_lets_an_llm_write_overwrite_a_user_row() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+
+        code_scope_set(&conn, pid, "src/vendor", "vendored", "user", "2026-09-20T00:00:00Z").unwrap();
+        code_scope_set(&conn, pid, "src/vendor", "product", "llm", "2026-09-23T00:00:00Z").unwrap();
+
+        let rows = code_scope_get(&conn, pid).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].category, "vendored", "the llm write must not clobber the user's override");
+        assert_eq!(rows[0].source, "user");
+        assert_eq!(rows[0].decided_at, "2026-09-20T00:00:00Z");
+
+        // A later user write still updates a user row.
+        code_scope_set(&conn, pid, "src/vendor", "assets", "user", "2026-09-24T00:00:00Z").unwrap();
+        let rows = code_scope_get(&conn, pid).unwrap();
+        assert_eq!(rows[0].category, "assets");
+
+        // And an llm write still lands on a directory with no prior decision.
+        code_scope_set(&conn, pid, "src/core", "product", "llm", "2026-09-23T00:00:00Z").unwrap();
+        let rows = code_scope_get(&conn, pid).unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn replace_code_chunks_replaces_rows_and_keeps_fts_in_sync() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+
+        let ids1 = replace_code_chunks(&conn, pid, "src/main.cpp", &[a_chunk("old_symbol", "old body text kumquatzzy")]).unwrap();
+        assert_eq!(ids1.len(), 1);
+
+        let before = search_code_chunks(&conn, Some(pid), "kumquatzzy", None, 10).unwrap();
+        assert_eq!(before.len(), 1, "the old text must be found before the file is re-chunked");
+
+        let ids2 = replace_code_chunks(&conn, pid, "src/main.cpp", &[a_chunk("new_symbol", "new body text wombatqqq")]).unwrap();
+        assert_eq!(ids2.len(), 1);
+        // `code_chunks.id` is a plain `INTEGER PRIMARY KEY` (no
+        // AUTOINCREMENT, per the exact schema), so SQLite is free to reuse
+        // `ids1[0]` here once the table is empty -- that's expected, not a
+        // bug; what matters is the FTS index tracking whichever id is live.
+
+        let old_hits = search_code_chunks(&conn, Some(pid), "kumquatzzy", None, 10).unwrap();
+        assert!(old_hits.is_empty(), "the old chunk's text must no longer be findable via FTS");
+
+        let new_hits = search_code_chunks(&conn, Some(pid), "wombatqqq", None, 10).unwrap();
+        assert_eq!(new_hits.len(), 1, "the new chunk's text must be findable via FTS");
+        assert_eq!(new_hits[0].id, ids2[0]);
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM code_chunks WHERE project_id = ?1 AND path = ?2", params![pid, "src/main.cpp"], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1, "the old row must actually be gone, not just unindexed");
+    }
+
+    #[test]
+    fn set_code_chunk_header_keeps_fts_searchable_by_the_new_header() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        let ids = replace_code_chunks(&conn, pid, "src/a.rs", &[a_chunk("do_thing", "fn body")]).unwrap();
+
+        set_code_chunk_header(&conn, ids[0], "handles the frobnicator_widget subsystem").unwrap();
+
+        let hits = search_code_chunks(&conn, Some(pid), "frobnicator_widget", None, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].header.as_deref(), Some("handles the frobnicator_widget subsystem"));
+    }
+
+    #[test]
+    fn search_code_chunks_filters_by_project_and_ranks_an_exact_symbol_match_first() {
+        let conn = mem_conn();
+        let helios = new_project(&conn, "helios");
+        let other = new_project(&conn, "other");
+
+        // In `helios`: one chunk whose SYMBOL is the query, one chunk that
+        // only mentions the same token in its body text.
+        replace_code_chunks(&conn, helios, "src/picking.cpp", &[a_chunk("ray_cast_terrain", "definition of ray_cast_terrain")]).unwrap();
+        replace_code_chunks(&conn, helios, "src/notes.cpp", &[a_chunk("unrelated_fn", "calls ray_cast_terrain from elsewhere")]).unwrap();
+        // In `other`: a same-named symbol that must never surface when the
+        // search is scoped to `helios`.
+        replace_code_chunks(&conn, other, "src/picking.cpp", &[a_chunk("ray_cast_terrain", "a different project's own definition")]).unwrap();
+
+        let hits = search_code_chunks(&conn, Some(helios), "ray_cast_terrain", None, 10).unwrap();
+        assert_eq!(hits.len(), 2, "only helios's two chunks must be returned");
+        assert!(hits.iter().all(|h| h.project_id == helios), "no hit from the other project must leak through");
+        assert_eq!(
+            hits[0].symbol.as_deref(),
+            Some("ray_cast_terrain"),
+            "the chunk whose symbol IS the query must outrank the one that merely mentions it in text"
+        );
+        assert!(hits[0].score > hits[1].score);
+    }
+
+    // -------------------------------------------------------------
+    // Code summaries (phase 2, schema 33)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn code_summary_upsert_then_get_round_trips_every_field() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+
+        code_summary_upsert(&conn, pid, "src/picking.cpp", "file", "does terrain picking", "digest-1", "2026-09-24T00:00:00Z")
+            .unwrap();
+
+        let row = code_summary_get(&conn, pid, "src/picking.cpp").unwrap().unwrap();
+        assert_eq!(row.project_id, pid);
+        assert_eq!(row.path, "src/picking.cpp");
+        assert_eq!(row.level, "file");
+        assert_eq!(row.text, "does terrain picking");
+        assert_eq!(row.source_digest, "digest-1");
+        assert!(!row.stale);
+        assert!(row.stale_since.is_none());
+        assert!(row.embedding.is_none());
+        assert!(row.memory_id.is_none());
+        assert_eq!(row.updated_at, "2026-09-24T00:00:00Z");
+    }
+
+    #[test]
+    fn code_summary_get_on_a_never_summarised_path_is_none() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        assert!(code_summary_get(&conn, pid, "src/never.cpp").unwrap().is_none());
+    }
+
+    #[test]
+    fn code_summary_upsert_clears_stale_on_regeneration() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        code_summary_upsert(&conn, pid, "src/a.cpp", "file", "v1", "digest-1", "2026-09-24T00:00:00Z").unwrap();
+        mark_code_summaries_stale(&conn, pid, &["src/a.cpp".to_string()], "2026-09-24T01:00:00Z").unwrap();
+        assert!(code_summary_get(&conn, pid, "src/a.cpp").unwrap().unwrap().stale);
+
+        code_summary_upsert(&conn, pid, "src/a.cpp", "file", "v2, regenerated", "digest-2", "2026-09-24T02:00:00Z").unwrap();
+
+        let row = code_summary_get(&conn, pid, "src/a.cpp").unwrap().unwrap();
+        assert!(!row.stale, "regenerating must clear stale");
+        assert!(row.stale_since.is_none(), "regenerating must clear stale_since too");
+        assert_eq!(row.text, "v2, regenerated");
+        assert_eq!(row.source_digest, "digest-2");
+    }
+
+    #[test]
+    fn code_summary_upsert_clears_a_previous_embedding_on_regeneration() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        code_summary_upsert(&conn, pid, "src/a.cpp", "file", "v1", "digest-1", "2026-09-24T00:00:00Z").unwrap();
+        set_code_summary_embedding(&conn, pid, "src/a.cpp", &fake_embed("v1")).unwrap();
+        assert!(code_summary_get(&conn, pid, "src/a.cpp").unwrap().unwrap().embedding.is_some());
+
+        code_summary_upsert(&conn, pid, "src/a.cpp", "file", "v2", "digest-2", "2026-09-24T01:00:00Z").unwrap();
+
+        assert!(
+            code_summary_get(&conn, pid, "src/a.cpp").unwrap().unwrap().embedding.is_none(),
+            "text and its embedding must never drift apart -- a regenerated summary needs a fresh embedding"
+        );
+    }
+
+    #[test]
+    fn mark_code_summaries_stale_keeps_the_first_stale_since_timestamp() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        code_summary_upsert(&conn, pid, "src/a.cpp", "file", "v1", "digest-1", "2026-09-24T00:00:00Z").unwrap();
+
+        mark_code_summaries_stale(&conn, pid, &["src/a.cpp".to_string()], "2026-09-24T01:00:00Z").unwrap();
+        let first = code_summary_get(&conn, pid, "src/a.cpp").unwrap().unwrap();
+        assert_eq!(first.stale_since.as_deref(), Some("2026-09-24T01:00:00Z"));
+
+        // A second sibling change re-marks it stale (still stale) but must
+        // not push stale_since forward -- the "how long has this been
+        // stale" clock starts at the FIRST staleness, not the latest.
+        mark_code_summaries_stale(&conn, pid, &["src/a.cpp".to_string()], "2026-09-24T05:00:00Z").unwrap();
+        let second = code_summary_get(&conn, pid, "src/a.cpp").unwrap().unwrap();
+        assert!(second.stale);
+        assert_eq!(second.stale_since.as_deref(), Some("2026-09-24T01:00:00Z"), "stale_since must not move once set");
+    }
+
+    #[test]
+    fn mark_code_summaries_stale_is_scoped_to_the_given_project_and_paths() {
+        let conn = mem_conn();
+        let helios = new_project(&conn, "helios");
+        let other = new_project(&conn, "other");
+        code_summary_upsert(&conn, helios, "src/a.cpp", "file", "a", "d", "2026-09-24T00:00:00Z").unwrap();
+        code_summary_upsert(&conn, helios, "src/b.cpp", "file", "b", "d", "2026-09-24T00:00:00Z").unwrap();
+        code_summary_upsert(&conn, other, "src/a.cpp", "file", "a-other", "d", "2026-09-24T00:00:00Z").unwrap();
+
+        let n = mark_code_summaries_stale(&conn, helios, &["src/a.cpp".to_string()], "2026-09-24T01:00:00Z").unwrap();
+        assert_eq!(n, 1);
+        assert!(code_summary_get(&conn, helios, "src/a.cpp").unwrap().unwrap().stale);
+        assert!(!code_summary_get(&conn, helios, "src/b.cpp").unwrap().unwrap().stale, "an unrelated path must not be marked");
+        assert!(!code_summary_get(&conn, other, "src/a.cpp").unwrap().unwrap().stale, "another project's same-named path must not be marked");
+    }
+
+    #[test]
+    fn mark_code_summaries_stale_with_no_paths_is_a_noop() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        assert_eq!(mark_code_summaries_stale(&conn, pid, &[], "2026-09-24T00:00:00Z").unwrap(), 0);
+    }
+
+    #[test]
+    fn stale_code_summaries_returns_only_the_stale_rows_of_one_project_path_ascending() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        code_summary_upsert(&conn, pid, "src/z.cpp", "file", "z", "d", "2026-09-24T00:00:00Z").unwrap();
+        code_summary_upsert(&conn, pid, "src/a.cpp", "file", "a", "d", "2026-09-24T00:00:00Z").unwrap();
+        code_summary_upsert(&conn, pid, "src/m.cpp", "file", "m", "d", "2026-09-24T00:00:00Z").unwrap();
+        mark_code_summaries_stale(&conn, pid, &["src/z.cpp".to_string(), "src/a.cpp".to_string()], "2026-09-24T01:00:00Z").unwrap();
+
+        let stale = stale_code_summaries(&conn, pid).unwrap();
+        assert_eq!(stale.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(), vec!["src/a.cpp", "src/z.cpp"]);
+    }
+
+    #[test]
+    fn code_summary_delete_removes_the_row_and_its_fts_entry() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        code_summary_upsert(&conn, pid, "src/a.cpp", "file", "unique kumquatzzy content", "d", "2026-09-24T00:00:00Z").unwrap();
+        assert_eq!(search_code_summaries(&conn, Some(pid), "kumquatzzy", None, 10).unwrap().len(), 1);
+
+        code_summary_delete(&conn, pid, "src/a.cpp").unwrap();
+
+        assert!(code_summary_get(&conn, pid, "src/a.cpp").unwrap().is_none());
+        assert!(search_code_summaries(&conn, Some(pid), "kumquatzzy", None, 10).unwrap().is_empty());
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM code_summaries WHERE project_id = ?1 AND path = ?2", params![pid, "src/a.cpp"], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn code_summaries_missing_embedding_returns_only_unembedded_rows_oldest_first() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        code_summary_upsert(&conn, pid, "src/a.cpp", "file", "a", "d", "2026-09-24T00:00:00Z").unwrap();
+        code_summary_upsert(&conn, pid, "src/b.cpp", "file", "b", "d", "2026-09-24T00:00:00Z").unwrap();
+        set_code_summary_embedding(&conn, pid, "src/a.cpp", &fake_embed("a")).unwrap();
+
+        let missing = code_summaries_missing_embedding(&conn, None, 10).unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0, pid);
+        assert_eq!(missing[0].1, "src/b.cpp");
+        assert_eq!(missing[0].2, "b");
+    }
+
+    #[test]
+    fn code_summaries_missing_embedding_filters_by_project() {
+        let conn = mem_conn();
+        let helios = new_project(&conn, "helios");
+        let other = new_project(&conn, "other");
+        code_summary_upsert(&conn, helios, "src/a.cpp", "file", "a", "d", "2026-09-24T00:00:00Z").unwrap();
+        code_summary_upsert(&conn, other, "src/b.cpp", "file", "b", "d", "2026-09-24T00:00:00Z").unwrap();
+
+        let missing = code_summaries_missing_embedding(&conn, Some(helios), 10).unwrap();
+        assert_eq!(missing.len(), 1, "must not see the other project's row");
+        assert_eq!(missing[0].0, helios);
+        assert_eq!(missing[0].1, "src/a.cpp");
+
+        assert_eq!(code_summaries_missing_embedding(&conn, None, 10).unwrap().len(), 2, "None still sees every project");
+    }
+
+    #[test]
+    fn code_file_increment_summary_attempts_counts_up_and_persists() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        code_file_upsert(&conn, pid, "src/a.cpp", "blob1", Some("Cpp"), 3, "indexed", "2026-09-24T00:00:00Z").unwrap();
+        assert_eq!(code_file_increment_summary_attempts(&conn, pid, "src/a.cpp").unwrap(), 1);
+        assert_eq!(code_file_increment_summary_attempts(&conn, pid, "src/a.cpp").unwrap(), 2);
+        assert_eq!(code_file_get(&conn, pid, "src/a.cpp").unwrap().unwrap().summary_attempts, 2);
+    }
+
+    #[test]
+    fn code_file_upsert_resets_summary_attempts_only_when_the_blob_changes() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        code_file_upsert(&conn, pid, "src/a.cpp", "blob1", Some("Cpp"), 3, "indexed", "2026-09-24T00:00:00Z").unwrap();
+        code_file_increment_summary_attempts(&conn, pid, "src/a.cpp").unwrap();
+        code_file_increment_summary_attempts(&conn, pid, "src/a.cpp").unwrap();
+
+        // Same blob re-upserted (e.g. mark_skipped re-recording an
+        // unchanged file): the count survives.
+        code_file_upsert(&conn, pid, "src/a.cpp", "blob1", Some("Cpp"), 3, "indexed", "2026-09-24T01:00:00Z").unwrap();
+        assert_eq!(code_file_get(&conn, pid, "src/a.cpp").unwrap().unwrap().summary_attempts, 2);
+
+        // A new blob resets it -- fresh content gets fresh tries.
+        code_file_upsert(&conn, pid, "src/a.cpp", "blob2", Some("Cpp"), 3, "indexed", "2026-09-24T02:00:00Z").unwrap();
+        assert_eq!(code_file_get(&conn, pid, "src/a.cpp").unwrap().unwrap().summary_attempts, 0);
+    }
+
+    #[test]
+    fn code_summary_seed_placeholder_records_stale_since_and_is_idempotent() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        code_summary_seed_placeholder(&conn, pid, "src/", "module", "2026-09-24T00:00:00Z").unwrap();
+        let row = code_summary_get(&conn, pid, "src/").unwrap().unwrap();
+        assert!(row.stale);
+        assert_eq!(row.stale_since.as_deref(), Some("2026-09-24T00:00:00Z"));
+        assert_eq!(row.level, "module");
+        assert_eq!(row.text, "");
+
+        // Idempotent: a second seed call (a later run, still not ready)
+        // must never move stale_since forward.
+        code_summary_seed_placeholder(&conn, pid, "src/", "module", "2026-09-25T00:00:00Z").unwrap();
+        let row2 = code_summary_get(&conn, pid, "src/").unwrap().unwrap();
+        assert_eq!(row2.stale_since.as_deref(), Some("2026-09-24T00:00:00Z"));
+    }
+
+    #[test]
+    fn code_summary_seed_placeholder_never_overwrites_a_real_row() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        code_summary_upsert(&conn, pid, "src/", "module", "real summary", "d", "2026-09-24T00:00:00Z").unwrap();
+        code_summary_seed_placeholder(&conn, pid, "src/", "module", "2026-09-25T00:00:00Z").unwrap();
+        let row = code_summary_get(&conn, pid, "src/").unwrap().unwrap();
+        assert_eq!(row.text, "real summary", "a real row must never be clobbered by a placeholder seed");
+        assert!(!row.stale);
+    }
+
+    #[test]
+    fn set_code_summary_memory_id_persists_and_is_read_back() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        code_summary_upsert(&conn, pid, "src/", "module", "module summary", "d", "2026-09-24T00:00:00Z").unwrap();
+        set_code_summary_memory_id(&conn, pid, "src/", 42).unwrap();
+        assert_eq!(code_summary_get(&conn, pid, "src/").unwrap().unwrap().memory_id, Some(42));
+    }
+
+    #[test]
+    fn replace_code_chunks_fts_sync_pattern_holds_for_code_summaries_too() {
+        // Same "old text unfindable, new text findable" contract
+        // `replace_code_chunks_replaces_rows_and_keeps_fts_in_sync` checks for
+        // chunks, exercised here for the summary table's own FTS index.
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        code_summary_upsert(&conn, pid, "src/a.cpp", "file", "old body text kumquatzzy", "d1", "2026-09-24T00:00:00Z").unwrap();
+        assert_eq!(search_code_summaries(&conn, Some(pid), "kumquatzzy", None, 10).unwrap().len(), 1);
+
+        code_summary_upsert(&conn, pid, "src/a.cpp", "file", "new body text wombatqqq", "d2", "2026-09-24T01:00:00Z").unwrap();
+
+        assert!(
+            search_code_summaries(&conn, Some(pid), "kumquatzzy", None, 10).unwrap().is_empty(),
+            "the old text must no longer be findable via FTS"
+        );
+        let new_hits = search_code_summaries(&conn, Some(pid), "wombatqqq", None, 10).unwrap();
+        assert_eq!(new_hits.len(), 1, "the new text must be findable via FTS");
+        assert_eq!(new_hits[0].path, "src/a.cpp");
+    }
+
+    #[test]
+    fn search_code_summaries_filters_by_project() {
+        let conn = mem_conn();
+        let helios = new_project(&conn, "helios");
+        let other = new_project(&conn, "other");
+        code_summary_upsert(&conn, helios, "src/a.cpp", "file", "definition of ray_cast_terrain", "d", "2026-09-24T00:00:00Z").unwrap();
+        code_summary_upsert(&conn, other, "src/a.cpp", "file", "a different project's ray_cast_terrain", "d", "2026-09-24T00:00:00Z").unwrap();
+
+        let hits = search_code_summaries(&conn, Some(helios), "ray_cast_terrain", None, 10).unwrap();
+        assert_eq!(hits.len(), 1, "only helios's summary must be returned");
+        assert_eq!(hits[0].project_id, helios);
+    }
+
+    #[test]
+    fn search_code_summaries_ranks_a_closer_lexical_match_first() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        code_summary_upsert(
+            &conn,
+            pid,
+            "src/picking.cpp",
+            "file",
+            "ray_cast_terrain ray_cast_terrain ray_cast_terrain implementation",
+            "d",
+            "2026-09-24T00:00:00Z",
+        )
+        .unwrap();
+        code_summary_upsert(&conn, pid, "src/notes.cpp", "file", "mentions ray_cast_terrain once in passing", "d", "2026-09-24T00:00:00Z")
+            .unwrap();
+
+        let hits = search_code_summaries(&conn, Some(pid), "ray_cast_terrain", None, 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].path, "src/picking.cpp");
+        assert!(hits[0].score > hits[1].score);
+    }
+
+    #[test]
+    fn search_code_summaries_semantic_channel_finds_a_summary_with_no_lexical_overlap() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        code_summary_upsert(&conn, pid, "src/a.cpp", "file", "alpha beta gamma", "d", "2026-09-24T00:00:00Z").unwrap();
+        set_code_summary_embedding(&conn, pid, "src/a.cpp", &fake_embed("alpha beta gamma")).unwrap();
+
+        let hits = search_code_summaries(&conn, Some(pid), "zzz_no_lexical_match_zzz", Some(&fake_embed("alpha beta gamma")), 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "src/a.cpp");
+        assert!(hits[0].score > 0.0);
+    }
+
+    // -------------------------------------------------------------
+    // Index-owned memories (upsert_index_memory)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn upsert_index_memory_supersedes_every_active_row_with_that_source_including_a_restored_pinned_one() {
+        // Final-review item 5: a restored (hence pinned) old index row used
+        // to stay active forever beside the new one -- the old code
+        // superseded only the newest active row.
+        let conn = mem_conn();
+        let source = "code-index:helios:src/";
+        let a = upsert_index_memory(&conn, "helios", source, "gen 1", None, "2026-09-24T00:00:00Z").unwrap();
+        let b = upsert_index_memory(&conn, "helios", source, "gen 2", None, "2026-09-24T01:00:00Z").unwrap();
+        assert!(restore(&conn, a, "2026-09-24T02:00:00Z").unwrap());
+        assert!(is_pinned(&conn, a).unwrap());
+        let c = upsert_index_memory(&conn, "helios", source, "gen 3", None, "2026-09-24T03:00:00Z").unwrap();
+        for old in [a, b] {
+            let m = get(&conn, old).unwrap().unwrap();
+            assert!(m.invalidated_at.is_some(), "#{} must be superseded", old);
+            assert_eq!(m.superseded_by, Some(c));
+        }
+        let active: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories WHERE source = ?1 AND invalidated_at IS NULL", params![source], |r| r.get(0))
+            .unwrap();
+        assert_eq!(active, 1);
+    }
+
+    #[test]
+    fn upsert_index_memory_for_summary_records_the_memory_id_on_the_summary_row() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        code_summary_upsert(&conn, pid, "src/", "module", "src text", "d", "2026-09-24T00:00:00Z").unwrap();
+        let id = upsert_index_memory_for_summary(&conn, pid, "src/", "helios", "code-index:helios:src/", "lead", None, "2026-09-24T00:00:00Z")
+            .unwrap();
+        assert_eq!(code_summary_get(&conn, pid, "src/").unwrap().unwrap().memory_id, Some(id));
+    }
+
+    #[test]
+    fn upsert_index_memory_never_links_mentions() {
+        // Final-review item 7: index rows stay out of the mention graph.
+        let conn = mem_conn();
+        let ent = insert_entity(&conn, "Picker", None, None).unwrap();
+        let id = upsert_index_memory(&conn, "helios", "code-index:helios:src/", "src/ holds the Picker class", None, "2026-09-24T00:00:00Z").unwrap();
+        let count = |eid: i64| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM memory_entities WHERE memory_id = ?1 AND entity_id = ?2", params![id, eid], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count(ent), 0);
+        // Nor does the reverse scan (a newly minted entity) reach index rows.
+        let ent2 = insert_entity(&conn, "holds", None, None).unwrap();
+        link_entity_mentions_by_name_scan(&conn, ent2, "holds", "2026-09-24T00:00:00Z").unwrap();
+        assert_eq!(count(ent2), 0);
+
+        // Nor a code-history-owned row (task-3 extension of the same rule).
+        let id2 = upsert_index_memory(&conn, "helios", "code-history:helios:2026-08", "helios 2026-08: touches Picker", None, "2026-09-24T00:00:00Z").unwrap();
+        let count2 = |eid: i64| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM memory_entities WHERE memory_id = ?1 AND entity_id = ?2", params![id2, eid], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count2(ent), 0);
+        let ent3 = insert_entity(&conn, "touches", None, None).unwrap();
+        link_entity_mentions_by_name_scan(&conn, ent3, "touches", "2026-09-24T00:00:00Z").unwrap();
+        assert_eq!(count2(ent3), 0);
+    }
+
+    #[test]
+    fn invalidate_index_memories_by_source_tombstones_every_active_row() {
+        let conn = mem_conn();
+        let source = "code-index:helios:gone/";
+        let a = upsert_index_memory(&conn, "helios", source, "gen 1", None, "2026-09-24T00:00:00Z").unwrap();
+        let b = upsert_index_memory(&conn, "helios", source, "gen 2", None, "2026-09-24T01:00:00Z").unwrap();
+        restore(&conn, a, "2026-09-24T02:00:00Z").unwrap();
+        let other = upsert_index_memory(&conn, "helios", "code-index:helios:kept/", "kept", None, "2026-09-24T00:00:00Z").unwrap();
+        assert_eq!(invalidate_index_memories_by_source(&conn, source, "2026-09-25T00:00:00Z").unwrap(), 2);
+        assert!(get(&conn, a).unwrap().unwrap().invalidated_at.is_some());
+        assert!(get(&conn, b).unwrap().unwrap().invalidated_at.is_some());
+        assert!(get(&conn, other).unwrap().unwrap().invalidated_at.is_none());
+    }
+
+    #[test]
+    fn placeholder_summaries_are_never_backfilled_or_searched() {
+        // Final-review item 3.
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        code_summary_seed_placeholder(&conn, pid, "src/", "module", "2026-09-24T00:00:00Z").unwrap();
+        code_summary_upsert(&conn, pid, "src/a.cpp", "file", "src picking text", "d", "2026-09-24T00:00:00Z").unwrap();
+        let missing: Vec<String> = code_summaries_missing_embedding(&conn, Some(pid), 10).unwrap().into_iter().map(|r| r.1).collect();
+        assert_eq!(missing, vec!["src/a.cpp".to_string()]);
+
+        // Even a placeholder that somehow holds an embedding stays out of search.
+        set_code_summary_embedding(&conn, pid, "src/", &fake_embed("src")).unwrap();
+        let hits = search_code_summaries(&conn, Some(pid), "src", Some(&fake_embed("src")), 10).unwrap();
+        assert!(hits.iter().all(|h| h.path != "src/"), "a placeholder must never be a search hit");
+    }
+
+    #[test]
+    fn code_summary_placeholderize_clears_text_stales_and_returns_the_mirror_id() {
+        // Final-review item 13.
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        code_summary_upsert(&conn, pid, "src/", "module", "old src text mentioning a secret file", "d", "2026-09-24T00:00:00Z").unwrap();
+        set_code_summary_embedding(&conn, pid, "src/", &fake_embed("x")).unwrap();
+        set_code_summary_memory_id(&conn, pid, "src/", 42).unwrap();
+        assert_eq!(code_summary_placeholderize(&conn, pid, "src/", "2026-09-25T00:00:00Z").unwrap(), Some(42));
+        let row = code_summary_get(&conn, pid, "src/").unwrap().unwrap();
+        assert_eq!(row.text, "");
+        assert!(row.stale);
+        assert!(row.embedding.is_none());
+        assert!(row.memory_id.is_none());
+        assert!(search_code_summaries(&conn, Some(pid), "secret", None, 10).unwrap().is_empty(), "FTS entry cleared too");
+        assert_eq!(code_summary_placeholderize(&conn, pid, "missing/", "2026-09-25T00:00:00Z").unwrap(), None);
+    }
+
+    #[test]
+    fn top_similar_never_offers_an_index_owned_row_to_the_save_time_classifier() {
+        let conn = mem_conn();
+        let v = [1.0f32, 0.0, 0.0];
+        upsert_index_memory(&conn, "helios", "code-index:helios:src/", "src/ handles picking", Some(&v), "2026-09-24T00:00:00Z").unwrap();
+        let user = insert5(&conn, "src/ handles picking", Some(&v));
+        let ids: Vec<i64> = top_similar(&conn, &v, 5).unwrap().into_iter().map(|(m, _)| m.id).collect();
+        assert_eq!(ids, vec![user]);
+    }
+
+    #[test]
+    fn top_similar_never_offers_a_code_history_owned_row_either() {
+        let conn = mem_conn();
+        let v = [1.0f32, 0.0, 0.0];
+        upsert_index_memory(&conn, "helios", "code-history:helios:2026-08", "helios 2026-08: aug work", Some(&v), "2026-09-24T00:00:00Z")
+            .unwrap();
+        let user = insert5(&conn, "aug work", Some(&v));
+        let ids: Vec<i64> = top_similar(&conn, &v, 5).unwrap().into_iter().map(|(m, _)| m.id).collect();
+        assert_eq!(ids, vec![user]);
+    }
+
+    #[test]
+    fn upsert_index_memory_first_call_is_a_plain_insert() {
+        let conn = mem_conn();
+        let id = upsert_index_memory(&conn, "helios", "code-index:helios:src/", "helios's src/ handles picking", None, "2026-09-24T00:00:00Z")
+            .unwrap();
+
+        let m = get(&conn, id).unwrap().unwrap();
+        assert_eq!(m.content, "helios's src/ handles picking");
+        assert_eq!(m.source.as_deref(), Some("code-index:helios:src/"));
+        assert_eq!(m.project.as_deref(), Some("helios"));
+        assert_eq!(m.importance, 6);
+        assert_eq!(m.basis.as_deref(), Some(BASIS_DERIVED));
+        assert!(m.reviewed);
+        assert!(m.invalidated_at.is_none());
+    }
+
+    #[test]
+    fn upsert_index_memory_sets_reflected_at_to_now_immediately() {
+        let conn = mem_conn();
+        let id = upsert_index_memory(&conn, "helios", "code-index:helios:src/", "text", None, "2026-09-24T00:00:00Z").unwrap();
+        let reflected_at: Option<String> =
+            conn.query_row("SELECT reflected_at FROM memories WHERE id = ?1", params![id], |r| r.get(0)).unwrap();
+        assert_eq!(reflected_at.as_deref(), Some("2026-09-24T00:00:00Z"));
+    }
+
+    #[test]
+    fn upsert_index_memory_regenerating_supersedes_the_previous_row() {
+        let conn = mem_conn();
+        let source = "code-index:helios:src/";
+        let first = upsert_index_memory(&conn, "helios", source, "src/ handles picking", None, "2026-09-24T00:00:00Z").unwrap();
+        let second = upsert_index_memory(&conn, "helios", source, "src/ handles picking and rendering now", None, "2026-09-24T01:00:00Z").unwrap();
+
+        assert_ne!(first, second);
+        let old = get(&conn, first).unwrap().unwrap();
+        assert_eq!(old.superseded_by, Some(second));
+        assert!(old.invalidated_at.is_some());
+        let new = get(&conn, second).unwrap().unwrap();
+        assert!(new.invalidated_at.is_none());
+
+        // Exactly one active row for this source.
+        let active: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE source = ?1 AND invalidated_at IS NULL",
+                params![source],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 1);
+        let total: i64 =
+            conn.query_row("SELECT COUNT(*) FROM memories WHERE source = ?1", params![source], |r| r.get(0)).unwrap();
+        assert_eq!(total, 2, "the superseded row must still exist as an audit trail, not be deleted");
+    }
+
+    #[test]
+    fn upsert_index_memory_three_generations_leaves_exactly_one_active_row() {
+        let conn = mem_conn();
+        let source = "code-index:helios:/";
+        upsert_index_memory(&conn, "helios", source, "gen 1", None, "2026-09-24T00:00:00Z").unwrap();
+        upsert_index_memory(&conn, "helios", source, "gen 2", None, "2026-09-24T01:00:00Z").unwrap();
+        let third = upsert_index_memory(&conn, "helios", source, "gen 3", None, "2026-09-24T02:00:00Z").unwrap();
+
+        let active_ids: Vec<i64> = {
+            let mut stmt = conn.prepare("SELECT id FROM memories WHERE source = ?1 AND invalidated_at IS NULL").unwrap();
+            stmt.query_map(params![source], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
+        };
+        assert_eq!(active_ids, vec![third]);
+    }
+
+    #[test]
+    fn upsert_index_memory_different_sources_never_interfere() {
+        let conn = mem_conn();
+        let a = upsert_index_memory(&conn, "helios", "code-index:helios:src/", "src summary", None, "2026-09-24T00:00:00Z").unwrap();
+        let b = upsert_index_memory(&conn, "helios", "code-index:helios:tools/", "tools summary", None, "2026-09-24T00:00:00Z").unwrap();
+        assert!(get(&conn, a).unwrap().unwrap().invalidated_at.is_none());
+        assert!(get(&conn, b).unwrap().unwrap().invalidated_at.is_none());
+    }
+
+    // -------------------------------------------------------------
+    // supersession_guard: index-owned losers
+    // -------------------------------------------------------------
+
+    #[test]
+    fn supersession_guard_blocks_an_index_owned_loser_for_every_automatic_kind() {
+        let conn = mem_conn();
+        let loser_id =
+            upsert_index_memory(&conn, "helios", "code-index:helios:src/", "src/ handles picking", None, "2026-09-24T00:00:00Z").unwrap();
+        let winner_id = insert5(&conn, "src/ handles picking and rendering", None);
+        let loser = get(&conn, loser_id).unwrap().unwrap();
+        let winner = get(&conn, winner_id).unwrap().unwrap();
+
+        for kind in [GuardKind::Dedupe, GuardKind::Contradiction, GuardKind::AddSupersede] {
+            assert_eq!(supersession_guard(&conn, &loser, &winner, kind), Some("index-owned"), "{:?}", kind);
+        }
+    }
+
+    #[test]
+    fn supersession_guard_blocks_a_code_history_owned_loser_for_every_automatic_kind() {
+        // The task-3 extension: `code-history:` must be guarded exactly
+        // like `code-index:`, via the same shared helper.
+        let conn = mem_conn();
+        let loser_id =
+            upsert_index_memory(&conn, "helios", "code-history:helios:2026-08", "helios 2026-08: aug work", None, "2026-09-24T00:00:00Z")
+                .unwrap();
+        let winner_id = insert5(&conn, "helios 2026-08: aug work, revised", None);
+        let loser = get(&conn, loser_id).unwrap().unwrap();
+        let winner = get(&conn, winner_id).unwrap().unwrap();
+
+        for kind in [GuardKind::Dedupe, GuardKind::Contradiction, GuardKind::AddSupersede] {
+            assert_eq!(supersession_guard(&conn, &loser, &winner, kind), Some("index-owned"), "{:?}", kind);
+        }
+    }
+
+    #[test]
+    fn supersession_guard_blocks_when_only_the_winner_is_index_owned() {
+        // An index-owned winner would tombstone a user memory into text the
+        // indexer replaces wholesale on the next regeneration -- data loss.
+        let conn = mem_conn();
+        let loser_id = insert5(&conn, "src/ handles picking", None);
+        let winner_id =
+            upsert_index_memory(&conn, "helios", "code-index:helios:src/", "src/ handles picking and rendering", None, "2026-09-24T00:00:00Z")
+                .unwrap();
+        let loser = get(&conn, loser_id).unwrap().unwrap();
+        let winner = get(&conn, winner_id).unwrap().unwrap();
+        for kind in [GuardKind::Dedupe, GuardKind::Contradiction, GuardKind::AddSupersede] {
+            assert_eq!(supersession_guard(&conn, &loser, &winner, kind), Some("index-owned"), "{:?}", kind);
+        }
+    }
+
+    #[test]
+    fn insert_with_basis_accepts_derived() {
+        let conn = mem_conn();
+        let id = insert_with_basis(&conn, "code-derived text", None, None, true, None, 6, Some(BASIS_DERIVED)).unwrap();
+        assert_eq!(get(&conn, id).unwrap().unwrap().basis.as_deref(), Some(BASIS_DERIVED));
+    }
+
+    // -------------------------------------------------------------
+    // Code symbol graph (schema 35): migration, replace/delete/move,
+    // resolve_edges, symbol_definitions, callers_of/callees_of,
+    // code_history. See `code_index::chunk::extract_refs`'s own tests for
+    // extraction correctness -- these test the store side only, plus one
+    // end-to-end round trip through both.
+    // -------------------------------------------------------------
+
+    fn a_symbol(name: &str, qualified: &str, kind: &str, start: i64, end: i64) -> NewSymbol {
+        NewSymbol { name: name.to_string(), qualified: qualified.to_string(), kind: kind.to_string(), start_line: start, end_line: end }
+    }
+
+    fn an_edge(src_line: i64, dst_name: &str, kind: &str) -> NewEdge {
+        NewEdge { src_line, dst_name: dst_name.to_string(), kind: kind.to_string() }
+    }
+
+    #[test]
+    fn migrate_v34_to_v35_is_idempotent() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        migrate_v34_to_v35(&conn).unwrap();
+        migrate_v34_to_v35(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 35);
+    }
+
+    #[test]
+    fn a_fresh_open_lands_on_v35_with_the_symbol_graph_tables() {
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION, "a fresh open lands on the latest schema, past v34");
+        for table in ["code_symbols", "code_edges", "code_history"] {
+            let exists: i64 = conn
+                .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", params![table], |r| r.get(0))
+                .unwrap();
+            assert_eq!(exists, 1, "{table} must exist after a fresh open");
+        }
+    }
+
+    #[test]
+    fn replace_file_symbols_resolves_src_symbol_id_by_enclosing_line_range() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        let symbols = vec![a_symbol("Foo", "Foo", "class", 1, 4), a_symbol("bar", "Foo::bar", "method", 6, 8)];
+        let edges = vec![an_edge(7, "baz", "calls")];
+        let ids = replace_file_symbols(&conn, pid, "t.cpp", &symbols, &edges).unwrap();
+        assert_eq!(ids.len(), 2);
+
+        let bar_id = ids[1];
+        let (src_symbol_id, dst_name, kind): (Option<i64>, String, String) = conn
+            .query_row("SELECT src_symbol_id, dst_name, kind FROM code_edges WHERE project_id = ?1", params![pid], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!((src_symbol_id, dst_name.as_str(), kind.as_str()), (Some(bar_id), "baz", "calls"));
+    }
+
+    #[test]
+    fn replace_file_symbols_picks_the_most_specific_enclosing_symbol() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        // Deliberate overlap, same as the chunker's own class+inline-method
+        // overlap: a "class" unit covering the whole class, and a "method"
+        // unit nested inside it. A call inside the method must resolve to
+        // the method, not the wider enclosing class.
+        let symbols = vec![a_symbol("Foo", "Foo", "class", 1, 5), a_symbol("bar", "Foo::bar", "method", 2, 4)];
+        let edges = vec![an_edge(3, "baz", "calls")];
+        let ids = replace_file_symbols(&conn, pid, "t.cpp", &symbols, &edges).unwrap();
+        let bar_id = ids[1];
+        let src_symbol_id: Option<i64> =
+            conn.query_row("SELECT src_symbol_id FROM code_edges WHERE project_id = ?1", params![pid], |r| r.get(0)).unwrap();
+        assert_eq!(src_symbol_id, Some(bar_id));
+    }
+
+    #[test]
+    fn replace_file_symbols_leaves_src_symbol_id_null_when_nothing_encloses_the_line() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        let symbols = vec![a_symbol("bar", "bar", "function", 5, 8)];
+        let edges = vec![an_edge(1, "std::cout", "includes")];
+        replace_file_symbols(&conn, pid, "t.cpp", &symbols, &edges).unwrap();
+        let src_symbol_id: Option<i64> =
+            conn.query_row("SELECT src_symbol_id FROM code_edges WHERE project_id = ?1", params![pid], |r| r.get(0)).unwrap();
+        assert_eq!(src_symbol_id, None);
+    }
+
+    #[test]
+    fn replace_file_symbols_replaces_old_rows_and_nulls_incoming_edges_pointing_at_removed_symbols() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        let ids1 = replace_file_symbols(&conn, pid, "a.cpp", &[a_symbol("helper", "helper", "function", 1, 3)], &[]).unwrap();
+        let helper_id = ids1[0];
+        replace_file_symbols(&conn, pid, "b.cpp", &[a_symbol("caller", "caller", "function", 1, 3)], &[an_edge(2, "helper", "calls")]).unwrap();
+        resolve_edges(&conn, pid).unwrap();
+        let linked: Option<i64> = conn
+            .query_row("SELECT dst_symbol_id FROM code_edges WHERE project_id = ?1 AND src_path = 'b.cpp'", params![pid], |r| r.get(0))
+            .unwrap();
+        assert_eq!(linked, Some(helper_id));
+
+        // a.cpp is re-chunked without `helper` any more.
+        replace_file_symbols(&conn, pid, "a.cpp", &[], &[]).unwrap();
+        let after: Option<i64> = conn
+            .query_row("SELECT dst_symbol_id FROM code_edges WHERE project_id = ?1 AND src_path = 'b.cpp'", params![pid], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, None, "the removed symbol's id must not dangle in another file's edge");
+
+        let remaining: i64 =
+            conn.query_row("SELECT COUNT(*) FROM code_symbols WHERE project_id = ?1 AND path = 'a.cpp'", params![pid], |r| r.get(0)).unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn delete_file_symbols_removes_symbols_and_outgoing_edges_and_nulls_incoming() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        replace_file_symbols(&conn, pid, "a.cpp", &[a_symbol("helper", "helper", "function", 1, 3)], &[]).unwrap();
+        replace_file_symbols(&conn, pid, "b.cpp", &[a_symbol("caller", "caller", "function", 1, 3)], &[an_edge(2, "helper", "calls")]).unwrap();
+        resolve_edges(&conn, pid).unwrap();
+
+        delete_file_symbols(&conn, pid, "a.cpp").unwrap();
+
+        let sym_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM code_symbols WHERE project_id = ?1 AND path = 'a.cpp'", params![pid], |r| r.get(0)).unwrap();
+        assert_eq!(sym_count, 0);
+        let dst: Option<i64> = conn
+            .query_row("SELECT dst_symbol_id FROM code_edges WHERE project_id = ?1 AND src_path = 'b.cpp'", params![pid], |r| r.get(0))
+            .unwrap();
+        assert_eq!(dst, None);
+
+        // "a.cpp"'s own outgoing edges (had it had any) would be gone too;
+        // here there were none, so this just documents the call succeeded
+        // without an outgoing edge to check.
+        let outgoing: i64 =
+            conn.query_row("SELECT COUNT(*) FROM code_edges WHERE project_id = ?1 AND src_path = 'a.cpp'", params![pid], |r| r.get(0)).unwrap();
+        assert_eq!(outgoing, 0);
+    }
+
+    #[test]
+    fn move_file_symbols_updates_path_on_symbols_and_outgoing_edges() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        replace_file_symbols(&conn, pid, "old.cpp", &[a_symbol("helper", "helper", "function", 1, 3)], &[an_edge(2, "other", "calls")]).unwrap();
+
+        move_file_symbols(&conn, pid, "old.cpp", "new.cpp").unwrap();
+
+        let sym_path: String = conn.query_row("SELECT path FROM code_symbols WHERE project_id = ?1", params![pid], |r| r.get(0)).unwrap();
+        assert_eq!(sym_path, "new.cpp");
+        let edge_path: String = conn.query_row("SELECT src_path FROM code_edges WHERE project_id = ?1", params![pid], |r| r.get(0)).unwrap();
+        assert_eq!(edge_path, "new.cpp");
+    }
+
+    #[test]
+    fn resolve_edges_unique_qualified_match_wins_over_name_fallback() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        replace_file_symbols(
+            &conn,
+            pid,
+            "a.cpp",
+            &[a_symbol("bar", "Foo::bar", "method", 1, 3), a_symbol("bar", "Other::bar", "method", 5, 7)],
+            &[],
+        )
+        .unwrap();
+        replace_file_symbols(&conn, pid, "b.cpp", &[a_symbol("caller", "caller", "function", 1, 3)], &[an_edge(2, "Foo::bar", "calls")]).unwrap();
+
+        let n = resolve_edges(&conn, pid).unwrap();
+        assert_eq!(n, 1);
+        let dst: Option<i64> = conn
+            .query_row("SELECT dst_symbol_id FROM code_edges WHERE project_id = ?1 AND src_path = 'b.cpp'", params![pid], |r| r.get(0))
+            .unwrap();
+        let expected: i64 = conn.query_row("SELECT id FROM code_symbols WHERE qualified = 'Foo::bar'", [], |r| r.get(0)).unwrap();
+        assert_eq!(dst, Some(expected));
+    }
+
+    #[test]
+    fn resolve_edges_falls_back_to_unique_name_match() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        replace_file_symbols(&conn, pid, "a.cpp", &[a_symbol("baz", "Foo::baz", "method", 1, 3)], &[]).unwrap();
+        replace_file_symbols(&conn, pid, "b.cpp", &[a_symbol("caller", "caller", "function", 1, 3)], &[an_edge(2, "baz", "calls")]).unwrap();
+
+        let n = resolve_edges(&conn, pid).unwrap();
+        assert_eq!(n, 1);
+        let dst: Option<i64> = conn
+            .query_row("SELECT dst_symbol_id FROM code_edges WHERE project_id = ?1 AND src_path = 'b.cpp'", params![pid], |r| r.get(0))
+            .unwrap();
+        let expected: i64 = conn.query_row("SELECT id FROM code_symbols WHERE qualified = 'Foo::baz'", [], |r| r.get(0)).unwrap();
+        assert_eq!(dst, Some(expected));
+    }
+
+    #[test]
+    fn resolve_edges_stays_null_when_ambiguous() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        replace_file_symbols(
+            &conn,
+            pid,
+            "a.cpp",
+            &[a_symbol("baz", "Foo::baz", "method", 1, 3), a_symbol("baz", "Bar::baz", "method", 5, 7)],
+            &[],
+        )
+        .unwrap();
+        replace_file_symbols(&conn, pid, "b.cpp", &[a_symbol("caller", "caller", "function", 1, 3)], &[an_edge(2, "baz", "calls")]).unwrap();
+
+        let n = resolve_edges(&conn, pid).unwrap();
+        assert_eq!(n, 0);
+        let dst: Option<i64> = conn
+            .query_row("SELECT dst_symbol_id FROM code_edges WHERE project_id = ?1 AND src_path = 'b.cpp'", params![pid], |r| r.get(0))
+            .unwrap();
+        assert_eq!(dst, None);
+    }
+
+    #[test]
+    fn resolve_edges_resolves_includes_to_the_unique_tracked_path() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        code_file_upsert(&conn, pid, "src/local/thing.h", "blob1", Some("Cpp"), 3, "indexed", "2026-09-24T00:00:00Z").unwrap();
+        replace_file_symbols(&conn, pid, "src/a.cpp", &[], &[an_edge(1, "local/thing.h", "includes")]).unwrap();
+
+        let n = resolve_edges(&conn, pid).unwrap();
+        assert_eq!(n, 1);
+        let (dst_name, dst_path, dst_symbol_id): (String, Option<String>, Option<i64>) = conn
+            .query_row("SELECT dst_name, dst_path, dst_symbol_id FROM code_edges WHERE project_id = ?1", params![pid], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(dst_name, "local/thing.h", "dst_name stays exactly as written");
+        assert_eq!(dst_path.as_deref(), Some("src/local/thing.h"), "the resolved path lands in dst_path");
+        assert_eq!(dst_symbol_id, None, "includes/imports resolve to a file, never a symbol id");
+
+        // Idempotent: nothing left to touch on a second pass.
+        assert_eq!(resolve_edges(&conn, pid).unwrap(), 0);
+    }
+
+    #[test]
+    fn resolve_edges_leaves_include_unresolved_when_target_matches_multiple_tracked_paths() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        code_file_upsert(&conn, pid, "src/a/thing.h", "b1", Some("Cpp"), 3, "indexed", "2026-09-24T00:00:00Z").unwrap();
+        code_file_upsert(&conn, pid, "src/b/thing.h", "b2", Some("Cpp"), 3, "indexed", "2026-09-24T00:00:00Z").unwrap();
+        replace_file_symbols(&conn, pid, "src/x.cpp", &[], &[an_edge(1, "thing.h", "includes")]).unwrap();
+
+        let n = resolve_edges(&conn, pid).unwrap();
+        assert_eq!(n, 0);
+        let (dst_name, dst_path): (String, Option<String>) =
+            conn.query_row("SELECT dst_name, dst_path FROM code_edges WHERE project_id = ?1", params![pid], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(dst_name, "thing.h", "ambiguous target must be left exactly as written");
+        assert_eq!(dst_path, None);
+    }
+
+    #[test]
+    fn symbol_definitions_exact_name_match() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        replace_file_symbols(&conn, pid, "a.cpp", &[a_symbol("bar", "Foo::bar", "method", 1, 3)], &[]).unwrap();
+
+        let exact = symbol_definitions(&conn, pid, "bar").unwrap();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].qualified, "Foo::bar");
+    }
+
+    #[test]
+    fn symbol_definitions_falls_back_to_qualified_suffix_when_no_exact_name_matches() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        replace_file_symbols(&conn, pid, "a.cpp", &[a_symbol("bar", "NS::Foo::bar", "method", 1, 3)], &[]).unwrap();
+
+        // Nothing is literally named "Foo::bar" (the `name` column holds
+        // just "bar"), so the exact-name query is empty and the
+        // qualified-suffix fallback must find it via "...::Foo::bar".
+        let hits = symbol_definitions(&conn, pid, "Foo::bar").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].qualified, "NS::Foo::bar");
+    }
+
+    #[test]
+    fn symbol_definitions_unknown_name_returns_empty() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        assert!(symbol_definitions(&conn, pid, "nope").unwrap().is_empty());
+    }
+
+    #[test]
+    fn callers_of_by_name_finds_edges_before_resolution_and_by_id_after() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        let ids = replace_file_symbols(&conn, pid, "a.cpp", &[a_symbol("target", "target", "function", 1, 3)], &[]).unwrap();
+        let target_id = ids[0];
+        replace_file_symbols(&conn, pid, "b.cpp", &[a_symbol("caller", "caller", "function", 1, 3)], &[an_edge(2, "target", "calls")]).unwrap();
+
+        let by_name = callers_of(&conn, pid, SymbolLookup::Name("target"), 10).unwrap();
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].src_path, "b.cpp");
+        assert_eq!(by_name[0].src_line, 2);
+
+        resolve_edges(&conn, pid).unwrap();
+        let by_id = callers_of(&conn, pid, SymbolLookup::Id(target_id), 10).unwrap();
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id[0].src_path, "b.cpp");
+    }
+
+    #[test]
+    fn callees_of_finds_edges_whose_enclosing_symbol_matches() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        let ids = replace_file_symbols(
+            &conn,
+            pid,
+            "a.cpp",
+            &[a_symbol("caller", "caller", "function", 1, 5)],
+            &[an_edge(2, "one", "calls"), an_edge(3, "two", "calls")],
+        )
+        .unwrap();
+        let caller_id = ids[0];
+
+        let callees = callees_of(&conn, pid, caller_id, 10).unwrap();
+        assert_eq!(callees.len(), 2);
+        assert_eq!(callees[0].dst_name, "one");
+        assert_eq!(callees[1].dst_name, "two");
+    }
+
+    #[test]
+    fn callers_and_callees_respect_limit() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        let edges: Vec<NewEdge> = (0..5).map(|i| an_edge(i + 1, "target", "calls")).collect();
+        replace_file_symbols(&conn, pid, "a.cpp", &[a_symbol("caller", "caller", "function", 1, 10)], &edges).unwrap();
+        assert_eq!(callers_of(&conn, pid, SymbolLookup::Name("target"), 3).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn code_history_upsert_get_list_and_memory_id_roundtrip() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        assert!(code_history_get(&conn, pid, "2026-09").unwrap().is_none());
+
+        code_history_upsert(&conn, pid, "2026-09", "did stuff", 5, "sha1", "digest1", None, "2026-09-24T00:00:00Z").unwrap();
+        let row = code_history_get(&conn, pid, "2026-09").unwrap().unwrap();
+        assert_eq!(row.text, "did stuff");
+        assert_eq!(row.commits, 5);
+        assert_eq!(row.memory_id, None);
+
+        code_history_set_memory_id(&conn, pid, "2026-09", 42).unwrap();
+        let row = code_history_get(&conn, pid, "2026-09").unwrap().unwrap();
+        assert_eq!(row.memory_id, Some(42));
+
+        // Regenerating the same month keeps the memory_id (upsert never
+        // touches it) -- the constraints doc's "never superseded by
+        // anything except the history job regenerating the same month"
+        // rule depends on the mirrored memory being updated in place, not
+        // re-minted.
+        code_history_upsert(&conn, pid, "2026-09", "did more stuff", 6, "sha2", "digest2", Some("a.rs"), "2026-09-25T00:00:00Z").unwrap();
+        let row = code_history_get(&conn, pid, "2026-09").unwrap().unwrap();
+        assert_eq!(row.text, "did more stuff");
+        assert_eq!(row.commits, 6);
+        assert_eq!(row.memory_id, Some(42), "memory_id must survive a regeneration of the same month");
+
+        code_history_upsert(&conn, pid, "2026-08", "earlier month", 2, "sha0", "digest0", None, "2026-08-24T00:00:00Z").unwrap();
+        let list = code_history_list(&conn, pid).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].month, "2026-08");
+        assert_eq!(list[1].month, "2026-09");
+    }
+
+    #[test]
+    fn extract_refs_then_replace_file_symbols_resolves_the_cpp_out_of_line_example() {
+        // End-to-end: `chunk::extract_refs` -> `replace_file_symbols` ->
+        // `resolve_edges`, the exact scenario the brief calls out.
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        let src = "class Foo {\npublic:\n    void bar();\n};\n\nvoid Foo::bar() {\n    baz();\n}\n";
+        let refs = crate::code_index::chunk::extract_refs("t.cpp", src);
+        let ids = replace_file_symbols(&conn, pid, "t.cpp", &refs.symbols, &refs.edges).unwrap();
+        replace_file_symbols(&conn, pid, "other.cpp", &[a_symbol("baz", "baz", "function", 1, 1)], &[]).unwrap();
+        resolve_edges(&conn, pid).unwrap();
+
+        let bar_id = *ids.iter().zip(refs.symbols.iter()).find(|(_, s)| s.name == "bar").unwrap().0;
+        let bar_qualified: String =
+            conn.query_row("SELECT qualified FROM code_symbols WHERE id = ?1", params![bar_id], |r| r.get(0)).unwrap();
+        assert_eq!(bar_qualified, "Foo::bar");
+
+        let (src_symbol_id, dst_symbol_id): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT src_symbol_id, dst_symbol_id FROM code_edges WHERE project_id = ?1 AND dst_name = 'baz'",
+                params![pid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(src_symbol_id, Some(bar_id), "the call inside Foo::bar must resolve back to it");
+        let baz_id: i64 = conn.query_row("SELECT id FROM code_symbols WHERE qualified = 'baz'", [], |r| r.get(0)).unwrap();
+        assert_eq!(dst_symbol_id, Some(baz_id));
+    }
+
+    // -- final-review fix wave: graph resolution -------------------------
+
+    fn dst_of(conn: &Connection, pid: i64, src_path: &str) -> Option<i64> {
+        conn.query_row("SELECT dst_symbol_id FROM code_edges WHERE project_id = ?1 AND src_path = ?2", params![pid, src_path], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_qualified_call_never_falls_back_to_an_unrelated_leaf_name() {
+        // Item 8: `std::find` must not resolve to the project's own `find`.
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        replace_file_symbols(&conn, pid, "a.cpp", &[a_symbol("find", "Registry::find", "method", 1, 3)], &[]).unwrap();
+        replace_file_symbols(&conn, pid, "b.cpp", &[a_symbol("caller", "caller", "function", 1, 3)], &[an_edge(2, "std::find", "calls")]).unwrap();
+        assert_eq!(resolve_edges(&conn, pid).unwrap(), 0);
+        assert_eq!(dst_of(&conn, pid, "b.cpp"), None, "std::find must stay unresolved");
+    }
+
+    #[test]
+    fn a_qualified_call_resolves_when_the_candidate_ends_with_it_on_a_boundary() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        let ids = replace_file_symbols(&conn, pid, "a.cpp", &[a_symbol("add_event", "helios::picking::add_event", "function", 1, 3)], &[]).unwrap();
+        // "king::add_event" is a suffix but not on a `::` boundary.
+        replace_file_symbols(
+            &conn,
+            pid,
+            "b.cpp",
+            &[a_symbol("caller", "caller", "function", 1, 5)],
+            &[an_edge(2, "picking::add_event", "calls"), an_edge(3, "king::add_event", "calls")],
+        )
+        .unwrap();
+        assert_eq!(resolve_edges(&conn, pid).unwrap(), 1);
+        let good: Option<i64> = conn
+            .query_row("SELECT dst_symbol_id FROM code_edges WHERE dst_name = 'picking::add_event'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(good, Some(ids[0]));
+        let bad: Option<i64> =
+            conn.query_row("SELECT dst_symbol_id FROM code_edges WHERE dst_name = 'king::add_event'", [], |r| r.get(0)).unwrap();
+        assert_eq!(bad, None);
+    }
+
+    #[test]
+    fn self_and_crate_relative_calls_still_resolve_by_leaf() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        replace_file_symbols(&conn, pid, "a.rs", &[a_symbol("helper", "Foo::helper", "function", 1, 3)], &[]).unwrap();
+        replace_file_symbols(
+            &conn,
+            pid,
+            "b.rs",
+            &[a_symbol("caller", "caller", "function", 1, 5)],
+            &[an_edge(2, "Self::helper", "calls"), an_edge(3, "crate::Foo::helper", "calls")],
+        )
+        .unwrap();
+        assert_eq!(resolve_edges(&conn, pid).unwrap(), 2);
+    }
+
+    #[test]
+    fn resolve_edges_at_scale_is_correct_and_an_unchanged_incremental_pass_examines_nothing() {
+        // Item 2: a synthetic project large enough that the old per-edge
+        // query loop was visibly quadratic; asserts behaviour, not timing.
+        let conn = mem_conn();
+        let pid = new_project(&conn, "big");
+        let files = 200usize;
+        for f in 0..files {
+            let symbols: Vec<NewSymbol> =
+                (0..20).map(|i| a_symbol(&format!("fn_{f}_{i}"), &format!("ns{f}::fn_{f}_{i}"), "function", (i * 10 + 1) as i64, (i * 10 + 9) as i64)).collect();
+            // Each file calls 20 functions of the next file (unique names),
+            // one shared ambiguous name, and one external std:: call.
+            let g = (f + 1) % files;
+            let mut edges: Vec<NewEdge> = (0..20).map(|i| an_edge((i * 10 + 2) as i64, &format!("fn_{g}_{i}"), "calls")).collect();
+            edges.push(an_edge(3, "dup", "calls"));
+            edges.push(an_edge(4, "std::find", "calls"));
+            replace_file_symbols(&conn, pid, &format!("f{f}.cpp"), &symbols, &edges).unwrap();
+        }
+        replace_file_symbols(&conn, pid, "dup1.cpp", &[a_symbol("dup", "a::dup", "function", 1, 2)], &[]).unwrap();
+        replace_file_symbols(&conn, pid, "dup2.cpp", &[a_symbol("dup", "b::dup", "function", 1, 2)], &[]).unwrap();
+
+        let stats = resolve_edges_all(&conn, pid).unwrap();
+        assert_eq!(stats.examined, files * 22);
+        assert_eq!(stats.resolved, files * 20, "every unique project call resolves; dup and std::find do not");
+
+        // Nothing changed since: the incremental pass examines 0 edges.
+        assert_eq!(resolve_edges_incremental(&conn, pid).unwrap(), ResolveStats::default());
+
+        // One file re-replaced: only its own edges plus edges naming its
+        // symbols (the 20 incoming from f(n-1)) are examined.
+        let symbols: Vec<NewSymbol> =
+            (0..20).map(|i| a_symbol(&format!("fn_5_{i}"), &format!("ns5::fn_5_{i}"), "function", (i * 10 + 1) as i64, (i * 10 + 9) as i64)).collect();
+        let edges: Vec<NewEdge> = (0..20).map(|i| an_edge((i * 10 + 2) as i64, &format!("fn_6_{i}"), "calls")).collect();
+        replace_file_symbols(&conn, pid, "f5.cpp", &symbols, &edges).unwrap();
+        let inc = resolve_edges_incremental(&conn, pid).unwrap();
+        assert_eq!(inc.examined, 40, "20 own edges + 20 nulled incoming edges from f4.cpp");
+        assert_eq!(inc.resolved, 40);
+        let unresolved_f4: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_edges WHERE project_id = ?1 AND src_path = 'f4.cpp' AND dst_symbol_id IS NULL", params![pid], |r| r.get(0))
+            .unwrap();
+        assert_eq!(unresolved_f4, 2, "only dup + std::find stay unresolved");
+        assert_eq!(resolve_edges_incremental(&conn, pid).unwrap(), ResolveStats::default());
+    }
+
+    #[test]
+    fn deleting_one_of_two_same_named_symbols_lets_the_incremental_pass_resolve_the_survivor() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        replace_file_symbols(&conn, pid, "a.cpp", &[a_symbol("dup", "a::dup", "function", 1, 2)], &[]).unwrap();
+        let ids = replace_file_symbols(&conn, pid, "b.cpp", &[a_symbol("dup", "b::dup", "function", 1, 2)], &[]).unwrap();
+        replace_file_symbols(&conn, pid, "c.cpp", &[a_symbol("caller", "caller", "function", 1, 3)], &[an_edge(2, "dup", "calls")]).unwrap();
+        assert_eq!(resolve_edges(&conn, pid).unwrap(), 0, "ambiguous");
+        delete_file_symbols(&conn, pid, "a.cpp").unwrap();
+        let inc = resolve_edges_incremental(&conn, pid).unwrap();
+        assert_eq!(inc.resolved, 1);
+        assert_eq!(dst_of(&conn, pid, "c.cpp"), Some(ids[0]));
+    }
+
+    #[test]
+    fn includes_resolve_incrementally_when_the_target_file_appears_and_unresolve_when_it_moves() {
+        let conn = mem_conn();
+        let pid = new_project(&conn, "helios");
+        replace_file_symbols(&conn, pid, "src/a.cpp", &[], &[an_edge(1, "thing.h", "includes")]).unwrap();
+        resolve_edges(&conn, pid).unwrap();
+        code_file_upsert(&conn, pid, "inc/thing.h", "b1", Some("Cpp"), 1, "indexed", "2026-09-24T00:00:00Z").unwrap();
+        replace_file_symbols_for_blob(&conn, pid, "inc/thing.h", "b1", &[], &[]).unwrap();
+        assert_eq!(resolve_edges_incremental(&conn, pid).unwrap().resolved, 1);
+        let dst_path: Option<String> = conn.query_row("SELECT dst_path FROM code_edges WHERE src_path = 'src/a.cpp'", [], |r| r.get(0)).unwrap();
+        assert_eq!(dst_path.as_deref(), Some("inc/thing.h"));
+        // refs matches by either form.
+        let refs_blob: Option<String> =
+            conn.query_row("SELECT refs_blob FROM code_files WHERE path = 'inc/thing.h'", [], |r| r.get(0)).unwrap();
+        assert_eq!(refs_blob.as_deref(), Some("b1"));
+
+        move_file_symbols(&conn, pid, "inc/thing.h", "inc2/thing.h").unwrap();
+        conn.execute("UPDATE code_files SET path = 'inc2/thing.h' WHERE path = 'inc/thing.h'", []).unwrap();
+        let after_move: Option<String> = conn.query_row("SELECT dst_path FROM code_edges WHERE src_path = 'src/a.cpp'", [], |r| r.get(0)).unwrap();
+        assert_eq!(after_move, None, "a moved target must not keep its stale resolved path");
+        assert_eq!(resolve_edges_incremental(&conn, pid).unwrap().resolved, 1);
+        let re: Option<String> = conn.query_row("SELECT dst_path FROM code_edges WHERE src_path = 'src/a.cpp'", [], |r| r.get(0)).unwrap();
+        assert_eq!(re.as_deref(), Some("inc2/thing.h"));
+    }
+
+    fn query_plan(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let rows = stmt.query_map(params, |r| r.get::<_, String>(3)).unwrap();
+        rows.map(|r| r.unwrap()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn null_out_incoming_edges_uses_the_dst_symbol_index() {
+        // Item 3: the replace/delete null-out must be an index search on
+        // (project_id, dst_symbol_id), never a scan of code_edges.
+        let conn = mem_conn();
+        let plan = query_plan(&conn, NULL_INCOMING_SQL, &[&1i64, &"a.cpp"]);
+        assert!(plan.contains("ix_code_edges_dst_symbol"), "{plan}");
+        assert!(!plan.contains("SCAN code_edges"), "{plan}");
+    }
+
+    #[test]
+    fn resolve_qualified_lookup_uses_the_qualified_index() {
+        let conn = mem_conn();
+        let plan = query_plan(&conn, "SELECT id FROM code_symbols WHERE project_id = ?1 AND qualified = ?2", &[&1i64, &"Foo::bar"]);
+        assert!(plan.contains("ix_code_symbols_qualified"), "{plan}");
+        let plan = query_plan(&conn, "SELECT rowid FROM code_edges WHERE project_id = ?1 AND src_symbol_id = ?2", &[&1i64, &5i64]);
+        assert!(plan.contains("ix_code_edges_src_symbol"), "{plan}");
+    }
+
+    #[test]
+    fn migrate_v34_to_v35_upgrades_a_first_cut_v35_database_in_place() {
+        // A scratch copy created by the first v35 cut lacks the fix-wave
+        // columns; reopening must add them (migrate re-runs v35 at <= 35).
+        let conn = open_with_path(Path::new(":memory:")).unwrap();
+        conn.execute_batch(
+            "DROP TABLE code_graph_pending; DROP INDEX ix_code_edges_dst_path; ALTER TABLE code_edges DROP COLUMN dst_path;
+             ALTER TABLE code_files DROP COLUMN refs_blob; ALTER TABLE code_history DROP COLUMN files;",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        for (table, col) in [("code_files", "refs_blob"), ("code_edges", "dst_path"), ("code_history", "files")] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"), params![col], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1, "{table}.{col}");
+        }
+        let t: i64 =
+            conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'code_graph_pending'", [], |r| r.get(0)).unwrap();
+        assert_eq!(t, 1);
     }
 }

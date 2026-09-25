@@ -10,6 +10,8 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::classify::{self, Classifier, Verdict};
+use crate::code_index::ask as code_ask;
+use crate::code_index::job;
 use crate::embed::{Embedder, OllamaEmbedder};
 use crate::eval;
 use crate::export;
@@ -105,6 +107,23 @@ fn print_help() {
     println!("                          search raw session passages directly (what ask's TRANSCRIPT: step sees)");
     println!("  index-transcripts [--all]");
     println!("                          index raw session transcripts for `ask` (incremental by mtime)");
+    println!("  index [--project P] [--budget N] [--path-prefix P] [--history-only] [--dry-run]");
+    println!("                          incremental code index: scope pass, tree-sitter chunks,");
+    println!("                          per-file LLM context headers, embeddings, for every");
+    println!("                          registered git project (others reported skipped).");
+    println!("                          --budget caps `claude -p` calls (default 300), stopping");
+    println!("                          cleanly and resuming next run; --dry-run prints the plan");
+    println!("                          and changes nothing");
+    println!("  index status [--project P]");
+    println!("                          per project: head vs indexed head, files by status,");
+    println!("                          chunk count, embedded %");
+    println!("  index scope <project> [--set <dir>=<category>]...");
+    println!("                          no --set: current per-directory scope categories;");
+    println!("                          --set: a manual (\"user\") override the scope pass never");
+    println!("                          clobbers");
+    println!("  eval-code [--file F] [--project X] [--json]");
+    println!("                          score the code-aware `ask` loop: a question passes when one");
+    println!("                          of its expect_paths appears in the answer's citations");
     println!("  projects [list|refresh|mark-indexed <name>|forget <name>]");
     println!("                          project registry: rename detection, cards, index drift");
     println!("  ask \"<question>\" [--rounds N] [--json]");
@@ -168,7 +187,9 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Some("cards") => cmd_cards(args),
         Some("ask") => cmd_ask(args),
         Some("eval-ask") => cmd_eval_ask(args),
+        Some("eval-code") => cmd_eval_code(args),
         Some("index-transcripts") => cmd_index_transcripts(args),
+        Some("index") => cmd_index(args),
         Some("projects") => cmd_projects(args),
         Some("transcripts") => cmd_transcripts(args),
         Some("graph") => cmd_graph(args),
@@ -1885,11 +1906,24 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
 /// four-figure backlog); the oldest slice is the actual fix, draining the
 /// backlog by a bounded amount every single run regardless of what any
 /// other pass in that run does.
+///
+/// Excludes index-owned rows (`source` starting with
+/// `store::INDEX_OWNED_SOURCE_PREFIX` or `store::CODE_HISTORY_SOURCE_PREFIX`,
+/// i.e. `code-index:...`/`code-history:...`) even though `upsert_index_memory`
+/// already sets `reflected_at` at insert time, which should keep them out of
+/// `unreflected_active_newest`/`_oldest` on its own -- this is a second,
+/// source-based line of defense so the insight stage never re-examines one
+/// of these, even if `reflected_at` ever ended up NULL some other way (a
+/// pre-phase-2 row, a bug, a manual edit). They are derived summaries, not
+/// session facts to reason about.
 fn reflect_working_set(conn: &Connection, cap: usize, newest_slice: usize) -> Result<Vec<Memory>, KbError> {
-    let newest = store::unreflected_active_newest(conn, newest_slice.min(cap))?;
+    let not_index_owned = |m: &Memory| !store::is_index_owned(m);
+    let newest: Vec<Memory> =
+        store::unreflected_active_newest(conn, newest_slice.min(cap))?.into_iter().filter(not_index_owned).collect();
     let newest_ids: HashSet<i64> = newest.iter().map(|m| m.id).collect();
     let remaining = cap.saturating_sub(newest.len());
-    let oldest = store::unreflected_active_oldest(conn, remaining, &newest_ids)?;
+    let oldest: Vec<Memory> =
+        store::unreflected_active_oldest(conn, remaining, &newest_ids)?.into_iter().filter(not_index_owned).collect();
     let mut out = oldest;
     out.extend(newest);
     out.sort_by_key(|m| m.id);
@@ -2572,7 +2606,13 @@ fn run_dedupe_pass<L: ReflectLlm>(
         return Ok((0, false));
     }
     let pool = store::active_memories_for_dormancy(conn)?;
-    let items: Vec<(i64, Vec<f32>)> = pool.iter().filter_map(|m| m.embedding.clone().map(|e| (m.id, e))).collect();
+    // Index-owned rows are regenerated and replaced only by the indexer:
+    // never a candidate on either side of an automatic supersession.
+    let items: Vec<(i64, Vec<f32>)> = pool
+        .iter()
+        .filter(|m| !store::is_index_owned(m))
+        .filter_map(|m| m.embedding.clone().map(|e| (m.id, e)))
+        .collect();
     let seen = store::dedupe_seen_pairs(conn)?;
     let pairs =
         reflect::dedupe_candidate_pairs(&items, new_ids, &seen, reflect::DEDUPE_MIN_SIM, reflect::DEDUPE_MAX_PAIRS_PER_RUN);
@@ -2661,7 +2701,13 @@ fn run_contradiction_pass<L: ReflectLlm>(
         return Ok((0, false));
     }
     let pool = store::active_memories_for_dormancy(conn)?;
-    let items: Vec<(i64, Vec<f32>)> = pool.iter().filter_map(|m| m.embedding.clone().map(|e| (m.id, e))).collect();
+    // Index-owned rows are regenerated and replaced only by the indexer:
+    // never a candidate on either side of an automatic supersession.
+    let items: Vec<(i64, Vec<f32>)> = pool
+        .iter()
+        .filter(|m| !store::is_index_owned(m))
+        .filter_map(|m| m.embedding.clone().map(|e| (m.id, e)))
+        .collect();
     let mut seen = store::dedupe_seen_pairs(conn)?;
     seen.extend(store::contradiction_seen_pairs(conn)?);
     let pairs = reflect::contradiction_candidate_pairs(
@@ -3793,6 +3839,10 @@ pub fn provenance_phrase(source: Option<&str>, basis: Option<&str>) -> String {
         None
     };
     match (basis, where_) {
+        // Index-owned (`code_index::summary`'s module/repo mirrors): never
+        // "you told me" -- the user never said it, an automatic pass
+        // generated it from code -- regardless of what `source` looks like.
+        (Some("derived"), _) => "derived by the code index".to_string(),
         (Some("experience"), w) => format!("I did this in {}", w.unwrap_or("an earlier session")),
         (Some("inferred"), w) => format!("I inferred this from {}", w.unwrap_or("context")),
         (Some("stated"), Some(w)) => format!("you said this in {}", w),
@@ -3889,6 +3939,7 @@ pub fn why_report(
                     Some("stated") => "stated (the user or a named person said it in so many words)",
                     Some("inferred") => "inferred (deduced from behavior, code, or context)",
                     Some("experience") => "experience (what Claude did here, and how the user responded)",
+                    Some("derived") => "derived",
                     _ => "unknown (written before the basis column existed, or by a channel that does not classify)",
                 }
             ));
@@ -4428,6 +4479,110 @@ fn cmd_eval_ask(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     Ok(())
 }
 
+/// `mach kb eval-code` — scores the code-aware `mach kb ask` loop against a
+/// fixed question set of real repo-relative paths.
+///
+/// Unlike `eval-ask` (substring match against the whole gathered pool),
+/// this scores the loop's actual contract: a question passes when one of
+/// its `expect_paths` is the path component of a citation the final
+/// answer actually gave (`code_ask::score_eval_code`). A project named in
+/// a question but not registered in this bank is reported and scored a
+/// fail rather than aborting the whole run — one bad row in the question
+/// set shouldn't hide every other result.
+fn cmd_eval_code(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut file: Option<String> = None;
+    let mut project_filter: Option<String> = None;
+    let mut json = false;
+    let mut verbose = false;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--file" => file = args.next(),
+            "--project" => project_filter = args.next(),
+            "--json" => json = true,
+            "--verbose" | "-v" => verbose = true,
+            "-h" | "--help" => {
+                println!("usage: mach kb eval-code [--file F] [--project X] [--json] [--verbose]");
+                println!("       Scores the code-aware `mach kb ask` loop: a question passes when one");
+                println!("       of its expect_paths appears in the answer's citations.");
+                println!("       Default question set: ~/{}", code_ask::DEFAULT_EVAL_CODE_PATH);
+                return Ok(());
+            }
+            other => {
+                eprintln!("mach kb eval-code: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let path = match file {
+        Some(f) => PathBuf::from(f),
+        None => {
+            let home = std::env::var("HOME").unwrap_or_default();
+            Path::new(&home).join(code_ask::DEFAULT_EVAL_CODE_PATH)
+        }
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("mach kb eval-code: cannot read {}: {}", path.display(), e);
+            std::process::exit(1);
+        }
+    };
+    let mut questions = code_ask::parse_eval_code_questions(&content).map_err(to_io)?;
+    if let Some(p) = &project_filter {
+        questions.retain(|q| &q.project == p);
+    }
+
+    let conn = store::open().map_err(to_io)?;
+    let embedder = OllamaEmbedder::new();
+    let llm = ProcessReflectLlm::new();
+    let now = store::now_rfc3339();
+
+    let mut results = Vec::new();
+    for q in &questions {
+        let Some(p) = store::get_project_by_name(&conn, &q.project).map_err(to_io)? else {
+            eprintln!("mach kb eval-code: {}: project '{}' is not registered -- scored a fail", q.id, q.project);
+            results.push(code_ask::EvalCodeResult {
+                id: q.id.clone(),
+                project: q.project.clone(),
+                passed: false,
+                citations: Vec::new(),
+                answer: String::new(),
+                rounds: 0,
+                tools: Vec::new(),
+            });
+            continue;
+        };
+        let out = code_ask::run_code_ask(&conn, &llm, &embedder, &p, &q.query, &now, verbose).map_err(to_io)?;
+        let passed = code_ask::score_eval_code(&q.expect_paths, &out.citations);
+        if verbose {
+            eprintln!("{}: passed={} citations={:?}", q.id, passed, out.citations);
+        }
+        results.push(code_ask::EvalCodeResult {
+            id: q.id.clone(),
+            project: q.project.clone(),
+            passed,
+            citations: out.citations,
+            answer: out.answer,
+            rounds: out.rounds,
+            tools: out.tools,
+        });
+    }
+
+    let total = results.len();
+    let passed = results.iter().filter(|r| r.passed).count();
+
+    if json {
+        println!("{}", serde_json::json!({"total": total, "passed": passed, "results": results}));
+    } else {
+        println!("mach kb eval-code: {}/{} ({}%)", passed, total, if total > 0 { passed * 100 / total } else { 0 });
+        for r in &results {
+            println!("  [{}] {} {}", if r.passed { "pass" } else { "FAIL" }, r.id, r.project);
+        }
+    }
+    Ok(())
+}
+
 /// `mach kb index-transcripts` — build/refresh the raw-transcript index
 /// that `mach kb ask` searches with its `TRANSCRIPT:` step.
 ///
@@ -4623,6 +4778,399 @@ fn cmd_index_transcripts(mut args: impl Iterator<Item = String>) -> io::Result<(
         "mach kb index-transcripts: scanned={} indexed={} skipped={} machine={} new_chunks={} (index now {} files, {} chunks)",
         scanned, indexed, skipped, machine, chunks_total, files, total_chunks
     );
+    Ok(())
+}
+
+/// `mach kb index [--project P] [--budget N] [--path-prefix P]
+/// [--history-only] [--dry-run]` -- the incremental code index (scope
+/// pass, tree-sitter chunks, per-file LLM context headers, embeddings,
+/// symbol graph, monthly commit-history summaries). `--history-only`
+/// (requires `--project`, rejected together with `--path-prefix`) skips
+/// straight to the commit-history stage for that one project.
+/// Orchestration lives in `code_index::job`; this function only parses
+/// args, wires up the real `ProcessReflectLlm`/`OllamaEmbedder`, and
+/// prints. `index status` and `index scope` are separate sub-subcommands
+/// (same nesting style as `mach kb graph audit`).
+fn cmd_index(args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut args = args.peekable();
+    match args.peek().map(|s| s.as_str()) {
+        Some("status") => {
+            args.next();
+            return cmd_index_status(args);
+        }
+        Some("scope") => {
+            args.next();
+            return cmd_index_scope(args);
+        }
+        _ => {}
+    }
+
+    let opts = match parse_index_args(args) {
+        Ok(Some(o)) => o,
+        Ok(None) => {
+            print_index_help();
+            return Ok(());
+        }
+        Err(msg) => {
+            eprintln!("mach kb index: {}", msg);
+            std::process::exit(1);
+        }
+    };
+    let conn = store::open().map_err(to_io)?;
+
+    if opts.dry_run {
+        let plans = match job::plan_index(&conn, &opts) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("mach kb index: {}", e);
+                std::process::exit(1);
+            }
+        };
+        let mut total_calls = 0usize;
+        for p in &plans {
+            if let Some(reason) = &p.skipped_reason {
+                println!("{:<20} skipped ({})", p.project, reason);
+                continue;
+            }
+            if opts.history_only {
+                println!("{:<20} months={} calls={}", p.project, p.months_to_summarize, p.calls_needed);
+            } else {
+                println!(
+                    "{:<20} files={} delete={} move={} modules-stale={} months={} calls={}{}",
+                    p.project,
+                    p.files_to_index,
+                    p.files_to_delete,
+                    p.files_moved,
+                    p.modules_stale,
+                    p.months_to_summarize,
+                    p.calls_needed,
+                    if p.needs_scope { " [scope pass needed]" } else { "" }
+                );
+            }
+            total_calls += p.calls_needed;
+        }
+        println!("mach kb index --dry-run: {} project(s), {} call(s) estimated, nothing changed", plans.len(), total_calls);
+        return Ok(());
+    }
+
+    // Same lock the systemd units take around every kb-writing command, so
+    // a manual run never overlaps the nightly index or reflect. Held until
+    // this function returns.
+    let _lock = match acquire_kb_job_lock() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("mach kb index: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let llm = ProcessReflectLlm::new();
+    let embedder = OllamaEmbedder::new();
+    let report = match job::run_index(&conn, &llm, &embedder, &opts) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("mach kb index: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let mut errored = 0usize;
+    for p in &report.projects {
+        if let Some(err) = &p.error {
+            errored += 1;
+            println!("{:<20} error: {} (run continued with the next project)", p.project, err);
+            continue;
+        }
+        if let Some(reason) = &p.skipped_reason {
+            println!("{:<20} skipped ({})", p.project, reason);
+            continue;
+        }
+        println!(
+            "{:<20} chunked={} deleted={} moved={} secret-skipped={} headers={} headers-failed={} months={} months-failed={} symbols={} edges={}{}{}{}",
+            p.project,
+            p.files_chunked,
+            p.files_deleted,
+            p.files_moved,
+            p.files_skipped_secret,
+            p.headers_attempted,
+            p.headers_failed,
+            p.months_summarized,
+            p.months_failed,
+            p.symbols_total,
+            p.edges_total,
+            match p.summaries_failed + p.modules_failed {
+                0 => String::new(),
+                n => format!(" summaries-failed={}", n),
+            },
+            if p.scope_ran { " scope-pass" } else { "" },
+            if p.head_advanced { " head-advanced" } else { "" }
+        );
+    }
+    if !report.embedder_up {
+        println!("index: embedder unreachable — no header calls made this run (chunking still ran)");
+    } else if report.backfill_embedded > 0 {
+        println!("index: backfilled {} missing embedding(s)", report.backfill_embedded);
+    }
+    if report.calls_failed > 0 {
+        println!(
+            "index: {} of {} call(s) failed (last: {})",
+            report.calls_failed,
+            report.calls_used,
+            report.last_error.as_deref().unwrap_or("unknown")
+        );
+    }
+    if report.stopped_on_failures {
+        println!(
+            "index: stopped after {} failed calls in a row — claude -p looks down or throttled; resumes next run",
+            job::MAX_CONSECUTIVE_FAILURES
+        );
+    } else if report.budget_reached {
+        println!("index: budget reached ({} calls) — resumes next run", report.calls_used);
+    } else {
+        println!("mach kb index: done ({} call(s) used of {})", report.calls_used, report.budget);
+    }
+    // A targeted run (--project) that failed should fail loudly; the
+    // nightly all-projects run stays exit 0 (errors are in its output).
+    if errored > 0 && opts.project.is_some() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Takes `~/.local/share/mach/kb-job.lock`, the lock the systemd units
+/// hold (via flock(1)) around every kb-writing command. Waits if another
+/// job holds it, saying so first so a manual run isn't silently stuck.
+fn acquire_kb_job_lock() -> io::Result<std::fs::File> {
+    let path = store::db_path().map_err(to_io)?.with_file_name("kb-job.lock");
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            eprintln!("mach kb index: another kb job holds {} — waiting for it to finish", path.display());
+            file.lock()?;
+        }
+        Err(std::fs::TryLockError::Error(e)) => return Err(e),
+    }
+    Ok(file)
+}
+
+fn print_index_help() {
+    println!("usage: mach kb index [--project P] [--budget N] [--path-prefix P] [--history-only] [--dry-run]");
+    println!("       mach kb index status [--project P]");
+    println!("       mach kb index scope <project> [--set <dir>=<category>]...");
+    println!();
+    println!("       Incrementally indexes every registered git project (others are");
+    println!("       reported skipped, never touched): a scope pass classifies");
+    println!("       directories, changed in-scope files are chunked (tree-sitter),");
+    println!("       each dirty file gets one LLM context-header call plus embeddings,");
+    println!("       a symbol graph (definitions/calls/includes/imports/inherits) is");
+    println!("       extracted for free, and each project's monthly commit-history is");
+    println!("       summarized (last, budget permitting).");
+    println!("       --budget caps `claude -p` calls for the whole invocation (default");
+    println!("       {}); the run stops cleanly once spent and resumes next time.", job::DEFAULT_BUDGET);
+    println!("       --path-prefix (requires --project) limits changed-file detection and");
+    println!("       the dirty/summary backlog to that subtree, never advances the");
+    println!("       indexed-head watermark, and skips");
+    println!("       the commit-history stage entirely (a partial file view has no");
+    println!("       meaningful month to report on).");
+    println!("       --history-only (requires --project, rejected together with");
+    println!("       --path-prefix) skips the scope/chunk/header/summary stages entirely");
+    println!("       and runs only the commit-history stage for that one project --");
+    println!("       useful to backfill every month's history without paying for a full");
+    println!("       index first.");
+    println!("       --dry-run prints the plan (files, stale modules and changed history");
+    println!("       months per project, calls needed; with --history-only just the");
+    println!("       months) and changes nothing.");
+    println!("       Files matching secret patterns (.env, *.pem, *.key, id_rsa*, tokens,");
+    println!("       private keys, ...) are recorded skipped and never chunked or sent.");
+    println!("       One project's error is reported and the run moves on to the next.");
+    println!("       Run output per project: headers=/months= are calls attempted this");
+    println!("       run, headers-failed=/months-failed= how many of those failed");
+    println!("       (timeout, error; nothing written, retried next run); symbols=/edges=");
+    println!("       are the project's current code_symbols/code_edges row totals (not");
+    println!("       just this run's delta).");
+    println!("       The run stops early after {} failed calls in a row.", job::MAX_CONSECUTIVE_FAILURES);
+    println!("       Takes ~/.local/share/mach/kb-job.lock (waits if another kb job");
+    println!("       holds it), so it never overlaps the nightly index or reflect.");
+}
+
+/// Parses `mach kb index [--project P] [--budget N] [--path-prefix P]
+/// [--history-only] [--dry-run]`. `Ok(None)` for `--help`. Errors (as a
+/// message) on an unknown flag, a missing or non-numeric `--budget`, a
+/// flag missing its value, `--path-prefix` without `--project` (a prefix
+/// only means something inside one repo), `--history-only` without
+/// `--project`, or `--history-only` combined with `--path-prefix`.
+fn parse_index_args(mut args: impl Iterator<Item = String>) -> Result<Option<job::IndexOptions>, String> {
+    let mut opts = job::IndexOptions::new();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--project" => opts.project = Some(args.next().ok_or("--project requires a project name")?),
+            "--budget" => {
+                let v = args.next().ok_or("--budget requires a number")?;
+                opts.budget = v.parse::<usize>().map_err(|_| format!("--budget must be a non-negative integer, got '{}'", v))?;
+            }
+            "--path-prefix" => opts.path_prefix = Some(args.next().ok_or("--path-prefix requires a path")?),
+            "--dry-run" => opts.dry_run = true,
+            "--history-only" => opts.history_only = true,
+            "-h" | "--help" => return Ok(None),
+            other => return Err(format!("unexpected argument '{}'", other)),
+        }
+    }
+    if opts.path_prefix.is_some() && opts.project.is_none() {
+        return Err("--path-prefix requires --project".to_string());
+    }
+    if opts.history_only && opts.project.is_none() {
+        return Err("--history-only requires --project".to_string());
+    }
+    if opts.history_only && opts.path_prefix.is_some() {
+        return Err("--history-only cannot be combined with --path-prefix".to_string());
+    }
+    Ok(Some(opts))
+}
+
+fn cmd_index_status(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut project: Option<String> = None;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--project" => {
+                let Some(p) = args.next() else {
+                    eprintln!("mach kb index status: --project requires a project name");
+                    std::process::exit(1);
+                };
+                project = Some(p);
+            }
+            "-h" | "--help" => {
+                println!("usage: mach kb index status [--project P]");
+                println!("       per project: head vs indexed head, files by status (skipped = secret");
+                println!("       path/content, never stored), chunk count, embedded %, how many files");
+                println!("       gave up on ever getting a summary (summaries_given_up), and the");
+                println!("       symbol graph (symbols, edges, edges_resolved %)");
+                return Ok(());
+            }
+            other => {
+                eprintln!("mach kb index status: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+    let conn = store::open().map_err(to_io)?;
+    let statuses = match job::all_project_statuses(&conn, project.as_deref()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("mach kb index status: {}", e);
+            std::process::exit(1);
+        }
+    };
+    if statuses.is_empty() {
+        println!("mach kb index status: no registered projects");
+    }
+    for s in &statuses {
+        if let Some(reason) = &s.skipped_reason {
+            println!("{:<20} skipped ({})", s.project, reason);
+            continue;
+        }
+        let short = |sha: &str| sha[..sha.len().min(10)].to_string();
+        let head = s.head.as_deref().map(short).unwrap_or_else(|| "(no commits)".to_string());
+        let indexed_head = s.code_indexed_head.as_deref().map(short).unwrap_or_else(|| "(never indexed)".to_string());
+        let behind = if s.head != s.code_indexed_head && s.code_indexed_head.is_some() { " [BEHIND]" } else { "" };
+        println!(
+            "{:<20} head={} indexed_head={}{} indexed={} fallback={} dirty={} skipped={} chunks={} embedded={:.0}% summaries_given_up={} symbols={} edges={} edges_resolved={:.0}%",
+            s.project,
+            head,
+            indexed_head,
+            behind,
+            s.indexed,
+            s.fallback,
+            s.dirty,
+            s.skipped,
+            s.chunks,
+            s.embedded_pct,
+            s.summaries_given_up,
+            s.symbols,
+            s.edges,
+            s.edges_resolved_pct
+        );
+        if !s.skip_reasons.is_empty() {
+            let parts: Vec<String> = s.skip_reasons.iter().map(|(r, n)| format!("{}={}", r, n)).collect();
+            println!("{:<20}   skipped: {}", "", parts.join(" "));
+        }
+    }
+    Ok(())
+}
+
+fn cmd_index_scope(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut project_name: Option<String> = None;
+    let mut sets: Vec<(String, String)> = Vec::new();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--set" => {
+                let Some(kv) = args.next() else {
+                    eprintln!("mach kb index scope: --set requires <dir>=<category>");
+                    std::process::exit(1);
+                };
+                let Some((dir, cat)) = kv.split_once('=') else {
+                    eprintln!("mach kb index scope: --set value must be <dir>=<category>, got '{}'", kv);
+                    std::process::exit(1);
+                };
+                sets.push((dir.to_string(), cat.to_string()));
+            }
+            "-h" | "--help" => {
+                println!("usage: mach kb index scope <project> [--set <dir>=<category>]...");
+                println!("       no --set: prints the project's current per-directory categories");
+                println!("       --set: records a manual (\"user\") override the scope pass never");
+                println!("       clobbers. Categories: product, tests, docs, vendored, generated,");
+                println!("       assets, build-output.");
+                return Ok(());
+            }
+            other => {
+                if project_name.is_none() {
+                    project_name = Some(other.to_string());
+                } else {
+                    eprintln!("mach kb index scope: unexpected argument '{}'", other);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    let Some(project_name) = project_name else {
+        eprintln!("mach kb index scope: missing <project>");
+        std::process::exit(1);
+    };
+    let conn = store::open().map_err(to_io)?;
+    let Some(project) = store::get_project_by_name(&conn, &project_name).map_err(to_io)? else {
+        eprintln!("mach kb index scope: unknown project '{}'", project_name);
+        std::process::exit(1);
+    };
+    if sets.is_empty() {
+        let rows = store::code_scope_get(&conn, project.id).map_err(to_io)?;
+        if rows.is_empty() {
+            println!("mach kb index scope {}: no scope decisions yet (run `mach kb index` first)", project_name);
+        }
+        for r in rows {
+            println!("{:<30} {:<12} ({})", r.dir, r.category, r.source);
+        }
+    } else {
+        // Validate every pair against the committed tree before writing any.
+        let root = Path::new(&project.root_path);
+        if !crate::code_index::git::Repo::is_repo(root) {
+            eprintln!("mach kb index scope: '{}' is not a git repo", project.root_path);
+            std::process::exit(1);
+        }
+        let tracked = crate::code_index::git::Repo::new(root).tracked_files().map_err(to_io)?;
+        let mut validated = Vec::with_capacity(sets.len());
+        for (dir, cat) in &sets {
+            match crate::code_index::scope::validate_user_scope_set(&tracked, dir, cat) {
+                Ok(v) => validated.push(v),
+                Err(e) => {
+                    eprintln!("mach kb index scope: --set {}={}: {}", dir, cat, e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        let now = store::now_rfc3339();
+        for (dir, cat) in &validated {
+            store::code_scope_set(&conn, project.id, dir, cat.as_str(), "user", &now).map_err(to_io)?;
+            println!("{:<30} -> {} (user)", dir, cat.as_str());
+        }
+    }
     Ok(())
 }
 
@@ -4848,22 +5396,76 @@ fn cmd_projects(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     }
 }
 
+/// Project resolution for `mach kb ask`/`--project`: an explicit flag wins,
+/// otherwise the current directory is checked against the `projects`
+/// registry the same way every other command with a `--cwd`-shaped
+/// resolution does (`store::project_for_path`) — a registered root is an
+/// actual identity claim, not a guess. `None` (no flag, cwd not inside any
+/// registered root, or no readable cwd at all) means "no project", and
+/// `cmd_ask` falls through to the unchanged memory-only path.
+fn resolve_ask_project(conn: &Connection, explicit: Option<&str>) -> Result<Option<store::ProjectRow>, KbError> {
+    if let Some(name) = explicit {
+        // An explicit --project that names nothing is a typo, not "no
+        // project": silently falling back to memory-only answers would hide it.
+        return match store::get_project_by_name(conn, name)? {
+            Some(p) => Ok(Some(p)),
+            None => Err(KbError::Other(format!("unknown project '{}' (see `mach kb projects`)", name))),
+        };
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => store::project_for_path(conn, &cwd.to_string_lossy()),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Parses a `--rounds` value: must be present and a non-negative integer.
+fn parse_rounds_value(v: Option<String>) -> Result<usize, String> {
+    let v = v.ok_or("--rounds requires a number")?;
+    v.parse::<usize>().map_err(|_| format!("--rounds must be a non-negative integer, got '{}'", v))
+}
+
 fn cmd_ask(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut question: Option<String> = None;
     let mut rounds = ask::MAX_ROUNDS;
+    let mut rounds_explicit: Option<usize> = None;
     let mut json = false;
     let mut verbose = false;
+    let mut project: Option<String> = None;
 
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--rounds" => rounds = args.next().and_then(|v| v.parse().ok()).unwrap_or(rounds),
+            "--rounds" => match parse_rounds_value(args.next()) {
+                Ok(n) => {
+                    rounds = n;
+                    rounds_explicit = Some(n);
+                }
+                Err(msg) => {
+                    eprintln!("mach kb ask: {}", msg);
+                    std::process::exit(1);
+                }
+            },
+            "--project" => {
+                let Some(p) = args.next() else {
+                    eprintln!("mach kb ask: --project requires a project name");
+                    std::process::exit(1);
+                };
+                project = Some(p);
+            }
             "--json" => json = true,
             "--verbose" | "-v" => verbose = true,
             "-h" | "--help" => {
-                println!("usage: mach kb ask \"<question>\" [--rounds N] [--json] [--verbose]");
-                println!("       Searches, judges whether the result answers the question, and if not");
-                println!("       rewords the query or hops to an entity — up to {} rounds — then answers", ask::MAX_ROUNDS);
-                println!("       with citations. Spends LLM calls: this is the deliberate path, not the hook.");
+                println!("usage: mach kb ask \"<question>\" [--project P] [--rounds N] [--json] [--verbose]");
+                println!("       With a registered project (--project, or detected from the current");
+                println!("       directory) that has a code index: an agentic loop over search/read/");
+                println!(
+                    "       symbol/history tools, up to {} rounds (--rounds lowers it), citing path:line@sha7.",
+                    code_ask::MAX_ROUNDS
+                );
+                println!("       Without a project, or one with no code index yet: searches memories,");
+                println!("       judges whether the result answers the question, and if not rewords the");
+                println!("       query or hops to an entity — up to {} rounds — then answers with", ask::MAX_ROUNDS);
+                println!("       citations. Spends LLM calls either way: this is the deliberate path,");
+                println!("       not the hook.");
                 return Ok(());
             }
             other if question.is_none() => question = Some(other.to_string()),
@@ -4884,6 +5486,42 @@ fn cmd_ask(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let embedder = OllamaEmbedder::new();
     let llm = ProcessReflectLlm::new();
     let now = store::now_rfc3339();
+
+    // Code-aware path: only when a project actually resolves AND its code
+    // index has something in it. Anything else (no project, or a
+    // registered project nobody has run `mach kb index` on yet) falls
+    // through to the memory-only path below completely unchanged, byte for
+    // byte, from before this branch existed.
+    let resolved = match resolve_ask_project(&conn, project.as_deref()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("mach kb ask: {}", e);
+            std::process::exit(1);
+        }
+    };
+    if let Some(p) = resolved {
+        if code_ask::has_code_chunks(&conn, p.id).map_err(to_io)? {
+            // --rounds is honored on the code path too (clamped to its own
+            // cap); without it the code loop uses its full MAX_ROUNDS.
+            let code_rounds = rounds_explicit.unwrap_or(code_ask::MAX_ROUNDS);
+            let out = code_ask::run_code_ask_with_rounds(&conn, &llm, &embedder, &p, &question, code_rounds, &now, verbose)
+                .map_err(to_io)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"question": question, "project": p.name, "answer": out.answer,
+                        "citations": out.citations, "trail": out.trail})
+                );
+            } else {
+                println!("{}", out.answer);
+                if !out.citations.is_empty() {
+                    println!("\ncitations: {}", out.citations.join(", "));
+                }
+            }
+            return Ok(());
+        }
+    }
+
     let out = run_ask_gather(&conn, &embedder, &llm, &question, rounds, &now, verbose)?;
     let (evidence, passages, trail) = (out.evidence, out.passages, out.trail);
 
@@ -7079,6 +7717,10 @@ fn improve_signal(conn: &Connection, state: &store::ImproveState) -> Result<(Vec
     let new_memories: Vec<Memory> = store::memories_since(conn, state.last_memory_id.unwrap_or(0))?
         .into_iter()
         .filter(|m| !history_ids.contains(&m.id))
+        // Index-owned code summaries are not behavioural evidence about the
+        // user (final-review item 7): a nightly index run must neither
+        // trip improve's signal threshold nor pad its prompt.
+        .filter(|m| !store::is_index_owned(m))
         .collect();
     let relations: Vec<store::Relation> = store::relations_since(conn, state.last_relation_id.unwrap_or(0))?
         .into_iter()
@@ -7505,6 +8147,52 @@ mod tests {
         store::ModelRow { kind, confidence, text: text.to_string(), doubted, nested, recent }
     }
 
+    // -- code index CLI argument validation (final-review items 10, 12) --
+
+    fn sargs(v: &[&str]) -> std::vec::IntoIter<String> {
+        v.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
+    }
+
+    #[test]
+    fn parse_index_args_rejects_a_non_numeric_budget_and_a_prefix_without_project() {
+        assert!(parse_index_args(sargs(&["--budget", "lots"])).unwrap_err().contains("--budget"));
+        assert!(parse_index_args(sargs(&["--budget"])).unwrap_err().contains("--budget"));
+        assert!(parse_index_args(sargs(&["--path-prefix", "src"])).unwrap_err().contains("--project"));
+        assert!(parse_index_args(sargs(&["--bogus"])).unwrap_err().contains("--bogus"));
+        let Some(o) = parse_index_args(sargs(&["--project", "p", "--budget", "7", "--path-prefix", "src", "--dry-run"])).unwrap() else {
+            panic!("not help");
+        };
+        assert_eq!((o.project.as_deref(), o.budget, o.path_prefix.as_deref(), o.dry_run), (Some("p"), 7, Some("src"), true));
+        assert!(parse_index_args(sargs(&["--help"])).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_index_args_parses_history_only_and_rejects_bad_combinations() {
+        assert!(parse_index_args(sargs(&["--history-only"])).unwrap_err().contains("--project"));
+        assert!(parse_index_args(sargs(&["--project", "p", "--history-only", "--path-prefix", "src"]))
+            .unwrap_err()
+            .contains("--path-prefix"));
+        let Some(o) = parse_index_args(sargs(&["--project", "p", "--history-only", "--budget", "12"])).unwrap() else {
+            panic!("not help");
+        };
+        assert_eq!((o.project.as_deref(), o.budget, o.path_prefix.as_deref(), o.history_only), (Some("p"), 12, None, true));
+        assert!(!parse_index_args(sargs(&["--project", "p"])).unwrap().unwrap().history_only, "default is false");
+    }
+
+    #[test]
+    fn resolve_ask_project_errors_on_an_explicit_unknown_name() {
+        let conn = store::open_with_path(Path::new(":memory:")).unwrap();
+        let err = resolve_ask_project(&conn, Some("nope")).unwrap_err();
+        assert!(err.to_string().contains("nope"), "{}", err);
+    }
+
+    #[test]
+    fn parse_rounds_flag_rejects_non_numeric() {
+        assert_eq!(parse_rounds_value(Some("2".to_string())).unwrap(), 2);
+        assert!(parse_rounds_value(Some("two".to_string())).is_err());
+        assert!(parse_rounds_value(None).is_err());
+    }
+
     #[test]
     fn format_model_row_renders_theme_and_belief_with_confidence() {
         let theme = row(store::ModelKind::Theme, 0.8, "a recurring pattern", false, false);
@@ -7891,6 +8579,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dedupe_pass_never_tombstones_an_index_owned_loser() {
+        // Fix-list item 6: same shape as the pinned-row and date-guard
+        // tests above, but the loser is an index-owned code-index summary
+        // mirror -- `store::supersession_guard`'s "index-owned" block must
+        // stop a dedupe KEEP from merging it away, end to end through
+        // `run_dedupe_pass`.
+        let conn = mem_conn();
+        let a = store::insert(&conn, "the user drinks tea", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        let b = store::upsert_index_memory(
+            &conn,
+            "proj",
+            "code-index:proj:src/",
+            "src/ handles tea brewing",
+            Some(&unit_vec(4, 0)),
+            &store::now_rfc3339(),
+        )
+        .unwrap();
+        let now = store::now_rfc3339();
+
+        let llm = OwnedReplyLlm { reply: format!("KEEP {}", a) }; // a would win, b (index-owned) would lose
+        let new_ids: HashSet<i64> = [a].into_iter().collect();
+        let (deduped, failed) = run_dedupe_pass(&conn, &llm, &new_ids, &now).unwrap();
+        assert_eq!(deduped, 0, "an index-owned loser must never be merged away");
+        assert!(!failed);
+
+        assert!(!store::get(&conn, b).unwrap().unwrap().is_superseded(), "index-owned loser stays active");
+        // Final-review item 1: index-owned rows are now excluded from the
+        // candidate pool, so the pair never reaches the judge (nothing to
+        // record as seen); the guard itself is covered separately.
+        assert!(store::dedupe_seen_pairs(&conn).unwrap().is_empty(), "an index-owned row never forms a candidate pair");
+    }
+
+    #[test]
+    fn dedupe_pass_never_tombstones_a_code_history_owned_loser() {
+        // Task-3 extension of the test above: `code-history:` rows must be
+        // excluded from the dedupe candidate pool exactly like
+        // `code-index:` ones, via the same shared helper.
+        let conn = mem_conn();
+        let a = store::insert(&conn, "the team shipped picking work in August", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        let b = store::upsert_index_memory(
+            &conn,
+            "proj",
+            "code-history:proj:2026-08",
+            "proj 2026-08: picking work shipped",
+            Some(&unit_vec(4, 0)),
+            &store::now_rfc3339(),
+        )
+        .unwrap();
+        let now = store::now_rfc3339();
+
+        let llm = OwnedReplyLlm { reply: format!("KEEP {}", a) };
+        let new_ids: HashSet<i64> = [a].into_iter().collect();
+        let (deduped, failed) = run_dedupe_pass(&conn, &llm, &new_ids, &now).unwrap();
+        assert_eq!(deduped, 0, "a history-owned loser must never be merged away");
+        assert!(!failed);
+
+        assert!(!store::get(&conn, b).unwrap().unwrap().is_superseded(), "history-owned loser stays active");
+        assert!(store::dedupe_seen_pairs(&conn).unwrap().is_empty(), "a history-owned row never forms a candidate pair");
+    }
+
     // --- run_contradiction_pass: band selection, offline safety, apply mechanics ---
 
     /// Two memories at ~0.707 cosine (a 45-degree angle) — squarely inside
@@ -7909,6 +8658,113 @@ mod tests {
         )
         .unwrap();
         (a, b)
+    }
+
+    /// Reply-fixed `ReflectLlm` that also counts calls, so a test can
+    /// prove a pair never reached the judge at all.
+    struct CountingReplyLlm {
+        reply: String,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl ReflectLlm for CountingReplyLlm {
+        fn call(&self, _model: &str, _prompt: &str, _timeout: std::time::Duration) -> Result<String, String> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.reply.clone())
+        }
+    }
+
+    #[test]
+    fn improve_signal_ignores_index_owned_memories() {
+        let conn = mem_conn();
+        let user = store::insert(&conn, "the user rejects verbose logging", None, None, true, None, 5).unwrap();
+        store::upsert_index_memory(&conn, "helios", "code-index:helios:src/", "src/ handles picking", None, &store::now_rfc3339()).unwrap();
+        let st = store::get_improve_state(&conn).unwrap();
+        let (nm, _) = improve_signal(&conn, &st).unwrap();
+        assert_eq!(nm.iter().map(|m| m.id).collect::<Vec<_>>(), vec![user]);
+    }
+
+    #[test]
+    fn improve_signal_ignores_code_history_owned_memories_too() {
+        // Task-3 extension: a nightly commit-history summary is derived
+        // prose about code, not behavioural evidence about the user, same
+        // as a code-index summary.
+        let conn = mem_conn();
+        let user = store::insert(&conn, "the user rejects verbose logging", None, None, true, None, 5).unwrap();
+        store::upsert_index_memory(&conn, "helios", "code-history:helios:2026-08", "helios 2026-08: aug work", None, &store::now_rfc3339()).unwrap();
+        let st = store::get_improve_state(&conn).unwrap();
+        let (nm, _) = improve_signal(&conn, &st).unwrap();
+        assert_eq!(nm.iter().map(|m| m.id).collect::<Vec<_>>(), vec![user]);
+    }
+
+    #[test]
+    fn dedupe_pass_never_lets_an_index_owned_row_win_over_a_user_memory() {
+        // KEEP names the index row: pre-fix this tombstoned the user memory
+        // into text the indexer later replaces wholesale.
+        let conn = mem_conn();
+        let user = store::insert(&conn, "src/ handles picking", None, None, true, Some(&unit_vec(4, 0)), 5).unwrap();
+        let idx = store::upsert_index_memory(
+            &conn,
+            "helios",
+            "code-index:helios:src/",
+            "src/ handles picking",
+            Some(&unit_vec(4, 0)),
+            &store::now_rfc3339(),
+        )
+        .unwrap();
+        let llm = CountingReplyLlm { reply: format!("KEEP {}", idx), calls: std::cell::Cell::new(0) };
+        let new_ids: HashSet<i64> = [user, idx].into_iter().collect();
+        let (deduped, _) = run_dedupe_pass(&conn, &llm, &new_ids, &store::now_rfc3339()).unwrap();
+        assert_eq!(deduped, 0);
+        assert_eq!(llm.calls.get(), 0, "index-owned rows are excluded from the dedupe pool");
+        assert!(!store::get(&conn, user).unwrap().unwrap().is_superseded());
+        assert!(!store::get(&conn, idx).unwrap().unwrap().is_superseded());
+    }
+
+    #[test]
+    fn contradiction_pass_never_lets_a_newer_index_owned_row_win_over_a_user_memory() {
+        // newer_wins would pick the (newer) index row as the winner.
+        let conn = mem_conn();
+        let user = store::insert(&conn, "TESTBOSS: Moses is the user's boss", None, None, true, Some(&[1.0f32, 0.0]), 5).unwrap();
+        let idx = store::upsert_index_memory(
+            &conn,
+            "helios",
+            "code-index:helios:/",
+            "TESTBOSS: the user's boss Ivar approved the RHI redesign",
+            Some(&[1.0f32, 1.0]),
+            "2099-01-01T00:00:00Z",
+        )
+        .unwrap();
+        let llm = CountingReplyLlm { reply: "CONFLICT".to_string(), calls: std::cell::Cell::new(0) };
+        let new_ids: HashSet<i64> = [user, idx].into_iter().collect();
+        let (resolved, _) = run_contradiction_pass(&conn, &llm, &new_ids, &store::now_rfc3339()).unwrap();
+        assert_eq!(resolved, 0);
+        assert_eq!(llm.calls.get(), 0, "index-owned rows are excluded from the contradiction pool");
+        assert!(!store::get(&conn, user).unwrap().unwrap().is_superseded());
+    }
+
+    #[test]
+    fn apply_contradiction_verdict_blocks_an_index_owned_winner_even_if_it_reached_the_judge() {
+        // Belt and braces below the pool filter: the guard itself refuses.
+        let conn = mem_conn();
+        let user = store::insert(&conn, "src/ handles picking", None, None, true, None, 5).unwrap();
+        let user_date = store::get(&conn, user).unwrap().unwrap().created_at;
+        let idx =
+            store::upsert_index_memory(&conn, "helios", "code-index:helios:src/", "src/ handles picking and rendering", None, "2099-01-01T00:00:00Z")
+                .unwrap();
+        let now = store::now_rfc3339();
+        let applied = apply_contradiction_verdict(
+            &conn,
+            reflect::ContradictionVerdict::Conflict,
+            user,
+            &user_date,
+            idx,
+            "2099-01-01T00:00:00Z",
+            &now,
+        )
+        .unwrap();
+        assert!(!applied);
+        assert!(!store::get(&conn, user).unwrap().unwrap().is_superseded());
     }
 
     #[test]
@@ -8069,6 +8925,83 @@ mod tests {
             [(lo, hi)].into_iter().collect(),
             "the pair must be recorded as judged so it isn't re-asked every run"
         );
+    }
+
+    #[test]
+    fn contradiction_pass_never_tombstones_an_index_owned_loser() {
+        // Fix-list item 6: same shape as the pinned-row and date-guard
+        // tests above, but the would-be loser is an index-owned code-index
+        // summary mirror -- `store::supersession_guard`'s "index-owned"
+        // block must stop a CONFLICT verdict from superseding it.
+        let conn = mem_conn();
+        let a = store::upsert_index_memory(
+            &conn,
+            "proj",
+            "code-index:proj:src/",
+            "TESTBOSS: src/ handles the user's boss module",
+            Some(&[1.0f32, 0.0]),
+            &store::now_rfc3339(),
+        )
+        .unwrap(); // index-owned, would-be loser (older -> newer_wins picks b)
+        let b = store::insert(
+            &conn,
+            "TESTBOSS: the user's boss module was rewritten entirely",
+            None,
+            None,
+            true,
+            Some(&[1.0f32, 1.0]),
+            5,
+        )
+        .unwrap();
+        let now = store::now_rfc3339();
+
+        let llm = FixedReflectLlm { reply: Ok("CONFLICT") };
+        let new_ids: HashSet<i64> = [b].into_iter().collect();
+        let (resolved, failed) = run_contradiction_pass(&conn, &llm, &new_ids, &now).unwrap();
+        assert_eq!(resolved, 0, "an index-owned loser must never be superseded on CONFLICT alone");
+        assert!(!failed);
+
+        assert!(!store::get(&conn, a).unwrap().unwrap().is_superseded(), "index-owned loser stays active");
+        // Final-review item 1: index-owned rows are now excluded from the
+        // candidate pool, so the pair never reaches the judge (nothing to
+        // record as seen); the guard itself is covered separately.
+        assert!(store::contradiction_seen_pairs(&conn).unwrap().is_empty(), "an index-owned row never forms a candidate pair");
+    }
+
+    #[test]
+    fn contradiction_pass_never_tombstones_a_code_history_owned_loser() {
+        // Task-3 extension: `code-history:` rows must be excluded from the
+        // contradiction candidate pool exactly like `code-index:` ones.
+        let conn = mem_conn();
+        let a = store::upsert_index_memory(
+            &conn,
+            "proj",
+            "code-history:proj:2026-08",
+            "TESTBOSS: proj 2026-08 touched the user's boss module",
+            Some(&[1.0f32, 0.0]),
+            &store::now_rfc3339(),
+        )
+        .unwrap();
+        let b = store::insert(
+            &conn,
+            "TESTBOSS: the user's boss module was rewritten entirely",
+            None,
+            None,
+            true,
+            Some(&[1.0f32, 1.0]),
+            5,
+        )
+        .unwrap();
+        let now = store::now_rfc3339();
+
+        let llm = FixedReflectLlm { reply: Ok("CONFLICT") };
+        let new_ids: HashSet<i64> = [b].into_iter().collect();
+        let (resolved, failed) = run_contradiction_pass(&conn, &llm, &new_ids, &now).unwrap();
+        assert_eq!(resolved, 0, "a history-owned loser must never be superseded on CONFLICT alone");
+        assert!(!failed);
+
+        assert!(!store::get(&conn, a).unwrap().unwrap().is_superseded(), "history-owned loser stays active");
+        assert!(store::contradiction_seen_pairs(&conn).unwrap().is_empty(), "a history-owned row never forms a candidate pair");
     }
 
     #[test]
@@ -9803,6 +10736,49 @@ mod tests {
     }
 
     #[test]
+    fn reflect_working_set_excludes_index_owned_memories_even_if_unreflected() {
+        let conn = mem_conn();
+        let ids = insert_n(&conn, 5, "ordinary");
+        // `upsert_index_memory` always sets `reflected_at` at insert time,
+        // so this row wouldn't reach `unreflected_active_newest`/`_oldest`
+        // in the first place -- clearing it back to NULL here simulates the
+        // edge case the source-prefix filter guards against (a pre-phase-2
+        // row, a bug, a manual edit) rather than relying solely on
+        // `reflected_at` staying set forever.
+        let index_id =
+            store::upsert_index_memory(&conn, "helios", "code-index:helios:src/", "src/ handles picking", None, &store::now_rfc3339())
+                .unwrap();
+        conn.execute("UPDATE memories SET reflected_at = NULL WHERE id = ?1", rusqlite::params![index_id]).unwrap();
+
+        let working = reflect_working_set(&conn, REFLECT_WORKING_SET_CAP, REFLECT_NEWEST_SLICE).unwrap();
+        let got: Vec<i64> = working.iter().map(|m| m.id).collect();
+        assert!(!got.contains(&index_id), "an index-owned memory must never enter the insight-stage working set");
+        assert_eq!(got.len(), ids.len(), "the ordinary rows must still all be present");
+    }
+
+    #[test]
+    fn reflect_working_set_excludes_code_history_owned_memories_too() {
+        // Task-3 extension of the test above.
+        let conn = mem_conn();
+        let ids = insert_n(&conn, 5, "ordinary");
+        let history_id = store::upsert_index_memory(
+            &conn,
+            "helios",
+            "code-history:helios:2026-08",
+            "helios 2026-08: aug work",
+            None,
+            &store::now_rfc3339(),
+        )
+        .unwrap();
+        conn.execute("UPDATE memories SET reflected_at = NULL WHERE id = ?1", rusqlite::params![history_id]).unwrap();
+
+        let working = reflect_working_set(&conn, REFLECT_WORKING_SET_CAP, REFLECT_NEWEST_SLICE).unwrap();
+        let got: Vec<i64> = working.iter().map(|m| m.id).collect();
+        assert!(!got.contains(&history_id), "a history-owned memory must never enter the insight-stage working set");
+        assert_eq!(got.len(), ids.len(), "the ordinary rows must still all be present");
+    }
+
+    #[test]
     fn reflect_working_set_moves_forward_after_marking_the_previous_run_reflected() {
         let conn = mem_conn();
         let ids = insert_n(&conn, 100, "moving backlog");
@@ -10649,6 +11625,17 @@ mod tests {
     }
 
     #[test]
+    fn why_report_renders_an_index_owned_derived_memory_correctly() {
+        let conn = mem_conn();
+        let now = store::now_rfc3339();
+        let id = store::upsert_index_memory(&conn, "helios", "code-index:helios:src/", "helios src/: handles picking", None, &now).unwrap();
+
+        let r = why_report(&conn, WhyTarget::Memory(id), None, None).unwrap();
+        assert!(r.contains("derived by the code index"), "{}", r);
+        assert!(r.contains("basis: derived"), "{}", r);
+    }
+
+    #[test]
     fn why_report_shows_pin_state_only_when_pinned() {
         let conn = mem_conn();
         let now = store::now_rfc3339();
@@ -10686,6 +11673,11 @@ mod tests {
         assert_eq!(provenance_phrase(None, Some("inferred")), "I inferred this from context");
         assert_eq!(provenance_phrase(Some("session-digest"), Some("experience")), "I did this in a session");
         assert_eq!(provenance_phrase(None, None), "you told me");
+        assert_eq!(
+            provenance_phrase(Some("code-index:helios:src/"), Some("derived")),
+            "derived by the code index",
+            "an index-owned module/repo summary is never \"you told me\""
+        );
     }
 
     #[test]

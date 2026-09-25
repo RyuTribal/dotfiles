@@ -872,6 +872,21 @@ impl ImproveLlm for ProcessImproveLlm {
             .arg("none")
             .arg("--allowedTools")
             .args(targets.allowed_tools())
+            // Same reasoning as `classify::run_claude` and note.rs's vision
+            // call, and it matters more here: this session's Edit/Write
+            // calls write directly into CLAUDE.md, skills and settings.json
+            // themselves, so a user hook that reshapes the model's own
+            // writing style (this user's "caveman" terse-speech hook) would
+            // corrupt the very files this pass is trusted to edit -- not
+            // just a transient reply. Unlike the tool allowlist (left
+            // alone, per instructions), this call has no functional
+            // dependency on the loaded settings: permissions come entirely
+            // from `--permission-prompts none` + `--allowedTools` above,
+            // the model is passed in explicitly, no MCP tool is in the
+            // allowlist so MCP server config is moot either way, and
+            // `MACH_KB_DIGEST=1` below already guards this repo's own
+            // hooks. OAuth login still works with no settings loaded.
+            .arg("--setting-sources=")
             .env("MACH_KB_DIGEST", "1")
             .current_dir(&self.cwd);
         run_with_stdin(cmd, timeout, prompt)

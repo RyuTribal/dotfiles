@@ -103,6 +103,41 @@ install_reflect_timer() {
 }
 install_reflect_timer
 
+# mach kb index (code index) runs on its own nightly systemd user timer,
+# separate from mach-reflect.timer — the two write to the same kb.db, so both
+# take ~/.local/share/mach/kb-job.lock (mach-reflect via flock(1) in its
+# unit, `mach kb index` in-process) to never overlap.
+# The timer is installed but deliberately NOT enabled: the first fill of a
+# large project set is many nights of budgeted runs, so do one manual run
+# first (`mach kb index --dry-run`, then `mach kb index`), check
+# `mach kb index status`, and only then enable the timer by hand. Same soft
+# treatment as the other timers: a non-systemd environment must not fail
+# the whole install.
+install_index_timer() {
+  local unit_dir="$HOME/.config/systemd/user"
+  install -Dm644 "$HERE/systemd/mach-index.service" "$unit_dir/mach-index.service"
+  install -Dm644 "$HERE/systemd/mach-index.timer"   "$unit_dir/mach-index.timer"
+  echo "installed: $unit_dir/mach-index.{service,timer}"
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "NOTE: systemctl not found — units installed but not enabled. Run 'mach kb index' via cron or by hand instead."
+    return
+  fi
+  if ! systemctl --user list-units >/dev/null 2>&1; then
+    echo "NOTE: no systemd --user session available here — units installed but not enabled."
+    return
+  fi
+  systemctl --user daemon-reload
+  if systemctl --user is-enabled --quiet mach-index.timer 2>/dev/null; then
+    echo "mach-index.timer: already enabled (left as is; unit files refreshed)"
+  else
+    echo "NOTE: mach-index.timer installed but NOT enabled. After a manual first run"
+    echo "      ('mach kb index --dry-run', then 'mach kb index', then 'mach kb index status'),"
+    echo "      enable it with: systemctl --user enable --now mach-index.timer"
+  fi
+}
+install_index_timer
+
 # mach kb export (phase 4 backup) — same soft-install treatment as the
 # reflect timer: a non-systemd environment must not fail the whole install,
 # `mach-kb-backup` still works run by hand or from cron in that case.

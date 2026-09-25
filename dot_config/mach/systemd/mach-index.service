@@ -1,0 +1,20 @@
+[Unit]
+Description=mach kb index — nightly incremental code index for registered projects
+# Best-effort like mach-reflect.service: a missing claude/ollama binary, no
+# git-backed projects registered, or an offline network must degrade to a
+# quiet no-op inside `mach kb index` itself (each project's scope/header
+# calls fail closed per-file, leaving it `dirty` for the next run — see
+# code_index/job.rs), never a failed unit — this is intentionally not wired
+# to any other target's dependency chain.
+
+[Service]
+Type=oneshot
+# Mutual exclusion with mach-reflect.service: both write to the same kb.db
+# and each can run for up to ~1h. mach-reflect wraps its commands in
+# flock(1) on ~/.local/share/mach/kb-job.lock; `mach kb index` takes that
+# same lock itself (so manual runs are covered too) and blocks with no
+# timeout until the other side releases it. Not wrapped in flock(1) here:
+# a second lock on the same file from the child would deadlock against
+# the wrapper. Type=oneshot has no start timeout by default, so waiting
+# for the lock never fails the unit. The lock file holds no data.
+ExecStart=%h/.local/bin/mach kb index

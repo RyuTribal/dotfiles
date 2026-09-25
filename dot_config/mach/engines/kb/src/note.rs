@@ -543,6 +543,45 @@ const VISION_TIMEOUT: Duration = Duration::from_secs(75);
 /// new desk setup" should yield facts about the setup; a latency graph
 /// captioned "zenith latency after the fix" should yield the finding it
 /// shows), not just get appended alongside an unrelated scene description.
+/// The vision call's `claude -p` invocation (no stdio wiring). The image
+/// is handed over as a path the model must open with the Read tool, so
+/// this is the one mach chore call that keeps a built-in tool -- and only
+/// that one: `--tools Read` (no Grep/Glob/Bash/...). Read is scoped as
+/// tightly as the CLI allows: with permission prompts off, Read is granted
+/// only inside the working directories, so the working directory is
+/// pinned to the image's own directory (never inherited from whatever
+/// cwd the daemon/shell had -- e.g. `$HOME`) and `--add-dir` names that
+/// same directory. No MCP servers either (`--strict-mcp-config` with an
+/// empty config), same as `classify::run_claude`.
+fn vision_command(claude_bin: &str, path: &Path) -> Command {
+    let mut cmd = Command::new(claude_bin);
+    cmd.arg("-p")
+        .arg("--model")
+        .arg("sonnet")
+        .arg("--permission-prompts")
+        .arg("none")
+        .arg("--tools")
+        .arg("Read")
+        .arg("--disallowedTools")
+        .arg("Bash Edit Write NotebookEdit WebFetch WebSearch Agent")
+        .arg("--strict-mcp-config")
+        .arg("--mcp-config")
+        .arg("{\"mcpServers\":{}}")
+        // Same reasoning as `classify::run_claude`: load no user/project/
+        // local settings.json, so the user's own hooks (a terse-speech
+        // style hook, in this user's case) cannot reshape the transcription
+        // this function returns before it gets stored as note content.
+        // `MACH_KB_DIGEST=1` below still guards this repo's own hooks
+        // specifically; this covers every other hook the user has
+        // configured. OAuth login still works with no settings loaded.
+        .arg("--setting-sources=");
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        cmd.arg("--add-dir").arg(dir).current_dir(dir);
+    }
+    cmd.env("MACH_KB_DIGEST", "1");
+    cmd
+}
+
 fn describe_image(claude_bin: &str, path: &Path, caption: &str) -> Option<String> {
     let caption_context = if caption.trim().is_empty() {
         String::new()
@@ -571,18 +610,8 @@ fn describe_image(claude_bin: &str, path: &Path, caption: &str) -> Option<String
     // correctly. A note capture happens rarely enough per image that the
     // extra latency/cost here is worth transcription actually being
     // trustworthy instead of quietly wrong.
-    let mut cmd = Command::new(claude_bin);
-    cmd.arg("-p")
-        .arg("--model")
-        .arg("sonnet")
-        .arg("--permission-prompts")
-        .arg("none")
-        .arg("--disallowedTools")
-        .arg("Bash Edit Write NotebookEdit WebFetch WebSearch Agent");
-    if let Some(dir) = path.parent() {
-        cmd.arg("--add-dir").arg(dir);
-    }
-    cmd.env("MACH_KB_DIGEST", "1").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut cmd = vision_command(claude_bin, path);
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
 
     let mut child = cmd.spawn().ok()?;
     if let Some(mut stdin) = child.stdin.take() {
@@ -989,6 +1018,30 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Security (final-review item 6): the vision call needs Read (the
+    /// image is passed as a path the model reads), so it gets exactly
+    /// `--tools Read` -- no Grep/Glob/Bash/etc. -- runs with its working
+    /// directory set to the image's own directory (Read is only granted
+    /// inside the working dirs when prompts are off), and no MCP servers.
+    #[test]
+    fn describe_image_command_only_has_read_scoped_to_the_image_dir() {
+        let img = Path::new("/var/tmp/kb-img-test/abc.jpg");
+        let cmd = vision_command("claude", img);
+        let argv: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let i = argv.iter().position(|a| a == "--tools").expect("--tools flag present");
+        assert_eq!(argv[i + 1], "Read");
+        let j = argv.iter().position(|a| a == "--add-dir").expect("--add-dir present");
+        assert_eq!(argv[j + 1], "/var/tmp/kb-img-test");
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/var/tmp/kb-img-test")), "cwd pinned to the image dir, never inherited");
+        assert!(argv.iter().any(|a| a == "--strict-mcp-config"), "no MCP servers for a vision chore call");
+        assert!(argv.iter().any(|a| a == "--disallowedTools"));
+        assert!(
+            argv.iter().any(|a| a == "--setting-sources="),
+            "must load no user/project/local settings -- otherwise the user's own hooks (e.g. a \
+             terse-speech style hook) reshape the stored transcription"
+        );
+    }
 
     struct FakeNoteLlm {
         reply: String,

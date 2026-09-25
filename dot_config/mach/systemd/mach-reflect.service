@@ -7,6 +7,16 @@ Description=mach kb reflect — periodic knowledge-bank reflection pass
 
 [Service]
 Type=oneshot
+# Mutual exclusion with mach-index.service (see its unit): every command
+# below that writes kb.db -- all the ExecStartPre steps as well as reflect
+# and improve -- runs under flock(1) on the shared kb-job.lock, with its
+# original command, flags and `-` prefix unchanged (flock passes the
+# command's exit status through, so `-` still means "never fail the unit").
+# Each step takes the lock for its own duration only: if mach kb index is
+# already running, the first step simply waits for it; if the index timer
+# fires mid-reflect, it can at most slot in *between* two steps, never
+# overlap one. Order of the steps is unchanged (ingest-sessions still runs
+# before reflect so reflect sees its facts).
 # Crash-safety net for engagement-gated reinforcement: `mach kb
 # ingest-sessions` normally runs instantly per-session via kb-capture.sh's
 # SessionEnd `--session-id` fast trigger, but a crash or unclean exit means
@@ -21,7 +31,7 @@ Type=oneshot
 # or blocks
 # the reflect pass that follows -- see ingest.rs's own offline discipline
 # for why a degraded run there is always safe to retry later.
-ExecStartPre=-%h/.local/bin/mach kb ingest-sessions
+ExecStartPre=-/usr/bin/flock %h/.local/share/mach/kb-job.lock %h/.local/bin/mach kb ingest-sessions
 # Refresh the raw-transcript index (`mach kb ask`'s TRANSCRIPT: step) on the
 # same wakeup. It is incremental by mtime and size, so an unchanged corpus
 # costs a few seconds of stat calls and only new or grown transcripts are
@@ -29,12 +39,12 @@ ExecStartPre=-%h/.local/bin/mach kb ingest-sessions
 # command by hand, and a stale index makes `ask` quietly answer from an
 # older conversation history than the one on disk. `-` for the same reason
 # as above: never fail or block the reflect pass.
-ExecStartPre=-%h/.local/bin/mach kb index-transcripts
+ExecStartPre=-/usr/bin/flock %h/.local/share/mach/kb-job.lock %h/.local/bin/mach kb index-transcripts
 # Project registry: rename and case detection, card rebuilds, drift
 # recomputation. No LLM call, so it is safe on every wakeup, and it is what
 # keeps a renamed project's index from being orphaned until someone
 # notices. `-` for the same reason as the steps above: never block reflect.
-ExecStartPre=-%h/.local/bin/mach kb projects refresh
+ExecStartPre=-/usr/bin/flock %h/.local/share/mach/kb-job.lock %h/.local/bin/mach kb projects refresh
 # Catch-up path for `mach meet process`: normally it runs as a detached
 # background spawn from `mach meet stop` (see cli.rs's spawn_detached_process),
 # but a meeting recorded (and stopped) while offline can leave its
@@ -47,12 +57,12 @@ ExecStartPre=-%h/.local/bin/mach kb projects refresh
 # to do) never fails this unit or blocks the reflect pass that follows;
 # transcription (local, offline-safe) always proceeds regardless of
 # connectivity, only the summarize step defers -- see markers.rs.
-ExecStartPre=-%h/.local/bin/mach meet process
-ExecStart=%h/.local/bin/mach kb reflect
+ExecStartPre=-/usr/bin/flock %h/.local/share/mach/kb-job.lock %h/.local/bin/mach meet process
+ExecStart=/usr/bin/flock %h/.local/share/mach/kb-job.lock %h/.local/bin/mach kb reflect
 # Self-improvement pass, after reflect so any insight or affective edge the
 # reflect run just derived is in this run's evidence. Same best-effort
 # posture: below its signal threshold, offline, or with `claude` missing it
 # exits 0 without doing anything. It edits ~/.claude/skills, CLAUDE.md,
 # settings.json and ~/.config/claude-hooks only through a verified,
 # snapshot-guarded chezmoi commit -- see engines/kb/src/improve.rs.
-ExecStart=-%h/.local/bin/mach kb improve
+ExecStart=-/usr/bin/flock %h/.local/share/mach/kb-job.lock %h/.local/bin/mach kb improve

@@ -58,7 +58,7 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 use crate::code_index::git::{CommitInfo, Repo, StatLine};
-use crate::code_index::job::{Budget, TIMEOUT_INDEX_SONNET};
+use crate::code_index::job::{is_tool_transcript, Budget, TIMEOUT_INDEX_SONNET};
 use crate::code_index::secrets;
 use crate::code_index::summary::lead_across_paragraphs;
 use crate::embed::Embedder;
@@ -180,7 +180,7 @@ pub(crate) fn run_history_pass<L: ReflectLlm, E: Embedder>(
         // What is stored is the model's SUMMARY (belt-and-braces redacted:
         // its input was already redacted, so this is normally a no-op).
         let summary_text = redact_secrets(reply.trim());
-        if summary_text.trim().is_empty() {
+        if summary_text.trim().is_empty() || is_tool_transcript(&summary_text) {
             continue;
         }
 

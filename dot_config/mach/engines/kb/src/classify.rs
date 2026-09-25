@@ -242,9 +242,12 @@ pub fn run_with_stdin(mut cmd: Command, timeout: Duration, prompt: &str) -> Resu
                     // failure without saying anything about it, and that is
                     // exactly what an unattended timer run leaves behind to
                     // debug from.
+                    // The claude CLI prints API errors (rate limits, auth)
+                    // to stdout, so fall back to it when stderr is empty.
                     let tail = last_lines(&err, 3);
+                    let tail = if tail.is_empty() { last_lines(&out, 3) } else { tail };
                     if tail.is_empty() {
-                        Err(format!("'{}' exited with {:?} (no stderr)", program, status.code()))
+                        Err(format!("'{}' exited with {:?} (no output)", program, status.code()))
                     } else {
                         Err(format!("'{}' exited with {:?}: {}", program, status.code(), tail))
                     }

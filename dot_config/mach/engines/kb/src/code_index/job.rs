@@ -187,6 +187,18 @@ impl Budget {
     }
 }
 
+/// True when a free-text reply is the model narrating tool calls it cannot
+/// make (every index call runs with no tools) instead of answering, e.g.
+/// `**Tool: bash**` followed by a JSON parameter block. Such a reply is
+/// never stored: it would become a module summary or history entry, and
+/// from there a mirrored memory.
+pub(crate) fn is_tool_transcript(reply: &str) -> bool {
+    reply.lines().any(|l| {
+        let l = l.trim_start();
+        l.starts_with("**Tool:") || l.starts_with("<function_calls>") || l.starts_with("<invoke ")
+    })
+}
+
 /// Failed calls in a row after which a run stops. Low on purpose: failures
 /// in a row mean the LLM side is down or throttled, not that one file is
 /// bad, and every further call would just burn budget for nothing.
@@ -2406,6 +2418,13 @@ mod tests {
         assert_eq!(report.projects[0].headers_failed, MAX_CONSECUTIVE_FAILURES);
         assert_eq!(report.projects[0].months_summarized, 0, "later stages stop too");
         assert_eq!(store::code_files_with_status(&conn, project.id, "dirty").unwrap().len(), names.len());
+    }
+
+    #[test]
+    fn tool_call_narration_is_recognised_but_prose_is_not() {
+        assert!(is_tool_transcript("Let me check.\n\n**Tool: glob**\n\nParameters:\n```json\n{}\n```"));
+        assert!(is_tool_transcript("<function_calls>\n<invoke name=\"Bash\">"));
+        assert!(!is_tool_transcript("**Purpose:** helios-unlit is a reference plugin.\nIt uses a tool: glslc."));
     }
 
     #[test]

@@ -70,7 +70,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 
-use crate::code_index::job::{Budget, SUMMARY_GIVE_UP_ATTEMPTS, TIMEOUT_INDEX_SONNET};
+use crate::code_index::job::{is_tool_transcript, Budget, SUMMARY_GIVE_UP_ATTEMPTS, TIMEOUT_INDEX_SONNET};
 use crate::embed::Embedder;
 use crate::reflect::{LoggedLlm, ReflectLlm};
 use crate::store::{self, CodeSummaryRow, KbError, INDEX_OWNED_SOURCE_PREFIX};
@@ -429,6 +429,9 @@ fn build_module_prompt(project: &str, dir: &str, is_repo: bool, children: &[Chil
         s.push_str(block);
         s.push('\n');
     }
+    // Spelled out because the model otherwise tries to "verify" a short
+    // child summary by narrating file-reading tool calls it doesn't have.
+    s.push_str("You have no tools and cannot read files. Answer only from the summaries above.\n");
     if is_repo {
         s.push_str("Reply with at most 350 words: an architecture overview of the whole project.\n");
     } else {
@@ -529,7 +532,7 @@ fn try_regenerate_one<L: ReflectLlm, E: Embedder>(
         return Ok(true);
     };
     let text = reply.trim();
-    if text.is_empty() {
+    if text.is_empty() || is_tool_transcript(text) {
         return Ok(true);
     }
 

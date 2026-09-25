@@ -579,6 +579,7 @@ fn vision_command(claude_bin: &str, path: &Path) -> Command {
         cmd.arg("--add-dir").arg(dir).current_dir(dir);
     }
     cmd.env("MACH_KB_DIGEST", "1");
+    crate::classify::detach_from_session_proxy(&mut cmd);
     cmd
 }
 

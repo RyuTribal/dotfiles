@@ -124,8 +124,7 @@ summary or its memory); an unknown
 (say, a repo with no commits) is printed on its line and the run carries
 on with the next project. After 5 failed LLM calls in a row a run stops
 early and reports it ("stopped after 5 failed calls in a row"; per-project
-`headers-failed=`/`months-failed=` counts show what wrote nothing) — `claude
--p` has been seen to stall for an hour or more after heavy use, so wait
+`headers-failed=`/`months-failed=` counts show what wrote nothing) — wait
 before re-running rather than looping. If the embedder is down, the run makes no
 header calls (so none are wasted) and later runs backfill missing
 embeddings for free.

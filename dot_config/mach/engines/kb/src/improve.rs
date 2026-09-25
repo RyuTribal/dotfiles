@@ -889,6 +889,7 @@ impl ImproveLlm for ProcessImproveLlm {
             .arg("--setting-sources=")
             .env("MACH_KB_DIGEST", "1")
             .current_dir(&self.cwd);
+        crate::classify::detach_from_session_proxy(&mut cmd);
         run_with_stdin(cmd, timeout, prompt)
     }
 }

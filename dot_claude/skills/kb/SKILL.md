@@ -785,11 +785,15 @@ run is about an hour. Every call's outcome is recorded: after 5 failed
 calls in a row (timeout, spawn error, non-zero exit) the run stops early
 ("stopped after 5 failed calls in a row") instead of spending the rest of
 the budget on an outage — failed files stay `dirty`, nothing is written.
-Index calls time out at 120s (haiku) / 180s (sonnet). Observed 2026-09-25:
-after roughly an hour of steady calls, `claude -p` index calls can stall
-for 1–1.5h (timeouts, or exit 1 with the CLI's error on stdout, which the
-error message now includes) while reflect calls keep working — cause
-unconfirmed; retry later rather than re-running immediately. Free-text
+Index calls time out at 120s (haiku) / 180s (sonnet). Every spawned
+`claude` has `ANTHROPIC_BASE_URL` removed from its environment
+(`classify::detach_from_session_proxy`): inside an interactive session it
+points at caveman-proxy (127.0.0.1:8787), which exits after 30 minutes
+without interactive activity — chore traffic doesn't keep it alive — and
+every call made while it was down failed with "Connection error" until
+the CLI's 11 retries ran out. That was the 2026-09-25 "stall window"
+(manual runs from a session stalled ~30 min after the session went quiet;
+systemd runs, which never had the variable, were unaffected). Free-text
 module/history replies that narrate tool calls (`**Tool: bash**` + JSON;
 index calls have no tools) are discarded and retried, never stored.
 `mach kb index` takes `~/.local/share/mach/kb-job.lock` itself (printing a

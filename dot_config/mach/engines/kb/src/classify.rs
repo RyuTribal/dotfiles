@@ -186,7 +186,21 @@ pub fn run_claude(claude_bin: &str, model: &str, timeout: Duration, prompt: &str
         // early on it: a chore subprocess must not be handed recalled
         // memories, and must not be ingested as if it were a user session.
         .env("MACH_KB_DIGEST", "1");
+    detach_from_session_proxy(&mut cmd);
     run_with_stdin(cmd, timeout, prompt)
+}
+
+/// Drops `ANTHROPIC_BASE_URL` from a spawned `claude`'s environment so it
+/// talks to the API directly, the same way the systemd-run jobs do.
+/// Inside an interactive Claude Code session that variable points at a
+/// session-local proxy (caveman-proxy on 127.0.0.1:8787) which exits after
+/// 30 minutes without interactive activity -- traffic from these chore
+/// calls does not keep it alive -- and every call made while it is down
+/// fails with "Connection error" until the CLI's retries run out. A manual
+/// `mach kb index` started from a session then stalls for as long as the
+/// session is idle.
+pub fn detach_from_session_proxy(cmd: &mut Command) {
+    cmd.env_remove("ANTHROPIC_BASE_URL");
 }
 
 /// Spawns `cmd` with `prompt` on stdin and polls it to completion (or up to
@@ -279,6 +293,15 @@ impl Classifier for ProcessClassifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawned_claude_never_inherits_the_session_proxy_url() {
+        let mut cmd = Command::new("claude");
+        cmd.env("ANTHROPIC_BASE_URL", "http://127.0.0.1:8787/w/claude");
+        detach_from_session_proxy(&mut cmd);
+        let base_url = cmd.get_envs().find(|(k, _)| *k == "ANTHROPIC_BASE_URL").map(|(_, v)| v);
+        assert_eq!(base_url, Some(None), "must be explicitly removed, not just left unset");
+    }
 
     /// Security (final-review item 6): every `run_claude` subcall must run
     /// with NO built-in tools (`--tools ""`) -- Read/Grep/Glob would

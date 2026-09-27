@@ -106,6 +106,20 @@ impl Targets {
         }
     }
 
+    /// The same four targets laid out under `root` with no dot-directory
+    /// in the path. Claude Code protects every `.claude` directory from
+    /// writes, and nothing (not `--allowedTools`, not a hook) lets a
+    /// headless `-p` run past that check, so the agentic call edits these
+    /// staged copies and Rust applies what changed (see [`stage`]).
+    pub fn staged(root: &Path) -> Self {
+        Targets {
+            skills_dir: root.join("skills"),
+            claude_md: root.join("CLAUDE.md"),
+            settings_json: root.join("settings.json"),
+            hooks_dir: root.join("claude-hooks"),
+        }
+    }
+
     pub fn roots(&self) -> [&Path; 4] {
         [&self.skills_dir, &self.claude_md, &self.settings_json, &self.hooks_dir]
     }
@@ -542,6 +556,69 @@ pub fn snapshot(targets: &Targets, dest: &Path) -> io::Result<Snapshot> {
         roots.push((root.to_path_buf(), copy));
     }
     Ok(Snapshot { dir: dest.to_path_buf(), roots })
+}
+
+/// Copies the real targets into `root/live` for the agentic call to edit,
+/// plus a snapshot of that starting copy (`root/base`) to diff against
+/// afterwards. Returns the staged targets and the base snapshot.
+pub fn stage(real: &Targets, root: &Path) -> io::Result<(Targets, Snapshot)> {
+    if root.exists() {
+        fs::remove_dir_all(root)?;
+    }
+    let staged = Targets::staged(&root.join("live"));
+    for (from, to) in real.roots().iter().zip(staged.roots()) {
+        if from.exists() {
+            copy_tree(from, to)?;
+        }
+    }
+    let base = snapshot(&staged, &root.join("base"))?;
+    Ok((staged, base))
+}
+
+/// Applies to the real targets exactly what the call changed in the stage
+/// (stage vs its own starting copy, never stage vs real, so an untouched
+/// stage writes nothing). Returns how many files were written or removed.
+pub fn apply_staged(base: &Snapshot, staged: &Targets, real: &Targets) -> io::Result<usize> {
+    let pairs: Vec<(&Path, &Path)> = staged.roots().into_iter().zip(real.roots()).collect();
+    let to_real = |p: &Path| -> Option<PathBuf> {
+        pairs.iter().find_map(|(s, r)| {
+            let rel = p.strip_prefix(s).ok()?;
+            Some(if rel.as_os_str().is_empty() { r.to_path_buf() } else { r.join(rel) })
+        })
+    };
+    let mut applied = 0usize;
+    for change in changed_files(base)? {
+        let Some(dest) = to_real(change.path()) else { continue };
+        match change {
+            Change::Added(src) | Change::Modified(src) => {
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::copy(&src, &dest)?;
+            }
+            Change::Deleted(_) => {
+                if dest.exists() {
+                    fs::remove_file(&dest)?;
+                }
+            }
+        }
+        applied += 1;
+    }
+    Ok(applied)
+}
+
+/// Prepended to the prompt of a staged run: the paths it edits are copies.
+pub fn staging_note(staged: &Targets, real: &Targets) -> String {
+    let mut s = String::from(
+        "## Staging\n\nYou edit staged copies of the real configuration; after your run they are verified and \
+         copied into place. Inside file contents (settings.json hook commands, paths mentioned in skills or \
+         CLAUDE.md) always refer to the REAL locations, never the staged ones:\n",
+    );
+    for (st, re) in staged.roots().iter().zip(real.roots()) {
+        s.push_str(&format!("- {} is {}\n", st.display(), re.display()));
+    }
+    s.push('\n');
+    s
 }
 
 /// Puts every target back exactly as snapshotted: files the run created
@@ -1521,6 +1598,33 @@ mod tests {
         assert_eq!(ps[0].need, "the same five commands are run by hand after every deploy");
         assert!(ps[0].memory_text("2026-09-27").starts_with("Tool proposal from mach kb improve (2026-09-27): deploy check CLI."));
         assert!(parse_proposals("IMPROVE-RESULT\naction: none\n").is_empty());
+    }
+
+    #[test]
+    fn staged_changes_apply_to_the_real_targets_and_an_untouched_stage_writes_nothing() {
+        let (s, real) = home_with_targets("stage");
+        write(&real.claude_md, "rule one\n");
+        write(&real.skills_dir.join("kb/SKILL.md"), "---\nname: kb\ndescription: d\n---\n");
+        write(&real.skills_dir.join("old/SKILL.md"), "---\nname: old\ndescription: d\n---\n");
+        let root = s.0.join("stage-root");
+        let (staged, base) = stage(&real, &root).unwrap();
+        assert!(!staged.claude_md.to_string_lossy().contains(".claude"), "no protected directory in the stage");
+        assert_eq!(apply_staged(&base, &staged, &real).unwrap(), 0);
+
+        // an edit made directly to the real file (not via the stage) is left alone
+        write(&real.claude_md, "edited outside the stage\n");
+        assert_eq!(apply_staged(&base, &staged, &real).unwrap(), 0);
+        assert_eq!(fs::read_to_string(&real.claude_md).unwrap(), "edited outside the stage\n");
+
+        write(&staged.claude_md, "rule one\nrule two\n");
+        write(&staged.skills_dir.join("new/SKILL.md"), "---\nname: new\ndescription: d\n---\n");
+        fs::remove_file(staged.skills_dir.join("old/SKILL.md")).unwrap();
+        assert_eq!(apply_staged(&base, &staged, &real).unwrap(), 3);
+        assert_eq!(fs::read_to_string(&real.claude_md).unwrap(), "rule one\nrule two\n");
+        assert!(real.skills_dir.join("new/SKILL.md").exists());
+        assert!(!real.skills_dir.join("old/SKILL.md").exists());
+        let note = staging_note(&staged, &real);
+        assert!(note.contains(&format!("{} is {}", staged.claude_md.display(), real.claude_md.display())));
     }
 
     #[test]

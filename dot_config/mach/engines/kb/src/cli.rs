@@ -8528,10 +8528,9 @@ fn run_improve<E: Embedder, L: ImproveLlm, V: Vcs>(
         return Ok(ImproveRun::BelowThreshold { signal, min_signal });
     }
 
-    let bundle = build_improve_bundle(conn, targets, new_memories, &relations, now_secs)?;
-    let prompt = improve::build_prompt(&bundle, targets);
     if dry_run {
-        return Ok(ImproveRun::DryRun { prompt });
+        let bundle = build_improve_bundle(conn, targets, new_memories, &relations, now_secs)?;
+        return Ok(ImproveRun::DryRun { prompt: improve::build_prompt(&bundle, targets) });
     }
 
     // A failure anywhere below is recorded as an outcome memory and never
@@ -8601,10 +8600,28 @@ fn run_improve<E: Embedder, L: ImproveLlm, V: Vcs>(
         }
     };
 
-    let output = match llm.run(&prompt, targets, model, timeout) {
-        Ok(o) => o,
-        Err(e) => return fail(rollback(format!("claude: {}", e))),
+    // The call edits staged copies (Claude Code protects ~/.claude from any
+    // headless write); what it changed there is applied to the real targets
+    // before verification, which then runs exactly as before.
+    let stage_root = snapshot_root.join(format!("{}-stage", now.replace(':', "-")));
+    let (staged, base) = match improve::stage(targets, &stage_root) {
+        Ok(s) => s,
+        Err(e) => return fail(rollback(format!("staging: {}", e))),
     };
+    let bundle = build_improve_bundle(conn, &staged, new_memories, &relations, now_secs)?;
+    let prompt = format!("{}{}", improve::staging_note(&staged, targets), improve::build_prompt(&bundle, &staged));
+    let output = match llm.run(&prompt, &staged, model, timeout) {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&stage_root);
+            return fail(rollback(format!("claude: {}", e)));
+        }
+    };
+    let applied = improve::apply_staged(&base, &staged, targets);
+    let _ = std::fs::remove_dir_all(&stage_root);
+    if let Err(e) = applied {
+        return fail(rollback(format!("applying staged edits: {}", e)));
+    }
     let Some(result) = improve::parse_result(&output) else {
         return fail(rollback("claude reply had no valid IMPROVE-RESULT block".to_string()));
     };
@@ -13571,9 +13588,21 @@ mod improve_run_tests {
     impl ImproveLlm for FakeLlm {
         fn run(&self, prompt: &str, targets: &improve::Targets, _m: &str, _t: Duration) -> Result<String, String> {
             assert!(prompt.contains("IMPROVE-RESULT"));
-            let home = targets.claude_md.parent().unwrap().parent().unwrap();
+            // Resolve home-relative paths onto whatever targets the run hands
+            // over (the staged copies, in a real run).
             for (rel, content) in &self.writes {
-                write(&home.join(rel), content);
+                let path = if let Some(r) = rel.strip_prefix(".claude/skills/") {
+                    targets.skills_dir.join(r)
+                } else if rel == ".claude/CLAUDE.md" {
+                    targets.claude_md.clone()
+                } else if rel == ".claude/settings.json" {
+                    targets.settings_json.clone()
+                } else if let Some(r) = rel.strip_prefix(".config/claude-hooks/") {
+                    targets.hooks_dir.join(r)
+                } else {
+                    panic!("FakeLlm write outside the targets: {}", rel)
+                };
+                write(&path, content);
             }
             Ok(self.reply.clone())
         }

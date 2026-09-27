@@ -2207,7 +2207,10 @@ fn run_self_stage<E: Embedder, L: ReflectLlm>(
     }
     let mut known: HashSet<i64> = working.iter().map(|m| m.id).collect();
     known.extend(open.iter().map(|(id, _, _)| *id));
-    match llm.call("haiku", &reflect::build_disagreement_prompt(&lines, &open), reflect::TIMEOUT_HAIKU_BATCH) {
+    // Sonnet, not haiku: replayed on 40 real episodes, haiku missed a
+    // disagreement Claude won and so reported only losses; the record is
+    // only worth keeping if it is balanced.
+    match llm.call("sonnet", &reflect::build_disagreement_prompt(&lines, &open), TIMEOUT_SONNET) {
         Ok(reply) => {
             for (id, outcome, topic) in reflect::parse_disagreements(&reply, &known) {
                 store::upsert_disagreement(conn, id, &topic, &outcome, now)?;
@@ -11619,7 +11622,10 @@ mod tests {
         let conn = mem_conn();
         let ids = insert_episodes(&conn, 3);
         let opinion = format!("I think rsync should ship code only, because config drifts. (because of: {}, {})", ids[0], ids[1]);
-        let record = format!("{}: mine_right | proxy root cause\n{}: winning | nonsense", ids[2], ids[1]);
+        let record = format!(
+            "{}: mine_right | proxy root cause | claude: an idle proxy / user: claude throttling\n{}: winning | nonsense | claude: a / user: b",
+            ids[2], ids[1]
+        );
         let llm = SeqLlm::new(vec![Ok("When X?".into()), Ok("NONE".into()), Ok(opinion), Ok(record)]);
         let now = store::now_rfc3339();
         let out = run_self_stage(&conn, &UnitEmbedder, &llm, Ok(Some(test_charter(1))), &now).unwrap();
@@ -11636,7 +11642,7 @@ mod tests {
         let now = store::now_rfc3339();
         store::upsert_disagreement(&conn, ids[0], "rsync scope", "unresolved", &now).unwrap();
         store::mark_memories_self_reflected(&conn, &[ids[0]], &now).unwrap();
-        let llm = RecordingLlm::new(vec![Ok("When X?".into()), Ok("NONE".into()), Ok("NONE".into()), Ok(format!("{}: theirs_right | rsync scope", ids[0]))]);
+        let llm = RecordingLlm::new(vec![Ok("When X?".into()), Ok("NONE".into()), Ok("NONE".into()), Ok(format!("{}: theirs_right | rsync scope | claude: ship config / user: code only", ids[0]))]);
         run_self_stage(&conn, &UnitEmbedder, &llm, Ok(Some(test_charter(1))), &now).unwrap();
         let prompts = llm.prompts.borrow();
         assert!(prompts[3].contains("later: episode 1"), "the open one is shown with its later episode");

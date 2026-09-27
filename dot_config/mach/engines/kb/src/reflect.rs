@@ -348,18 +348,25 @@ pub fn build_disagreement_prompt(episodes: &[(i64, String)], open: &[(i64, Strin
         }
     }
     s.push_str(
-        "\nFor every episode above that records a real disagreement between Claude and the user (not a \
-         plain correction of a mistake with no argument, not agreement), output one line \
-         `<id>: <outcome> | <topic>` where outcome is mine_right (Claude's position proved right), \
-         theirs_right (the user's did), mixed, or unresolved (not yet known), and topic is 2-5 words. \
-         For an earlier open one, judge from its later episodes whether it has resolved. Skip every \
-         other episode. Nothing else.\n",
+        "\nA disagreement means Claude and the user each held and argued a position on something. A \
+         correction is NOT a disagreement: Claude making a mistake (a wrong fact, a bug, an invented \
+         detail, an unverified claim) that the user points out has no Claude position to name. Neither \
+         is the user redirecting scope, or Claude simply accepting feedback. Disagreements are rare; \
+         most episodes have none. Claude can be the one proved right, e.g. Claude argued against an \
+         approach and the user accepted its reasoning.\n\n\
+         For every episode above that records a real disagreement, output one line \
+         `<id>: <outcome> | <topic> | claude: <Claude's position> / user: <the user's position>` where \
+         outcome is mine_right (Claude's position proved right or was accepted), theirs_right (the \
+         user's did), mixed, or unresolved (not yet known), and topic is 2-5 words. For an earlier open \
+         one, judge from its later episodes whether it has resolved. Skip every other episode. Nothing else.\n",
     );
     s
 }
 
-/// Parses `<id>: <outcome> | <topic>` lines, keeping known ids and valid
-/// outcomes; the first line for an id wins.
+/// Parses `<id>: <outcome> | <topic> | claude: <pos> / user: <pos>` lines,
+/// keeping known ids and valid outcomes; the first line for an id wins. A
+/// line that does not name both positions is dropped: a correction has no
+/// Claude position, so it cannot pose as a disagreement.
 pub fn parse_disagreements(output: &str, known: &std::collections::HashSet<i64>) -> Vec<(i64, String, String)> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -367,7 +374,20 @@ pub fn parse_disagreements(output: &str, known: &std::collections::HashSet<i64>)
         let line = strip_list_marker(line.trim());
         let Some((id, rest)) = line.split_once(':') else { continue };
         let Ok(id) = id.trim().trim_start_matches('#').parse::<i64>() else { continue };
-        let Some((outcome, topic)) = rest.split_once('|') else { continue };
+        let mut fields = rest.split('|');
+        let (Some(outcome), Some(topic), Some(positions)) = (fields.next(), fields.next(), fields.next()) else {
+            continue;
+        };
+        let positions = positions.to_lowercase();
+        let named = |side: &str| {
+            positions.split_once(side).is_some_and(|(_, after)| {
+                let pos = after.split(" / ").next().unwrap_or("").trim();
+                pos.chars().filter(|c| c.is_alphanumeric()).count() >= 3
+            })
+        };
+        if !named("claude:") || !named("user:") {
+            continue;
+        }
         let outcome = outcome.trim().to_lowercase();
         let topic = topic.trim();
         if known.contains(&id) && crate::store::OUTCOMES.contains(&outcome.as_str()) && !topic.is_empty() && seen.insert(id) {
@@ -2857,8 +2877,18 @@ mod tests {
     #[test]
     fn disagreement_parse_keeps_valid_outcomes_for_known_ids() {
         let known: std::collections::HashSet<i64> = [1, 2, 3].into_iter().collect();
-        let got = parse_disagreements("1: mine_right | proxy root cause\n2: winning | x\n3: Theirs_Right | rsync scope\n9: mixed | y\n1: mixed | dup", &known);
-        assert_eq!(got, vec![(1, "mine_right".into(), "proxy root cause".into()), (3, "theirs_right".into(), "rsync scope".into())]);
+        let got = parse_disagreements(
+            "1: mine_right | survival drives | claude: no self-preservation goals / user: add a drive\n\
+             2: winning | x | claude: a / user: b\n\
+             3: Theirs_Right | rsync scope | claude: ship config too / user: code only\n\
+             9: mixed | y | claude: p / user: q\n\
+             1: mixed | dup | claude: x / user: y",
+            &known,
+        );
+        assert_eq!(got, vec![(1, "mine_right".into(), "survival drives".into()), (3, "theirs_right".into(), "rsync scope".into())]);
+        // A correction dressed as a disagreement names no Claude position.
+        assert!(parse_disagreements("2: theirs_right | invented fields | claude: - / user: those fields do not exist", &known).is_empty());
+        assert!(parse_disagreements("2: theirs_right | invented fields", &known).is_empty());
     }
 
     #[test]

@@ -3159,6 +3159,12 @@ fn migrate_v34_to_v35(conn: &Connection) -> Result<(), KbError> {
 /// a later subject is an insert, not a table rebuild.
 pub const SUBJECT_USER: &str = "user";
 pub const SUBJECT_SELF: &str = "self";
+/// A stance Claude formed through its work with the user (phase 3): its
+/// own, distinct from beliefs about the user, and never an instruction.
+pub const SUBJECT_OPINION: &str = "opinion";
+
+/// Disagreement outcomes (phase 3 track record).
+pub const OUTCOMES: [&str; 4] = ["mine_right", "theirs_right", "mixed", "unresolved"];
 
 /// Schema v36 (self-model phase 1): `insights.subject` (existing rows are
 /// `user`) and `memories.self_reflected_at`, the self-reflection step's own
@@ -3178,6 +3184,99 @@ fn migrate_v35_to_v36(conn: &Connection) -> Result<(), KbError> {
 fn migrate_v36_to_v37(conn: &Connection) -> Result<(), KbError> {
     add_column_if_missing(conn, "memories", "goal_relevance", "REAL")?;
     conn.execute("PRAGMA user_version = 37", [])?;
+    Ok(())
+}
+
+/// Schema v38 (self-model phase 3): `self_disagreements`, one classified
+/// outcome per disagreement episode (the track record), and
+/// `self_narrative`, the single current first-person self-story.
+fn migrate_v37_to_v38(conn: &Connection) -> Result<(), KbError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS self_disagreements (
+            memory_id INTEGER PRIMARY KEY,
+            topic TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            classified_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS self_narrative (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            text TEXT NOT NULL,
+            digest TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );",
+    )?;
+    conn.execute("PRAGMA user_version = 38", [])?;
+    Ok(())
+}
+
+/// Inserts a level-1 opinion (`subject = opinion`); same citation rules as
+/// any insight, enforced by the caller.
+pub fn insert_opinion(
+    conn: &Connection,
+    text: &str,
+    confidence: f64,
+    source_ids: &[String],
+    embedding: Option<&[f32]>,
+) -> Result<i64, KbError> {
+    insert_insight_leveled(conn, text, confidence, source_ids, embedding, 1, SUBJECT_OPINION)
+}
+
+/// Records (or re-records) a disagreement episode's outcome. Unknown
+/// outcomes are rejected.
+pub fn upsert_disagreement(conn: &Connection, memory_id: i64, topic: &str, outcome: &str, now: &str) -> Result<(), KbError> {
+    if !OUTCOMES.contains(&outcome) {
+        return Err(KbError::Other(format!("unknown disagreement outcome {:?}", outcome)));
+    }
+    conn.execute(
+        "INSERT INTO self_disagreements (memory_id, topic, outcome, classified_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(memory_id) DO UPDATE SET topic = excluded.topic, outcome = excluded.outcome,
+             classified_at = excluded.classified_at",
+        params![memory_id, topic, outcome, now],
+    )?;
+    Ok(())
+}
+
+/// Unresolved disagreements whose episode is still active, oldest
+/// classification first: `(memory_id, topic)`.
+pub fn unresolved_disagreements(conn: &Connection, cap: usize) -> Result<Vec<(i64, String)>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT d.memory_id, d.topic FROM self_disagreements d JOIN memories m ON m.id = d.memory_id
+         WHERE d.outcome = 'unresolved' AND m.invalidated_at IS NULL
+         ORDER BY d.classified_at ASC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![cap as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// The track record: per outcome, the count and the topics, over
+/// disagreements whose episode is still active. Outcomes in [`OUTCOMES`]
+/// order; topics most recent first.
+pub fn disagreement_record(conn: &Connection) -> Result<Vec<(String, usize, Vec<String>)>, KbError> {
+    let mut out = Vec::new();
+    for outcome in OUTCOMES {
+        let mut stmt = conn.prepare(
+            "SELECT d.topic FROM self_disagreements d JOIN memories m ON m.id = d.memory_id
+             WHERE d.outcome = ?1 AND m.invalidated_at IS NULL ORDER BY d.memory_id DESC",
+        )?;
+        let topics: Vec<String> = stmt.query_map(params![outcome], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        out.push((outcome.to_string(), topics.len(), topics));
+    }
+    Ok(out)
+}
+
+/// The current self narrative: `(text, digest)`.
+pub fn self_narrative(conn: &Connection) -> Result<Option<(String, String)>, KbError> {
+    Ok(conn
+        .query_row("SELECT text, digest FROM self_narrative WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?)
+}
+
+pub fn set_self_narrative(conn: &Connection, text: &str, digest: &str, now: &str) -> Result<(), KbError> {
+    conn.execute(
+        "INSERT INTO self_narrative (id, text, digest, updated_at) VALUES (1, ?1, ?2, ?3)
+         ON CONFLICT(id) DO UPDATE SET text = excluded.text, digest = excluded.digest, updated_at = excluded.updated_at",
+        params![text, digest, now],
+    )?;
     Ok(())
 }
 
@@ -3850,7 +3949,7 @@ const MEMORY_COLUMNS: &[(&str, &str)] = &[
 /// against this rather than a literal: every schema addition used to
 /// require hunting down a dozen hard-coded version numbers across the
 /// migration tests, which is busywork that also invites getting one wrong.
-pub const SCHEMA_VERSION: i64 = 37;
+pub const SCHEMA_VERSION: i64 = 38;
 
 fn ensure_memory_columns(conn: &Connection) -> Result<(), KbError> {
     if !table_exists(conn, "memories")? {
@@ -3981,6 +4080,9 @@ fn migrate(conn: &Connection) -> Result<(), KbError> {
     }
     if version < 37 {
         migrate_v36_to_v37(conn)?;
+    }
+    if version < 38 {
+        migrate_v37_to_v38(conn)?;
     }
     Ok(())
 }
@@ -6089,7 +6191,19 @@ pub fn insert_theme(
     source_ids: &[String],
     embedding: Option<&[f32]>,
 ) -> Result<i64, KbError> {
-    insert_insight_leveled(conn, text, confidence, source_ids, embedding, 2, SUBJECT_USER)
+    insert_theme_for(conn, text, confidence, source_ids, embedding, SUBJECT_USER)
+}
+
+/// A level-2 theme of one subject (self themes cite self traits only).
+pub fn insert_theme_for(
+    conn: &Connection,
+    text: &str,
+    confidence: f64,
+    source_ids: &[String],
+    embedding: Option<&[f32]>,
+    subject: &str,
+) -> Result<i64, KbError> {
+    insert_insight_leveled(conn, text, confidence, source_ids, embedding, 2, subject)
 }
 
 fn insert_insight_leveled(
@@ -6713,24 +6827,6 @@ pub fn stale_self_insights(conn: &Connection, cutoff: &str) -> Result<Vec<Insigh
     Ok(out)
 }
 
-/// The "who I am" block: active level-1 self traits, ranked like the user
-/// model's beliefs (doubted last, then by score).
-pub fn self_model(conn: &Connection) -> Result<Vec<ModelRow>, KbError> {
-    let now = now_secs() as i64;
-    let mut traits = active_insights_by_level(conn, 1, Some(SUBJECT_SELF))?;
-    sort_model_rank(&mut traits, |i| i.is_flagged(), |i| model_score(i, now), |i| i.id);
-    Ok(traits
-        .iter()
-        .map(|t| ModelRow {
-            kind: ModelKind::Trait,
-            confidence: t.confidence,
-            text: t.text.clone(),
-            doubted: t.is_flagged(),
-            nested: false,
-            recent: model_is_recent(t, now),
-        })
-        .collect())
-}
 
 /// Ids "new since the last reflect run" for the nightly dedupe and
 /// contradiction passes, now derived from `memories.reflected_at` instead
@@ -6907,10 +7003,10 @@ pub fn memories_by_source_prefix_or_project(
 /// Count of active (non-invalidated) insights at exactly `level` — the
 /// meta-reflection trigger's evidence-count input
 /// (`reflect::should_run_meta_pass`).
-pub fn count_active_insights_level(conn: &Connection, level: i64) -> Result<i64, KbError> {
+pub fn count_active_insights_level(conn: &Connection, level: i64, subject: &str) -> Result<i64, KbError> {
     conn.query_row(
-        "SELECT COUNT(*) FROM insights WHERE level = ?1 AND invalidated_at IS NULL",
-        params![level],
+        "SELECT COUNT(*) FROM insights WHERE level = ?1 AND invalidated_at IS NULL AND subject = ?2",
+        params![level, subject],
         |r| r.get(0),
     )
     .map_err(Into::into)
@@ -6918,21 +7014,21 @@ pub fn count_active_insights_level(conn: &Connection, level: i64) -> Result<i64,
 
 /// The newest active level-2 theme (highest id), if any — `None` means no
 /// theme has ever been derived yet.
-pub fn newest_active_theme(conn: &Connection) -> Result<Option<Insight>, KbError> {
+pub fn newest_active_theme(conn: &Connection, subject: &str) -> Result<Option<Insight>, KbError> {
     let mut stmt = conn.prepare(
-        "SELECT * FROM insights WHERE level = 2 AND invalidated_at IS NULL ORDER BY id DESC LIMIT 1",
+        "SELECT * FROM insights WHERE level = 2 AND invalidated_at IS NULL AND subject = ?1 ORDER BY id DESC LIMIT 1",
     )?;
-    Ok(stmt.query_row([], row_to_insight).optional()?)
+    Ok(stmt.query_row(params![subject], row_to_insight).optional()?)
 }
 
 /// Count of active level-1 insights created after `after_id`. Insights and
 /// themes share one `id` sequence (same table), so "how many level-1
 /// insights have accumulated since the newest theme" is simply "how many
 /// have `id` greater than the theme's `id`."
-pub fn count_active_level1_created_after(conn: &Connection, after_id: i64) -> Result<i64, KbError> {
+pub fn count_active_level1_created_after(conn: &Connection, after_id: i64, subject: &str) -> Result<i64, KbError> {
     conn.query_row(
-        "SELECT COUNT(*) FROM insights WHERE level = 1 AND invalidated_at IS NULL AND id > ?1",
-        params![after_id],
+        "SELECT COUNT(*) FROM insights WHERE level = 1 AND invalidated_at IS NULL AND id > ?1 AND subject = ?2",
+        params![after_id, subject],
         |r| r.get(0),
     )
     .map_err(Into::into)
@@ -6984,6 +7080,8 @@ pub enum ModelKind {
     Belief,
     /// A self trait (`subject = self`), rendered in the "who I am" block.
     Trait,
+    /// An opinion (`subject = opinion`), rendered in the "who I am" block.
+    Opinion,
 }
 
 /// One row of the mental-model view (`mach kb model`): a theme or a
@@ -7071,9 +7169,28 @@ fn model_is_recent(insight: &Insight, now: i64) -> bool {
 /// cheap enough to inject on every session start, not to support
 /// investigation.
 pub fn mental_model(conn: &Connection) -> Result<Vec<ModelRow>, KbError> {
+    model_for(conn, SUBJECT_USER, ModelKind::Belief)
+}
+
+/// The "who I am" block: self themes with their traits nested, then
+/// unthemed traits, ranked exactly like the user model. Traits render as
+/// `trait`.
+pub fn self_model(conn: &Connection) -> Result<Vec<ModelRow>, KbError> {
+    model_for(conn, SUBJECT_SELF, ModelKind::Trait)
+}
+
+/// Opinions Claude holds, ranked like beliefs.
+pub fn opinion_model(conn: &Connection) -> Result<Vec<ModelRow>, KbError> {
+    model_for(conn, SUBJECT_OPINION, ModelKind::Opinion)
+}
+
+/// One subject's model: its level-2 themes with their level-1 insights
+/// nested, then unthemed level-1 insights, ranked non-doubted and
+/// highest-scoring first. `leaf` is the kind level-1 rows render as.
+fn model_for(conn: &Connection, subject: &str, leaf: ModelKind) -> Result<Vec<ModelRow>, KbError> {
     let now = now_secs() as i64;
-    let themes = active_insights_by_level(conn, 2, Some(SUBJECT_USER))?;
-    let level1 = active_insights_by_level(conn, 1, Some(SUBJECT_USER))?;
+    let themes = active_insights_by_level(conn, 2, Some(subject))?;
+    let level1 = active_insights_by_level(conn, 1, Some(subject))?;
     let themed = themed_insight_ids(conn)?;
 
     enum TopCandidate<'a> {
@@ -7130,7 +7247,7 @@ pub fn mental_model(conn: &Connection) -> Result<Vec<ModelRow>, KbError> {
                 });
                 for ins in nested {
                     rows.push(ModelRow {
-                        kind: ModelKind::Belief,
+                        kind: leaf,
                         confidence: ins.confidence,
                         text: ins.text.clone(),
                         doubted: ins.is_flagged(),
@@ -7141,7 +7258,7 @@ pub fn mental_model(conn: &Connection) -> Result<Vec<ModelRow>, KbError> {
             }
             TopCandidate::Unthemed(ins) => {
                 rows.push(ModelRow {
-                    kind: ModelKind::Belief,
+                    kind: leaf,
                     confidence: ins.confidence,
                     text: ins.text.clone(),
                     doubted: ins.is_flagged(),
@@ -11995,19 +12112,19 @@ mod tests {
         .unwrap();
         insert_theme(&conn, "a theme", 0.5, &["i1".into(), "i2".into(), "3".into()], None).unwrap();
 
-        assert_eq!(count_active_insights_level(&conn, 1).unwrap(), 2, "invalidated row excluded");
-        assert_eq!(count_active_insights_level(&conn, 2).unwrap(), 1);
+        assert_eq!(count_active_insights_level(&conn, 1, SUBJECT_USER).unwrap(), 2, "invalidated row excluded");
+        assert_eq!(count_active_insights_level(&conn, 2, SUBJECT_USER).unwrap(), 1);
     }
 
     #[test]
     fn newest_active_theme_is_none_until_one_exists_then_tracks_highest_id() {
         let conn = mem_conn();
-        assert!(newest_active_theme(&conn).unwrap().is_none());
+        assert!(newest_active_theme(&conn, SUBJECT_USER).unwrap().is_none());
 
         let _first = insert_theme(&conn, "first theme", 0.5, &["i1".into(), "i2".into(), "3".into()], None).unwrap();
         let second = insert_theme(&conn, "second theme", 0.5, &["i1".into(), "i2".into(), "3".into()], None).unwrap();
 
-        let newest = newest_active_theme(&conn).unwrap().expect("a theme exists");
+        let newest = newest_active_theme(&conn, SUBJECT_USER).unwrap().expect("a theme exists");
         assert_eq!(newest.id, second);
     }
 
@@ -12018,8 +12135,8 @@ mod tests {
         insert_insight(&conn, "b", 0.5, &["1".into(), "2".into()], None).unwrap();
         insert_insight(&conn, "c", 0.5, &["1".into(), "2".into()], None).unwrap();
 
-        assert_eq!(count_active_level1_created_after(&conn, a).unwrap(), 2);
-        assert_eq!(count_active_level1_created_after(&conn, 0).unwrap(), 3);
+        assert_eq!(count_active_level1_created_after(&conn, a, SUBJECT_USER).unwrap(), 2);
+        assert_eq!(count_active_level1_created_after(&conn, 0, SUBJECT_USER).unwrap(), 3);
     }
 
     #[test]

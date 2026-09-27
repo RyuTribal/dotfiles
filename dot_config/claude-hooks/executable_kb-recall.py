@@ -605,6 +605,7 @@ def main():
             conf = " (confidence {:.2})".format(confidence) \
                 if isinstance(confidence, (int, float)) else ""
             label = "self-knowledge" if h.get("source") == "derived-self" \
+                else "my opinion" if h.get("source") == "derived-opinion" \
                 else "derived theme" if h.get("level") == 2 else "derived belief"
             lines.append("- [{}, {}]{} {}".format(label, date, conf, content))
         else:

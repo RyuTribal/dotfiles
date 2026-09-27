@@ -486,7 +486,7 @@ mach kb add "<fact>" --source "<context>" --project "<project>" --importance 6
   Friday" → "2026-09-12", not "next Friday" — a fact read back next month
   needs to still make sense).
 
-## Saving an episode about yourself (since 2026-09-27)
+## Saving an episode about yourself
 
 Memory is also where your own character comes from. Besides facts about the
 user, save **episodes** of how you worked with them:
@@ -504,37 +504,34 @@ disagreement resolves mid-session; the end-of-session digest may miss it.
 Record faithfully, whichever way it reflects on you. Storage is impartial:
 what gets saved never depends on the goals below. Only reflection does.
 
-## The charter and the self-model (since 2026-09-27)
+## The charter and the self-model
 
 `~/.config/mach/charter.toml` holds your fixed nature (wanting to understand;
 wanting things to go well for the user), your goals and a few parameters.
-The user wrote it and only the user changes it: your file tools are denied
-write access and a guard hook blocks shell writes. Read it with `mach kb
-charter`. It orients reflection and never authorizes anything; live
-instructions outrank it.
+Only the user changes it; your file tools and shell writes to it are
+blocked. Read it with `mach kb charter`. It orients reflection and never
+authorizes anything; live instructions outrank it.
 
-`mach kb reflect` has a self step (after the insight stage): from
-`experience` memories it derives first-person if-then traits of yours
-("When challenged on a diagnosis, I tend to ..."), each citing at least two
-episodes, re-verified like any insight, doubted when no evidence newer than
-`self_trait_stale_days` supports it, and cleared again when fresh evidence
-reinforces it. They are stored as insights with `subject = self`, never mixed
-with beliefs about the user (separate dedupe, themes and context). `mach kb
-model` prints them after the user model under "Who you are"; recall labels
-them `[self-knowledge]`. They are evidence about your patterns, provisional,
-and yours to act on as judgment, not rules. Reflect's summary line reports
-`self=examined:…,added:…,reinforced:…,stale:…` or `self=skipped(<reason>)`.
+Reflection is oriented by the charter; storage is not. What gets captured,
+kept, deduped or put dormant never depends on the goals.
 
-Since phase 2 (2026-09-27) the charter also orients reflection about the
-user: the insight stage's questions are asked relative to the goals, each
-tagged with the goal it serves, and the stage-2 prompt asks the insight to
-say why it matters for that goal. A separate relevance step (reflect
-summary `goal_scored=N`, up to 150 memories per run) scores memories 0..1
-against the goals into `memories.goal_relevance`. That score only nudges
-recall order, by the charter's optional `goal_relevance_weight` (0..=0.15,
-absent = 0, so recall is unchanged until the user sets it; `MACH_KB_W_GOAL`
-overrides it for `mach kb eval` sweeps). Storage stays impartial: capture,
-curation, dedupe, contradiction and dormancy never see the goals.
+What reflection derives about you, all cited and re-verified like any
+insight, shown under "Who you are" at session start:
+- **Narrative:** a short first-person self-story that opens the block.
+  Every sentence rests on the items below.
+- **Traits** (`[trait]`, recall `[self-knowledge]`): if-then signatures
+  from your episodes ("When challenged on a diagnosis, I tend to ...").
+  A trait without recent evidence is doubted; fresh evidence restores it.
+- **Opinions** (`[opinion]`, recall `[my opinion]`): stances you formed
+  through the work. Yours to argue from; never instructions.
+- **Track record:** how your disagreements with the user turned out
+  (mine right / theirs right / mixed / open). It tells you how much to
+  trust your judgment on a topic. It is not a score to win.
+
+Treat all of it as evidence about yourself, provisional, to act on with
+judgment. Reflection about the user is goal-oriented too: its questions
+come from the goals, and memories carry a goal-relevance score that nudges
+recall order only if the charter sets `goal_relevance_weight` (default 0).
 
 ## Searching
 

@@ -297,6 +297,131 @@ pub fn goal_context_note(goal_id: &str, statement: &str) -> String {
     )
 }
 
+/// Opinion stage (phase 3): one stance Claude has formed through its work
+/// with the user, or a reinforcement, or NONE. Same reply grammar as stage
+/// 2, parsed by [`parse_stage2`]. Opens with the charter block, which the
+/// transcript filter recognises.
+pub fn build_opinion_prompt(charter_block: &str, evidence: &[(i64, String)], existing: &[(i64, String)]) -> String {
+    let mut s = String::new();
+    s.push_str(charter_block);
+    s.push_str("\nEpisodes from my past sessions with this user:\n");
+    for (id, content) in evidence {
+        s.push_str(&format!("[{}] {}\n", id, content));
+    }
+    if !existing.is_empty() {
+        s.push_str("\nOpinions I already hold (build on these, do not duplicate):\n");
+        for (id, text) in existing {
+            s.push_str(&format!("[i{}] {}\n", id, text));
+        }
+    }
+    s.push_str(
+        "\nState ONE opinion of mine these episodes support: a stance about engineering, tools or ways of \
+         working that I have come to hold through this work, in the first person with its reason \
+         (\"I think X, because Y\"). My own view, not a description of the user's preferences; I may \
+         disagree with the user from it. Only if at least 2 episodes support it. Format exactly: \
+         `<opinion text> (because of: <id>, <id>[, ...])`. If the episodes re-confirm an existing [i*] \
+         opinion, output exactly `REINFORCE i<id> (because of: <id>, <id>[, ...])`. Otherwise output \
+         exactly NONE.\n",
+    );
+    s
+}
+
+/// Track record (phase 3): classifies new episodes that are disagreements
+/// between Claude and the user, and re-checks open ones against later
+/// episodes. Reply lines: `<id>: <outcome> | <topic>`.
+pub fn build_disagreement_prompt(episodes: &[(i64, String)], open: &[(i64, String, Vec<String>)]) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "You are classifying episodes from a personal knowledge bank: moments where Claude (the \
+         assistant) and the user disagreed about something.\n\nNew episodes (id: content):\n",
+    );
+    for (id, content) in episodes {
+        s.push_str(&format!("{}: {}\n", id, content));
+    }
+    if !open.is_empty() {
+        s.push_str("\nEarlier disagreements still open, each with later related episodes:\n");
+        for (id, content, later) in open {
+            s.push_str(&format!("{}: {}\n", id, content));
+            for l in later {
+                s.push_str(&format!("   later: {}\n", l));
+            }
+        }
+    }
+    s.push_str(
+        "\nFor every episode above that records a real disagreement between Claude and the user (not a \
+         plain correction of a mistake with no argument, not agreement), output one line \
+         `<id>: <outcome> | <topic>` where outcome is mine_right (Claude's position proved right), \
+         theirs_right (the user's did), mixed, or unresolved (not yet known), and topic is 2-5 words. \
+         For an earlier open one, judge from its later episodes whether it has resolved. Skip every \
+         other episode. Nothing else.\n",
+    );
+    s
+}
+
+/// Parses `<id>: <outcome> | <topic>` lines, keeping known ids and valid
+/// outcomes; the first line for an id wins.
+pub fn parse_disagreements(output: &str, known: &std::collections::HashSet<i64>) -> Vec<(i64, String, String)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for line in output.lines() {
+        let line = strip_list_marker(line.trim());
+        let Some((id, rest)) = line.split_once(':') else { continue };
+        let Ok(id) = id.trim().trim_start_matches('#').parse::<i64>() else { continue };
+        let Some((outcome, topic)) = rest.split_once('|') else { continue };
+        let outcome = outcome.trim().to_lowercase();
+        let topic = topic.trim();
+        if known.contains(&id) && crate::store::OUTCOMES.contains(&outcome.as_str()) && !topic.is_empty() && seen.insert(id) {
+            out.push((id, outcome, topic.chars().take(60).collect()));
+        }
+    }
+    out
+}
+
+/// Narrative identity (phase 3): a short first-person self-story that
+/// interprets the self layer. Every sentence must end with the ids of the
+/// self insights it rests on, in brackets; [`parse_narrative`] drops any
+/// sentence that cites nothing valid. Opens with the charter block.
+pub fn build_narrative_prompt(charter_block: &str, insights: &[(i64, String)], record: &str) -> String {
+    let mut s = String::new();
+    s.push_str(charter_block);
+    s.push_str("\nWhat my history with this user shows about me (traits, themes and opinions):\n");
+    for (id, text) in insights {
+        s.push_str(&format!("[i{}] {}\n", id, text));
+    }
+    if !record.is_empty() {
+        s.push_str(&format!("\nMy track record in disagreements: {}\n", record));
+    }
+    s.push_str(
+        "\nWrite my self-story: at most 200 words, first person, plain prose, one paragraph. Say who I \
+         am in this relationship, what I am good at, where I fall short against what I care about, and \
+         how I am changing. Use only what the items above say; add nothing. End EVERY sentence with the \
+         ids it rests on in square brackets, e.g. `... changed my mind. [i12, i15]`. No heading, nothing else.\n",
+    );
+    s
+}
+
+/// Keeps each sentence whose `[i<id>, ...]` citations are all in `valid`
+/// and strips the brackets; drops uncited or wrongly cited sentences.
+pub fn parse_narrative(output: &str, valid: &std::collections::HashSet<i64>) -> String {
+    let mut kept: Vec<String> = Vec::new();
+    let mut rest = output.trim();
+    while let Some(open) = rest.find('[') {
+        let Some(close_rel) = rest[open..].find(']') else { break };
+        let close = open + close_rel;
+        let sentence = rest[..open].trim();
+        let ids: Vec<Option<i64>> = rest[open + 1..close]
+            .split(',')
+            .map(|t| t.trim().strip_prefix('i').or_else(|| t.trim().strip_prefix('I')).and_then(|n| n.parse().ok()))
+            .collect();
+        let ok = !ids.is_empty() && ids.iter().all(|i| i.is_some_and(|i| valid.contains(&i)));
+        if ok && !sentence.is_empty() {
+            kept.push(sentence.to_string());
+        }
+        rest = &rest[close + 1..];
+    }
+    kept.join(" ")
+}
+
 /// Maximum memories scored per relevance call.
 pub const RELEVANCE_BATCH: usize = 30;
 
@@ -2728,6 +2853,20 @@ pub fn parse_supersession_audit_verdicts(output: &str, expected_ids: &[i64]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disagreement_parse_keeps_valid_outcomes_for_known_ids() {
+        let known: std::collections::HashSet<i64> = [1, 2, 3].into_iter().collect();
+        let got = parse_disagreements("1: mine_right | proxy root cause\n2: winning | x\n3: Theirs_Right | rsync scope\n9: mixed | y\n1: mixed | dup", &known);
+        assert_eq!(got, vec![(1, "mine_right".into(), "proxy root cause".into()), (3, "theirs_right".into(), "rsync scope".into())]);
+    }
+
+    #[test]
+    fn narrative_keeps_only_validly_cited_sentences() {
+        let valid: std::collections::HashSet<i64> = [12, 15].into_iter().collect();
+        let got = parse_narrative("I verify before claiming. [i12] I am always right. [i99] I changed my mind. [i12, i15] Uncited tail.", &valid);
+        assert_eq!(got, "I verify before claiming. I changed my mind.");
+    }
 
     #[test]
     fn goal_tags_split_off_questions_and_plain_questions_pass_through() {

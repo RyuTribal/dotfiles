@@ -441,7 +441,11 @@ pub(crate) fn to_hit(h: RankedHit) -> SearchHit {
 
 pub(crate) fn insight_to_hit(h: InsightHit) -> SearchHit {
     let flagged = h.insight.is_flagged();
-    let source = if h.insight.subject == store::SUBJECT_SELF { "derived-self" } else { "derived" };
+    let source = match h.insight.subject.as_str() {
+        store::SUBJECT_SELF => "derived-self",
+        store::SUBJECT_OPINION => "derived-opinion",
+        _ => "derived",
+    };
     SearchHit {
         id: h.insight.id,
         content: h.insight.text,
@@ -1704,12 +1708,14 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let self_summary = match &self_stage.skipped {
         Some(reason) => format!("skipped({})", reason),
         None => format!(
-            "examined:{},questions:{},added:{},reinforced:{},stale:{},reflected:{}",
+            "examined:{},questions:{},added:{},reinforced:{},stale:{},opinions:{},disagreements:{},reflected:{}",
             self_stage.examined,
             self_stage.questions,
             self_stage.traits_added,
             self_stage.reinforced,
             self_stage.stale_flagged,
+            self_stage.opinions_added,
+            self_stage.disagreements,
             self_stage.reflected
         ),
     };
@@ -1851,20 +1857,38 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
 
     // Step 5: meta-reflection (theme) pass — only when triggered, or
     // forced via --meta for manual runs.
-    let level1_active = store::count_active_insights_level(&conn, 1).map_err(to_io)?;
-    let newest_theme = store::newest_active_theme(&conn).map_err(to_io)?;
-    let since_newest_theme = match &newest_theme {
-        Some(t) => store::count_active_level1_created_after(&conn, t.id).map_err(to_io)?,
-        None => 0,
-    };
-    let meta_trigger = reflect::should_run_meta_pass(level1_active, newest_theme.is_some(), since_newest_theme);
+    // Run once per subject: user themes group beliefs about the user, self
+    // themes group Claude's own traits (self-model phase 3). A theme never
+    // mixes the two.
     let mut themes_added = 0usize;
-    if meta_trigger || force_meta {
-        let (added, meta_llm_failed) =
-            run_meta_pass(&conn, &embedder, &reflect::LoggedLlm::new(&conn, "meta", &llm)).map_err(to_io)?;
-        themes_added = added;
-        llm_failed = llm_failed || meta_llm_failed;
+    for subject in [store::SUBJECT_USER, store::SUBJECT_SELF] {
+        let level1_active = store::count_active_insights_level(&conn, 1, subject).map_err(to_io)?;
+        let newest_theme = store::newest_active_theme(&conn, subject).map_err(to_io)?;
+        let since_newest_theme = match &newest_theme {
+            Some(t) => store::count_active_level1_created_after(&conn, t.id, subject).map_err(to_io)?,
+            None => 0,
+        };
+        let meta_trigger = reflect::should_run_meta_pass(level1_active, newest_theme.is_some(), since_newest_theme);
+        if meta_trigger || force_meta {
+            let (added, meta_llm_failed) =
+                run_meta_pass(&conn, &embedder, &reflect::LoggedLlm::new(&conn, "meta", &llm), subject).map_err(to_io)?;
+            themes_added += added;
+            llm_failed = llm_failed || meta_llm_failed;
+        }
     }
+
+    // Step 5.1: narrative identity — rewritten only when the self layer
+    // (traits, self themes, opinions, track record) changed. After the
+    // theme pass so a new self theme is in it.
+    let narrative_rewritten = match charter.as_ref() {
+        Some(c) => {
+            let (rewritten, failed) =
+                run_narrative_step(&conn, &reflect::LoggedLlm::new(&conn, "narrative", &llm), c, &now).map_err(to_io)?;
+            llm_failed = llm_failed || failed;
+            rewritten
+        }
+        None => false,
+    };
 
     // Step 6: `reflect_state.last_run_at` now updates every run
     // unconditionally (it's `store::ids_new_since_reflect`'s own cutoff for
@@ -1897,7 +1921,7 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
          consolidated={} deduped={} contradictions={} mem_verified={} mem_stale={} mem_routed={} \
          graph_examined={} graph_edges={} graph_entities={} evidence_dead={} entities_merged={} \
          cards_examined={} cards_built={} insight_pairs={} insights_merged={} \
-         judge_log_pruned={} recall_engagement_pruned={} self={} goal_scored={}{}",
+         judge_log_pruned={} recall_engagement_pruned={} self={} goal_scored={} narrative={}{}",
         examined,
         questions_count,
         insights_added,
@@ -1932,6 +1956,7 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         recall_engagement_pruned,
         self_summary,
         goal_scored,
+        if narrative_rewritten { "rewritten" } else { "unchanged" },
         if llm_failed { " (degraded: some claude calls failed this run)" } else { "" }
     );
     Ok(())
@@ -2003,8 +2028,17 @@ struct SelfStageOutcome {
     stale_flagged: usize,
     /// Working-set rows marked `self_reflected_at` (0 when a stage failed).
     reflected: usize,
+    opinions_added: usize,
+    /// Disagreement episodes classified (new ones and re-checked open ones).
+    disagreements: usize,
     failed: bool,
 }
+
+/// Open disagreements re-checked per run, and later episodes shown for each.
+const OPEN_DISAGREEMENTS_PER_RUN: usize = 5;
+const LATER_EPISODES_PER_OPEN: usize = 3;
+/// What the opinion question searches the episodes for.
+const OPINION_QUERY: &str = "a stance I have formed about engineering, tools or ways of working, and why";
 
 /// Relevance calls per reflect run. Each scores up to
 /// `reflect::RELEVANCE_BATCH` memories, so a first fill of a ~2,300-row bank
@@ -2127,41 +2161,60 @@ fn run_self_stage<E: Embedder, L: ReflectLlm>(
             }
         };
         let evidence_ids: HashSet<i64> = evidence.iter().map(|(m, _)| m.id).collect();
-        let valid = |ids: Vec<i64>| {
-            let mut v: Vec<i64> = ids.into_iter().filter(|id| evidence_ids.contains(id)).collect();
-            v.sort_unstable();
-            v.dedup();
-            v
-        };
-        match reflect::parse_stage2(&raw) {
-            Stage2Result::Insight { text, memory_ids } => {
-                let ids = valid(memory_ids);
-                if ids.len() < 2 {
-                    continue;
-                }
-                let source_ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
-                let emb = embedder.embed(&text).ok();
-                store::insert_self_insight(conn, &text, reflect::compute_confidence(ids.len()), &source_ids, emb.as_deref())?;
-                out.traits_added += 1;
-            }
-            Stage2Result::Reinforce { insight_id, memory_ids } => {
-                let ids = valid(memory_ids);
-                let Some(target) = store::get_insight(conn, insight_id)? else { continue };
-                if !target.is_active() || target.subject != store::SUBJECT_SELF {
-                    continue;
-                }
-                let cited: HashSet<i64> = target.source_ids.iter().filter_map(|s| s.parse().ok()).collect();
-                let fresh: Vec<i64> = ids.into_iter().filter(|id| !cited.contains(id)).collect();
-                if fresh.is_empty() {
-                    continue;
-                }
-                if store::reinforce_insight(conn, insight_id, &fresh, now)? {
-                    store::unflag_insight(conn, insight_id)?;
-                    out.reinforced += 1;
-                }
-            }
-            Stage2Result::None | Stage2Result::Rejected => {}
+        if apply_cited_reply(conn, embedder, &raw, &evidence_ids, store::SUBJECT_SELF, now, &mut out.traits_added)? {
+            out.reinforced += 1;
         }
+    }
+
+    // Opinions (phase 3): one stance per run, formed through the work.
+    match embedder.embed(OPINION_QUERY) {
+        Ok(q_emb) => {
+            let evidence = store::top_similar_experience(conn, &q_emb, SELF_EVIDENCE_PER_QUESTION)?;
+            if evidence.len() >= 2 {
+                let existing = store::top_similar_insights(conn, &q_emb, REFLECT_EXISTING_INSIGHTS_CONTEXT, store::SUBJECT_OPINION)?;
+                let evidence_pairs: Vec<(i64, String)> = evidence.iter().map(|(m, _)| (m.id, m.content.clone())).collect();
+                let existing_pairs: Vec<(i64, String)> = existing.iter().map(|(i, _)| (i.id, i.text.clone())).collect();
+                let prompt = reflect::build_opinion_prompt(&block, &evidence_pairs, &existing_pairs);
+                match llm.call("sonnet", &prompt, TIMEOUT_SONNET) {
+                    Ok(raw) => {
+                        let evidence_ids: HashSet<i64> = evidence.iter().map(|(m, _)| m.id).collect();
+                        apply_cited_reply(conn, embedder, &raw, &evidence_ids, store::SUBJECT_OPINION, now, &mut out.opinions_added)?;
+                    }
+                    Err(_) => out.failed = true,
+                }
+            }
+        }
+        Err(_) => out.failed = true,
+    }
+
+    // Track record (phase 3): classify this working set's disagreements and
+    // re-check open ones against later episodes.
+    let mut open: Vec<(i64, String, Vec<String>)> = Vec::new();
+    for (mid, _topic) in store::unresolved_disagreements(conn, OPEN_DISAGREEMENTS_PER_RUN)? {
+        let Some(m) = store::get(conn, mid)? else { continue };
+        let later: Vec<String> = match &m.embedding {
+            Some(e) if !e.is_empty() => store::top_similar_experience(conn, e, LATER_EPISODES_PER_OPEN + 1)?
+                .into_iter()
+                .filter(|(l, _)| l.id > mid)
+                .take(LATER_EPISODES_PER_OPEN)
+                .map(|(l, _)| l.content)
+                .collect(),
+            _ => Vec::new(),
+        };
+        if !later.is_empty() {
+            open.push((mid, m.content, later));
+        }
+    }
+    let mut known: HashSet<i64> = working.iter().map(|m| m.id).collect();
+    known.extend(open.iter().map(|(id, _, _)| *id));
+    match llm.call("haiku", &reflect::build_disagreement_prompt(&lines, &open), reflect::TIMEOUT_HAIKU_BATCH) {
+        Ok(reply) => {
+            for (id, outcome, topic) in reflect::parse_disagreements(&reply, &known) {
+                store::upsert_disagreement(conn, id, &topic, &outcome, now)?;
+                out.disagreements += 1;
+            }
+        }
+        Err(_) => out.failed = true,
     }
 
     if !out.failed {
@@ -2169,6 +2222,124 @@ fn run_self_stage<E: Embedder, L: ReflectLlm>(
         out.reflected = store::mark_memories_self_reflected(conn, &ids, now)?;
     }
     Ok(out)
+}
+
+/// Applies a stage-2-grammar reply for a self-layer subject (`self` or
+/// `opinion`): a new cited insight, a reinforcement of an active insight of
+/// the same subject (clearing a staleness flag), or nothing. Citations must
+/// be ids actually shown (`evidence_ids`), at least 2 for a new insight and
+/// at least 1 not already cited for a reinforcement. `added` counts inserts.
+fn apply_cited_reply<E: Embedder>(
+    conn: &Connection,
+    embedder: &E,
+    raw: &str,
+    evidence_ids: &HashSet<i64>,
+    subject: &str,
+    now: &str,
+    added: &mut usize,
+) -> Result<bool, KbError> {
+    let valid = |ids: Vec<i64>| {
+        let mut v: Vec<i64> = ids.into_iter().filter(|id| evidence_ids.contains(id)).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    match reflect::parse_stage2(raw) {
+        Stage2Result::Insight { text, memory_ids } => {
+            let ids = valid(memory_ids);
+            if ids.len() < 2 {
+                return Ok(false);
+            }
+            let source_ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+            let emb = embedder.embed(&text).ok();
+            let confidence = reflect::compute_confidence(ids.len());
+            if subject == store::SUBJECT_OPINION {
+                store::insert_opinion(conn, &text, confidence, &source_ids, emb.as_deref())?;
+            } else {
+                store::insert_self_insight(conn, &text, confidence, &source_ids, emb.as_deref())?;
+            }
+            *added += 1;
+            Ok(false)
+        }
+        Stage2Result::Reinforce { insight_id, memory_ids } => {
+            let ids = valid(memory_ids);
+            let Some(target) = store::get_insight(conn, insight_id)? else { return Ok(false) };
+            if !target.is_active() || target.subject != subject {
+                return Ok(false);
+            }
+            let cited: HashSet<i64> = target.source_ids.iter().filter_map(|s| s.parse().ok()).collect();
+            let fresh: Vec<i64> = ids.into_iter().filter(|id| !cited.contains(id)).collect();
+            if fresh.is_empty() || !store::reinforce_insight(conn, insight_id, &fresh, now)? {
+                return Ok(false);
+            }
+            store::unflag_insight(conn, insight_id)?;
+            Ok(true)
+        }
+        Stage2Result::None | Stage2Result::Rejected => Ok(false),
+    }
+}
+
+/// The track record as one line, e.g. "mine right 3, theirs right 5, mixed
+/// 1, open 2"; empty when there are no disagreements yet.
+fn record_summary(conn: &Connection) -> Result<String, KbError> {
+    let record = store::disagreement_record(conn)?;
+    if record.iter().all(|(_, n, _)| *n == 0) {
+        return Ok(String::new());
+    }
+    let label = |o: &str| match o {
+        "mine_right" => "mine right",
+        "theirs_right" => "theirs right",
+        "unresolved" => "open",
+        other => other,
+    }
+    .to_string();
+    Ok(record.iter().map(|(o, n, _)| format!("{} {}", label(o), n)).collect::<Vec<_>>().join(", "))
+}
+
+/// Narrative identity (phase 3): regenerates the first-person self-story
+/// when the self layer (active self traits, self themes, opinions, the
+/// track record) has changed since it was last written, and only then.
+/// Needs at least two self insights. Returns (rewritten, call failed).
+fn run_narrative_step<L: ReflectLlm>(
+    conn: &Connection,
+    llm: &L,
+    charter: &crate::charter::Charter,
+    now: &str,
+) -> Result<(bool, bool), KbError> {
+    let mut items: Vec<Insight> = store::active_insights_by_level(conn, 2, Some(store::SUBJECT_SELF))?;
+    items.extend(store::active_insights_by_level(conn, 1, Some(store::SUBJECT_SELF))?);
+    items.extend(store::active_insights_by_level(conn, 1, Some(store::SUBJECT_OPINION))?);
+    items.retain(|i| !i.is_flagged());
+    if items.len() < 2 {
+        return Ok((false, false));
+    }
+    items.sort_by_key(|i| i.id);
+    let record = record_summary(conn)?;
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        for i in &items {
+            h.update(format!("{}:{}\n", i.id, i.text));
+        }
+        h.update(&record);
+        h.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>()
+    };
+    if store::self_narrative(conn)?.is_some_and(|(_, d)| d == digest) {
+        return Ok((false, false));
+    }
+    let pairs: Vec<(i64, String)> = items.iter().map(|i| (i.id, i.text.clone())).collect();
+    let valid: HashSet<i64> = items.iter().map(|i| i.id).collect();
+    match llm.call("sonnet", &reflect::build_narrative_prompt(&charter.prompt_block(), &pairs, &record), TIMEOUT_SONNET) {
+        Ok(raw) => {
+            let text = reflect::parse_narrative(&raw, &valid);
+            if text.is_empty() {
+                return Ok((false, false));
+            }
+            store::set_self_narrative(conn, &text, &digest, now)?;
+            Ok((true, false))
+        }
+        Err(_) => Ok((false, true)),
+    }
 }
 
 struct InsightStageOutcome {
@@ -2745,10 +2916,15 @@ fn run_dormancy_pass<L: ReflectLlm>(
 /// any_llm_call_failed)`. Never touches the watermark or the per-memory
 /// reinforcement/insight logic above — this is a self-contained extra
 /// pass over the insights table.
-fn run_meta_pass<L: ReflectLlm>(conn: &Connection, embedder: &OllamaEmbedder, llm: &L) -> Result<(usize, bool), KbError> {
+fn run_meta_pass<L: ReflectLlm>(
+    conn: &Connection,
+    embedder: &OllamaEmbedder,
+    llm: &L,
+    subject: &str,
+) -> Result<(usize, bool), KbError> {
     let themed = store::themed_insight_ids(conn)?;
     let mut pool: Vec<Insight> =
-        store::active_insights_by_level(conn, 1, Some(store::SUBJECT_USER))?
+        store::active_insights_by_level(conn, 1, Some(subject))?
             .into_iter()
             .filter(|i| !themed.contains(&i.id))
             .collect();
@@ -2793,7 +2969,13 @@ fn run_meta_pass<L: ReflectLlm>(conn: &Connection, embedder: &OllamaEmbedder, ll
             continue; // never a theme without at least one raw memory row
         }
 
-        let prompt = reflect::build_theme_prompt(&insight_pairs, &evidence_pairs);
+        let mut prompt = reflect::build_theme_prompt(&insight_pairs, &evidence_pairs);
+        if subject == store::SUBJECT_SELF {
+            prompt.push_str(
+                "\nThese insights are traits of mine (Claude's own, from my history with this user). State the \
+                 theme in the first person, about how I work. The output format above is unchanged.\n",
+            );
+        }
         let raw = match llm.call("sonnet", &prompt, TIMEOUT_SONNET) {
             Ok(out) => out,
             Err(_) => {
@@ -2818,7 +3000,7 @@ fn run_meta_pass<L: ReflectLlm>(conn: &Connection, embedder: &OllamaEmbedder, ll
             let mut source_ids: Vec<String> = insight_ids.iter().map(|id| format!("i{}", id)).collect();
             source_ids.extend(valid_memory_ids.iter().map(|id| id.to_string()));
             let text_embedding = embedder.embed(&text).ok();
-            if store::insert_theme(conn, &text, confidence, &source_ids, text_embedding.as_deref()).is_ok() {
+            if store::insert_theme_for(conn, &text, confidence, &source_ids, text_embedding.as_deref(), subject).is_ok() {
                 themes_added += 1;
             }
         }
@@ -6715,6 +6897,7 @@ fn format_model_row(row: &store::ModelRow) -> String {
         store::ModelKind::Theme => "theme",
         store::ModelKind::Belief => "belief",
         store::ModelKind::Trait => "trait",
+        store::ModelKind::Opinion => "opinion",
     };
     let indent = if row.nested { "  " } else { "" };
     let doubt = if row.doubted { " [DOUBTED — evidence under review]" } else { "" };
@@ -6738,8 +6921,15 @@ fn to_model_row_json(row: &store::ModelRow) -> ModelRowJson {
             store::ModelKind::Theme => "theme",
             store::ModelKind::Belief => "belief",
             store::ModelKind::Trait => "trait",
+            store::ModelKind::Opinion => "opinion",
         },
-        subject: if matches!(row.kind, store::ModelKind::Trait) { store::SUBJECT_SELF } else { store::SUBJECT_USER },
+        // A self theme renders as `theme`; `cmd_model` re-tags every row of
+        // the self block as `self`.
+        subject: match row.kind {
+            store::ModelKind::Opinion => store::SUBJECT_OPINION,
+            store::ModelKind::Trait => store::SUBJECT_SELF,
+            _ => store::SUBJECT_USER,
+        },
         confidence: row.confidence,
         text: row.text.clone(),
         doubted: row.doubted,
@@ -6895,15 +7085,75 @@ fn cmd_model(mut args: impl Iterator<Item = String>) -> io::Result<()> {
 
     let conn = store::open().map_err(to_io)?;
     let rows = store::mental_model(&conn).map_err(to_io)?;
-    let self_rows = store::self_model(&conn).map_err(to_io)?;
+    let block = SelfBlock {
+        narrative: store::self_narrative(&conn).map_err(to_io)?.map(|(t, _)| t),
+        traits: store::self_model(&conn).map_err(to_io)?,
+        opinions: store::opinion_model(&conn).map_err(to_io)?,
+        record: record_summary(&conn).map_err(to_io)?,
+    };
 
     if json {
-        let json_rows: Vec<ModelRowJson> = rows.iter().chain(self_rows.iter()).map(to_model_row_json).collect();
+        let mut json_rows: Vec<ModelRowJson> = rows.iter().map(to_model_row_json).collect();
+        for r in &block.traits {
+            let mut j = to_model_row_json(r);
+            j.subject = store::SUBJECT_SELF;
+            json_rows.push(j);
+        }
+        json_rows.extend(block.opinions.iter().map(to_model_row_json));
         println!("{}", serde_json::to_string(&json_rows)?);
     } else {
-        print!("{}", render_full_model_text(&rows, &self_rows, max_chars));
+        print!("{}", render_full_model_text(&rows, &block, max_chars));
     }
     Ok(())
+}
+
+/// Everything in the "who I am" block, in display order.
+struct SelfBlock {
+    narrative: Option<String>,
+    /// Self themes with their traits nested, then unthemed traits.
+    traits: Vec<store::ModelRow>,
+    opinions: Vec<store::ModelRow>,
+    /// `record_summary`; empty when there is no track record yet.
+    record: String,
+}
+
+impl SelfBlock {
+    fn is_empty(&self) -> bool {
+        self.narrative.is_none() && self.traits.is_empty() && self.opinions.is_empty() && self.record.is_empty()
+    }
+
+    /// The block's body within `budget` characters (None = unbounded):
+    /// narrative, traits, opinions, track record, each dropped when it no
+    /// longer fits.
+    fn render(&self, budget: Option<usize>) -> String {
+        let mut out = String::new();
+        let left = |out: &String| budget.map(|b| b.saturating_sub(out.chars().count()));
+        let fits = |out: &String, s: &str| left(out).map_or(true, |l| s.chars().count() <= l);
+        if let Some(n) = &self.narrative {
+            let line = format!("{}\n", n);
+            if fits(&out, &line) {
+                out.push_str(&line);
+            }
+        }
+        out.push_str(&render_model_text(&self.traits, left(&out)));
+        if !self.opinions.is_empty() {
+            let head = "Opinions I hold:\n";
+            if fits(&out, head) {
+                let rows = render_model_text(&self.opinions, left(&out).map(|l| l - head.chars().count()));
+                if !rows.is_empty() {
+                    out.push_str(head);
+                    out.push_str(&rows);
+                }
+            }
+        }
+        if !self.record.is_empty() {
+            let line = format!("Track record in disagreements with this user: {}.\n", self.record);
+            if fits(&out, &line) {
+                out.push_str(&line);
+            }
+        }
+        out
+    }
 }
 
 /// `mach kb charter [--path]`: prints the parsed charter (nature, goals,
@@ -6959,16 +7209,16 @@ const SELF_MODEL_HEADING: &str =
 /// The user model followed, when there are self traits, by the "who I am"
 /// block. With a budget, the self block gets at most a quarter of it and
 /// the user model the rest (plus whatever the self block leaves unused).
-fn render_full_model_text(rows: &[store::ModelRow], self_rows: &[store::ModelRow], max_chars: Option<usize>) -> String {
-    if self_rows.is_empty() {
+fn render_full_model_text(rows: &[store::ModelRow], block: &SelfBlock, max_chars: Option<usize>) -> String {
+    if block.is_empty() {
         return render_model_text(rows, max_chars);
     }
     let heading_len = SELF_MODEL_HEADING.chars().count() + 1;
     let (self_text, user_budget) = match max_chars {
-        None => (render_model_text(self_rows, None), None),
+        None => (block.render(None), None),
         Some(max) => {
             let self_budget = (max / 4).saturating_sub(heading_len);
-            let text = render_model_text(self_rows, Some(self_budget));
+            let text = block.render(Some(self_budget));
             let used = if text.is_empty() { 0 } else { text.chars().count() + heading_len };
             (text, Some(max.saturating_sub(used)))
         }
@@ -11304,11 +11554,16 @@ mod tests {
         let conn = mem_conn();
         let ids = insert_episodes(&conn, 3);
         let trait_reply = format!("When challenged, I re-read the code first. (because of: {}, {}, 9999)", ids[0], ids[1]);
-        let llm = SeqLlm::new(vec![Ok("When challenged, what do I do?\nAnd a second question?".into()), Ok(trait_reply)]);
+        let llm = SeqLlm::new(vec![
+            Ok("When challenged, what do I do?\nAnd a second question?".into()),
+            Ok(trait_reply),
+            Ok("NONE".into()), // opinion
+            Ok(String::new()), // track record: no disagreements
+        ]);
         let now = store::now_rfc3339();
         let out = run_self_stage(&conn, &UnitEmbedder, &llm, Ok(Some(test_charter(1))), &now).unwrap();
         assert_eq!((out.questions, out.traits_added, out.reflected), (1, 1, 3), "{:?}", out);
-        assert_eq!(llm.left(), 0, "per-run cap: one question, one stage-2 call");
+        assert_eq!(llm.left(), 0, "per-run cap: one question, one stage-2 call, then opinion and track record");
         let traits = store::active_insights_by_level(&conn, 1, Some(store::SUBJECT_SELF)).unwrap();
         assert_eq!(traits.len(), 1);
         assert_eq!(traits[0].source_ids, vec![ids[0].to_string(), ids[1].to_string()], "the invented id 9999 is dropped");
@@ -11320,7 +11575,7 @@ mod tests {
     fn self_stage_marks_nothing_when_a_stage_fails() {
         let conn = mem_conn();
         insert_episodes(&conn, 3);
-        let llm = SeqLlm::new(vec![Err("timed out".into())]);
+        let llm = SeqLlm::new(vec![Err("timed out".into()), Ok("NONE".into()), Ok(String::new())]);
         let now = store::now_rfc3339();
         let out = run_self_stage(&conn, &UnitEmbedder, &llm, Ok(Some(test_charter(2))), &now).unwrap();
         assert!(out.failed);
@@ -11340,13 +11595,84 @@ mod tests {
         // Only the newer episodes are unreflected, so the old citations stay old.
         store::mark_memories_self_reflected(&conn, &[ids[0], ids[1]], &old).unwrap();
         let reinforce = format!("REINFORCE i{} (because of: {}, {})", tid, ids[2], ids[3]);
-        let llm = SeqLlm::new(vec![Ok("When X, what do I do?".into()), Ok(reinforce)]);
+        let llm = SeqLlm::new(vec![Ok("When X, what do I do?".into()), Ok(reinforce), Ok("NONE".into()), Ok(String::new())]);
         let now = store::now_rfc3339();
         let out = run_self_stage(&conn, &UnitEmbedder, &llm, Ok(Some(test_charter(1))), &now).unwrap();
         assert_eq!((out.stale_flagged, out.reinforced), (1, 1), "{:?}", out);
         let t = store::get_insight(&conn, tid).unwrap().unwrap();
         assert!(!t.is_flagged(), "fresh evidence clears the staleness flag");
         assert_eq!(t.source_ids.len(), 4);
+    }
+
+    #[test]
+    fn self_stage_records_an_opinion_and_a_disagreement_outcome() {
+        let conn = mem_conn();
+        let ids = insert_episodes(&conn, 3);
+        let opinion = format!("I think rsync should ship code only, because config drifts. (because of: {}, {})", ids[0], ids[1]);
+        let record = format!("{}: mine_right | proxy root cause\n{}: winning | nonsense", ids[2], ids[1]);
+        let llm = SeqLlm::new(vec![Ok("When X?".into()), Ok("NONE".into()), Ok(opinion), Ok(record)]);
+        let now = store::now_rfc3339();
+        let out = run_self_stage(&conn, &UnitEmbedder, &llm, Ok(Some(test_charter(1))), &now).unwrap();
+        assert_eq!((out.opinions_added, out.disagreements), (1, 1), "{:?}", out);
+        assert_eq!(store::opinion_model(&conn).unwrap().len(), 1);
+        assert!(store::self_model(&conn).unwrap().is_empty(), "an opinion is not a trait");
+        assert_eq!(record_summary(&conn).unwrap(), "mine right 1, theirs right 0, mixed 0, open 0");
+    }
+
+    #[test]
+    fn open_disagreements_are_rechecked_against_later_episodes() {
+        let conn = mem_conn();
+        let ids = insert_episodes(&conn, 2);
+        let now = store::now_rfc3339();
+        store::upsert_disagreement(&conn, ids[0], "rsync scope", "unresolved", &now).unwrap();
+        store::mark_memories_self_reflected(&conn, &[ids[0]], &now).unwrap();
+        let llm = RecordingLlm::new(vec![Ok("When X?".into()), Ok("NONE".into()), Ok("NONE".into()), Ok(format!("{}: theirs_right | rsync scope", ids[0]))]);
+        run_self_stage(&conn, &UnitEmbedder, &llm, Ok(Some(test_charter(1))), &now).unwrap();
+        let prompts = llm.prompts.borrow();
+        assert!(prompts[3].contains("later: episode 1"), "the open one is shown with its later episode");
+        assert!(store::unresolved_disagreements(&conn, 10).unwrap().is_empty());
+        assert_eq!(record_summary(&conn).unwrap(), "mine right 0, theirs right 1, mixed 0, open 0");
+    }
+
+    #[test]
+    fn narrative_is_written_from_valid_citations_and_only_rewritten_when_the_self_layer_changes() {
+        let conn = mem_conn();
+        let emb = [1.0f32, 0.0, 0.0];
+        let a = store::insert_self_insight(&conn, "When challenged, I re-read the code.", 0.6, &["1".into(), "2".into()], Some(&emb)).unwrap();
+        let b = store::insert_opinion(&conn, "I think tests are not verification.", 0.6, &["1".into(), "2".into()], Some(&emb)).unwrap();
+        let now = store::now_rfc3339();
+        let reply = format!("I re-read before I argue. [i{}] I distrust green tests alone. [i{}, i{}] I am perfect. [i999]", a, a, b);
+        let charter = test_charter(1);
+        let (rewritten, failed) = run_narrative_step(&conn, &RecordingLlm::new(vec![Ok(reply)]), &charter, &now).unwrap();
+        assert!(rewritten && !failed);
+        let (text, _) = store::self_narrative(&conn).unwrap().unwrap();
+        assert_eq!(text, "I re-read before I argue. I distrust green tests alone.");
+
+        let untouched = RecordingLlm::new(vec![]);
+        assert_eq!(run_narrative_step(&conn, &untouched, &charter, &now).unwrap(), (false, false));
+        assert!(untouched.prompts.borrow().is_empty(), "no call when nothing changed");
+
+        store::insert_self_insight(&conn, "When stuck, I ask.", 0.6, &["1".into(), "2".into()], Some(&emb)).unwrap();
+        let changed = RecordingLlm::new(vec![Ok(format!("I ask. [i{}]", a))]);
+        assert_eq!(run_narrative_step(&conn, &changed, &charter, &now).unwrap(), (true, false));
+    }
+
+    #[test]
+    fn self_block_renders_in_order_and_drops_what_does_not_fit() {
+        let block = SelfBlock {
+            narrative: Some("I am a careful collaborator.".into()),
+            traits: vec![row(store::ModelKind::Trait, 0.6, "When X, I do Y.", false, false)],
+            opinions: vec![row(store::ModelKind::Opinion, 0.6, "I think Z.", false, false)],
+            record: "mine right 1, theirs right 2, mixed 0, open 0".into(),
+        };
+        let full = block.render(None);
+        let pos = |needle: &str| full.find(needle).unwrap_or_else(|| panic!("{} missing in {}", needle, full));
+        assert!(pos("I am a careful") < pos("[trait") && pos("[trait") < pos("Opinions I hold:") && pos("Opinions I hold:") < pos("Track record"));
+        assert!(pos("[opinion, confidence 0.60] I think Z.") > 0);
+        let tight = block.render(Some(40));
+        assert!(tight.chars().count() <= 40);
+        assert!(tight.contains("I am a careful collaborator."));
+        assert!(!tight.contains("Track record"));
     }
 
     #[test]
@@ -11370,8 +11696,10 @@ mod tests {
             (0..40).map(|i| row(store::ModelKind::Belief, 0.6, &format!("user belief number {}", i), false, false)).collect();
         let selfs: Vec<store::ModelRow> =
             (0..40).map(|i| row(store::ModelKind::Trait, 0.6, &format!("When {}, I tend to act.", i), false, false)).collect();
-        assert_eq!(render_full_model_text(&user, &[], Some(500)), render_model_text(&user, Some(500)), "no self rows: unchanged");
-        let out = render_full_model_text(&user, &selfs, Some(2000));
+        let empty = SelfBlock { narrative: None, traits: vec![], opinions: vec![], record: String::new() };
+        assert_eq!(render_full_model_text(&user, &empty, Some(500)), render_model_text(&user, Some(500)), "no self rows: unchanged");
+        let block = SelfBlock { narrative: None, traits: selfs, opinions: vec![], record: String::new() };
+        let out = render_full_model_text(&user, &block, Some(2000));
         assert!(out.chars().count() <= 2000);
         let (u, s) = out.split_once(SELF_MODEL_HEADING).expect("self heading present");
         assert!(u.contains("user belief number 0"));

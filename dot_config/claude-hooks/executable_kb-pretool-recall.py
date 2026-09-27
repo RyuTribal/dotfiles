@@ -204,6 +204,7 @@ def main():
         date = (h.get("created_at") or "")[:10]
         if h.get("derived"):
             label = "self-knowledge" if h.get("source") == "derived-self" \
+                else "my opinion" if h.get("source") == "derived-opinion" \
                 else "derived theme" if h.get("level") == 2 else "derived belief"
             lines.append("- [{}, {}] {}".format(label, date, content))
         else:

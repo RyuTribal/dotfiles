@@ -1044,7 +1044,7 @@ impl Outcome {
             Outcome::Applied { result, sha } => {
                 let files: Vec<String> = result.files.iter().map(|p| p.display().to_string()).collect();
                 format!(
-                    "Improve run applied `{}` to {} (chezmoi commit {}). Rationale: {} Evidence: {}.",
+                    "Working on my own between sessions, I made an `{}` change to {} (chezmoi commit {}). Why: {} Evidence: {}.",
                     result.action.as_str(),
                     if files.is_empty() { "no files".to_string() } else { files.join(", ") },
                     sha,
@@ -1053,9 +1053,15 @@ impl Outcome {
                 )
             }
             Outcome::Nothing { rationale } => {
-                format!("Improve run decided no config change was warranted. Rationale: {}", rationale.trim())
+                format!(
+                    "Working on my own between sessions, I reviewed my memory for changes to how I work and decided none was warranted. Why: {}",
+                    rationale.trim()
+                )
             }
-            Outcome::Failed { reason } => format!("Improve run failed and was rolled back: {}", reason.trim()),
+            Outcome::Failed { reason } => format!(
+                "Working on my own between sessions, I tried to change how I work, but the attempt was rolled back: {}",
+                reason.trim()
+            ),
         }
     }
 
@@ -1816,7 +1822,7 @@ mod tests {
 
         let outcome = Outcome::Failed { reason };
         let text = outcome.memory_text();
-        assert!(text.starts_with("Improve run failed and was rolled back: chezmoi source has uncommitted changes"));
+        assert!(text.contains("the attempt was rolled back: chezmoi source has uncommitted changes"));
 
         let parsed = parse_uncommitted_targets(&text).unwrap();
         assert_eq!(parsed, vec!["/h/.claude/skills".to_string(), "/h/.claude/CLAUDE.md".to_string()]);
@@ -1906,7 +1912,7 @@ mod tests {
 
         let outcome = Outcome::Failed { reason };
         let text = outcome.memory_text();
-        assert!(text.starts_with("Improve run failed and was rolled back: chezmoi source drifted"));
+        assert!(text.contains("the attempt was rolled back: chezmoi source drifted"));
 
         let parsed = parse_pre_run_drift(&text).unwrap();
         assert_eq!(parsed, vec!["/h/.claude/CLAUDE.md".to_string(), "/h/.claude/settings.json".to_string()]);

@@ -676,14 +676,61 @@ pub fn verify_claude_md(path: &Path, before_len: Option<u64>) -> Result<(), Stri
     Ok(())
 }
 
+/// The charter lock: deny rules and guard hook that keep Claude from
+/// editing `~/.config/mach/charter.toml`. An improve run may never remove
+/// them or touch the guard script; if it does, the run is rolled back.
+pub const CHARTER_GUARD_FILE: &str = "charter-guard.py";
+pub const CHARTER_DENY_RULES: [&str; 4] = [
+    "Edit(~/.config/mach/charter.toml)",
+    "Write(~/.config/mach/charter.toml)",
+    "Edit(~/.config/claude-hooks/charter-guard.py)",
+    "Write(~/.config/claude-hooks/charter-guard.py)",
+];
+
+/// settings.json must still carry every charter deny rule and a
+/// PreToolUse hook command running the charter guard.
+pub fn verify_charter_lock(path: &Path) -> Result<(), String> {
+    let text = fs::read_to_string(path).map_err(|e| format!("{}: unreadable: {}", path.display(), e))?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{}: invalid JSON: {}", path.display(), e))?;
+    let deny: Vec<&str> = v
+        .pointer("/permissions/deny")
+        .and_then(|d| d.as_array())
+        .map(|a| a.iter().filter_map(|r| r.as_str()).collect())
+        .unwrap_or_default();
+    for rule in CHARTER_DENY_RULES {
+        if !deny.contains(&rule) {
+            return Err(format!("{}: charter lock removed (missing deny rule {})", path.display(), rule));
+        }
+    }
+    let guarded = v
+        .pointer("/hooks/PreToolUse")
+        .and_then(|g| g.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|g| g.get("hooks").and_then(|h| h.as_array()))
+        .flatten()
+        .filter_map(|h| h.get("command").and_then(|c| c.as_str()))
+        .any(|c| c.contains(CHARTER_GUARD_FILE));
+    if !guarded {
+        return Err(format!("{}: charter lock removed (no PreToolUse hook runs {})", path.display(), CHARTER_GUARD_FILE));
+    }
+    Ok(())
+}
+
 /// Every change must be inside the targets and pass its file-type check.
 /// Deleted files are allowed (a revert may remove a skill this pass created)
-/// except for the two single-file targets, which must never vanish.
+/// except for the two single-file targets, which must never vanish. The
+/// charter, its guard and its settings.json lock are never improve's to
+/// change.
 pub fn verify_changes(changes: &[Change], targets: &Targets, snap: &Snapshot) -> Result<(), String> {
     for c in changes {
         let p = c.path();
         if !targets.allows(p) {
             return Err(format!("{}: outside write targets", p.display()));
+        }
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name == CHARTER_GUARD_FILE || name == "charter.toml" {
+            return Err(format!("{}: the charter and its guard are the user's to change, never improve's", p.display()));
         }
         if let Change::Deleted(_) = c {
             if p == targets.claude_md || p == targets.settings_json {
@@ -695,6 +742,7 @@ pub fn verify_changes(changes: &[Change], targets: &Targets, snap: &Snapshot) ->
             verify_claude_md(p, snapshot_len(snap, p))?;
         } else if p == targets.settings_json {
             verify_settings_json(p, &targets.hooks_dir)?;
+            verify_charter_lock(p)?;
         } else if p.starts_with(&targets.hooks_dir) {
             verify_hook_script(p)?;
         } else if p.starts_with(&targets.skills_dir) {
@@ -1359,6 +1407,30 @@ mod tests {
         assert!(verify_changes(&[del], &t, &snap).unwrap_err().contains("deleted"));
         let del_skill = Change::Deleted(t.skills_dir.join("old/SKILL.md"));
         assert!(verify_changes(&[del_skill], &t, &snap).is_ok());
+    }
+
+    #[test]
+    fn verify_changes_rolls_back_any_run_that_weakens_the_charter_lock() {
+        let (_s, t) = home_with_targets("charter-lock");
+        let snap = snapshot(&t, &_s.0.join("snap")).unwrap();
+        let guard = t.hooks_dir.join(CHARTER_GUARD_FILE);
+        write(&guard, "import sys\nsys.exit(0)\n");
+        assert!(verify_changes(&[Change::Modified(guard)], &t, &snap).unwrap_err().contains("never improve's"));
+
+        let deny: Vec<String> = CHARTER_DENY_RULES.iter().map(|r| format!("{:?}", r)).collect();
+        let locked = format!(
+            r#"{{"permissions":{{"deny":[{}]}},"hooks":{{"PreToolUse":[{{"hooks":[{{"command":"python3 /x/{}"}}]}}]}}}}"#,
+            deny.join(","),
+            CHARTER_GUARD_FILE
+        );
+        write(&t.settings_json, &locked);
+        assert!(verify_changes(&[Change::Modified(t.settings_json.clone())], &t, &snap).is_ok());
+
+        write(&t.settings_json, &locked.replace(&deny[0], "\"Edit(x)\""));
+        assert!(verify_changes(&[Change::Modified(t.settings_json.clone())], &t, &snap).unwrap_err().contains("deny rule"));
+
+        write(&t.settings_json, &locked.replace(&format!("python3 /x/{}", CHARTER_GUARD_FILE), "python3 /x/other.py"));
+        assert!(verify_changes(&[Change::Modified(t.settings_json.clone())], &t, &snap).unwrap_err().contains("PreToolUse"));
     }
 
     #[test]

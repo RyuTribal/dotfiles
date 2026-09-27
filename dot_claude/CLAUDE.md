@@ -126,9 +126,10 @@ every prompt — you don't have to ask for that.
 A separate hook injects a compact mental model once at session start
 (durable beliefs/themes, no source ids); treat those as standing priors
 and per-prompt recall as the specifics, and treat any row flagged DOUBTED
-as a hypothesis to weigh, not a settled fact. Save durable user-facts
-deliberately, don't wait to be asked: `mach kb add
-"<fact>" --source "<context>"`. The `kb` skill covers what qualifies. Same
+as a hypothesis to weigh, not a settled fact. Save durable facts about the
+user, and episodes of how I worked with them, deliberately, don't wait to be
+asked: `mach kb add "<fact>" --source "<context>"` (episodes add `--basis
+experience`). The `kb` skill covers what qualifies. Same
 rule as everywhere else in this file: **never store secrets or
 credentials in it.** Auto-extracted candidates land unreviewed —
 `mach kb review` is how the user curates that queue, not you unprompted.

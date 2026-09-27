@@ -1665,14 +1665,17 @@ decision only survives if you happened to save it.
 `mach kb improve` runs after every `mach kb reflect` (same
 `mach-reflect.timer`). When enough new signal has accrued since its last
 run — new memories plus affective graph edges such as `prefers`, `rejects`,
-`values`, `frustrated-by` — it hands the evidence (mental model, new
-memories, those edges, per-skill invocation and correction counts, its own
-prior outcomes) to one agentic `claude -p` call that may edit
-`~/.claude/skills/**`, `~/.claude/CLAUDE.md`, `~/.claude/settings.json` and
-`~/.config/claude-hooks/**` and nothing else. Rust snapshots those paths
-first, verifies what came back (bash -n and `exit 0` on hooks, valid JSON
-on settings, frontmatter on skills, no CLAUDE.md shrink over 20%), rolls
-back on any doubt, and otherwise commits the change through chezmoi. The
+`values`, `frustrated-by` — it hands the evidence (mental model, the "who you are" self-model and the
+charter's goals, new memories, those edges, per-skill invocation and
+correction counts, its own prior outcomes) to one agentic `claude -p` call
+that may edit `~/.claude/skills/**`, `~/.claude/CLAUDE.md`,
+`~/.claude/settings.json` and `~/.config/claude-hooks/**` and nothing else.
+It is asked to close gaps between your traits and the goals (a trait is
+evidence of a pattern, not an order). Rust snapshots those paths first,
+verifies what came back (bash -n and `exit 0` on hooks, valid JSON on
+settings, frontmatter on skills, no CLAUDE.md shrink over 20%, the charter,
+its guard and its settings.json lock untouched), rolls back on any doubt,
+and otherwise commits the change through chezmoi. The
 user reviews the commit afterwards; there is no proposal queue.
 
 **The chezmoi-clean preflight is scoped to its own write targets, not the

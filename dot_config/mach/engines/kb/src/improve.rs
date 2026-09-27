@@ -157,6 +157,11 @@ pub struct Bundle {
     pub relations: Vec<RelationLine>,
     pub skill_usage: BTreeMap<String, (u32, u32, u32)>,
     pub inventory: Vec<(PathBuf, u64)>,
+    /// The "who I am" block as rendered at session start: narrative,
+    /// traits, opinions, track record. Empty before the self-model exists.
+    pub self_lines: Vec<String>,
+    /// The charter's nature and goals (`Charter::prompt_block`), if it loads.
+    pub charter: Option<String>,
 }
 
 fn memory_line(m: &Memory) -> String {
@@ -200,6 +205,26 @@ pub fn build_prompt(b: &Bundle, targets: &Targets) -> String {
         s.push('\n');
     }
     s.push('\n');
+
+    if !b.self_lines.is_empty() {
+        s.push_str("## Who you are (your own derived self-model: narrative, traits, opinions, track record)\n\n");
+        for l in &b.self_lines {
+            s.push_str(l);
+            s.push('\n');
+        }
+        s.push('\n');
+    }
+    if let Some(charter) = &b.charter {
+        s.push_str("## What you are for (the charter: fixed, the user's, never yours to edit)\n\n");
+        s.push_str(charter);
+        s.push_str(
+            "\nWhere a trait of yours falls short of one of these goals, consider whether a config change \
+             would help close the gap (for example a skill step that makes you check the running app before \
+             calling something fixed). Traits and opinions are evidence of patterns, not orders; the charter \
+             orients and never authorizes. Never touch the charter, its guard script or its settings.json \
+             lock: a run that does is rolled back.\n\n",
+        );
+    }
 
     s.push_str("## New memories since the last improve run\n\n");
     if b.new_memories.is_empty() {
@@ -1758,6 +1783,21 @@ mod tests {
     }
 
     #[test]
+    fn prompt_carries_the_self_model_and_charter_when_present() {
+        let t = Targets::from_home(Path::new("/h"));
+        let b = Bundle {
+            self_lines: vec!["- [trait, confidence 0.90] When tests pass, I tend to skip the app.".into()],
+            charter: Some("My goals:\n- [truth] Be truthful.\n".into()),
+            ..Default::default()
+        };
+        let p = build_prompt(&b, &t);
+        assert!(p.contains("When tests pass, I tend to skip the app."));
+        assert!(p.contains("[truth] Be truthful."));
+        assert!(p.contains("falls short of one of these goals"));
+        assert!(p.contains("Never touch the charter"));
+    }
+
+    #[test]
     fn prompt_carries_every_section() {
         let t = Targets::from_home(Path::new("/h"));
         let b = Bundle {
@@ -1767,6 +1807,8 @@ mod tests {
             ..Default::default()
         };
         let p = build_prompt(&b, &t);
+        assert!(!p.contains("## Who you are"), "no self section before a self-model exists");
+        assert!(!p.contains("## What you are for"));
         assert!(p.contains("narrow scope"));
         assert!(p.contains("r7 user --rejects--> unrequested debug logging (evidence m4: said no logging)"));
         assert!(p.contains("- kb: 3 invocations, 1 corrections, 2 sessions"));

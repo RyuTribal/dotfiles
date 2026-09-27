@@ -8502,12 +8502,16 @@ pub fn entity_card_candidates(conn: &Connection, cap: usize) -> Result<Vec<Entit
                   WHERE me.entity_id = e.id AND m.invalidated_at IS NULL AND m.dormant_at IS NULL) AS deg,
                 (SELECT COALESCE(MAX(me.memory_id), 0) FROM memory_entities me JOIN memories m ON m.id = me.memory_id
                   WHERE me.entity_id = e.id AND m.invalidated_at IS NULL AND m.dormant_at IS NULL) AS hi,
+                (SELECT AVG(COALESCE(m.goal_relevance, 0.5)) FROM memory_entities me JOIN memories m ON m.id = me.memory_id
+                  WHERE me.entity_id = e.id AND m.invalidated_at IS NULL AND m.dormant_at IS NULL) AS rel,
                 c.built_watermark AS wm, c.mention_count AS mc
             FROM entities e LEFT JOIN entity_cards c ON c.entity_id = e.id
             WHERE e.name <> 'user' COLLATE NOCASE
          )
          WHERE deg >= ?1 AND (wm IS NULL OR hi > wm OR mc <> deg)
-         ORDER BY (hi - COALESCE(wm, 0)) DESC, deg DESC
+         -- Goal relevance (self-model phase 4) orders which stale cards are
+         -- rebuilt first; it never decides which entities are candidates.
+         ORDER BY ROUND(COALESCE(rel, 0.5), 1) DESC, (hi - COALESCE(wm, 0)) DESC, deg DESC
          LIMIT ?2",
     )?;
     let rows = stmt.query_map(params![CARD_MIN_MENTIONS, cap as i64], row_to_entity)?;
@@ -9319,6 +9323,32 @@ mod tests {
         let due: Vec<i64> = entity_card_candidates(&conn, 10).unwrap().iter().map(|e| e.id).collect();
         assert!(!due.contains(&thin), "one mention is below CARD_MIN_MENTIONS");
         assert!(!due.contains(&user), "the reserved user entity never gets a card");
+    }
+
+    #[test]
+    fn goal_relevance_reorders_entity_card_candidates_without_changing_the_set() {
+        let conn = mem_conn();
+        let now = now_rfc3339();
+        let mut add = |name: &str, n: usize| {
+            let e = insert_entity(&conn, name, Some("project"), None).unwrap();
+            let ids: Vec<i64> = (0..n)
+                .map(|i| {
+                    let m = insert(&conn, &format!("{} fact {}", name, i), None, None, true, None, 5).unwrap();
+                    link_mention(&conn, m, e, MENTION_SOURCE_EXTRACTION, &now).unwrap();
+                    m
+                })
+                .collect();
+            (e, ids)
+        };
+        let (older, _) = add("Alpha", CARD_MIN_MENTIONS as usize);
+        let (newer, newer_ids) = add("Beta", CARD_MIN_MENTIONS as usize);
+        let before: Vec<i64> = entity_card_candidates(&conn, 10).unwrap().iter().map(|e| e.id).collect();
+        assert_eq!(before, vec![newer, older], "unscored: staleness order, newest evidence first");
+        for id in newer_ids {
+            set_goal_relevance(&conn, id, 0.1).unwrap();
+        }
+        let after: Vec<i64> = entity_card_candidates(&conn, 10).unwrap().iter().map(|e| e.id).collect();
+        assert_eq!(after, vec![older, newer], "less goal-relevant evidence moves an entity back, never out");
     }
 
     #[test]

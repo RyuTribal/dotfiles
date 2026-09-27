@@ -8352,6 +8352,16 @@ fn build_improve_bundle(
         relations: rel_lines,
         skill_usage,
         inventory: improve::inventory(targets),
+        self_lines: {
+            let block = SelfBlock {
+                narrative: store::self_narrative(conn)?.map(|(t, _)| t),
+                traits: store::self_model(conn)?,
+                opinions: store::opinion_model(conn)?,
+                record: record_summary(conn)?,
+            };
+            block.render(None).lines().map(str::to_string).collect()
+        },
+        charter: crate::charter::load().ok().flatten().map(|c| c.prompt_block()),
     })
 }
 

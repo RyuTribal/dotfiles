@@ -134,7 +134,11 @@ impl Targets {
     /// everywhere, edits only inside the targets, and the two syntax
     /// checkers the prompt asks Claude to run on what it wrote.
     pub fn allowed_tools(&self) -> Vec<String> {
-        let d = |p: &Path| p.display().to_string();
+        // Permission rules read `/path` as relative to the project root; an
+        // absolute path needs a leading `//`. With a single slash none of
+        // these rules ever matched, so every edit was denied (verified
+        // against the real CLI, 2026-09-27).
+        let d = |p: &Path| format!("/{}", p.display());
         vec![
             "Read".to_string(),
             "Glob".to_string(),
@@ -1495,7 +1499,7 @@ mod tests {
         assert!(t.allows(Path::new("/h/.config/claude-hooks/x.sh")));
         assert!(!t.allows(Path::new("/h/.claude/settings.local.json")));
         assert!(!t.allows(Path::new("/h/.bashrc")));
-        assert!(t.allowed_tools().iter().any(|s| s == "Edit(/h/.claude/CLAUDE.md)"));
+        assert!(t.allowed_tools().iter().any(|s| s == "Edit(//h/.claude/CLAUDE.md)"));
         assert!(!t.allowed_tools().iter().any(|s| s == "Bash"));
     }
 
@@ -1625,6 +1629,15 @@ mod tests {
         assert!(!real.skills_dir.join("old/SKILL.md").exists());
         let note = staging_note(&staged, &real);
         assert!(note.contains(&format!("{} is {}", staged.claude_md.display(), real.claude_md.display())));
+    }
+
+    #[test]
+    fn allowed_tool_rules_use_the_absolute_double_slash_form() {
+        let t = Targets::from_home(Path::new("/h"));
+        let tools = t.allowed_tools();
+        assert!(tools.contains(&"Edit(//h/.claude/CLAUDE.md)".to_string()), "{:?}", tools);
+        assert!(tools.contains(&"Write(//h/.claude/skills/**)".to_string()));
+        assert!(!tools.iter().any(|r| r.contains("(/h/")), "a single-slash absolute path never matches");
     }
 
     #[test]

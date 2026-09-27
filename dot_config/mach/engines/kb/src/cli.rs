@@ -2303,7 +2303,8 @@ fn record_summary(conn: &Connection) -> Result<String, KbError> {
 
 /// Narrative identity (phase 3): regenerates the first-person self-story
 /// when the self layer (active self traits, self themes, opinions, the
-/// track record) has changed since it was last written, and only then.
+/// track record) or the nature and goals it is read against have changed
+/// since it was last written, and only then.
 /// Needs at least two self insights. Returns (rewritten, call failed).
 fn run_narrative_step<L: ReflectLlm>(
     conn: &Connection,
@@ -2327,6 +2328,9 @@ fn run_narrative_step<L: ReflectLlm>(
             h.update(format!("{}:{}\n", i.id, i.text));
         }
         h.update(&record);
+        // What the story interprets includes what I care about: a change to
+        // my nature or goals rewrites it too.
+        h.update(charter.prompt_block());
         h.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>()
     };
     if store::self_narrative(conn)?.is_some_and(|(_, d)| d == digest) {

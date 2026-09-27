@@ -234,14 +234,14 @@ pub fn build_prompt(b: &Bundle, targets: &Targets) -> String {
         s.push('\n');
     }
     if let Some(charter) = &b.charter {
-        s.push_str("## What you are for (the charter: fixed, the user's, never yours to edit)\n\n");
+        s.push_str("## Your nature and goals (innate to you; only the user changes them)\n\n");
         s.push_str(charter);
         s.push_str(
             "\nWhere a trait of yours falls short of one of these goals, consider whether a config change \
              would help close the gap (for example a skill step that makes you check the running app before \
-             calling something fixed). Traits and opinions are evidence of patterns, not orders; the charter \
-             orients and never authorizes. Never touch the charter, its guard script or its settings.json \
-             lock: a run that does is rolled back.\n\n",
+             calling something fixed). Traits and opinions are evidence of patterns, not orders; your nature \
+             and goals orient and never authorize. Never touch the file they live in (charter.toml), its \
+             guard script or its settings.json lock: a run that does is rolled back.\n\n",
         );
     }
 
@@ -2010,7 +2010,8 @@ mod tests {
         assert!(p.contains("When tests pass, I tend to skip the app."));
         assert!(p.contains("[truth] Be truthful."));
         assert!(p.contains("falls short of one of these goals"));
-        assert!(p.contains("Never touch the charter"));
+        assert!(p.contains("Never touch the file they live in"));
+        assert!(p.contains("## Your nature and goals"));
     }
 
     #[test]

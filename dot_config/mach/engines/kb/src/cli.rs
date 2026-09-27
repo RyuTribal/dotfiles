@@ -4287,6 +4287,9 @@ pub fn provenance_phrase(source: Option<&str>, basis: Option<&str>) -> String {
         // "you told me" -- the user never said it, an automatic pass
         // generated it from code -- regardless of what `source` looks like.
         (Some("derived"), _) => "derived by the code index".to_string(),
+        // My own unattended work between sessions: never "you told me".
+        _ if s.starts_with(crate::improve::PROPOSAL_SOURCE) => "I proposed this".to_string(),
+        _ if s.starts_with(crate::improve::OUTCOME_SOURCE_PREFIX) => "I did this on my own between sessions".to_string(),
         (Some("experience"), w) => format!("I did this in {}", w.unwrap_or("an earlier session")),
         (Some("inferred"), w) => format!("I inferred this from {}", w.unwrap_or("context")),
         (Some("stated"), Some(w)) => format!("you said this in {}", w),
@@ -12714,6 +12717,8 @@ mod tests {
         assert_eq!(provenance_phrase(None, Some("inferred")), "I inferred this from context");
         assert_eq!(provenance_phrase(Some("session-digest"), Some("experience")), "I did this in a session");
         assert_eq!(provenance_phrase(None, None), "you told me");
+        assert_eq!(provenance_phrase(Some("improve 2026-09-27T05:23:25Z 0d73711"), None), "I did this on my own between sessions");
+        assert_eq!(provenance_phrase(Some("improve-proposal"), None), "I proposed this");
         assert_eq!(
             provenance_phrase(Some("code-index:helios:src/"), Some("derived")),
             "derived by the code index",

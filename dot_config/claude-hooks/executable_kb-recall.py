@@ -284,6 +284,11 @@ def source_phrase(source, basis=None):
     elif s == "session-digest" or s.startswith("session-digest:") \
             or s == "transcript-backfill" or s.startswith("transcript-backfill:"):
         where = "a session"
+    # Claude's own unattended work between sessions (mach kb improve).
+    if s.startswith("improve-proposal"):
+        return "I proposed this"
+    if s.startswith("improve "):
+        return "I did this on my own between sessions"
     if b == "experience":
         # The agent's own conduct: what Claude did and how the user reacted.
         return "I did this in {}".format(where or "an earlier session")

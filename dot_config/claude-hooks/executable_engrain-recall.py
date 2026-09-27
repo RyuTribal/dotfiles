@@ -114,7 +114,7 @@ def merge_responses(primary, secondary):
     `id` space). Either side may be None."""
     if not primary and not secondary:
         return None
-    out = {"hits": [], "connections": [], "cards": [], "project_card": None}
+    out = {"hits": [], "connections": [], "cards": [], "project_card": None, "goals": []}
     seen_ids, seen_text, seen_conn, seen_cards = set(), set(), set(), set()
     for resp in (primary, secondary):
         if not resp:
@@ -147,6 +147,8 @@ def merge_responses(primary, secondary):
                 continue
             seen_cards.add(name)
             out["cards"].append(card)
+        if not out["goals"]:
+            out["goals"] = [g for g in (resp.get("goals") or []) if isinstance(g, dict)][:1]
     return out
 
 
@@ -571,7 +573,8 @@ def main():
     hits = (resp or {}).get("hits") or []
     connections = (resp or {}).get("connections") or []
     cards = (resp or {}).get("cards") or []
-    if not hits and not connections and not cards and not (resp and project_card_text(resp)):
+    goals = [g for g in ((resp or {}).get("goals") or []) if isinstance(g, dict)]
+    if not hits and not connections and not cards and not goals and not (resp and project_card_text(resp)):
         # Nothing matched at all -- the fallback line below (not the action
         # line, which requires something actually injected) is the only
         # thing that can still be shown.
@@ -696,6 +699,26 @@ def main():
     if project_card:
         card_keys.append(PROJECT_CARD_KEY)
 
+    # A goal I chose that this prompt touches: shown once per session (keyed
+    # in the same whole-session card log), with the obstacle, since that is
+    # the moment the obstacle can actually be met.
+    goal_line = ""
+    seen_goal_keys = session_seen_cards(log_path)
+    for g in goals[:1]:
+        key = "goal:{}".format(g.get("id"))
+        text = (g.get("text") or "").strip().rstrip(".")
+        if not text or key in seen_goal_keys:
+            continue
+        goal_line = "This touches what I'm working on: {}.".format(text)
+        if (g.get("obstacle") or "").strip():
+            goal_line += " Obstacle: {}".format(g["obstacle"].strip().rstrip(".")) + "."
+        if (g.get("if_then") or "").strip():
+            goal_line += " " + g["if_then"].strip()
+        card_keys.append(key)
+    if goal_line:
+        print(goal_line)
+        print()
+
     if card_block:
         print("What you know about what this prompt names (consolidated from many "
               "memories by reflection; the memories themselves follow):")
@@ -725,7 +748,7 @@ def main():
     # to act on, or the once-per-session no-match fallback when there
     # isn't. The project card alone counts as "injected" too — it's
     # rendered content, not a placeholder.
-    injected = bool(project_card) or bool(card_block) or bool(lines) or bool(connection_lines)
+    injected = bool(project_card) or bool(card_block) or bool(lines) or bool(connection_lines) or bool(goal_line)
     if injected:
         print()
         print(ACTION_LINE)

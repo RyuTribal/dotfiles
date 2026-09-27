@@ -3171,6 +3171,68 @@ fn migrate_v35_to_v36(conn: &Connection) -> Result<(), KbError> {
     Ok(())
 }
 
+/// Schema v37 (self-model phase 2): `memories.goal_relevance`, 0..1 against
+/// the charter goals, NULL until the relevance step scores it. It only
+/// nudges recall order (weight from the charter, default 0) and feeds
+/// nothing that decides what is kept.
+fn migrate_v36_to_v37(conn: &Connection) -> Result<(), KbError> {
+    add_column_if_missing(conn, "memories", "goal_relevance", "REAL")?;
+    conn.execute("PRAGMA user_version = 37", [])?;
+    Ok(())
+}
+
+/// Active, awake memories not yet scored for goal relevance, newest first.
+pub fn memories_missing_goal_relevance(conn: &Connection, cap: usize) -> Result<Vec<Memory>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM memories WHERE goal_relevance IS NULL AND invalidated_at IS NULL AND dormant_at IS NULL
+         ORDER BY id DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![cap as i64], row_to_memory)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Writes one memory's goal relevance, clamped to 0..1. Touches no other
+/// column.
+pub fn set_goal_relevance(conn: &Connection, id: i64, relevance: f64) -> Result<bool, KbError> {
+    Ok(conn.execute("UPDATE memories SET goal_relevance = ?1 WHERE id = ?2", params![relevance.clamp(0.0, 1.0), id])? > 0)
+}
+
+fn goal_relevance_map(conn: &Connection) -> Result<std::collections::HashMap<i64, f32>, KbError> {
+    let mut stmt = conn.prepare("SELECT id, goal_relevance FROM memories WHERE goal_relevance IS NOT NULL")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)? as f32)))?;
+    let mut out = std::collections::HashMap::new();
+    for r in rows {
+        let (id, v) = r?;
+        out.insert(id, v);
+    }
+    Ok(out)
+}
+
+/// Relevance assumed for a memory not yet scored: the midpoint, so scoring
+/// never penalizes a memory for being new.
+pub const GOAL_RELEVANCE_UNSCORED: f32 = 0.5;
+
+/// Recall weight of goal relevance: `MACH_KB_W_GOAL` (for eval sweeps), else
+/// the charter's `goal_relevance_weight`, else 0. Taken out of the
+/// similarity weight so the blend's total is unchanged. Read once per
+/// process.
+pub fn goal_weight() -> f32 {
+    static W: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        if let Some(v) = env::var("MACH_KB_W_GOAL").ok().and_then(|v| v.parse::<f32>().ok()) {
+            return v.clamp(0.0, 0.15);
+        }
+        match crate::charter::load() {
+            Ok(Some(c)) => c.parameters.goal_relevance_weight as f32,
+            _ => 0.0,
+        }
+    })
+}
+
 /// Backfill helper for `migrate_v29_to_v30` (also exposed for tests, same
 /// convention as `backfill_occurrence_from_text`): marks every memory with
 /// `id <= reflect_state.last_memory_id` reflected as of
@@ -3788,7 +3850,7 @@ const MEMORY_COLUMNS: &[(&str, &str)] = &[
 /// against this rather than a literal: every schema addition used to
 /// require hunting down a dozen hard-coded version numbers across the
 /// migration tests, which is busywork that also invites getting one wrong.
-pub const SCHEMA_VERSION: i64 = 36;
+pub const SCHEMA_VERSION: i64 = 37;
 
 fn ensure_memory_columns(conn: &Connection) -> Result<(), KbError> {
     if !table_exists(conn, "memories")? {
@@ -3916,6 +3978,9 @@ fn migrate(conn: &Connection) -> Result<(), KbError> {
     }
     if version < 36 {
         migrate_v35_to_v36(conn)?;
+    }
+    if version < 37 {
+        migrate_v36_to_v37(conn)?;
     }
     Ok(())
 }
@@ -5196,6 +5261,19 @@ pub fn ranking_weights() -> (f32, f32, f32) {
     })
 }
 
+/// One memory's ranking score. With `w_goal = 0` this is exactly the
+/// three-term blend; otherwise `w_goal` moves from the similarity weight to
+/// goal relevance (unscored counts as the midpoint).
+#[allow(clippy::too_many_arguments)]
+pub fn blend_score(w_sim: f32, w_rec: f32, w_str: f32, w_goal: f32, sim: f32, recency: f32, strength: f32, goal: Option<f32>) -> f32 {
+    let base = (w_sim - w_goal).max(0.0) * sim + w_rec * recency + w_str * strength;
+    if w_goal > 0.0 {
+        base + w_goal * goal.unwrap_or(GOAL_RELEVANCE_UNSCORED)
+    } else {
+        base
+    }
+}
+
 /// Rescales raw cosine so `SIM_NOISE_FLOOR` maps to 0 and 1.0 stays 1.0,
 /// making the similarity term mean "how far above chance is this" -- which
 /// is what a threshold needs it to mean.
@@ -5368,11 +5446,13 @@ fn rank_with_lexical(
     };
 
     let (w_sim, w_rec, w_str) = ranking_weights();
+    let w_goal = goal_weight();
+    let goal = if w_goal > 0.0 { goal_relevance_map(conn)? } else { std::collections::HashMap::new() };
     let mut scored: Vec<RankedHit> = cands
         .drain(..)
         .map(|c| {
             let rel = relevance.get(&c.memory.id).copied().unwrap_or(0.0);
-            let mut score = w_sim * rel + w_rec * c.recency + w_str * c.strength;
+            let mut score = blend_score(w_sim, w_rec, w_str, w_goal, rel, c.recency, c.strength, goal.get(&c.memory.id).copied());
             if c.superseded {
                 score *= 0.1;
             }
@@ -11232,6 +11312,29 @@ mod tests {
         // idempotent on repeat, like the v0->v1 migration
         migrate(&conn).unwrap();
         assert_eq!(list(&conn, None, false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn blend_score_is_unchanged_at_zero_goal_weight_and_moves_weight_otherwise() {
+        let base = blend_score(0.85, 0.10, 0.05, 0.0, 0.6, 0.5, 0.2, Some(1.0));
+        assert!((base - (0.85 * 0.6 + 0.10 * 0.5 + 0.05 * 0.2)).abs() < 1e-6, "relevance ignored at weight 0");
+        let with = blend_score(0.85, 0.10, 0.05, 0.05, 0.6, 0.5, 0.2, Some(1.0));
+        assert!((with - (0.80 * 0.6 + 0.10 * 0.5 + 0.05 * 0.2 + 0.05)).abs() < 1e-6);
+        let unscored = blend_score(0.85, 0.10, 0.05, 0.05, 0.6, 0.5, 0.2, None);
+        assert!((unscored - (with - 0.05 * 0.5)).abs() < 1e-6, "unscored counts as the midpoint");
+    }
+
+    #[test]
+    fn goal_relevance_writes_clamp_and_touch_nothing_else() {
+        let conn = mem_conn();
+        let id = insert(&conn, "a memory", None, None, true, None, 5).unwrap();
+        let before = get(&conn, id).unwrap().unwrap();
+        assert!(set_goal_relevance(&conn, id, 3.0).unwrap());
+        let v: f64 = conn.query_row("SELECT goal_relevance FROM memories WHERE id = ?1", params![id], |r| r.get(0)).unwrap();
+        assert_eq!(v, 1.0);
+        let after = get(&conn, id).unwrap().unwrap();
+        assert_eq!((before.importance, before.reviewed, before.stability), (after.importance, after.reviewed, after.stability));
+        assert!(memories_missing_goal_relevance(&conn, 10).unwrap().is_empty());
     }
 
     #[test]

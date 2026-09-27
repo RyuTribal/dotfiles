@@ -248,6 +248,95 @@ pub fn build_questions_prompt(working_set: &[(i64, String)]) -> String {
     s
 }
 
+/// Stage 1 of the user insight stage when a charter is present: the same
+/// task as [`build_questions_prompt`] (and the same opening line, which the
+/// transcript filter keys on), oriented by the goals. Each question comes
+/// back prefixed with the goal it serves, `[goal_id] question`, split off
+/// again by [`split_goal_tag`].
+pub fn build_goal_questions_prompt(charter_block: &str, working_set: &[(i64, String)]) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "You are analyzing a personal knowledge bank to find deeper patterns. \
+         These are the goals the patterns should matter to:\n\n",
+    );
+    s.push_str(charter_block);
+    s.push_str("\nStatements from the knowledge bank (id: content):\n\n");
+    for (id, content) in working_set {
+        s.push_str(&format!("{}: {}\n", id, content));
+    }
+    s.push_str(
+        "\nWhat are the 2-3 most salient higher-level questions these statements could answer that bear \
+         on those goals -- what the user is actually trying to achieve, how they work, learn or get \
+         stuck, their projects and systems, recurring patterns across work? Prefix each question with \
+         the id of the goal it serves in square brackets, e.g. `[growth] ...`. One per line, nothing else.\n",
+    );
+    s
+}
+
+/// Splits a leading `[goal_id]` tag off a stage-1 question.
+pub fn split_goal_tag(question: &str) -> (Option<String>, String) {
+    let q = question.trim();
+    if let Some(rest) = q.strip_prefix('[') {
+        if let Some((tag, text)) = rest.split_once(']') {
+            let tag = tag.trim();
+            if !tag.is_empty() && tag.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                return (Some(tag.to_string()), text.trim().to_string());
+            }
+        }
+    }
+    (None, q.to_string())
+}
+
+/// Appended to a stage-2 insight prompt when its question came from a goal:
+/// the insight should say why it matters, not only what it is.
+pub fn goal_context_note(goal_id: &str, statement: &str) -> String {
+    format!(
+        "\nThis question bears on the goal [{}]: {} Where the evidence allows, say in the insight itself \
+         why it matters for that goal. The output format above is unchanged.\n",
+        goal_id, statement
+    )
+}
+
+/// Maximum memories scored per relevance call.
+pub const RELEVANCE_BATCH: usize = 30;
+
+/// Goal-relevance scoring: one haiku call rates a batch of memories 0..1
+/// against the charter goals. The score only nudges recall order; it is
+/// never used to decide what is kept.
+pub fn build_relevance_prompt(charter_block: &str, rows: &[(i64, String)]) -> String {
+    let mut s = String::new();
+    s.push_str("You are scoring memories in a personal knowledge bank for how much each bears on these goals:\n\n");
+    s.push_str(charter_block);
+    s.push_str("\nMemories (id: content):\n");
+    for (id, content) in rows {
+        s.push_str(&format!("{}: {}\n", id, content));
+    }
+    s.push_str(
+        "\nFor every memory above, output one line `<id>: <score>` with a score from 0.0 (irrelevant to \
+         all the goals) to 1.0 (central to at least one). Judge relevance only, not importance, truth or \
+         quality. Nothing else.\n",
+    );
+    s
+}
+
+/// Parses `<id>: <score>` lines, keeping only ids in `known` and scores
+/// that parse; clamps to 0..1. The first score for an id wins.
+pub fn parse_relevance(output: &str, known: &std::collections::HashSet<i64>) -> Vec<(i64, f64)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for line in output.lines() {
+        let line = strip_list_marker(line.trim());
+        let Some((id, score)) = line.split_once(':') else { continue };
+        let (Ok(id), Ok(score)) = (id.trim().trim_start_matches('#').parse::<i64>(), score.trim().parse::<f64>()) else {
+            continue;
+        };
+        if known.contains(&id) && score.is_finite() && seen.insert(id) {
+            out.push((id, score.clamp(0.0, 1.0)));
+        }
+    }
+    out
+}
+
 /// Self-reflection stage 1: questions about Claude's own recurring
 /// patterns, oriented by the charter. `charter_block` is
 /// `Charter::prompt_block`; `episodes` are `experience` memories.
@@ -2639,6 +2728,27 @@ pub fn parse_supersession_audit_verdicts(output: &str, expected_ids: &[i64]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn goal_tags_split_off_questions_and_plain_questions_pass_through() {
+        assert_eq!(split_goal_tag("[growth] Where does the user get stuck?"), (Some("growth".into()), "Where does the user get stuck?".into()));
+        assert_eq!(split_goal_tag("What does the user prefer?"), (None, "What does the user prefer?".into()));
+        assert_eq!(split_goal_tag("[Not A Tag] x"), (None, "[Not A Tag] x".into()));
+    }
+
+    #[test]
+    fn relevance_parse_keeps_known_ids_clamps_and_takes_the_first_score() {
+        let known: std::collections::HashSet<i64> = [1, 2, 3].into_iter().collect();
+        let got = parse_relevance("1: 0.8\n- 2: 1.7\n#3: x\n9: 0.5\n1: 0.1\nnoise", &known);
+        assert_eq!(got, vec![(1, 0.8), (2, 1.0)]);
+    }
+
+    #[test]
+    fn goal_questions_prompt_keeps_the_filtered_opener() {
+        let p = build_goal_questions_prompt("GOALS", &[(1, "m".into())]);
+        assert!(p.starts_with("You are analyzing a personal knowledge bank"));
+        assert!(p.contains("GOALS") && p.contains("[growth]"));
+    }
 
     // --- stage 1 ---
 

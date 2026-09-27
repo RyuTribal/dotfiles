@@ -525,6 +525,17 @@ them `[self-knowledge]`. They are evidence about your patterns, provisional,
 and yours to act on as judgment, not rules. Reflect's summary line reports
 `self=examined:…,added:…,reinforced:…,stale:…` or `self=skipped(<reason>)`.
 
+Since phase 2 (2026-09-27) the charter also orients reflection about the
+user: the insight stage's questions are asked relative to the goals, each
+tagged with the goal it serves, and the stage-2 prompt asks the insight to
+say why it matters for that goal. A separate relevance step (reflect
+summary `goal_scored=N`, up to 150 memories per run) scores memories 0..1
+against the goals into `memories.goal_relevance`. That score only nudges
+recall order, by the charter's optional `goal_relevance_weight` (0..=0.15,
+absent = 0, so recall is unchanged until the user sets it; `MACH_KB_W_GOAL`
+overrides it for `mach kb eval` sweeps). Storage stays impartial: capture,
+curation, dedupe, contradiction and dormancy never see the goals.
+
 ## Searching
 
 ```

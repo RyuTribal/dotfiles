@@ -39,6 +39,10 @@ pub struct Parameters {
     pub correction_weight: f64,
     pub self_trait_stale_days: i64,
     pub self_insights_per_run: usize,
+    /// How much a memory's goal relevance nudges recall order (0..=0.15).
+    /// Optional; absent means 0, i.e. recall ignores the goals entirely.
+    #[serde(default)]
+    pub goal_relevance_weight: f64,
 }
 
 /// `~/.config/mach/charter.toml`.
@@ -97,6 +101,9 @@ fn validate(c: &Charter) -> Result<(), KbError> {
     }
     if !(1..=3).contains(&p.self_insights_per_run) {
         return bad(format!("self_insights_per_run {} is outside 1..=3", p.self_insights_per_run));
+    }
+    if !(0.0..=0.15).contains(&p.goal_relevance_weight) {
+        return bad(format!("goal_relevance_weight {} is outside 0.0..=0.15", p.goal_relevance_weight));
     }
     Ok(())
 }
@@ -166,6 +173,15 @@ self_insights_per_run = 2
         assert!(parse(&VALID.replace("self_insights_per_run = 2", "self_insights_per_run = 0")).is_err());
         assert!(parse(&VALID.replace("id = \"truth\"", "id = \"Truth!\"")).is_err());
         assert!(parse(&VALID.replace("desires = [\"I want to understand.\"]", "desires = []")).is_err());
+        let too_heavy = VALID.replace("self_insights_per_run = 2", "self_insights_per_run = 2\ngoal_relevance_weight = 0.5");
+        assert!(parse(&too_heavy).is_err());
+    }
+
+    #[test]
+    fn goal_relevance_weight_is_optional_and_defaults_to_zero() {
+        assert_eq!(parse(VALID).unwrap().parameters.goal_relevance_weight, 0.0);
+        let set = VALID.replace("self_insights_per_run = 2", "self_insights_per_run = 2\ngoal_relevance_weight = 0.05");
+        assert_eq!(parse(&set).unwrap().parameters.goal_relevance_weight, 0.05);
     }
 
     #[test]

@@ -149,7 +149,9 @@ pub fn chunk_turns(turns: &[Turn]) -> Vec<Chunk> {
 ///
 /// Matched against the first user turn, because a chore session is
 /// machinery from its first line to its last.
-const MACHINE_OPENERS: [&str; 8] = [
+const MACHINE_OPENERS: [&str; 9] = [
+    // reflect::build_insight_prompt (stage 2 of the user insight stage)
+    "Evidence (knowledge-bank memories):",
     // ingest::DIGEST_INSTRUCTIONS
     "You are extracting durable, cross-session-worthy facts from a Claude Code session transcript",
     // ingest::DIGEST_INSTRUCTIONS before 2026-09-27, for transcripts written then
@@ -321,23 +323,24 @@ mod tests {
     /// going blind and re-polluting the index.
     #[test]
     fn the_machine_openers_still_match_the_prompts_they_came_from() {
-        assert!(crate::ingest::DIGEST_INSTRUCTIONS.starts_with(MACHINE_OPENERS[0]));
-        assert!(crate::reflect::build_self_questions_prompt("c", &[], 1).starts_with(MACHINE_OPENERS[2]));
+        assert!(crate::reflect::build_insight_prompt("q", &[], &[]).starts_with(MACHINE_OPENERS[0]));
+        assert!(crate::ingest::DIGEST_INSTRUCTIONS.starts_with(MACHINE_OPENERS[1]));
+        assert!(crate::reflect::build_self_questions_prompt("c", &[], 1).starts_with(MACHINE_OPENERS[3]));
         let charter = crate::charter::parse(
             "[nature]\ndesires = [\"d\"]\n[[goals]]\nid = \"g\"\nstatement = \"s\"\nlooks_like = \"l\"\n\
              [parameters]\ncorrection_weight = 2.0\nself_trait_stale_days = 30\nself_insights_per_run = 1\n",
         )
         .unwrap();
         let trait_prompt = crate::reflect::build_self_trait_prompt(&charter.prompt_block(), "q", &[], &[], 2.0);
-        assert!(trait_prompt.starts_with(MACHINE_OPENERS[3]));
+        assert!(trait_prompt.starts_with(MACHINE_OPENERS[4]));
         let engagement = crate::ingest::build_engagement_prompt("d", &[(1, "m".into())]);
-        assert!(engagement.starts_with(MACHINE_OPENERS[4]));
+        assert!(engagement.starts_with(MACHINE_OPENERS[5]));
         let card = crate::reflect::build_entity_card_prompt("E", None, &[(1, "m".into())], None);
-        assert!(card.starts_with(MACHINE_OPENERS[5]));
+        assert!(card.starts_with(MACHINE_OPENERS[6]));
         let probe = crate::ask::build_probe_prompt("q", &[], &[], 1);
-        assert!(probe.starts_with(MACHINE_OPENERS[6]));
+        assert!(probe.starts_with(MACHINE_OPENERS[7]));
         let answer = crate::ask::build_answer_prompt("q", &[], &[]);
-        assert!(answer.starts_with(MACHINE_OPENERS[7]));
+        assert!(answer.starts_with(MACHINE_OPENERS[8]));
     }
 
     #[test]

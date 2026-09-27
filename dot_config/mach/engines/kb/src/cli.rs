@@ -1666,7 +1666,12 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     // process — see that function's own doc comment for why only stage-1
     // and stage-2 (not re-verification) gate `reflected_at`.
     let insight_llm = reflect::LoggedLlm::new(&conn, "insights", &llm);
-    let stage = run_insight_stage(&conn, &embedder, &insight_llm, &verification_queue, &now).map_err(to_io)?;
+    // The charter orients the insight stage's questions (phase 2) and the
+    // self step (phase 1); a missing or invalid one leaves the insight stage
+    // exactly as it was before the self-model.
+    let charter = crate::charter::load().ok().flatten();
+    let stage =
+        run_insight_stage(&conn, &embedder, &insight_llm, &verification_queue, charter.as_ref(), &now).map_err(to_io)?;
     let examined = stage.examined;
     let questions_count = stage.questions;
     let insights_added = stage.insights_added;
@@ -1688,6 +1693,14 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let self_llm = reflect::LoggedLlm::new(&conn, "self", &llm);
     let self_stage = run_self_stage(&conn, &embedder, &self_llm, crate::charter::load(), &now).map_err(to_io)?;
     llm_failed = llm_failed || self_stage.failed;
+    // Step 4.2: goal relevance — scores memories 0..1 against the charter
+    // goals, for recall order only (see `run_relevance_pass`).
+    let relevance_llm = reflect::LoggedLlm::new(&conn, "relevance", &llm);
+    let (goal_scored, relevance_failed) = match charter.as_ref() {
+        Some(c) => run_relevance_pass(&conn, &relevance_llm, c).map_err(to_io)?,
+        None => (0, false),
+    };
+    llm_failed = llm_failed || relevance_failed;
     let self_summary = match &self_stage.skipped {
         Some(reason) => format!("skipped({})", reason),
         None => format!(
@@ -1884,7 +1897,7 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
          consolidated={} deduped={} contradictions={} mem_verified={} mem_stale={} mem_routed={} \
          graph_examined={} graph_edges={} graph_entities={} evidence_dead={} entities_merged={} \
          cards_examined={} cards_built={} insight_pairs={} insights_merged={} \
-         judge_log_pruned={} recall_engagement_pruned={} self={}{}",
+         judge_log_pruned={} recall_engagement_pruned={} self={} goal_scored={}{}",
         examined,
         questions_count,
         insights_added,
@@ -1918,6 +1931,7 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         judge_log_pruned,
         recall_engagement_pruned,
         self_summary,
+        goal_scored,
         if llm_failed { " (degraded: some claude calls failed this run)" } else { "" }
     );
     Ok(())
@@ -1990,6 +2004,43 @@ struct SelfStageOutcome {
     /// Working-set rows marked `self_reflected_at` (0 when a stage failed).
     reflected: usize,
     failed: bool,
+}
+
+/// Relevance calls per reflect run. Each scores up to
+/// `reflect::RELEVANCE_BATCH` memories, so a first fill of a ~2,300-row bank
+/// takes about 16 runs and later runs only see new memories.
+const RELEVANCE_CALLS_PER_RUN: usize = 5;
+
+/// Goal relevance (self-model phase 2): scores unscored memories 0..1
+/// against the charter goals in batches. Writes nothing but
+/// `memories.goal_relevance`, which only nudges recall order under the
+/// charter's weight (default 0). It deliberately runs outside curation,
+/// dedupe and dormancy: storage stays impartial, so no goal ever decides
+/// what is kept. Returns (memories scored, whether any call failed). A
+/// failed or unparseable batch leaves its rows unscored for a later run.
+fn run_relevance_pass<L: ReflectLlm>(
+    conn: &Connection,
+    llm: &L,
+    charter: &crate::charter::Charter,
+) -> Result<(usize, bool), KbError> {
+    let block = charter.prompt_block();
+    let rows = store::memories_missing_goal_relevance(conn, RELEVANCE_CALLS_PER_RUN * reflect::RELEVANCE_BATCH)?;
+    let (mut scored, mut failed) = (0usize, false);
+    for batch in rows.chunks(reflect::RELEVANCE_BATCH) {
+        let lines: Vec<(i64, String)> = batch.iter().map(|m| (m.id, m.content.clone())).collect();
+        let known: HashSet<i64> = batch.iter().map(|m| m.id).collect();
+        match llm.call("haiku", &reflect::build_relevance_prompt(&block, &lines), reflect::TIMEOUT_HAIKU_BATCH) {
+            Ok(reply) => {
+                for (id, score) in reflect::parse_relevance(&reply, &known) {
+                    if store::set_goal_relevance(conn, id, score)? {
+                        scored += 1;
+                    }
+                }
+            }
+            Err(_) => failed = true,
+        }
+    }
+    Ok((scored, failed))
 }
 
 /// Working-set cap for the self step: `experience` memories are fewer and
@@ -2230,6 +2281,7 @@ fn run_insight_stage<E: Embedder, L: ReflectLlm>(
     embedder: &E,
     llm: &L,
     verification_queue: &[Insight],
+    charter: Option<&crate::charter::Charter>,
     now: &str,
 ) -> Result<InsightStageOutcome, KbError> {
     let mut stage_failed = false;
@@ -2254,7 +2306,12 @@ fn run_insight_stage<E: Embedder, L: ReflectLlm>(
         // `TIMEOUT_HAIKU_BATCH` was raised for elsewhere), and the 20,000-
         // char prompt cap above still bounds it even so.
         let question_lines: Vec<(i64, String)> = working_vec.iter().map(|m| (m.id, m.content.clone())).collect();
-        let q_prompt = reflect::build_questions_prompt(&question_lines);
+        // With a charter, the questions are asked relative to its goals
+        // (self-model phase 2), each tagged with the goal it serves.
+        let q_prompt = match charter {
+            Some(c) => reflect::build_goal_questions_prompt(&c.prompt_block(), &question_lines),
+            None => reflect::build_questions_prompt(&question_lines),
+        };
         let questions: Vec<String> = match llm.call("haiku", &q_prompt, reflect::TIMEOUT_HAIKU_BATCH) {
             Ok(out) => reflect::parse_questions(&out),
             Err(_) => {
@@ -2267,7 +2324,10 @@ fn run_insight_stage<E: Embedder, L: ReflectLlm>(
         // Step 3 (stage 2): one durable insight — or a reinforcement of an
         // existing one — per question, sonnet, only when the evidence
         // actually supports it.
-        for question in &questions {
+        for tagged in &questions {
+            let (goal_id, question_text) = reflect::split_goal_tag(tagged);
+            let question = &question_text;
+            let goal = goal_id.and_then(|id| charter.and_then(|c| c.goals.iter().find(|g| g.id == id)));
             let q_emb = match embedder.embed(question) {
                 Ok(v) => v,
                 Err(_) => {
@@ -2301,7 +2361,10 @@ fn run_insight_stage<E: Embedder, L: ReflectLlm>(
             let evidence_pairs: Vec<(i64, String)> = evidence.iter().map(|(m, _)| (m.id, m.content.clone())).collect();
             let existing_pairs: Vec<(i64, String)> =
                 existing_near.iter().map(|(ins, _)| (ins.id, ins.text.clone())).collect();
-            let prompt = reflect::build_insight_prompt(question, &evidence_pairs, &existing_pairs);
+            let mut prompt = reflect::build_insight_prompt(question, &evidence_pairs, &existing_pairs);
+            if let Some(g) = goal {
+                prompt.push_str(&reflect::goal_context_note(&g.id, &g.statement));
+            }
 
             let raw = match llm.call("sonnet", &prompt, TIMEOUT_SONNET) {
                 Ok(out) => out,
@@ -11163,6 +11226,66 @@ mod tests {
         }
     }
 
+    /// Scripted replies plus a record of every prompt it was sent.
+    struct RecordingLlm {
+        replies: std::cell::RefCell<std::collections::VecDeque<Result<String, String>>>,
+        prompts: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl RecordingLlm {
+        fn new(replies: Vec<Result<String, String>>) -> Self {
+            RecordingLlm { replies: std::cell::RefCell::new(replies.into_iter().collect()), prompts: Default::default() }
+        }
+    }
+
+    impl ReflectLlm for RecordingLlm {
+        fn call(&self, _model: &str, prompt: &str, _timeout: std::time::Duration) -> Result<String, String> {
+            self.prompts.borrow_mut().push(prompt.to_string());
+            self.replies.borrow_mut().pop_front().unwrap_or_else(|| Ok("NONE".to_string()))
+        }
+    }
+
+    #[test]
+    fn insight_stage_with_a_charter_asks_goal_questions_and_names_the_goal_in_stage_2() {
+        let conn = mem_conn();
+        insert_episodes(&conn, 3); // any memories with a shared embedding serve as evidence
+        let llm = RecordingLlm::new(vec![Ok("[truth] When is the user candid?".into())]);
+        let now = store::now_rfc3339();
+        let charter = test_charter(1);
+        run_insight_stage(&conn, &UnitEmbedder, &llm, &[], Some(&charter), &now).unwrap();
+        let prompts = llm.prompts.borrow();
+        assert!(prompts[0].contains("[truth] Be truthful."), "stage 1 carries the goals");
+        assert!(prompts[1].contains("Question: When is the user candid?"), "the tag is stripped from the question");
+        assert!(prompts[1].contains("bears on the goal [truth]: Be truthful."));
+    }
+
+    #[test]
+    fn insight_stage_without_a_charter_keeps_the_original_prompts() {
+        let conn = mem_conn();
+        insert_episodes(&conn, 3);
+        let llm = RecordingLlm::new(vec![Ok("What does the user prefer?".into())]);
+        let now = store::now_rfc3339();
+        run_insight_stage(&conn, &UnitEmbedder, &llm, &[], None, &now).unwrap();
+        let prompts = llm.prompts.borrow();
+        assert!(!prompts[0].contains("My goals:"));
+        assert!(!prompts[1].contains("bears on the goal"));
+    }
+
+    #[test]
+    fn relevance_pass_scores_only_what_it_parsed_and_retries_failed_batches_later() {
+        let conn = mem_conn();
+        let ids = insert_n(&conn, 3, "relevance row");
+        let reply = format!("{}: 0.9\n{}: 0.2", ids[0], ids[1]);
+        let (scored, failed) = run_relevance_pass(&conn, &RecordingLlm::new(vec![Ok(reply)]), &test_charter(1)).unwrap();
+        assert_eq!((scored, failed), (2, false));
+        let left: Vec<i64> = store::memories_missing_goal_relevance(&conn, 10).unwrap().iter().map(|m| m.id).collect();
+        assert_eq!(left, vec![ids[2]], "an id the model skipped stays unscored");
+
+        let (scored, failed) = run_relevance_pass(&conn, &RecordingLlm::new(vec![Err("timed out".into())]), &test_charter(1)).unwrap();
+        assert_eq!((scored, failed), (0, true));
+        assert_eq!(store::memories_missing_goal_relevance(&conn, 10).unwrap().len(), 1);
+    }
+
     #[test]
     fn self_stage_does_nothing_without_a_valid_charter() {
         let conn = mem_conn();
@@ -11262,7 +11385,7 @@ mod tests {
         let ids = insert_n(&conn, 5, "insight stage success");
         let llm = FixedReflectLlm { reply: Ok("what does the user prefer?") };
         let now = store::now_rfc3339();
-        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, &[], &now).unwrap();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, &[], None, &now).unwrap();
 
         assert_eq!(outcome.examined, 5);
         assert!(!outcome.stage_failed);
@@ -11280,7 +11403,7 @@ mod tests {
         // Stage 1's own haiku call fails outright.
         let llm = FixedReflectLlm { reply: Err("'claude' exited with Some(1) (no stderr)") };
         let now = store::now_rfc3339();
-        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, &[], &now).unwrap();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, &[], None, &now).unwrap();
 
         assert_eq!(outcome.examined, 5, "the working set was still selected and examined");
         assert!(outcome.stage_failed);
@@ -11302,7 +11425,7 @@ mod tests {
         // then fails for it.
         let llm = ScriptedSequenceLlm::new(vec![Ok("what pattern holds here?"), Err("'claude' exited with Some(1)")]);
         let now = store::now_rfc3339();
-        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, &[], &now).unwrap();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, &[], None, &now).unwrap();
 
         assert_eq!(outcome.questions, 1, "stage 1 succeeded and produced one question");
         assert!(outcome.stage_failed, "stage 2's own call failure must still gate reflected_at");
@@ -11327,7 +11450,7 @@ mod tests {
         }
         let llm = FixedReflectLlm { reply: Ok("what does the evidence show?") };
         let now = store::now_rfc3339();
-        let outcome = run_insight_stage(&conn, &AlwaysFailingEmbedder, &llm, &[], &now).unwrap();
+        let outcome = run_insight_stage(&conn, &AlwaysFailingEmbedder, &llm, &[], None, &now).unwrap();
 
         assert_eq!(outcome.questions, 1);
         assert!(outcome.stage_failed, "an embedding-provider error in stage 2 must set stage_failed");
@@ -11348,7 +11471,7 @@ mod tests {
         insert_n(&conn, 5, "too little evidence");
         let llm = FixedReflectLlm { reply: Ok("a question nothing backs") };
         let now = store::now_rfc3339();
-        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, &[], &now).unwrap();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, &[], None, &now).unwrap();
 
         assert!(!outcome.stage_failed, "insufficient evidence is not a failure");
         assert!(!outcome.any_failed);
@@ -11380,7 +11503,7 @@ mod tests {
             Err("'claude' exited with Some(1) (no stderr)"),
         ]);
         let now = store::now_rfc3339();
-        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), None, &now).unwrap();
 
         assert_eq!(outcome.examined, 60);
         assert!(!outcome.stage_failed, "stage 1 and stage 2 both succeeded");
@@ -11404,7 +11527,7 @@ mod tests {
         let stale = store::get_insight(&conn, ins_id).unwrap().unwrap();
         let llm = FixedReflectLlm { reply: Ok("NONE") };
         let now = store::now_rfc3339();
-        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&stale), &now).unwrap();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&stale), None, &now).unwrap();
 
         assert_eq!(outcome.examined, 0);
         assert_eq!(outcome.reflected, 0);
@@ -11445,7 +11568,7 @@ mod tests {
             Ok("REVISE: the user ships mid-week, not on Fridays (because of: 1, 2)"),
         ]);
         let now = store::now_rfc3339();
-        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), None, &now).unwrap();
 
         assert_eq!(outcome.revised, 1);
         assert_eq!(outcome.flagged, 0);
@@ -11487,7 +11610,7 @@ mod tests {
 
         let llm = ScriptedSequenceLlm::new(vec![Ok("YES 1"), Ok("DROP")]);
         let now = store::now_rfc3339();
-        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), None, &now).unwrap();
 
         assert_eq!(outcome.flagged, 1);
         assert_eq!(outcome.revised, 0);
@@ -11519,7 +11642,7 @@ mod tests {
         // verification, not a flag.
         let llm = ScriptedSequenceLlm::new(vec![Ok("YES 1"), Ok("KEEP")]);
         let now = store::now_rfc3339();
-        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), None, &now).unwrap();
 
         assert_eq!(outcome.verified, 1);
         assert_eq!(outcome.flagged, 0);
@@ -11548,7 +11671,7 @@ mod tests {
 
         let llm = ScriptedSequenceLlm::new(vec![Ok("YES 1"), Ok("uh, not sure?")]);
         let now = store::now_rfc3339();
-        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), None, &now).unwrap();
 
         assert_eq!(outcome.flagged, 1, "an unparseable reply falls back to the pre-existing flag behavior");
         assert_eq!(outcome.revised, 0);
@@ -11576,7 +11699,7 @@ mod tests {
 
         let llm = ScriptedSequenceLlm::new(vec![Ok("YES 1"), Err("'claude' exited with Some(1) (no stderr)")]);
         let now = store::now_rfc3339();
-        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), None, &now).unwrap();
 
         assert_eq!(outcome.flagged, 1, "the contradiction is already established -- a failed second call falls back to flagging");
         assert_eq!(outcome.revised, 0);
@@ -11615,7 +11738,7 @@ mod tests {
             Ok("REVISE: the user ships mid-week, not on Fridays (because of: 99)"),
         ]);
         let now = store::now_rfc3339();
-        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), None, &now).unwrap();
 
         assert_eq!(outcome.flagged, 1, "an under-cited REVISE is applied as DROP");
         assert_eq!(outcome.revised, 0);
@@ -11648,7 +11771,7 @@ mod tests {
         // scripted replies").
         let llm = ScriptedSequenceLlm::new(vec![Ok("YES 1")]);
         let now = store::now_rfc3339();
-        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), None, &now).unwrap();
 
         assert_eq!(outcome.flagged, 1, "a contradicted theme is flagged directly, never revised");
         assert_eq!(outcome.revised, 0);
@@ -11691,7 +11814,7 @@ mod tests {
             Ok("REVISE: the user ships mid-week, not on Tuesdays (because of: 1, 2)"),
         ]);
         let now = store::now_rfc3339();
-        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), None, &now).unwrap();
 
         assert_eq!(outcome.flagged, 1, "a REVISE within 14 days of the last revision is applied as DROP");
         assert_eq!(outcome.revised, 0);
@@ -11734,7 +11857,7 @@ mod tests {
             Ok("REVISE: the user ships mid-week, not on Tuesdays (because of: 1, 2)"),
         ]);
         let now = store::now_rfc3339();
-        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, std::slice::from_ref(&due), None, &now).unwrap();
 
         assert_eq!(outcome.revised, 1, "past the 14-day window, REVISE proceeds normally");
         assert_eq!(outcome.flagged, 0);
@@ -11781,7 +11904,7 @@ mod tests {
             Ok("REVISE: the user ships mid-week, not on Fridays (because of: 1, 2)"),
         ]);
         let now = store::now_rfc3339();
-        let outcome = run_insight_stage(&conn, &embedder, &llm, std::slice::from_ref(&due), &now).unwrap();
+        let outcome = run_insight_stage(&conn, &embedder, &llm, std::slice::from_ref(&due), None, &now).unwrap();
 
         assert_eq!(outcome.revised, 0, "an embed failure must skip the revise entirely");
         assert_eq!(outcome.flagged, 0, "and must NOT fall back to flagging either -- left unchanged, due again");
@@ -11810,7 +11933,7 @@ mod tests {
         insert_n(&conn, 3, "isolated from graph extraction's own failures");
         let llm = FixedReflectLlm { reply: Ok("what pattern holds here?") };
         let now = store::now_rfc3339();
-        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, &[], &now).unwrap();
+        let outcome = run_insight_stage(&conn, &FakeEmbedder, &llm, &[], None, &now).unwrap();
         assert!(!outcome.stage_failed);
         assert!(!outcome.any_failed);
         assert_eq!(outcome.reflected, 3);

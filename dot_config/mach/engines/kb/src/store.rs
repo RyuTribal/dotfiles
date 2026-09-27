@@ -6973,6 +6973,18 @@ pub fn latest_memory_id(conn: &Connection) -> Result<i64, KbError> {
 pub fn latest_relation_id(conn: &Connection) -> Result<i64, KbError> {
     Ok(conn.query_row("SELECT COALESCE(MAX(id), 0) FROM relations", [], |r| r.get(0))?)
 }
+/// Active memories with exactly this `source`, oldest first, dormant ones
+/// included (a proposal must not vanish just because nobody recalled it).
+pub fn active_memories_with_source(conn: &Connection, source: &str) -> Result<Vec<Memory>, KbError> {
+    let mut stmt = conn.prepare("SELECT * FROM memories WHERE source = ?1 AND invalidated_at IS NULL ORDER BY id ASC")?;
+    let rows = stmt.query_map(params![source], row_to_memory)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
 
 /// Active memories whose `source` starts with `prefix` OR whose `project`
 /// equals `project`, oldest first -- how the improve pass reads back its own

@@ -71,6 +71,7 @@ fn print_help() {
     println!("  tree                    render the theme -> insight -> memory hierarchy");
     println!("  model [--json] [--max-chars N]");
     println!("  charter [--path]        show the read-only charter (~/.config/mach/charter.toml) or its error");
+    println!("  proposals [done <id>]   tool proposals from improve, to build in a session; close one when done");
     println!("                          compact mental-model view (active themes/insights only,");
     println!("                          no source ids or memory leaves) for context injection");
     println!("  export [--out FILE]     full-fidelity JSONL backup of every row (default: stdout)");
@@ -198,6 +199,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Some("recall-stats") => cmd_recall_stats(args),
         Some("audit-supersessions") => cmd_audit_supersessions(args),
         Some("charter") => cmd_charter(args),
+        Some("proposals") => cmd_proposals(args),
         Some("-h") | Some("--help") => {
             print_help();
             Ok(())
@@ -7093,6 +7095,7 @@ fn cmd_model(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         traits: store::self_model(&conn).map_err(to_io)?,
         opinions: store::opinion_model(&conn).map_err(to_io)?,
         record: record_summary(&conn).map_err(to_io)?,
+        proposals: open_proposals(&conn).map_err(to_io)?,
     };
 
     if json {
@@ -7118,11 +7121,17 @@ struct SelfBlock {
     opinions: Vec<store::ModelRow>,
     /// `record_summary`; empty when there is no track record yet.
     record: String,
+    /// Open tool proposals as `(id, title)`.
+    proposals: Vec<(i64, String)>,
 }
 
 impl SelfBlock {
     fn is_empty(&self) -> bool {
-        self.narrative.is_none() && self.traits.is_empty() && self.opinions.is_empty() && self.record.is_empty()
+        self.narrative.is_none()
+            && self.traits.is_empty()
+            && self.opinions.is_empty()
+            && self.record.is_empty()
+            && self.proposals.is_empty()
     }
 
     /// The block's body within `budget` characters (None = unbounded):
@@ -7153,6 +7162,17 @@ impl SelfBlock {
             let line = format!("Track record in disagreements with this user: {}.\n", self.record);
             if fits(&out, &line) {
                 out.push_str(&line);
+            }
+        }
+        if !self.proposals.is_empty() {
+            let mut lines = String::from(
+                "Tools you proposed building (from improve; build with the user, then `mach kb proposals done <id>`):\n",
+            );
+            for (id, title) in &self.proposals {
+                lines.push_str(&format!("- #{} {}\n", id, title));
+            }
+            if fits(&out, &lines) {
+                out.push_str(&lines);
             }
         }
         out
@@ -8361,11 +8381,104 @@ fn build_improve_bundle(
                 traits: store::self_model(conn)?,
                 opinions: store::opinion_model(conn)?,
                 record: record_summary(conn)?,
+                proposals: open_proposals(conn)?,
             };
             block.render(None).lines().map(str::to_string).collect()
         },
         charter: crate::charter::load().ok().flatten().map(|c| c.prompt_block()),
     })
+}
+
+/// Stores each tool proposal as a memory (`source = improve-proposal`),
+/// skipping one whose title matches an open proposal. Returns how many were
+/// stored.
+fn record_proposals<E: Embedder>(
+    conn: &Connection,
+    embedder: &E,
+    proposals: &[improve::Proposal],
+    now: &str,
+) -> Result<usize, KbError> {
+    let open: Vec<String> = open_proposals(conn)?.into_iter().map(|(_, t)| t.to_lowercase()).collect();
+    let mut stored = 0usize;
+    for p in proposals {
+        if open.contains(&p.title.to_lowercase()) {
+            continue;
+        }
+        let text = p.memory_text(now.get(..10).unwrap_or(now));
+        let embedding = embedder.embed(&text).ok();
+        store::insert(
+            conn,
+            &text,
+            Some(improve::PROPOSAL_SOURCE),
+            Some(improve::OUTCOME_PROJECT),
+            true,
+            embedding.as_deref(),
+            improve::OUTCOME_IMPORTANCE,
+        )?;
+        stored += 1;
+    }
+    Ok(stored)
+}
+
+/// Open tool proposals as `(memory id, title)`, oldest first.
+fn open_proposals(conn: &Connection) -> Result<Vec<(i64, String)>, KbError> {
+    Ok(store::active_memories_with_source(conn, improve::PROPOSAL_SOURCE)?
+        .iter()
+        .map(|m| (m.id, proposal_title(&m.content)))
+        .collect())
+}
+
+/// The title out of a proposal memory's text (see `Proposal::memory_text`).
+fn proposal_title(text: &str) -> String {
+    let after = text.split_once("): ").map(|(_, r)| r).unwrap_or(text);
+    after.split_once(". Need:").map(|(t, _)| t).unwrap_or(after).trim().to_string()
+}
+
+/// `mach kb proposals [done <id>]`: lists the open tool proposals improve
+/// has made, or closes one (built, or decided against) by invalidating it.
+fn cmd_proposals(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let conn = store::open().map_err(to_io)?;
+    match args.next().as_deref() {
+        None => {
+            let open = store::active_memories_with_source(&conn, improve::PROPOSAL_SOURCE).map_err(to_io)?;
+            if open.is_empty() {
+                println!("no open tool proposals");
+            }
+            for m in open {
+                println!("#{} {}", m.id, m.content);
+            }
+            Ok(())
+        }
+        Some("done") => {
+            let Some(id) = args.next().and_then(|v| v.parse::<i64>().ok()) else {
+                eprintln!("usage: mach kb proposals done <id>");
+                std::process::exit(1);
+            };
+            let is_open = store::get(&conn, id)
+                .map_err(to_io)?
+                .is_some_and(|m| m.source.as_deref() == Some(improve::PROPOSAL_SOURCE) && m.invalidated_at.is_none());
+            if !is_open {
+                eprintln!("mach kb proposals: #{} is not an open proposal", id);
+                std::process::exit(1);
+            }
+            store::invalidate_memory(&conn, id, &store::now_rfc3339()).map_err(to_io)?;
+            println!("closed proposal #{}", id);
+            Ok(())
+        }
+        Some("-h") | Some("--help") => {
+            println!("usage: mach kb proposals [done <id>]");
+            println!(
+                "       tool proposals from mach kb improve: needs no skill or config edit can meet (a new hook, \
+                 MCP server, CLI or mach subcommand), to build with the user in a session. `done <id>` closes \
+                 one once built or decided against."
+            );
+            Ok(())
+        }
+        Some(other) => {
+            eprintln!("mach kb proposals: unexpected argument '{}'", other);
+            std::process::exit(1);
+        }
+    }
 }
 
 fn record_improve_outcome<E: Embedder>(
@@ -8495,6 +8608,9 @@ fn run_improve<E: Embedder, L: ImproveLlm, V: Vcs>(
     let Some(result) = improve::parse_result(&output) else {
         return fail(rollback("claude reply had no valid IMPROVE-RESULT block".to_string()));
     };
+    // Proposals touch no file, so they are kept whatever happens to the
+    // run's edits below.
+    record_proposals(conn, embedder, &improve::parse_proposals(&output), now)?;
 
     // anything chezmoi now sees out of sync that it didn't before and that
     // is outside the targets: put it back from source, then roll back
@@ -11680,6 +11796,7 @@ mod tests {
             traits: vec![row(store::ModelKind::Trait, 0.6, "When X, I do Y.", false, false)],
             opinions: vec![row(store::ModelKind::Opinion, 0.6, "I think Z.", false, false)],
             record: "mine right 1, theirs right 2, mixed 0, open 0".into(),
+            proposals: vec![(7, "deploy check CLI".into())],
         };
         let full = block.render(None);
         let pos = |needle: &str| full.find(needle).unwrap_or_else(|| panic!("{} missing in {}", needle, full));
@@ -11689,6 +11806,29 @@ mod tests {
         assert!(tight.chars().count() <= 40);
         assert!(tight.contains("I am a careful collaborator."));
         assert!(!tight.contains("Track record"));
+        assert!(full.contains("- #7 deploy check CLI"));
+    }
+
+    #[test]
+    fn proposals_are_recorded_once_per_title_and_listed_by_title() {
+        let conn = mem_conn();
+        let p = improve::Proposal {
+            title: "deploy check CLI".into(),
+            need: "the same five commands after every deploy".into(),
+            design: "mach subcommand".into(),
+            evidence: "m1".into(),
+        };
+        let now = store::now_rfc3339();
+        assert_eq!(record_proposals(&conn, &FakeEmbedder, &[p.clone()], &now).unwrap(), 1);
+        let mut again = p.clone();
+        again.title = "Deploy Check CLI".into();
+        assert_eq!(record_proposals(&conn, &FakeEmbedder, &[again], &now).unwrap(), 0, "same title, still open");
+        let open = open_proposals(&conn).unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].1, "deploy check CLI");
+        store::invalidate_memory(&conn, open[0].0, &now).unwrap();
+        assert!(open_proposals(&conn).unwrap().is_empty());
+        assert_eq!(record_proposals(&conn, &FakeEmbedder, &[p], &now).unwrap(), 1, "a closed proposal can be proposed again");
     }
 
     #[test]
@@ -11712,9 +11852,9 @@ mod tests {
             (0..40).map(|i| row(store::ModelKind::Belief, 0.6, &format!("user belief number {}", i), false, false)).collect();
         let selfs: Vec<store::ModelRow> =
             (0..40).map(|i| row(store::ModelKind::Trait, 0.6, &format!("When {}, I tend to act.", i), false, false)).collect();
-        let empty = SelfBlock { narrative: None, traits: vec![], opinions: vec![], record: String::new() };
+        let empty = SelfBlock { narrative: None, traits: vec![], opinions: vec![], record: String::new(), proposals: vec![] };
         assert_eq!(render_full_model_text(&user, &empty, Some(500)), render_model_text(&user, Some(500)), "no self rows: unchanged");
-        let block = SelfBlock { narrative: None, traits: selfs, opinions: vec![], record: String::new() };
+        let block = SelfBlock { narrative: None, traits: selfs, opinions: vec![], record: String::new(), proposals: vec![] };
         let out = render_full_model_text(&user, &block, Some(2000));
         assert!(out.chars().count() <= 2000);
         let (u, s) = out.split_once(SELF_MODEL_HEADING).expect("self heading present");
@@ -13612,15 +13752,17 @@ mod improve_run_tests {
     #[test]
     fn verification_failure_rolls_back() {
         let (s, t, conn) = setup("verify");
+        let original = "#!/usr/bin/env bash\nexit 0\n";
+        std::fs::write(t.hooks_dir.join("existing.sh"), original).unwrap();
         let llm = FakeLlm {
-            writes: vec![(".config/claude-hooks/new.sh".into(), "#!/usr/bin/env bash\nset -e\nexit 0\n".into())],
-            reply: "IMPROVE-RESULT\naction: create\nfiles: x\nrationale: r\nevidence: m1\n".into(),
+            writes: vec![(".config/claude-hooks/existing.sh".into(), "#!/usr/bin/env bash\nset -e\nexit 0\n".into())],
+            reply: "IMPROVE-RESULT\naction: edit\nfiles: x\nrationale: r\nevidence: m1\n".into(),
         };
         let vcs = FakeVcs::managing(&t);
         let run = go(&conn, &llm, &vcs, &t, &s.0.join("snap"), false);
         let ImproveRun::Done(improve::Outcome::Failed { reason }) = run else { panic!("{:?}", run) };
         assert!(reason.contains("set -e"), "{}", reason);
-        assert!(!t.hooks_dir.join("new.sh").exists());
+        assert_eq!(std::fs::read_to_string(t.hooks_dir.join("existing.sh")).unwrap(), original, "rolled back");
     }
 
     #[test]

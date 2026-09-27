@@ -1671,7 +1671,14 @@ correction counts, its own prior outcomes) to one agentic `claude -p` call
 that may edit `~/.claude/skills/**`, `~/.claude/CLAUDE.md`,
 `~/.claude/settings.json` and `~/.config/claude-hooks/**` and nothing else.
 It is asked to close gaps between your traits and the goals (a trait is
-evidence of a pattern, not an order). Rust snapshots those paths first,
+evidence of a pattern, not an order). It may create and edit skills, and
+edit existing hooks, but never creates a hook, MCP server, CLI or mach
+subcommand: executable code is built with the user, with tests. When it
+finds a need only such a tool could meet, it writes a **proposal** instead
+(a memory with source `improve-proposal`). Open proposals are listed at
+session start under "Tools you proposed building" and by `mach kb
+proposals`; build one with the user when it fits the work at hand, and
+close it with `mach kb proposals done <id>` once built or rejected. Rust snapshots those paths first,
 verifies what came back (bash -n and `exit 0` on hooks, valid JSON on
 settings, frontmatter on skills, no CLAUDE.md shrink over 20%, the charter,
 its guard and its settings.json lock untouched), rolls back on any doubt,

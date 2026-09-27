@@ -203,7 +203,8 @@ def main():
             continue
         date = (h.get("created_at") or "")[:10]
         if h.get("derived"):
-            label = "derived theme" if h.get("level") == 2 else "derived belief"
+            label = "self-knowledge" if h.get("source") == "derived-self" \
+                else "derived theme" if h.get("level") == 2 else "derived belief"
             lines.append("- [{}, {}] {}".format(label, date, content))
         else:
             mem_id = h.get("id")

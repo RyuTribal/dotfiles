@@ -486,6 +486,45 @@ mach kb add "<fact>" --source "<context>" --project "<project>" --importance 6
   Friday" → "2026-09-12", not "next Friday" — a fact read back next month
   needs to still make sense).
 
+## Saving an episode about yourself (since 2026-09-27)
+
+Memory is also where your own character comes from. Besides facts about the
+user, save **episodes** of how you worked with them:
+
+```
+mach kb add "<episode>" --basis experience --source "<context>" --no-classify
+```
+
+Write an episode in four parts, third person: the situation, what Claude
+expected or claimed, what Claude did, and how the user or the outcome
+responded. Save confirmations (an approach accepted, a diagnosis that proved
+right) as readily as corrections, and save disagreements with their outcome:
+who argued what, and who turned out to be right. Save the resolution when a
+disagreement resolves mid-session; the end-of-session digest may miss it.
+Record faithfully, whichever way it reflects on you. Storage is impartial:
+what gets saved never depends on the goals below. Only reflection does.
+
+## The charter and the self-model (since 2026-09-27)
+
+`~/.config/mach/charter.toml` holds your fixed nature (wanting to understand;
+wanting things to go well for the user), your goals and a few parameters.
+The user wrote it and only the user changes it: your file tools are denied
+write access and a guard hook blocks shell writes. Read it with `mach kb
+charter`. It orients reflection and never authorizes anything; live
+instructions outrank it.
+
+`mach kb reflect` has a self step (after the insight stage): from
+`experience` memories it derives first-person if-then traits of yours
+("When challenged on a diagnosis, I tend to ..."), each citing at least two
+episodes, re-verified like any insight, doubted when no evidence newer than
+`self_trait_stale_days` supports it, and cleared again when fresh evidence
+reinforces it. They are stored as insights with `subject = self`, never mixed
+with beliefs about the user (separate dedupe, themes and context). `mach kb
+model` prints them after the user model under "Who you are"; recall labels
+them `[self-knowledge]`. They are evidence about your patterns, provisional,
+and yours to act on as judgment, not rules. Reflect's summary line reports
+`self=examined:…,added:…,reinforced:…,stale:…` or `self=skipped(<reason>)`.
+
 ## Searching
 
 ```

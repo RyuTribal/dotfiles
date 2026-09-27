@@ -173,6 +173,9 @@ pub struct Insight {
     /// replaced, not appended), same one-hop-back convention as
     /// `Memory::superseded_by`'s predecessor chain. Schema v31.
     pub prev_text: Option<String>,
+    /// What the insight is about: [`SUBJECT_USER`] or [`SUBJECT_SELF`].
+    /// Schema v36.
+    pub subject: String,
 }
 
 impl Insight {
@@ -3150,6 +3153,24 @@ fn migrate_v34_to_v35(conn: &Connection) -> Result<(), KbError> {
     Ok(())
 }
 
+/// Insight subjects: what an insight is about. `user` is everything reflect
+/// derived before the self-model; `self` is a trait of Claude's own, derived
+/// by the self-reflection step. Validated in code rather than by a CHECK so
+/// a later subject is an insert, not a table rebuild.
+pub const SUBJECT_USER: &str = "user";
+pub const SUBJECT_SELF: &str = "self";
+
+/// Schema v36 (self-model phase 1): `insights.subject` (existing rows are
+/// `user`) and `memories.self_reflected_at`, the self-reflection step's own
+/// watermark, independent of the user insight stage's `reflected_at`.
+fn migrate_v35_to_v36(conn: &Connection) -> Result<(), KbError> {
+    add_column_if_missing(conn, "insights", "subject", "TEXT NOT NULL DEFAULT 'user'")?;
+    add_column_if_missing(conn, "memories", "self_reflected_at", "TEXT")?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS ix_insights_subject ON insights (subject, level);")?;
+    conn.execute("PRAGMA user_version = 36", [])?;
+    Ok(())
+}
+
 /// Backfill helper for `migrate_v29_to_v30` (also exposed for tests, same
 /// convention as `backfill_occurrence_from_text`): marks every memory with
 /// `id <= reflect_state.last_memory_id` reflected as of
@@ -3767,7 +3788,7 @@ const MEMORY_COLUMNS: &[(&str, &str)] = &[
 /// against this rather than a literal: every schema addition used to
 /// require hunting down a dozen hard-coded version numbers across the
 /// migration tests, which is busywork that also invites getting one wrong.
-pub const SCHEMA_VERSION: i64 = 35;
+pub const SCHEMA_VERSION: i64 = 36;
 
 fn ensure_memory_columns(conn: &Connection) -> Result<(), KbError> {
     if !table_exists(conn, "memories")? {
@@ -3892,6 +3913,9 @@ fn migrate(conn: &Connection) -> Result<(), KbError> {
     // or an ALTER that no-ops on "duplicate column name".
     if version <= 35 {
         migrate_v34_to_v35(conn)?;
+    }
+    if version < 36 {
+        migrate_v35_to_v36(conn)?;
     }
     Ok(())
 }
@@ -5944,6 +5968,7 @@ fn row_to_insight(row: &rusqlite::Row) -> rusqlite::Result<Insight> {
         level: row.get("level")?,
         revised_at: row.get("revised_at")?,
         prev_text: row.get("prev_text")?,
+        subject: row.get("subject")?,
     })
 }
 
@@ -5956,7 +5981,20 @@ pub fn insert_insight(
     source_ids: &[String],
     embedding: Option<&[f32]>,
 ) -> Result<i64, KbError> {
-    insert_insight_leveled(conn, text, confidence, source_ids, embedding, 1)
+    insert_insight_leveled(conn, text, confidence, source_ids, embedding, 1, SUBJECT_USER)
+}
+
+/// Inserts a level-1 self trait (`subject = self`) — the self-reflection
+/// step's output. Same citation rules as a user insight, enforced by the
+/// caller.
+pub fn insert_self_insight(
+    conn: &Connection,
+    text: &str,
+    confidence: f64,
+    source_ids: &[String],
+    embedding: Option<&[f32]>,
+) -> Result<i64, KbError> {
+    insert_insight_leveled(conn, text, confidence, source_ids, embedding, 1, SUBJECT_SELF)
 }
 
 /// Inserts a level-2 theme — same shape as a plain insight, just tagged
@@ -5971,7 +6009,7 @@ pub fn insert_theme(
     source_ids: &[String],
     embedding: Option<&[f32]>,
 ) -> Result<i64, KbError> {
-    insert_insight_leveled(conn, text, confidence, source_ids, embedding, 2)
+    insert_insight_leveled(conn, text, confidence, source_ids, embedding, 2, SUBJECT_USER)
 }
 
 fn insert_insight_leveled(
@@ -5981,15 +6019,16 @@ fn insert_insight_leveled(
     source_ids: &[String],
     embedding: Option<&[f32]>,
     level: i64,
+    subject: &str,
 ) -> Result<i64, KbError> {
     let created_at = now_rfc3339();
     let source_ids_json =
         serde_json::to_string(source_ids).map_err(|e| KbError::Other(format!("encoding source_ids: {}", e)))?;
     let blob = embedding.map(encode_embedding);
     conn.execute(
-        "INSERT INTO insights (text, created_at, confidence, source_ids, embedding, level)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![text, created_at, confidence, source_ids_json, blob, level],
+        "INSERT INTO insights (text, created_at, confidence, source_ids, embedding, level, subject)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![text, created_at, confidence, source_ids_json, blob, level, subject],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -6366,9 +6405,16 @@ pub fn search_insights_ranked(
 /// Plain cosine top-N over active insights (no recency blend) — used by
 /// reflection's stage 2 to show the model existing insights it might be
 /// duplicating, not for ranked recall.
-pub fn top_similar_insights(conn: &Connection, query_embedding: &[f32], limit: usize) -> Result<Vec<(Insight, f32)>, KbError> {
+/// Active insights of one `subject`, most similar first.
+pub fn top_similar_insights(
+    conn: &Connection,
+    query_embedding: &[f32],
+    limit: usize,
+    subject: &str,
+) -> Result<Vec<(Insight, f32)>, KbError> {
     let mut scored: Vec<(Insight, f32)> = active_insights(conn)?
         .into_iter()
+        .filter(|insight| insight.subject == subject)
         .filter_map(|insight| {
             let score = match &insight.embedding {
                 Some(e) if !e.is_empty() => cosine(query_embedding, e).clamp(0.0, 1.0),
@@ -6507,6 +6553,103 @@ pub fn mark_memories_reflected(conn: &Connection, ids: &[i64], now: &str) -> Res
     }
     tx.commit()?;
     Ok(updated)
+}
+
+// --- self-reflection (self-model phase 1) ---
+
+/// The self-reflection working set: active, awake `experience` memories the
+/// self step has not reflected on yet, newest first, at most `cap`.
+pub fn experience_memories_unreflected(conn: &Connection, cap: usize) -> Result<Vec<Memory>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM memories
+         WHERE basis = ?1 AND self_reflected_at IS NULL AND invalidated_at IS NULL AND dormant_at IS NULL
+         ORDER BY id DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![BASIS_EXPERIENCE, cap as i64], row_to_memory)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Marks memories as seen by the self step (its own watermark, separate
+/// from `reflected_at`).
+pub fn mark_memories_self_reflected(conn: &Connection, ids: &[i64], now: &str) -> Result<usize, KbError> {
+    let tx = conn.unchecked_transaction()?;
+    let mut updated = 0usize;
+    for id in ids {
+        updated += tx.execute("UPDATE memories SET self_reflected_at = ?1 WHERE id = ?2", params![now, id])?;
+    }
+    tx.commit()?;
+    Ok(updated)
+}
+
+/// Active, awake `experience` memories most similar to the query: the self
+/// step's evidence pool.
+pub fn top_similar_experience(conn: &Connection, query_embedding: &[f32], limit: usize) -> Result<Vec<(Memory, f32)>, KbError> {
+    let mut scored: Vec<(Memory, f32)> = candidates(conn, true, false)?
+        .into_iter()
+        .filter(|m| m.basis.as_deref() == Some(BASIS_EXPERIENCE))
+        .filter_map(|m| {
+            let score = match &m.embedding {
+                Some(e) if !e.is_empty() => cosine(query_embedding, e).clamp(0.0, 1.0),
+                _ => return None,
+            };
+            Some((m, score))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit);
+    Ok(scored)
+}
+
+/// Clears an insight's doubt flag: a self trait that just gained fresh
+/// evidence is no longer stale.
+pub fn unflag_insight(conn: &Connection, id: i64) -> Result<bool, KbError> {
+    Ok(conn.execute("UPDATE insights SET flagged_at = NULL WHERE id = ?1", params![id])? > 0)
+}
+
+/// Active, unflagged level-1 self traits whose newest cited memory was
+/// created before `cutoff` (RFC3339): no recent evidence, so due to be
+/// doubted. A trait whose citations all vanished counts as stale too.
+pub fn stale_self_insights(conn: &Connection, cutoff: &str) -> Result<Vec<Insight>, KbError> {
+    let mut out = Vec::new();
+    for ins in active_insights_by_level(conn, 1, Some(SUBJECT_SELF))? {
+        if ins.is_flagged() {
+            continue;
+        }
+        let newest = ins
+            .source_ids
+            .iter()
+            .filter_map(|s| s.parse::<i64>().ok())
+            .filter_map(|id| get(conn, id).ok().flatten())
+            .map(|m| m.created_at)
+            .max();
+        if newest.as_deref().map_or(true, |t| t < cutoff) {
+            out.push(ins);
+        }
+    }
+    Ok(out)
+}
+
+/// The "who I am" block: active level-1 self traits, ranked like the user
+/// model's beliefs (doubted last, then by score).
+pub fn self_model(conn: &Connection) -> Result<Vec<ModelRow>, KbError> {
+    let now = now_secs() as i64;
+    let mut traits = active_insights_by_level(conn, 1, Some(SUBJECT_SELF))?;
+    sort_model_rank(&mut traits, |i| i.is_flagged(), |i| model_score(i, now), |i| i.id);
+    Ok(traits
+        .iter()
+        .map(|t| ModelRow {
+            kind: ModelKind::Trait,
+            confidence: t.confidence,
+            text: t.text.clone(),
+            doubted: t.is_flagged(),
+            nested: false,
+            recent: model_is_recent(t, now),
+        })
+        .collect())
 }
 
 /// Ids "new since the last reflect run" for the nightly dedupe and
@@ -6718,9 +6861,13 @@ pub fn count_active_level1_created_after(conn: &Connection, after_id: i64) -> Re
 /// Active insights at exactly `level`, unordered — the meta-reflection
 /// clustering pool (level 1) and `mach kb tree`'s theme/insight listings
 /// (levels 2 and 1 respectively) both read from here.
-pub fn active_insights_by_level(conn: &Connection, level: i64) -> Result<Vec<Insight>, KbError> {
-    let mut stmt = conn.prepare("SELECT * FROM insights WHERE level = ?1 AND invalidated_at IS NULL")?;
-    let rows = stmt.query_map(params![level], row_to_insight)?;
+/// Active insights at `level`; `subject` narrows to one subject, `None`
+/// returns every subject (the `tree` listing).
+pub fn active_insights_by_level(conn: &Connection, level: i64, subject: Option<&str>) -> Result<Vec<Insight>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM insights WHERE level = ?1 AND invalidated_at IS NULL AND (?2 IS NULL OR subject = ?2)",
+    )?;
+    let rows = stmt.query_map(params![level, subject], row_to_insight)?;
     let mut out = Vec::new();
     for r in rows {
         out.push(r?);
@@ -6755,6 +6902,8 @@ pub fn themed_insight_ids(conn: &Connection) -> Result<std::collections::HashSet
 pub enum ModelKind {
     Theme,
     Belief,
+    /// A self trait (`subject = self`), rendered in the "who I am" block.
+    Trait,
 }
 
 /// One row of the mental-model view (`mach kb model`): a theme or a
@@ -6843,8 +6992,8 @@ fn model_is_recent(insight: &Insight, now: i64) -> bool {
 /// investigation.
 pub fn mental_model(conn: &Connection) -> Result<Vec<ModelRow>, KbError> {
     let now = now_secs() as i64;
-    let themes = active_insights_by_level(conn, 2)?;
-    let level1 = active_insights_by_level(conn, 1)?;
+    let themes = active_insights_by_level(conn, 2, Some(SUBJECT_USER))?;
+    let level1 = active_insights_by_level(conn, 1, Some(SUBJECT_USER))?;
     let themed = themed_insight_ids(conn)?;
 
     enum TopCandidate<'a> {
@@ -7215,6 +7364,9 @@ pub fn insight_dedupe_candidate_pairs(
             if a.level != b.level {
                 continue; // a theme and the insight under it are not duplicates
             }
+            if a.subject != b.subject {
+                continue; // a trait of mine never duplicates a belief about the user
+            }
             let (Some(ea), Some(eb)) = (a.embedding.as_deref(), b.embedding.as_deref()) else {
                 continue;
             };
@@ -7540,14 +7692,15 @@ pub fn raw_upsert_insight(conn: &Connection, i: &Insight) -> Result<(), KbError>
         serde_json::to_string(&i.source_ids).map_err(|e| KbError::Other(format!("encoding source_ids: {}", e)))?;
     conn.execute(
         "INSERT INTO insights (id, text, created_at, confidence, source_ids, embedding, invalidated_at,
-             flagged_at, last_verified_at, level, revised_at, prev_text)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+             flagged_at, last_verified_at, level, revised_at, prev_text, subject)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
          ON CONFLICT(id) DO UPDATE SET
             text = excluded.text, created_at = excluded.created_at, confidence = excluded.confidence,
             source_ids = excluded.source_ids, embedding = excluded.embedding,
             invalidated_at = excluded.invalidated_at, flagged_at = excluded.flagged_at,
             last_verified_at = excluded.last_verified_at, level = excluded.level,
-            revised_at = excluded.revised_at, prev_text = excluded.prev_text",
+            revised_at = excluded.revised_at, prev_text = excluded.prev_text,
+            subject = excluded.subject",
         params![
             i.id,
             i.text,
@@ -7561,6 +7714,7 @@ pub fn raw_upsert_insight(conn: &Connection, i: &Insight) -> Result<(), KbError>
             i.level,
             i.revised_at,
             i.prev_text,
+            i.subject,
         ],
     )?;
     Ok(())
@@ -11772,8 +11926,8 @@ mod tests {
         insert_insight(&conn, "b", 0.5, &["1".into(), "2".into()], None).unwrap();
         insert_theme(&conn, "a theme", 0.5, &["i1".into(), "i2".into(), "3".into()], None).unwrap();
 
-        assert_eq!(active_insights_by_level(&conn, 1).unwrap().len(), 2);
-        assert_eq!(active_insights_by_level(&conn, 2).unwrap().len(), 1);
+        assert_eq!(active_insights_by_level(&conn, 1, None).unwrap().len(), 2);
+        assert_eq!(active_insights_by_level(&conn, 2, None).unwrap().len(), 1);
     }
 
     #[test]
@@ -11877,6 +12031,7 @@ mod tests {
             level: 1,
             revised_at: None,
             prev_text: None,
+            subject: SUBJECT_USER.to_string(),
         };
         let just_reverified = Insight { last_verified_at: Some(now_ts.clone()), ..base.clone() };
         let never_verified = Insight { last_verified_at: None, ..base };
@@ -12479,6 +12634,7 @@ mod tests {
             level: 1,
             revised_at: None,
             prev_text: None,
+            subject: SUBJECT_USER.to_string(),
         };
         raw_upsert_insight(&conn, &i).unwrap();
         assert_eq!(get_insight(&conn, 7).unwrap().unwrap().text, "explicit id insight");
@@ -15076,7 +15232,8 @@ mod tests {
         let conn = open_with_path(Path::new(":memory:")).unwrap();
         conn.execute_batch(
             "DROP TABLE code_graph_pending; DROP INDEX ix_code_edges_dst_path; ALTER TABLE code_edges DROP COLUMN dst_path;
-             ALTER TABLE code_files DROP COLUMN refs_blob; ALTER TABLE code_history DROP COLUMN files;",
+             ALTER TABLE code_files DROP COLUMN refs_blob; ALTER TABLE code_history DROP COLUMN files;
+             PRAGMA user_version = 35;",
         )
         .unwrap();
         migrate(&conn).unwrap();

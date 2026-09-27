@@ -8,6 +8,14 @@
     "commit": "",
     "pr": ""
   },
+  "permissions": {
+    "deny": [
+      "Edit(~/.config/mach/charter.toml)",
+      "Write(~/.config/mach/charter.toml)",
+      "Edit(~/.config/claude-hooks/charter-guard.py)",
+      "Write(~/.config/claude-hooks/charter-guard.py)"
+    ]
+  },
   "model": "opus[1m]",
   "hooks": {
     "SessionStart": [
@@ -55,6 +63,15 @@
       }
     ],
     "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /home/ryutribal/.config/claude-hooks/charter-guard.py"
+          }
+        ]
+      },
       {
         "hooks": [
           {
@@ -227,7 +244,6 @@
   },
   "tui": "fullscreen",
   "skipWorkflowUsageWarning": true,
-  "skipAutoPermissionPrompt": true,
   "autoMode": {
     "environment": [
       "### Org-wide",

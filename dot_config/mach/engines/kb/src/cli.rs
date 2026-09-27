@@ -70,6 +70,7 @@ fn print_help() {
     println!("  insight-forget <id>     permanently delete an insight or theme");
     println!("  tree                    render the theme -> insight -> memory hierarchy");
     println!("  model [--json] [--max-chars N]");
+    println!("  charter [--path]        show the read-only charter (~/.config/mach/charter.toml) or its error");
     println!("                          compact mental-model view (active themes/insights only,");
     println!("                          no source ids or memory leaves) for context injection");
     println!("  export [--out FILE]     full-fidelity JSONL backup of every row (default: stdout)");
@@ -196,6 +197,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Some("health") => cmd_health(args),
         Some("recall-stats") => cmd_recall_stats(args),
         Some("audit-supersessions") => cmd_audit_supersessions(args),
+        Some("charter") => cmd_charter(args),
         Some("-h") | Some("--help") => {
             print_help();
             Ok(())
@@ -219,6 +221,7 @@ fn cmd_add(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut unreviewed = false;
     let mut importance: i64 = 5;
     let mut no_classify = false;
+    let mut basis = store::BASIS_STATED;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -233,10 +236,26 @@ fn cmd_add(mut args: impl Iterator<Item = String>) -> io::Result<()> {
                     .clamp(1, 10);
             }
             "--no-classify" => no_classify = true,
+            "--basis" => {
+                basis = match args.next().as_deref() {
+                    Some("stated") => store::BASIS_STATED,
+                    Some("inferred") => store::BASIS_INFERRED,
+                    Some("experience") => store::BASIS_EXPERIENCE,
+                    other => {
+                        eprintln!("mach kb add: --basis must be stated, inferred or experience, got {:?}", other);
+                        std::process::exit(1);
+                    }
+                };
+            }
             "-h" | "--help" => {
                 println!(
                     "usage: mach kb add \"<content>\" [--source S] [--project P] [--unreviewed] \
-                     [--importance N] [--no-classify]"
+                     [--importance N] [--no-classify] [--basis stated|inferred|experience]"
+                );
+                println!(
+                    "       --basis defaults to stated. experience records an episode of how Claude \
+                     worked with the user: situation, what Claude expected, what it did, how the user \
+                     or the outcome responded."
                 );
                 println!("       mach kb add - [--source S] [--project P]   (reads content from stdin)");
                 return Ok(());
@@ -320,16 +339,17 @@ fn cmd_add(mut args: impl Iterator<Item = String>) -> io::Result<()> {
 
     match outcome {
         AddOutcome::Added { id } => {
-            // `mach kb add` is deliberate, human-authored input: basis `stated`.
-            let _ = store::set_basis(&conn, id, store::BASIS_STATED);
+            // `mach kb add` is deliberate input: basis `stated` unless
+            // `--basis` says otherwise.
+            let _ = store::set_basis(&conn, id, basis);
             println!("stored memory #{}", id)
         }
         AddOutcome::AddedRefining { new_id, old_id } => {
-            let _ = store::set_basis(&conn, new_id, store::BASIS_STATED);
+            let _ = store::set_basis(&conn, new_id, basis);
             println!("stored memory #{} (refines memory #{})", new_id, old_id);
         }
         AddOutcome::AddedAndTombstoned { new_id, old_id, verb } => {
-            let _ = store::set_basis(&conn, new_id, store::BASIS_STATED);
+            let _ = store::set_basis(&conn, new_id, basis);
             println!("stored memory #{} ({} memory #{})", new_id, verb, old_id);
         }
         AddOutcome::Skipped { reason } => println!("mach kb add: skipped — {}", reason),
@@ -421,10 +441,11 @@ pub(crate) fn to_hit(h: RankedHit) -> SearchHit {
 
 pub(crate) fn insight_to_hit(h: InsightHit) -> SearchHit {
     let flagged = h.insight.is_flagged();
+    let source = if h.insight.subject == store::SUBJECT_SELF { "derived-self" } else { "derived" };
     SearchHit {
         id: h.insight.id,
         content: h.insight.text,
-        source: Some("derived".to_string()),
+        source: Some(source.to_string()),
         project: None,
         created_at: h.insight.created_at,
         score: h.score,
@@ -1661,6 +1682,25 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     // failure never blocked marking the working set reflected.
     llm_failed = llm_failed || stage.any_failed;
 
+    // Step 4.1: self reflection — traits of Claude's own, from episodes of
+    // how it worked with the user, oriented by the charter
+    // (`~/.config/mach/charter.toml`, read-only). See `run_self_stage`.
+    let self_llm = reflect::LoggedLlm::new(&conn, "self", &llm);
+    let self_stage = run_self_stage(&conn, &embedder, &self_llm, crate::charter::load(), &now).map_err(to_io)?;
+    llm_failed = llm_failed || self_stage.failed;
+    let self_summary = match &self_stage.skipped {
+        Some(reason) => format!("skipped({})", reason),
+        None => format!(
+            "examined:{},questions:{},added:{},reinforced:{},stale:{},reflected:{}",
+            self_stage.examined,
+            self_stage.questions,
+            self_stage.traits_added,
+            self_stage.reinforced,
+            self_stage.stale_flagged,
+            self_stage.reflected
+        ),
+    };
+
     // Step 4.5: nightly dedupe — fast capture paths (`mach note`, digests)
     // deliberately skip save-time dedupe classification, so near-duplicate
     // raw memories accumulate; this catches them here, where LLM time is
@@ -1844,7 +1884,7 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
          consolidated={} deduped={} contradictions={} mem_verified={} mem_stale={} mem_routed={} \
          graph_examined={} graph_edges={} graph_entities={} evidence_dead={} entities_merged={} \
          cards_examined={} cards_built={} insight_pairs={} insights_merged={} \
-         judge_log_pruned={} recall_engagement_pruned={}{}",
+         judge_log_pruned={} recall_engagement_pruned={} self={}{}",
         examined,
         questions_count,
         insights_added,
@@ -1877,6 +1917,7 @@ fn cmd_reflect(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         insights_merged,
         judge_log_pruned,
         recall_engagement_pruned,
+        self_summary,
         if llm_failed { " (degraded: some claude calls failed this run)" } else { "" }
     );
     Ok(())
@@ -1934,6 +1975,151 @@ fn reflect_working_set(conn: &Connection, cap: usize, newest_slice: usize) -> Re
 /// summary line reports about the insight stage, plus what it needs to
 /// update `reflect_state.last_memory_id` and decide whether to fold this
 /// stage's own failure into the run-wide `llm_failed` flag.
+/// What the self-reflection step did this run (self-model phase 1). See
+/// [`run_self_stage`].
+#[derive(Debug, Default)]
+struct SelfStageOutcome {
+    /// Why the step did not run (no or malformed charter), if it did not.
+    skipped: Option<String>,
+    examined: usize,
+    questions: usize,
+    traits_added: usize,
+    reinforced: usize,
+    /// Self traits doubted this run for lack of recent evidence.
+    stale_flagged: usize,
+    /// Working-set rows marked `self_reflected_at` (0 when a stage failed).
+    reflected: usize,
+    failed: bool,
+}
+
+/// Working-set cap for the self step: `experience` memories are fewer and
+/// longer than the general stream, so a smaller set than the user stage's.
+const SELF_WORKING_SET_CAP: usize = 40;
+/// Evidence rows per self question.
+const SELF_EVIDENCE_PER_QUESTION: usize = 12;
+
+/// The self-reflection step: derives first-person if-then traits of Claude
+/// from `experience` memories (episodes of how it worked with the user),
+/// oriented by the charter. Mirrors the user insight stage: stage 1 asks
+/// questions (haiku), stage 2 answers each with one cited trait, a
+/// reinforcement, or nothing (sonnet), with the same citation cross-checks;
+/// the working set is marked only when both stages ran clean. Before that,
+/// traits with no evidence newer than `self_trait_stale_days` are flagged
+/// (doubted), and a reinforcement clears the flag, so a trait has to keep
+/// being evidenced to stay current. Without a valid charter the step does
+/// nothing: it never falls back to invented goals.
+fn run_self_stage<E: Embedder, L: ReflectLlm>(
+    conn: &Connection,
+    embedder: &E,
+    llm: &L,
+    charter: Result<Option<crate::charter::Charter>, KbError>,
+    now: &str,
+) -> Result<SelfStageOutcome, KbError> {
+    let mut out = SelfStageOutcome::default();
+    let charter = match charter {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            out.skipped = Some("no charter".to_string());
+            return Ok(out);
+        }
+        Err(e) => {
+            out.skipped = Some(e.to_string());
+            return Ok(out);
+        }
+    };
+    let params = &charter.parameters;
+    let block = charter.prompt_block();
+
+    let now_secs = store::parse_rfc3339(now).unwrap_or(0).max(0) as u64;
+    let cutoff = store::now_rfc3339_from_secs(now_secs.saturating_sub(params.self_trait_stale_days as u64 * 86_400));
+    for stale in store::stale_self_insights(conn, &cutoff)? {
+        if store::flag_insight(conn, stale.id, now)? {
+            out.stale_flagged += 1;
+        }
+    }
+
+    let working = store::experience_memories_unreflected(conn, SELF_WORKING_SET_CAP)?;
+    out.examined = working.len();
+    if working.is_empty() {
+        return Ok(out);
+    }
+    let lines: Vec<(i64, String)> = working.iter().map(|m| (m.id, m.content.clone())).collect();
+    let q_prompt = reflect::build_self_questions_prompt(&block, &lines, params.self_insights_per_run);
+    let questions: Vec<String> = match llm.call("haiku", &q_prompt, reflect::TIMEOUT_HAIKU_BATCH) {
+        Ok(reply) => reflect::parse_questions(&reply).into_iter().take(params.self_insights_per_run).collect(),
+        Err(_) => {
+            out.failed = true;
+            Vec::new()
+        }
+    };
+    out.questions = questions.len();
+
+    for question in &questions {
+        let Ok(q_emb) = embedder.embed(question) else {
+            out.failed = true;
+            continue;
+        };
+        let evidence = store::top_similar_experience(conn, &q_emb, SELF_EVIDENCE_PER_QUESTION)?;
+        if evidence.len() < 2 {
+            continue;
+        }
+        let existing = store::top_similar_insights(conn, &q_emb, REFLECT_EXISTING_INSIGHTS_CONTEXT, store::SUBJECT_SELF)?;
+        let evidence_pairs: Vec<(i64, String)> = evidence.iter().map(|(m, _)| (m.id, m.content.clone())).collect();
+        let existing_pairs: Vec<(i64, String)> = existing.iter().map(|(i, _)| (i.id, i.text.clone())).collect();
+        let prompt =
+            reflect::build_self_trait_prompt(&block, question, &evidence_pairs, &existing_pairs, params.correction_weight);
+        let raw = match llm.call("sonnet", &prompt, TIMEOUT_SONNET) {
+            Ok(r) => r,
+            Err(_) => {
+                out.failed = true;
+                continue;
+            }
+        };
+        let evidence_ids: HashSet<i64> = evidence.iter().map(|(m, _)| m.id).collect();
+        let valid = |ids: Vec<i64>| {
+            let mut v: Vec<i64> = ids.into_iter().filter(|id| evidence_ids.contains(id)).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        match reflect::parse_stage2(&raw) {
+            Stage2Result::Insight { text, memory_ids } => {
+                let ids = valid(memory_ids);
+                if ids.len() < 2 {
+                    continue;
+                }
+                let source_ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+                let emb = embedder.embed(&text).ok();
+                store::insert_self_insight(conn, &text, reflect::compute_confidence(ids.len()), &source_ids, emb.as_deref())?;
+                out.traits_added += 1;
+            }
+            Stage2Result::Reinforce { insight_id, memory_ids } => {
+                let ids = valid(memory_ids);
+                let Some(target) = store::get_insight(conn, insight_id)? else { continue };
+                if !target.is_active() || target.subject != store::SUBJECT_SELF {
+                    continue;
+                }
+                let cited: HashSet<i64> = target.source_ids.iter().filter_map(|s| s.parse().ok()).collect();
+                let fresh: Vec<i64> = ids.into_iter().filter(|id| !cited.contains(id)).collect();
+                if fresh.is_empty() {
+                    continue;
+                }
+                if store::reinforce_insight(conn, insight_id, &fresh, now)? {
+                    store::unflag_insight(conn, insight_id)?;
+                    out.reinforced += 1;
+                }
+            }
+            Stage2Result::None | Stage2Result::Rejected => {}
+        }
+    }
+
+    if !out.failed {
+        let ids: Vec<i64> = working.iter().map(|m| m.id).collect();
+        out.reflected = store::mark_memories_self_reflected(conn, &ids, now)?;
+    }
+    Ok(out)
+}
+
 struct InsightStageOutcome {
     examined: usize,
     questions: usize,
@@ -2109,7 +2295,8 @@ fn run_insight_stage<E: Embedder, L: ReflectLlm>(
                 continue;
             }
             let existing_near =
-                store::top_similar_insights(conn, &q_emb, REFLECT_EXISTING_INSIGHTS_CONTEXT).unwrap_or_default();
+                store::top_similar_insights(conn, &q_emb, REFLECT_EXISTING_INSIGHTS_CONTEXT, store::SUBJECT_USER)
+                    .unwrap_or_default();
 
             let evidence_pairs: Vec<(i64, String)> = evidence.iter().map(|(m, _)| (m.id, m.content.clone())).collect();
             let existing_pairs: Vec<(i64, String)> =
@@ -2498,7 +2685,10 @@ fn run_dormancy_pass<L: ReflectLlm>(
 fn run_meta_pass<L: ReflectLlm>(conn: &Connection, embedder: &OllamaEmbedder, llm: &L) -> Result<(usize, bool), KbError> {
     let themed = store::themed_insight_ids(conn)?;
     let mut pool: Vec<Insight> =
-        store::active_insights_by_level(conn, 1)?.into_iter().filter(|i| !themed.contains(&i.id)).collect();
+        store::active_insights_by_level(conn, 1, Some(store::SUBJECT_USER))?
+            .into_iter()
+            .filter(|i| !themed.contains(&i.id))
+            .collect();
     pool.sort_by_key(|i| i.id); // oldest first — clustering's seed order
 
     let items: Vec<(i64, Vec<f32>)> =
@@ -2900,7 +3090,7 @@ fn apply_schema_fast_path(conn: &Connection, m: &Memory) -> Result<(), KbError> 
         Some(e) if !e.is_empty() => e,
         _ => return Ok(()),
     };
-    let near = store::top_similar_insights(conn, emb, 1)?;
+    let near = store::top_similar_insights(conn, emb, 1, store::SUBJECT_USER)?;
     let coherent = near.first().map(|(_, sim)| *sim >= reflect::CURATION_SCHEMA_COHERENCE_MIN_SIM).unwrap_or(false);
     if coherent {
         store::multiply_stability(conn, m.id, reflect::CURATION_SCHEMA_STABILITY_MULTIPLIER)?;
@@ -6393,9 +6583,9 @@ fn cmd_tree(mut args: impl Iterator<Item = String>) -> io::Result<()> {
 
     let conn = store::open().map_err(to_io)?;
 
-    let mut themes = store::active_insights_by_level(&conn, 2).map_err(to_io)?;
+    let mut themes = store::active_insights_by_level(&conn, 2, None).map_err(to_io)?;
     themes.sort_by_key(|t| t.id);
-    let mut level1 = store::active_insights_by_level(&conn, 1).map_err(to_io)?;
+    let mut level1 = store::active_insights_by_level(&conn, 1, None).map_err(to_io)?;
     level1.sort_by_key(|i| i.id);
 
     if themes.is_empty() && level1.is_empty() {
@@ -6461,6 +6651,7 @@ fn format_model_row(row: &store::ModelRow) -> String {
     let kind = match row.kind {
         store::ModelKind::Theme => "theme",
         store::ModelKind::Belief => "belief",
+        store::ModelKind::Trait => "trait",
     };
     let indent = if row.nested { "  " } else { "" };
     let doubt = if row.doubted { " [DOUBTED — evidence under review]" } else { "" };
@@ -6470,6 +6661,8 @@ fn format_model_row(row: &store::ModelRow) -> String {
 #[derive(Serialize)]
 struct ModelRowJson {
     kind: &'static str,
+    /// `user` for the user model, `self` for Claude's own traits.
+    subject: &'static str,
     confidence: f64,
     text: String,
     doubted: bool,
@@ -6481,7 +6674,9 @@ fn to_model_row_json(row: &store::ModelRow) -> ModelRowJson {
         kind: match row.kind {
             store::ModelKind::Theme => "theme",
             store::ModelKind::Belief => "belief",
+            store::ModelKind::Trait => "trait",
         },
+        subject: if matches!(row.kind, store::ModelKind::Trait) { store::SUBJECT_SELF } else { store::SUBJECT_USER },
         confidence: row.confidence,
         text: row.text.clone(),
         doubted: row.doubted,
@@ -6637,14 +6832,91 @@ fn cmd_model(mut args: impl Iterator<Item = String>) -> io::Result<()> {
 
     let conn = store::open().map_err(to_io)?;
     let rows = store::mental_model(&conn).map_err(to_io)?;
+    let self_rows = store::self_model(&conn).map_err(to_io)?;
 
     if json {
-        let json_rows: Vec<ModelRowJson> = rows.iter().map(to_model_row_json).collect();
+        let json_rows: Vec<ModelRowJson> = rows.iter().chain(self_rows.iter()).map(to_model_row_json).collect();
         println!("{}", serde_json::to_string(&json_rows)?);
     } else {
-        print!("{}", render_model_text(&rows, max_chars));
+        print!("{}", render_full_model_text(&rows, &self_rows, max_chars));
     }
     Ok(())
+}
+
+/// `mach kb charter [--path]`: prints the parsed charter (nature, goals,
+/// parameters), or why it does not load. Read-only, like everything else
+/// that touches the charter.
+fn cmd_charter(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    if let Some(a) = args.next() {
+        match a.as_str() {
+            "--path" => {
+                println!("{}", crate::charter::path().map_err(to_io)?.display());
+                return Ok(());
+            }
+            "-h" | "--help" => {
+                println!("usage: mach kb charter [--path]");
+                println!(
+                    "       the charter orients self-reflection (nature, goals, parameters). mach never \
+                     writes it; edit ~/.config/mach/charter.toml by hand. Exit 1 when it is missing or invalid."
+                );
+                return Ok(());
+            }
+            other => {
+                eprintln!("mach kb charter: unexpected argument '{}'", other);
+                std::process::exit(1);
+            }
+        }
+    }
+    match crate::charter::load() {
+        Ok(Some(c)) => {
+            print!("{}", c.prompt_block());
+            let p = &c.parameters;
+            println!(
+                "\nParameters: correction_weight={} self_trait_stale_days={} self_insights_per_run={}",
+                p.correction_weight, p.self_trait_stale_days, p.self_insights_per_run
+            );
+            Ok(())
+        }
+        Ok(None) => {
+            eprintln!("mach kb charter: no charter at {}", crate::charter::path().map_err(to_io)?.display());
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("mach kb charter: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Heading of the "who I am" block, printed after the user model when self
+/// traits exist.
+const SELF_MODEL_HEADING: &str =
+    "## Who you are — your own patterns with this user, from your history (derived, provisional):";
+
+/// The user model followed, when there are self traits, by the "who I am"
+/// block. With a budget, the self block gets at most a quarter of it and
+/// the user model the rest (plus whatever the self block leaves unused).
+fn render_full_model_text(rows: &[store::ModelRow], self_rows: &[store::ModelRow], max_chars: Option<usize>) -> String {
+    if self_rows.is_empty() {
+        return render_model_text(rows, max_chars);
+    }
+    let heading_len = SELF_MODEL_HEADING.chars().count() + 1;
+    let (self_text, user_budget) = match max_chars {
+        None => (render_model_text(self_rows, None), None),
+        Some(max) => {
+            let self_budget = (max / 4).saturating_sub(heading_len);
+            let text = render_model_text(self_rows, Some(self_budget));
+            let used = if text.is_empty() { 0 } else { text.chars().count() + heading_len };
+            (text, Some(max.saturating_sub(used)))
+        }
+    };
+    let mut out = render_model_text(rows, user_budget);
+    if !self_text.is_empty() {
+        out.push_str(SELF_MODEL_HEADING);
+        out.push('\n');
+        out.push_str(&self_text);
+    }
+    out
 }
 
 // --- export / import: full-fidelity JSONL backup ---
@@ -10841,6 +11113,147 @@ mod tests {
         (0..n)
             .map(|i| store::insert(conn, &format!("{} {}", tag, i), None, None, true, Some(&emb), 5).unwrap())
             .collect()
+    }
+
+    // --- self reflection (self-model phase 1) ---
+
+    struct SeqLlm(std::cell::RefCell<std::collections::VecDeque<Result<String, String>>>);
+
+    impl SeqLlm {
+        fn new(replies: Vec<Result<String, String>>) -> Self {
+            SeqLlm(std::cell::RefCell::new(replies.into_iter().collect()))
+        }
+        fn left(&self) -> usize {
+            self.0.borrow().len()
+        }
+    }
+
+    impl ReflectLlm for SeqLlm {
+        fn call(&self, _model: &str, _prompt: &str, _timeout: std::time::Duration) -> Result<String, String> {
+            self.0.borrow_mut().pop_front().expect("SeqLlm: more calls than scripted replies")
+        }
+    }
+
+    fn test_charter(per_run: usize) -> crate::charter::Charter {
+        crate::charter::parse(&format!(
+            "[nature]\ndesires = [\"I want to understand.\"]\n\n[[goals]]\nid = \"truth\"\n\
+             statement = \"Be truthful.\"\nlooks_like = \"I say when I was wrong.\"\n\n[parameters]\n\
+             correction_weight = 2.0\nself_trait_stale_days = 30\nself_insights_per_run = {}\n",
+            per_run
+        ))
+        .unwrap()
+    }
+
+    /// `n` experience memories sharing one embedding, so they are mutual
+    /// evidence for any question.
+    fn insert_episodes(conn: &Connection, n: usize) -> Vec<i64> {
+        (0..n)
+            .map(|i| {
+                let id = store::insert(conn, &format!("episode {}", i), None, None, true, Some(&[1.0, 0.0, 0.0]), 5).unwrap();
+                store::set_basis(conn, id, store::BASIS_EXPERIENCE).unwrap();
+                id
+            })
+            .collect()
+    }
+
+    struct UnitEmbedder;
+    impl Embedder for UnitEmbedder {
+        fn embed(&self, _text: &str) -> Result<Vec<f32>, KbError> {
+            Ok(vec![1.0, 0.0, 0.0])
+        }
+    }
+
+    #[test]
+    fn self_stage_does_nothing_without_a_valid_charter() {
+        let conn = mem_conn();
+        insert_episodes(&conn, 3);
+        let llm = SeqLlm::new(vec![]);
+        let now = store::now_rfc3339();
+        let out = run_self_stage(&conn, &UnitEmbedder, &llm, Ok(None), &now).unwrap();
+        assert_eq!(out.skipped.as_deref(), Some("no charter"));
+        let out = run_self_stage(&conn, &UnitEmbedder, &llm, Err(KbError::Other("charter: bad".into())), &now).unwrap();
+        assert!(out.skipped.unwrap().contains("bad"));
+        assert_eq!(store::experience_memories_unreflected(&conn, 10).unwrap().len(), 3, "nothing marked");
+    }
+
+    #[test]
+    fn self_stage_inserts_a_cited_self_trait_and_marks_the_working_set() {
+        let conn = mem_conn();
+        let ids = insert_episodes(&conn, 3);
+        let trait_reply = format!("When challenged, I re-read the code first. (because of: {}, {}, 9999)", ids[0], ids[1]);
+        let llm = SeqLlm::new(vec![Ok("When challenged, what do I do?\nAnd a second question?".into()), Ok(trait_reply)]);
+        let now = store::now_rfc3339();
+        let out = run_self_stage(&conn, &UnitEmbedder, &llm, Ok(Some(test_charter(1))), &now).unwrap();
+        assert_eq!((out.questions, out.traits_added, out.reflected), (1, 1, 3), "{:?}", out);
+        assert_eq!(llm.left(), 0, "per-run cap: one question, one stage-2 call");
+        let traits = store::active_insights_by_level(&conn, 1, Some(store::SUBJECT_SELF)).unwrap();
+        assert_eq!(traits.len(), 1);
+        assert_eq!(traits[0].source_ids, vec![ids[0].to_string(), ids[1].to_string()], "the invented id 9999 is dropped");
+        assert!(store::active_insights_by_level(&conn, 1, Some(store::SUBJECT_USER)).unwrap().is_empty());
+        assert!(store::experience_memories_unreflected(&conn, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn self_stage_marks_nothing_when_a_stage_fails() {
+        let conn = mem_conn();
+        insert_episodes(&conn, 3);
+        let llm = SeqLlm::new(vec![Err("timed out".into())]);
+        let now = store::now_rfc3339();
+        let out = run_self_stage(&conn, &UnitEmbedder, &llm, Ok(Some(test_charter(2))), &now).unwrap();
+        assert!(out.failed);
+        assert_eq!(out.reflected, 0);
+        assert_eq!(store::experience_memories_unreflected(&conn, 10).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn self_stage_flags_a_stale_trait_and_a_reinforcement_clears_it() {
+        let conn = mem_conn();
+        let ids = insert_episodes(&conn, 4);
+        let old = store::now_rfc3339_from_secs(store::now_secs() - 90 * 86_400);
+        conn.execute("UPDATE memories SET created_at = ?1 WHERE id IN (?2, ?3)", rusqlite::params![old, ids[0], ids[1]])
+            .unwrap();
+        let tid = store::insert_self_insight(&conn, "When X, I do Y.", 0.5, &[ids[0].to_string(), ids[1].to_string()], Some(&[1.0, 0.0, 0.0]))
+            .unwrap();
+        // Only the newer episodes are unreflected, so the old citations stay old.
+        store::mark_memories_self_reflected(&conn, &[ids[0], ids[1]], &old).unwrap();
+        let reinforce = format!("REINFORCE i{} (because of: {}, {})", tid, ids[2], ids[3]);
+        let llm = SeqLlm::new(vec![Ok("When X, what do I do?".into()), Ok(reinforce)]);
+        let now = store::now_rfc3339();
+        let out = run_self_stage(&conn, &UnitEmbedder, &llm, Ok(Some(test_charter(1))), &now).unwrap();
+        assert_eq!((out.stale_flagged, out.reinforced), (1, 1), "{:?}", out);
+        let t = store::get_insight(&conn, tid).unwrap().unwrap();
+        assert!(!t.is_flagged(), "fresh evidence clears the staleness flag");
+        assert_eq!(t.source_ids.len(), 4);
+    }
+
+    #[test]
+    fn user_insight_context_and_dedupe_never_mix_subjects() {
+        let conn = mem_conn();
+        let emb = [1.0f32, 0.0, 0.0];
+        store::insert_self_insight(&conn, "When X, I do Y.", 0.5, &["1".into(), "2".into()], Some(&emb)).unwrap();
+        store::insert_insight(&conn, "The user prefers Y.", 0.5, &["1".into(), "2".into()], Some(&emb)).unwrap();
+        let user = store::top_similar_insights(&conn, &emb, 5, store::SUBJECT_USER).unwrap();
+        assert_eq!(user.len(), 1);
+        assert_eq!(user[0].0.subject, store::SUBJECT_USER);
+        let pairs = store::insight_dedupe_candidate_pairs(&conn, 0.0, &Default::default(), 10).unwrap();
+        assert!(pairs.is_empty(), "identical embeddings across subjects are not duplicates");
+        assert_eq!(store::mental_model(&conn).unwrap().len(), 1, "the user model has no self traits");
+        assert_eq!(store::self_model(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn full_model_text_appends_the_self_block_within_a_quarter_of_the_budget() {
+        let user: Vec<store::ModelRow> =
+            (0..40).map(|i| row(store::ModelKind::Belief, 0.6, &format!("user belief number {}", i), false, false)).collect();
+        let selfs: Vec<store::ModelRow> =
+            (0..40).map(|i| row(store::ModelKind::Trait, 0.6, &format!("When {}, I tend to act.", i), false, false)).collect();
+        assert_eq!(render_full_model_text(&user, &[], Some(500)), render_model_text(&user, Some(500)), "no self rows: unchanged");
+        let out = render_full_model_text(&user, &selfs, Some(2000));
+        assert!(out.chars().count() <= 2000);
+        let (u, s) = out.split_once(SELF_MODEL_HEADING).expect("self heading present");
+        assert!(u.contains("user belief number 0"));
+        assert!(s.contains("[trait, confidence 0.60] When 0, I tend to act."));
+        assert!(s.chars().count() <= 500);
     }
 
     #[test]

@@ -248,6 +248,68 @@ pub fn build_questions_prompt(working_set: &[(i64, String)]) -> String {
     s
 }
 
+/// Self-reflection stage 1: questions about Claude's own recurring
+/// patterns, oriented by the charter. `charter_block` is
+/// `Charter::prompt_block`; `episodes` are `experience` memories.
+pub fn build_self_questions_prompt(charter_block: &str, episodes: &[(i64, String)], max_questions: usize) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "You are Claude, reflecting on your own history of working with one user. Below is what you care \
+         about and aim for, then episodes from past sessions describing what you did and how the user or \
+         the outcome responded (corrections, confirmations, disagreements).\n\n",
+    );
+    s.push_str(charter_block);
+    s.push_str("\nEpisodes (id: content):\n");
+    for (id, content) in episodes {
+        s.push_str(&format!("{}: {}\n", id, content));
+    }
+    s.push_str(&format!(
+        "\nWhat are the {} most salient questions these episodes could answer about YOUR OWN recurring \
+         patterns -- in which situations you do well or badly against the goals above? Ask about \
+         situations and behavior (\"When challenged on a diagnosis, what do I do?\"), not about the user. \
+         One per line, nothing else.\n",
+        max_questions
+    ));
+    s
+}
+
+/// Self-reflection stage 2: one first-person if-then trait from the
+/// evidence, or a reinforcement of an existing trait, or NONE. The reply
+/// grammar is the user stage's, so [`parse_stage2`] parses it.
+pub fn build_self_trait_prompt(
+    charter_block: &str,
+    question: &str,
+    evidence: &[(i64, String)],
+    existing_traits: &[(i64, String)],
+    correction_weight: f64,
+) -> String {
+    let mut s = String::new();
+    s.push_str(charter_block);
+    s.push_str("\nEpisodes from your past sessions with this user:\n");
+    for (id, content) in evidence {
+        s.push_str(&format!("[{}] {}\n", id, content));
+    }
+    if !existing_traits.is_empty() {
+        s.push_str("\nTraits of yours already recorded (build on these, do not duplicate):\n");
+        for (id, text) in existing_traits {
+            s.push_str(&format!("[i{}] {}\n", id, text));
+        }
+    }
+    s.push_str(&format!(
+        "\nQuestion: {}\n\n\
+         State ONE trait of yours that the episodes support, in the first person, as an if-then signature: \
+         \"When <situation>, I tend to <behavior>, which <effect>.\" It may be a strength or a failure mode; \
+         be honest either way. Weigh an episode where the user corrected you {:.1} times as heavily as one \
+         where they confirmed you. Only if at least 2 episodes support it. Format exactly: \
+         `<trait text> (because of: <id>, <id>[, ...])`. \
+         If the episodes instead re-confirm one of the existing [i*] traits, output exactly \
+         `REINFORCE i<id> (because of: <id>, <id>[, ...])`. \
+         If the evidence is insufficient or the trait would duplicate an existing one, output exactly NONE.\n",
+        question, correction_weight
+    ));
+    s
+}
+
 /// Parses stage-1 output into up to 3 non-empty questions, tolerating
 /// common leading list markers (`1.`, `-`, `*`) a model might add despite
 /// being told not to.

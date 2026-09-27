@@ -15,6 +15,8 @@ sha2 = "0.10"
 # vanishingly rare 1-ULP miss that `mach kb export`/`import`'s full-fidelity
 # round trip (every `stability` value included) can't tolerate.
 serde_json = { version = "1", features = ["float_roundtrip"] }
+# charter -- the read-only ~/.config/mach/charter.toml (self-model goals).
+toml = "0.8"
 # code_index::chunk -- tree-sitter grammars for the syntax-aware chunker.
 # Pinned exact versions verified to build and parse correctly together:
 # tree-sitter-c-sharp's generated parser targets ABI 15, which needs a

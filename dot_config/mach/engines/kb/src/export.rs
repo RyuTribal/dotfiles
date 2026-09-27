@@ -177,6 +177,13 @@ struct InsightRow {
     revised_at: Option<String>,
     #[serde(default)]
     prev_text: Option<String>,
+    // Schema v36; an older export line is a user insight.
+    #[serde(default = "default_subject")]
+    subject: String,
+}
+
+fn default_subject() -> String {
+    store::SUBJECT_USER.to_string()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -263,6 +270,7 @@ fn insight_to_row(i: &Insight) -> InsightRow {
         level: i.level,
         revised_at: i.revised_at.clone(),
         prev_text: i.prev_text.clone(),
+        subject: i.subject.clone(),
     }
 }
 
@@ -287,6 +295,7 @@ fn row_to_insight(row: InsightRow) -> Result<Insight, KbError> {
         level: row.level,
         revised_at: row.revised_at,
         prev_text: row.prev_text,
+        subject: row.subject,
     })
 }
 

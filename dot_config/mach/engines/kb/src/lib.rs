@@ -24,6 +24,7 @@
 //! `embed` wraps that call behind an `Embedder` trait so store/search logic
 //! can be tested with a fake embedder that never touches the network.
 pub mod ask;
+pub mod charter;
 pub mod classify;
 pub mod cli;
 pub mod code_index;

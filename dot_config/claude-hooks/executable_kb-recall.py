@@ -604,7 +604,8 @@ def main():
             confidence = h.get("confidence")
             conf = " (confidence {:.2})".format(confidence) \
                 if isinstance(confidence, (int, float)) else ""
-            label = "derived theme" if h.get("level") == 2 else "derived belief"
+            label = "self-knowledge" if h.get("source") == "derived-self" \
+                else "derived theme" if h.get("level") == 2 else "derived belief"
             lines.append("- [{}, {}]{} {}".format(label, date, conf, content))
         else:
             mem_id = h.get("id")

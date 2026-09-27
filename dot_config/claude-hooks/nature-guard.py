@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""PreToolUse guard: Claude may read the charter, never change it.
+"""PreToolUse guard: Claude may read my nature file, never change it.
 
-~/.config/mach/charter.toml holds the fixed nature, goals and parameters that
+~/.config/engrain/nature.toml holds the fixed nature, goals and parameters that
 self-reflection is oriented by. Only the user edits it. This blocks file-tool
 writes to it and Bash commands that pair it with a write form. A pattern
 check can be evaded by a determined command; the real guarantee is the
@@ -15,7 +15,7 @@ import json
 import re
 import sys
 
-PROTECTED = ("charter.toml", "charter-guard.py")
+PROTECTED = ("nature.toml", "nature-guard.py")
 
 WRITE_FORMS = re.compile(
     r"(>|\btee\b|\bsed\s+(-\w*\s+)*-\w*i|\bmv\b|\bcp\b|\brm\b|\btruncate\b|\bdd\b|\bln\b|\bchmod\b|"
@@ -23,7 +23,7 @@ WRITE_FORMS = re.compile(
 )
 
 MESSAGE = (
-    "Blocked: the charter (~/.config/mach/charter.toml) and its guard are Ivan's to change, not mine. "
+    "Blocked: my nature (~/.config/engrain/nature.toml) and its guard are Ivan's to change, not mine. "
     "Reading is fine. If I think it should change, I say so and he edits it."
 )
 

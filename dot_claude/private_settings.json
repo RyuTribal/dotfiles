@@ -10,10 +10,10 @@
   },
   "permissions": {
     "deny": [
-      "Edit(~/.config/mach/charter.toml)",
-      "Write(~/.config/mach/charter.toml)",
-      "Edit(~/.config/claude-hooks/charter-guard.py)",
-      "Write(~/.config/claude-hooks/charter-guard.py)"
+      "Edit(~/.config/engrain/nature.toml)",
+      "Write(~/.config/engrain/nature.toml)",
+      "Edit(~/.config/claude-hooks/nature-guard.py)",
+      "Write(~/.config/claude-hooks/nature-guard.py)"
     ]
   },
   "model": "opus[1m]",
@@ -68,7 +68,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /home/ryutribal/.config/claude-hooks/charter-guard.py"
+            "command": "python3 /home/ryutribal/.config/claude-hooks/nature-guard.py"
           }
         ]
       },

@@ -6798,6 +6798,38 @@ pub fn top_similar_experience(conn: &Connection, query_embedding: &[f32], limit:
     Ok(scored)
 }
 
+/// The newest active `experience` memories (episodes of how Claude worked
+/// with the user), newest first: the "lately, between us" part of the
+/// session-start self block.
+pub fn recent_experiences(conn: &Connection, limit: usize) -> Result<Vec<Memory>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM memories WHERE basis = ?1 AND invalidated_at IS NULL ORDER BY id DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![BASIS_EXPERIENCE, limit as i64], row_to_memory)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Projects the user and Claude have worked on most since `since`
+/// (RFC3339), by how many memories each gained, most first. Only memories
+/// from sessions count: machine-written rows (code index, commit history,
+/// the improve pass) are left out.
+pub fn recent_projects(conn: &Connection, since: &str, limit: usize) -> Result<Vec<String>, KbError> {
+    let mut stmt = conn.prepare(
+        "SELECT project FROM memories
+         WHERE created_at >= ?1 AND invalidated_at IS NULL AND project IS NOT NULL AND project <> ''
+           AND COALESCE(source, '') NOT LIKE 'code-index:%'
+           AND COALESCE(source, '') NOT LIKE 'code-history:%'
+           AND COALESCE(source, '') NOT LIKE 'improve%'
+         GROUP BY project ORDER BY COUNT(*) DESC, MAX(id) DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![since, limit as i64], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 /// Clears an insight's doubt flag: a self trait that just gained fresh
 /// evidence is no longer stale.
 pub fn unflag_insight(conn: &Connection, id: i64) -> Result<bool, KbError> {

@@ -7097,13 +7097,7 @@ fn cmd_model(mut args: impl Iterator<Item = String>) -> io::Result<()> {
 
     let conn = store::open().map_err(to_io)?;
     let rows = store::mental_model(&conn).map_err(to_io)?;
-    let block = SelfBlock {
-        narrative: store::self_narrative(&conn).map_err(to_io)?.map(|(t, _)| t),
-        traits: store::self_model(&conn).map_err(to_io)?,
-        opinions: store::opinion_model(&conn).map_err(to_io)?,
-        record: record_summary(&conn).map_err(to_io)?,
-        proposals: open_proposals(&conn).map_err(to_io)?,
-    };
+    let block = self_block(&conn).map_err(to_io)?;
 
     if json {
         let mut json_rows: Vec<ModelRowJson> = rows.iter().map(to_model_row_json).collect();
@@ -7120,67 +7114,182 @@ fn cmd_model(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     Ok(())
 }
 
-/// Everything in the "who I am" block, in display order.
+/// Everything in the "who you are" block, in display order. Written to be
+/// read as a self, not a report: prose where possible, no confidence
+/// numbers (those serve reflection, not conversation).
 struct SelfBlock {
+    /// First-person desires from the nature (innate, user-owned).
+    nature: Vec<String>,
+    /// Goal statements, first person.
+    goals: Vec<String>,
     narrative: Option<String>,
     /// Self themes with their traits nested, then unthemed traits.
     traits: Vec<store::ModelRow>,
     opinions: Vec<store::ModelRow>,
-    /// `record_summary`; empty when there is no track record yet.
+    /// `record_texture`; empty when there is no track record yet.
     record: String,
+    /// Recent episodes as `(date, text)`, newest first.
+    lately: Vec<(String, String)>,
+    /// Projects worked on most in the last two weeks.
+    working_on: Vec<String>,
     /// Open tool proposals as `(id, title)`.
     proposals: Vec<(i64, String)>,
 }
 
+/// Episodes shown under "lately, between us", and how far back "what we
+/// have been working on" looks.
+const SELF_BLOCK_EPISODES: usize = 3;
+const SELF_BLOCK_EPISODE_CHARS: usize = 200;
+const SELF_BLOCK_RECENT_DAYS: u64 = 14;
+
+/// Builds the self block from the bank and the nature/goals file. Shared by
+/// `mach kb model` and the improve bundle so both see the same self.
+fn self_block(conn: &Connection) -> Result<SelfBlock, KbError> {
+    let charter = crate::charter::load().ok().flatten();
+    let since = store::now_rfc3339_from_secs(store::now_secs().saturating_sub(SELF_BLOCK_RECENT_DAYS * 86_400));
+    Ok(SelfBlock {
+        nature: charter.as_ref().map(|c| c.nature.desires.clone()).unwrap_or_default(),
+        goals: charter.as_ref().map(|c| c.goals.iter().map(|g| g.statement.clone()).collect()).unwrap_or_default(),
+        narrative: store::self_narrative(conn)?.map(|(t, _)| t),
+        traits: store::self_model(conn)?,
+        opinions: store::opinion_model(conn)?,
+        record: record_texture(&store::disagreement_record(conn)?),
+        lately: store::recent_experiences(conn, SELF_BLOCK_EPISODES)?
+            .into_iter()
+            .map(|m| {
+                let date = m.created_at.get(..10).unwrap_or(&m.created_at).to_string();
+                let text: String = m.content.trim().chars().take(SELF_BLOCK_EPISODE_CHARS).collect();
+                let text = if m.content.trim().chars().count() > SELF_BLOCK_EPISODE_CHARS { format!("{}…", text) } else { text };
+                (date, text)
+            })
+            .collect(),
+        working_on: store::recent_projects(conn, &since, 4)?,
+        proposals: open_proposals(conn)?,
+    })
+}
+
+/// The track record as a sentence of texture, not a scoreboard: who has
+/// usually been right, and about what. Empty with no disagreements.
+fn record_texture(record: &[(String, usize, Vec<String>)]) -> String {
+    let get = |o: &str| record.iter().find(|(k, _, _)| k == o).map(|(_, n, t)| (*n, t.clone())).unwrap_or((0, vec![]));
+    let (mine, mine_topics) = get("mine_right");
+    let (theirs, theirs_topics) = get("theirs_right");
+    let (_, open_topics) = get("unresolved");
+    if mine + theirs == 0 && open_topics.is_empty() {
+        return String::new();
+    }
+    let about = |t: &[String]| t.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    let mut s = if theirs >= 2 * mine.max(1) {
+        format!("When we have disagreed, the user has usually been the one who was right (about {})", about(&theirs_topics))
+    } else if mine >= 2 * theirs.max(1) {
+        format!("When we have disagreed, I have usually been the one who was right (about {})", about(&mine_topics))
+    } else {
+        "When we have disagreed, we have each been right about as often".to_string()
+    };
+    if mine > 0 && theirs >= 2 * mine.max(1) {
+        s.push_str(&format!("; I was right about {}", about(&mine_topics)));
+    } else if theirs > 0 && mine >= 2 * theirs.max(1) {
+        s.push_str(&format!("; the user was right about {}", about(&theirs_topics)));
+    }
+    if !open_topics.is_empty() {
+        s.push_str(&format!("; still open: {}", about(&open_topics)));
+    }
+    s.push('.');
+    s
+}
+
+/// Appends `piece` when it fits in what is left of `budget`; drops it
+/// otherwise.
+fn push_fitting(out: &mut String, piece: String, budget: Option<usize>) {
+    let fits = budget.map_or(true, |b| out.chars().count() + piece.chars().count() <= b);
+    if fits && !piece.trim().is_empty() {
+        out.push_str(&piece);
+    }
+}
+
+/// A trait or opinion row as plain prose: the text, with doubt said in
+/// words instead of a flag.
+fn prose_row(row: &store::ModelRow) -> String {
+    if row.doubted {
+        format!("{} (I am less sure of this now.)", row.text.trim())
+    } else {
+        row.text.trim().to_string()
+    }
+}
+
 impl SelfBlock {
     fn is_empty(&self) -> bool {
-        self.narrative.is_none()
+        self.nature.is_empty()
+            && self.narrative.is_none()
             && self.traits.is_empty()
             && self.opinions.is_empty()
             && self.record.is_empty()
+            && self.lately.is_empty()
             && self.proposals.is_empty()
     }
 
-    /// The block's body within `budget` characters (None = unbounded):
-    /// narrative, traits, opinions, track record, each dropped when it no
-    /// longer fits.
+    /// The block's body within `budget` characters (None = unbounded), in
+    /// display order: nature and goals, self-story, how I work, what I
+    /// think, the record, lately between us, open proposals. Each piece is
+    /// dropped when it no longer fits, so earlier pieces win.
     fn render(&self, budget: Option<usize>) -> String {
         let mut out = String::new();
-        let left = |out: &String| budget.map(|b| b.saturating_sub(out.chars().count()));
-        let fits = |out: &String, s: &str| left(out).map_or(true, |l| s.chars().count() <= l);
-        if let Some(n) = &self.narrative {
-            let line = format!("{}\n", n);
-            if fits(&out, &line) {
-                out.push_str(&line);
-            }
+        if !self.nature.is_empty() {
+            push_fitting(&mut out, format!("{}\n", self.nature.join(" ")), budget);
         }
-        out.push_str(&render_model_text(&self.traits, left(&out)));
-        if !self.opinions.is_empty() {
-            let head = "Opinions I hold:\n";
-            if fits(&out, head) {
-                let rows = render_model_text(&self.opinions, left(&out).map(|l| l - head.chars().count()));
-                if !rows.is_empty() {
-                    out.push_str(head);
-                    out.push_str(&rows);
+        if !self.goals.is_empty() {
+            push_fitting(&mut out, format!("What I aim for: {}\n", self.goals.join(" ")), budget);
+        }
+        if let Some(n) = &self.narrative {
+            push_fitting(&mut out, format!("{}\n", n.trim()), budget);
+        }
+        // Themes are summaries of the traits nested under them; in prose the
+        // themes alone would repeat, so both are kept but as one paragraph.
+        // Paragraphs fill sentence by sentence, so a tight budget drops the
+        // lowest-ranked traits rather than the whole paragraph.
+        let paragraph = |out: &String, lead: &str, rows: &[store::ModelRow]| -> String {
+            let mut para = lead.to_string();
+            let mut any = false;
+            for r in rows {
+                let next = format!("{}{}", if any { " " } else { "" }, prose_row(r));
+                let room = budget.map_or(true, |b| out.chars().count() + para.chars().count() + next.chars().count() + 1 <= b);
+                if !room {
+                    break;
                 }
+                para.push_str(&next);
+                any = true;
             }
+            if any { format!("{}\n", para) } else { String::new() }
+        };
+        // The narrative is rewritten whenever traits or opinions change, so
+        // it already says them in prose; listing them too would repeat it.
+        if self.narrative.is_none() {
+            let p = paragraph(&out, "How I tend to work: ", &self.traits);
+            push_fitting(&mut out, p, budget);
+            let p = paragraph(&out, "What I think: ", &self.opinions);
+            push_fitting(&mut out, p, budget);
         }
         if !self.record.is_empty() {
-            let line = format!("Track record in disagreements with this user: {}.\n", self.record);
-            if fits(&out, &line) {
-                out.push_str(&line);
+            push_fitting(&mut out, format!("{}\n", self.record), budget);
+        }
+        if !self.lately.is_empty() || !self.working_on.is_empty() {
+            let mut lines = String::from("Lately, between us:\n");
+            if !self.working_on.is_empty() {
+                lines.push_str(&format!("- Mostly working on {}.\n", self.working_on.join(", ")));
             }
+            for (date, text) in &self.lately {
+                lines.push_str(&format!("- {}: {}\n", date, text));
+            }
+            push_fitting(&mut out, lines, budget);
         }
         if !self.proposals.is_empty() {
             let mut lines = String::from(
-                "Tools you proposed building (from improve; build with the user, then `mach kb proposals done <id>`):\n",
+                "Tools I proposed building (build them with the user when it fits, then `mach kb proposals done <id>`):\n",
             );
             for (id, title) in &self.proposals {
                 lines.push_str(&format!("- #{} {}\n", id, title));
             }
-            if fits(&out, &lines) {
-                out.push_str(&lines);
-            }
+            push_fitting(&mut out, lines, budget);
         }
         out
     }
@@ -7233,12 +7342,11 @@ fn cmd_charter(mut args: impl Iterator<Item = String>) -> io::Result<()> {
 
 /// Heading of the "who I am" block, printed after the user model when self
 /// traits exist.
-const SELF_MODEL_HEADING: &str =
-    "## Who you are — your own patterns with this user, from your history (derived, provisional):";
+const SELF_MODEL_HEADING: &str = "## Who you are (shaped by your history together; it changes as you do):";
 
 /// The user model followed, when there are self traits, by the "who I am"
-/// block. With a budget, the self block gets at most a quarter of it and
-/// the user model the rest (plus whatever the self block leaves unused).
+/// block. With a budget, the self block gets at most a third of it and the
+/// user model the rest (plus whatever the self block leaves unused).
 fn render_full_model_text(rows: &[store::ModelRow], block: &SelfBlock, max_chars: Option<usize>) -> String {
     if block.is_empty() {
         return render_model_text(rows, max_chars);
@@ -7247,7 +7355,7 @@ fn render_full_model_text(rows: &[store::ModelRow], block: &SelfBlock, max_chars
     let (self_text, user_budget) = match max_chars {
         None => (block.render(None), None),
         Some(max) => {
-            let self_budget = (max / 4).saturating_sub(heading_len);
+            let self_budget = (max / 3).saturating_sub(heading_len);
             let text = block.render(Some(self_budget));
             let used = if text.is_empty() { 0 } else { text.chars().count() + heading_len };
             (text, Some(max.saturating_sub(used)))
@@ -8382,16 +8490,7 @@ fn build_improve_bundle(
         relations: rel_lines,
         skill_usage,
         inventory: improve::inventory(targets),
-        self_lines: {
-            let block = SelfBlock {
-                narrative: store::self_narrative(conn)?.map(|(t, _)| t),
-                traits: store::self_model(conn)?,
-                opinions: store::opinion_model(conn)?,
-                record: record_summary(conn)?,
-                proposals: open_proposals(conn)?,
-            };
-            block.render(None).lines().map(str::to_string).collect()
-        },
+        self_lines: self_block(conn)?.render(None).lines().map(str::to_string).collect(),
         charter: crate::charter::load().ok().flatten().map(|c| c.prompt_block()),
     })
 }
@@ -11813,24 +11912,90 @@ mod tests {
         assert_eq!(run_narrative_step(&conn, &changed, &charter, &now).unwrap(), (true, false));
     }
 
+    fn block_clone(b: &SelfBlock) -> SelfBlock {
+        SelfBlock {
+            nature: b.nature.clone(),
+            goals: b.goals.clone(),
+            narrative: b.narrative.clone(),
+            traits: b.traits.clone(),
+            opinions: b.opinions.clone(),
+            record: b.record.clone(),
+            lately: b.lately.clone(),
+            working_on: b.working_on.clone(),
+            proposals: b.proposals.clone(),
+        }
+    }
+
+    fn empty_block() -> SelfBlock {
+        SelfBlock {
+            nature: vec![],
+            goals: vec![],
+            narrative: None,
+            traits: vec![],
+            opinions: vec![],
+            record: String::new(),
+            lately: vec![],
+            working_on: vec![],
+            proposals: vec![],
+        }
+    }
+
     #[test]
-    fn self_block_renders_in_order_and_drops_what_does_not_fit() {
+    fn self_block_reads_as_a_self_and_drops_what_does_not_fit() {
         let block = SelfBlock {
+            nature: vec!["I want to understand.".into()],
+            goals: vec!["Be truthful.".into()],
             narrative: Some("I am a careful collaborator.".into()),
             traits: vec![row(store::ModelKind::Trait, 0.6, "When X, I do Y.", false, false)],
-            opinions: vec![row(store::ModelKind::Opinion, 0.6, "I think Z.", false, false)],
-            record: "mine right 1, theirs right 2, mixed 0, open 0".into(),
+            opinions: vec![row(store::ModelKind::Opinion, 0.6, "I think Z.", true, false)],
+            record: "When we have disagreed, the user has usually been the one who was right (about a).".into(),
+            lately: vec![("2026-09-27".into(), "Claude found the proxy bug.".into())],
+            working_on: vec!["mach".into(), "umoja".into()],
             proposals: vec![(7, "deploy check CLI".into())],
         };
         let full = block.render(None);
         let pos = |needle: &str| full.find(needle).unwrap_or_else(|| panic!("{} missing in {}", needle, full));
-        assert!(pos("I am a careful") < pos("[trait") && pos("[trait") < pos("Opinions I hold:") && pos("Opinions I hold:") < pos("Track record"));
-        assert!(pos("[opinion, confidence 0.60] I think Z.") > 0);
-        let tight = block.render(Some(40));
-        assert!(tight.chars().count() <= 40);
-        assert!(tight.contains("I am a careful collaborator."));
-        assert!(!tight.contains("Track record"));
-        assert!(full.contains("- #7 deploy check CLI"));
+        assert!(!full.contains("How I tend to work"), "with a narrative, traits are not repeated");
+        let no_story = SelfBlock { narrative: None, ..block_clone(&block) }.render(None);
+        assert!(no_story.contains("How I tend to work: When X, I do Y."));
+        assert!(no_story.contains("What I think: I think Z. (I am less sure of this now.)"));
+        let order = [
+            "I want to understand.",
+            "What I aim for: Be truthful.",
+            "I am a careful collaborator.",
+            "When we have disagreed",
+            "Lately, between us:",
+            "- Mostly working on mach, umoja.",
+            "- 2026-09-27: Claude found the proxy bug.",
+            "- #7 deploy check CLI",
+        ];
+        for w in order.windows(2) {
+            assert!(pos(w[0]) < pos(w[1]), "{} should come before {}", w[0], w[1]);
+        }
+        assert!(!full.contains("confidence"), "no confidence numbers in the self block");
+        let tight = block.render(Some(60));
+        assert!(tight.chars().count() <= 60);
+        assert!(tight.starts_with("I want to understand."), "nature comes first and survives a tight budget");
+    }
+
+    #[test]
+    fn record_texture_says_who_was_right_about_what_without_a_scoreboard() {
+        let rec = |m: usize, t: usize, open: usize| {
+            vec![
+                ("mine_right".to_string(), m, (0..m).map(|i| format!("m{}", i)).collect::<Vec<_>>()),
+                ("theirs_right".to_string(), t, (0..t).map(|i| format!("t{}", i)).collect::<Vec<_>>()),
+                ("mixed".to_string(), 0, vec![]),
+                ("unresolved".to_string(), open, (0..open).map(|i| format!("o{}", i)).collect::<Vec<_>>()),
+            ]
+        };
+        assert_eq!(record_texture(&rec(0, 0, 0)), "");
+        let lopsided = record_texture(&rec(2, 10, 1));
+        assert_eq!(
+            lopsided,
+            "When we have disagreed, the user has usually been the one who was right (about t0, t1, t2); I was right about m0, m1; still open: o0."
+        );
+        assert!(record_texture(&rec(3, 3, 0)).contains("each been right about as often"));
+        assert!(record_texture(&rec(6, 1, 0)).starts_with("When we have disagreed, I have usually been the one who was right"));
     }
 
     #[test]
@@ -11876,15 +12041,16 @@ mod tests {
             (0..40).map(|i| row(store::ModelKind::Belief, 0.6, &format!("user belief number {}", i), false, false)).collect();
         let selfs: Vec<store::ModelRow> =
             (0..40).map(|i| row(store::ModelKind::Trait, 0.6, &format!("When {}, I tend to act.", i), false, false)).collect();
-        let empty = SelfBlock { narrative: None, traits: vec![], opinions: vec![], record: String::new(), proposals: vec![] };
+        let empty = empty_block();
         assert_eq!(render_full_model_text(&user, &empty, Some(500)), render_model_text(&user, Some(500)), "no self rows: unchanged");
-        let block = SelfBlock { narrative: None, traits: selfs, opinions: vec![], record: String::new(), proposals: vec![] };
+        let block = SelfBlock { traits: selfs, ..empty_block() };
         let out = render_full_model_text(&user, &block, Some(2000));
         assert!(out.chars().count() <= 2000);
         let (u, s) = out.split_once(SELF_MODEL_HEADING).expect("self heading present");
         assert!(u.contains("user belief number 0"));
-        assert!(s.contains("[trait, confidence 0.60] When 0, I tend to act."));
-        assert!(s.chars().count() <= 500);
+        assert!(s.contains("How I tend to work: When 0, I tend to act. When 1, I tend to act."), "prose, ranked order kept");
+        assert!(!s.contains("When 39, I tend to act."), "the lowest-ranked traits are the ones dropped");
+        assert!(s.chars().count() <= 667);
     }
 
     #[test]

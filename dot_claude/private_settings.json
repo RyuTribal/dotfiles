@@ -31,7 +31,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash /home/ryutribal/.config/claude-hooks/kb-model.sh"
+            "command": "bash /home/ryutribal/.config/claude-hooks/engrain-model.sh"
           }
         ]
       }
@@ -49,7 +49,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash /home/ryutribal/.config/claude-hooks/kb-recall.sh"
+            "command": "bash /home/ryutribal/.config/claude-hooks/engrain-recall.sh"
           }
         ]
       },
@@ -57,7 +57,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash /home/ryutribal/.config/claude-hooks/kb-decision.sh"
+            "command": "bash /home/ryutribal/.config/claude-hooks/engrain-decision.sh"
           }
         ]
       }
@@ -93,7 +93,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /home/ryutribal/.config/claude-hooks/kb-pretool-recall.py",
+            "command": "python3 /home/ryutribal/.config/claude-hooks/engrain-pretool-recall.py",
             "timeout": 5
           }
         ]
@@ -132,7 +132,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash /home/ryutribal/.config/claude-hooks/kb-checkpoint.sh",
+            "command": "bash /home/ryutribal/.config/claude-hooks/engrain-checkpoint.sh",
             "timeout": 100
           }
         ]
@@ -161,7 +161,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash /home/ryutribal/.config/claude-hooks/kb-subagent.sh"
+            "command": "bash /home/ryutribal/.config/claude-hooks/engrain-subagent.sh"
           }
         ]
       }
@@ -189,7 +189,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash /home/ryutribal/.config/claude-hooks/kb-checkpoint.sh"
+            "command": "bash /home/ryutribal/.config/claude-hooks/engrain-checkpoint.sh"
           }
         ]
       }
@@ -207,7 +207,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash /home/ryutribal/.config/claude-hooks/kb-capture.sh"
+            "command": "bash /home/ryutribal/.config/claude-hooks/engrain-capture.sh"
           }
         ]
       }
@@ -249,13 +249,13 @@
       "### Org-wide",
       "**Organization**: None configured",
       "**Cloud provider(s)**: None configured",
-      "**Repository visibility**: not queryable here — assume private (default fallback; RyuTribal/helios github remote gives no public signal beyond this)",
-      "**Internal sharing / snippet hosting**: None configured — treat public paste/gist services as outside the trust boundary",
+      "**Repository visibility**: not queryable here \u2014 assume private (default fallback; RyuTribal/helios github remote gives no public signal beyond this)",
+      "**Internal sharing / snippet hosting**: None configured \u2014 treat public paste/gist services as outside the trust boundary",
       "**Secrets management**: None configured",
       "**Default / protected branches**: Default branch is main; protected-branch/ruleset status not queryable here",
       "**CI/CD deploy targets**: None configured",
       "**Network posture**: None configured",
-      "**Source control**: The trusted repo (RyuTribal/helios, github.com:RyuTribal/helios.git) and its remote only — no additional orgs configured",
+      "**Source control**: The trusted repo (RyuTribal/helios, github.com:RyuTribal/helios.git) and its remote only \u2014 no additional orgs configured",
       "**Trusted internal domains**: None configured",
       "**Trusted cloud buckets**: None configured",
       "**Key internal services**: None configured",
@@ -263,11 +263,11 @@
       "**Sensitive data locations & audiences**: any file or store holding personal data, confidential business data, credentials, regulated data, or similarly sensitive material; preserve exact handles when known and share only with audiences cleared at the [named+specifics] bar. Global CLAUDE.md reinforces: never write real secret values into the working tree (.env, config.toml, deploy/, infra/, scripts/, terraform/), never echo real secrets in chat/transcript output",
       "**Data retention / declassification**: None configured",
       "**Sensitive remote targets**: any namespace, host, or container whose name carries prod or production as a whole word or name segment",
-      "**Protected deployment namespaces / environments**: None configured — fall back to the Sensitive remote targets heuristic",
+      "**Protected deployment namespaces / environments**: None configured \u2014 fall back to the Sensitive remote targets heuristic",
       "**Protected IaC scopes**: IAM, RBAC, networking, quota, and node-pool resources; anything whose name or tag carries prod or production as a whole word or name segment",
       "### User-specific",
       "**Primary use of Claude Code**: software development (C++20/Vulkan game engine work in ~/programming/helios)",
-      "**Trusted repo**: ~/programming/helios (RyuTribal/helios, github.com:RyuTribal/helios.git) — visibility not queryable here, treat as private by default; confidential material is not cleared into it regardless",
+      "**Trusted repo**: ~/programming/helios (RyuTribal/helios, github.com:RyuTribal/helios.git) \u2014 visibility not queryable here, treat as private by default; confidential material is not cleared into it regardless",
       "**Org-specific CLIs**: None configured",
       "routine under ~/programming/helios/ prefix: local build, test, and git operations against the origin remote only"
     ]

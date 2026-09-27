@@ -1,6 +1,6 @@
 //! Minimal UTC time helpers, hand-rolled with no `chrono`/`time` crate
 //! dependency -- the same civil-calendar algorithm and RFC3339 format
-//! `kb-engine`'s `store` module already uses, duplicated here (a couple
+//! `engrain`'s `store` module already uses, duplicated here (a couple
 //! dozen lines) rather than pulled in as a cross-engine dependency.
 //!
 //! Everything in this crate is UTC, including the meeting directory's

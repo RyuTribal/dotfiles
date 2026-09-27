@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""kb-recall — Claude Code UserPromptSubmit hook (single-process).
+"""engrain-recall — Claude Code UserPromptSubmit hook (single-process).
 
-Searches `mach kb` for memories related to the incoming prompt and prints
+Searches `engrain` for memories related to the incoming prompt and prints
 them to stdout; Claude Code adds a UserPromptSubmit hook's plain-text stdout
 as additionalContext automatically on exit 0.
 
@@ -9,13 +9,13 @@ This used to be a bash script spawning four separate python3 processes per
 prompt (prompt extraction, session-id extraction, socket client, formatter)
 plus mktemp files between them — process startup dominated the hook's
 latency once the search itself got cheap. Everything now runs in this one
-interpreter; kb-recall.sh remains only as the configured entry point.
+interpreter; engrain-recall.sh remains only as the configured entry point.
 
 Engagement-gated reinforcement: this hook never reinforces anything itself
 (impression is not engagement). It appends the ids it actually injects, per
-prompt, to ~/.local/share/mach/recall-log/<session_id>.jsonl; `mach kb
+prompt, to ~/.local/share/engrain/recall-log/<session_id>.jsonl; `engrain
 ingest-sessions` later pairs that log against the session transcript and
-reinforces only what the conversation engaged with (engines/kb/src/ingest.rs).
+reinforces only what the conversation engaged with (src/ingest.rs).
 
 Contract: this hook must NEVER block a prompt. Every failure path degrades
 to silence and exit 0.
@@ -52,13 +52,13 @@ PROJECT_CARD_KEY = "__project_card__"
 
 # Appended whenever this hook actually injects something (a memory line, a
 # connection, a card, or the project card) -- the injected block on its own
-# gets skimmed past (64% of real sessions never call `mach kb`); this line
+# gets skimmed past (64% of real sessions never call `engrain`); this line
 # asks explicitly for one of the three actions available: use it, search or
 # `why` deeper, or write a new fact down.
 ACTION_LINE = (
     'If these memories bear on the task, use them; if they are close but '
-    'incomplete, run `mach kb search "<topic>"` or `mach kb why <id>` '
-    'before exploring files. Save durable new facts with `mach kb add`.'
+    'incomplete, run `engrain search "<topic>"` or `engrain why <id>` '
+    'before exploring files. Save durable new facts with `engrain add`.'
 )
 
 # Printed instead of ACTION_LINE when nothing was injected at all (either
@@ -68,11 +68,11 @@ ACTION_LINE = (
 # prompts doesn't repeat it every time.
 NO_MATCH_LINE = (
     'No stored memory matched. For project history or decisions, try '
-    '`mach kb search "<topic>" --cwd .` before re-deriving from files.'
+    '`engrain search "<topic>" --cwd .` before re-deriving from files.'
 )
 
-RECALL_LOG_DIR = os.path.expanduser("~/.local/share/mach/recall-log")
-MACH_BIN = os.environ.get("MACH_BIN", "mach")
+RECALL_LOG_DIR = os.path.expanduser("~/.local/share/engrain/recall-log")
+ENGRAIN_BIN = os.environ.get("ENGRAIN_BIN", "engrain")
 
 
 def read_input():
@@ -152,21 +152,21 @@ def merge_responses(primary, secondary):
 
 def _valid_response(data):
     """A successful response is `{"hits": [...], "connections": [...]}`
-    (see engines/kb/src/cli.rs's `SearchResponse`); an `{"error": ...}`
+    (see src/cli.rs's `SearchResponse`); an `{"error": ...}`
     object, a bare list (the pre-graph-layer shape), or anything else means
     fall back."""
     return data if isinstance(data, dict) and isinstance(data.get("hits"), list) else None
 
 
 def search_via_socket(query, project=None, cwd=None):
-    """machd's kb socket subsystem (engines/kb/src/socket.rs) keeps a warm
+    """the `engrain serve` socket (src/socket.rs) keeps a warm
     db connection + a warm ollama HTTP agent alive. Tried first; ANY failure
     (daemon down, socket missing, timeout, error response) returns None and
     the subprocess path takes over — graceful degradation."""
     runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
     if not runtime_dir:
         return None
-    sock_path = os.path.join(runtime_dir, "mach-kb.sock")
+    sock_path = os.path.join(runtime_dir, "engrain.sock")
     try:
         if not os.path.exists(sock_path):
             return None
@@ -211,7 +211,7 @@ def search_via_socket(query, project=None, cwd=None):
 
 def search_via_subprocess(query, project=None, cwd=None):
     def build_argv(include_cwd):
-        argv = [MACH_BIN, "kb", "search", query,
+        argv = [ENGRAIN_BIN, "search", query,
                 "--limit", str(SEARCH_LIMIT), "--json",
                 "--min-score", str(SCORE_THRESHOLD),
                 "--budget", str(TOKEN_BUDGET)]
@@ -221,7 +221,7 @@ def search_via_subprocess(query, project=None, cwd=None):
         if project:
             argv += ["--project", project]
         # Same as search_via_socket's cwd field, for the subprocess
-        # fallback: `mach kb search --cwd PATH` resolves it against the
+        # fallback: `engrain search --cwd PATH` resolves it against the
         # `projects` registry and, on a match, uses it as the session
         # project instead of `--project`.
         if include_cwd and cwd:
@@ -249,7 +249,7 @@ def search_via_subprocess(query, project=None, cwd=None):
             return None
     if proc.returncode != 0:
         return None
-    # `mach kb search` degrades to a substring fallback (every hit forced to
+    # `engrain search` degrades to a substring fallback (every hit forced to
     # score 1.0) when it can't reach ollama — too noisy for automatic
     # injection, so treat its stderr warning the same as an outage.
     err = (proc.stderr or "").lower()
@@ -270,7 +270,7 @@ def source_phrase(source, basis=None):
     themes never go through this; they keep their own [derived ...] markers,
     a separate axis (a belief ABOUT the user, not a provenance class).
 
-    `basis` is the row's ground for being believed (mach kb `memories.basis`,
+    `basis` is the row's ground for being believed (engrain `memories.basis`,
     "stated" | "inferred" | "experience" | None). It refines the phrase, never replaces the
     source class: an INFERRED digest line reads "I inferred this from a
     session", a STATED one "you said this in a session". A row with no basis
@@ -284,7 +284,7 @@ def source_phrase(source, basis=None):
     elif s == "session-digest" or s.startswith("session-digest:") \
             or s == "transcript-backfill" or s.startswith("transcript-backfill:"):
         where = "a session"
-    # Claude's own unattended work between sessions (mach kb improve).
+    # Claude's own unattended work between sessions (engrain improve).
     if s.startswith("improve-proposal"):
         return "I proposed this"
     if s.startswith("improve "):
@@ -302,7 +302,7 @@ def source_phrase(source, basis=None):
         return "from earlier project memory"
     if where == "a session":
         return "picked up from a session"
-    # note:/manual/kb design/empty and any unrecognized tag all read as
+    # note:/manual/engrain design/empty and any unrecognized tag all read as
     # deliberate, reviewed input — an unknown tag can never masquerade as
     # more authoritative than it is.
     return "you told me"
@@ -354,7 +354,7 @@ def session_seen_cards(log_path):
     project card) ever logged this session, across ALL lines — unlike
     `suppressed_cards` above, not bounded to the last `DEDUPE_WINDOW`
     entries. Pretool recall's own once-per-session card rule (see
-    kb-pretool-recall.py) needs the whole session's history: a card shown
+    engrain-pretool-recall.py) needs the whole session's history: a card shown
     on prompt 1 must still suppress a pretool hit on tool call 50, long
     outside any sliding window. Same silence-on-error contract as every
     other log reader here."""
@@ -428,7 +428,7 @@ def emit_no_match(project, log_path):
 
 def project_card_text(resp):
     """Extract the session's project card from a search response, or None.
-    It arrives as an Option<String> on the wire (engines/kb/src/socket.rs
+    It arrives as an Option<String> on the wire (src/socket.rs
     marks it `skip_serializing_if = "Option::is_none"`), so it is ABSENT
     from the response rather than null when the session's project has no
     card yet -- but treat a missing key, a null, and a blank/whitespace
@@ -495,7 +495,7 @@ def connection_key(c):
     key = "{}|{}|{}".format(src, predicate, dst)
     if c.get("hops") == 2:
         predicate2 = (c.get("predicate2") or "").strip()
-        # src_name2: the second edge's own stored source (newer mach kb);
+        # src_name2: the second edge's own stored source (newer engrain);
         # absent from an older daemon's JSON, where hop 2 always started at
         # dst_name -- fall back to that so the key stays stable either way.
         src2 = (c.get("src_name2") or dst).strip()
@@ -507,7 +507,7 @@ def connection_key(c):
 
 
 def connection_line(c):
-    """Renders one association-graph connection (engines/kb/src/cli.rs's
+    """Renders one association-graph connection (src/cli.rs's
     `ConnectionHit`) as either a 1-hop edge — "- [connection] Moses
     —boss-of→ user (learned 2026-09-07)" — or, for a 2-hop spreading-
     activation connection (`hops == 2`), a two-edge chain continuing
@@ -528,7 +528,7 @@ def connection_line(c):
         dst2 = (c.get("dst_name2") or "").strip()
         if not predicate2 or not dst2:
             return None
-        # Every edge arrives in its STORED direction (mach kb never
+        # Every edge arrives in its STORED direction (engrain never
         # re-orients an edge to read as a chain). When the second edge
         # starts where the first ends, render one chain; otherwise render
         # the two edges side by side so no arrow is ever shown flipped.
@@ -602,7 +602,7 @@ def main():
             continue
         date = (h.get("created_at") or "")[:10]
         if h.get("derived"):
-            # An insight (level 2: theme) from `mach kb reflect` — a belief
+            # An insight (level 2: theme) from `engrain reflect` — a belief
             # derived from evidence, not something the user said verbatim.
             # Never reinforced (no strength term) so never logged below, and
             # never subject to the dedupe window (no memory id to dedupe on).
@@ -658,7 +658,7 @@ def main():
         conn_keys.append(key)
 
     # Project card: the session's own project, rebuilt with no LLM call on
-    # every reflect run (see `mach kb projects refresh`), so it is the
+    # every reflect run (see `engrain projects refresh`), so it is the
     # cheapest orientation in this injection and never stale. Rendered
     # first, ahead of even the entity cards — it is deterministic structure
     # about where the session already is, not something reflection derived
@@ -670,7 +670,7 @@ def main():
             print(l)
         print()
 
-    # Entity cards: `mach kb reflect`'s consolidated profile of something
+    # Entity cards: `engrain reflect`'s consolidated profile of something
     # this prompt named — a person, project, practice or tool. Rendered
     # before the individual memories because it is the summary those
     # memories were distilled into.
@@ -710,7 +710,7 @@ def main():
         for l in lines:
             print(l)
         # Connections render after memory lines — a plain association the
-        # graph layer (`mach kb reflect`'s extraction pass) has derived
+        # graph layer (`engrain reflect`'s extraction pass) has derived
         # alongside whatever verbatim memories matched. Never logged/
         # suppressed by memory id (a connection has none), but its own
         # rendered key IS now session-deduped the same way ids are — see
@@ -733,7 +733,7 @@ def main():
         emit_no_match(project, log_path)
 
     # Only ids/connection keys actually rendered above are logged — the
-    # engagement sweep (`mach kb ingest-sessions`) depends on the "ids"
+    # engagement sweep (`engrain ingest-sessions`) depends on the "ids"
     # field meaning "shown", not "considered"; "conn" exists purely for this
     # hook's own session dedupe and carries no reinforcement semantics, so
     # ingest.rs's own parsing must (and does) simply ignore it. Best-effort:

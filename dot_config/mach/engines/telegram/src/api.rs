@@ -1,9 +1,9 @@
 //! Telegram Bot HTTP API client, behind the `TelegramApi` trait so `bot`'s
 //! dispatch/allowlist/reply-formatting logic is unit-testable against a
 //! fake instead of ever making a real network call -- mirrors
-//! `kb::classify::Classifier` / `kb::reflect::ReflectLlm`'s shape.
+//! `engrain::classify::Classifier` / `engrain::reflect::ReflectLlm`'s shape.
 //! `HttpTelegramApi` is the real implementation, built on `ureq` (already a
-//! workspace dependency via `kb-engine`'s ollama client).
+//! workspace dependency via `engrain`'s ollama client).
 //!
 //! SECURITY: every error path here goes through `redact`, which strips the
 //! literal bot token out of whatever `ureq`/`io` handed back before it's

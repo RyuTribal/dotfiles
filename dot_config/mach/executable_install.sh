@@ -16,13 +16,8 @@ install_bins() {
   install -Dm755 "$HERE/target/release/machd"  "$BIN_DIR/machd"
   install -Dm755 "$HERE/target/release/sweep"  "$BIN_DIR/sweep"
   install -Dm755 "$HERE/target/release/sweepd" "$BIN_DIR/sweepd"
-  install -Dm755 "$HERE/scripts/kb-backup.sh"  "$BIN_DIR/mach-kb-backup"
-  # `note` is a plain symlink to `mach` — busybox-style argv0 dispatch (see
-  # mach/src/main.rs's `invoked_as_note`) makes `note "text"` equivalent to
-  # `mach note "text"`. Relative target so it keeps working if BIN_DIR moves.
-  mkdir -p "$BIN_DIR"
-  ln -sf mach "$BIN_DIR/note"
-  echo "installed: $BIN_DIR/{mach,machd,sweep,sweepd,mach-kb-backup,note}"
+  # `note` belongs to engrain now (~/programming/engrain/install.sh links it).
+  echo "installed: $BIN_DIR/{mach,machd,sweep,sweepd}"
 }
 
 build() {
@@ -51,145 +46,49 @@ case ":$PATH:" in
   *) echo "NOTE: $BIN_DIR is not on your PATH — add it or the panel can't spawn sweepd." ;;
 esac
 
-# kb (phase 2) needs a running ollama with the embedding model pulled. This
-# is a soft check: kb itself degrades gracefully (clear error on add, warned
-# substring fallback on search) when ollama is missing, so an absent or
-# unconfigured ollama must not fail the whole install.
-check_ollama() {
-  if ! command -v ollama >/dev/null 2>&1; then
-    echo "NOTE: ollama not found — 'mach kb' needs it for embeddings (https://ollama.com)."
-    echo "      Install it, then run: ollama pull nomic-embed-text"
-    return
-  fi
-  if ollama list 2>/dev/null | awk '{print $1}' | grep -qx 'nomic-embed-text:latest\|nomic-embed-text'; then
-    echo "ollama: nomic-embed-text already present."
-  else
-    echo "ollama found but nomic-embed-text is missing — pulling it now..."
-    if ollama pull nomic-embed-text; then
-      echo "ollama: nomic-embed-text pulled."
-    else
-      echo "WARNING: 'ollama pull nomic-embed-text' failed — 'mach kb add'/'search' will error until this succeeds (is ollama serve running?)."
-    fi
-  fi
-}
-check_ollama
+# Memory lives in engrain (~/programming/engrain), a separate project with
+# its own installer and units. mach only depends on it (meet and telegram
+# store through it), so check it is there, retire the units mach used to
+# own, and add mach's own pieces on top of engrain's.
+if ! command -v engrain >/dev/null 2>&1; then
+  echo "NOTE: engrain not found on PATH; install it: ~/programming/engrain/install.sh"
+fi
 
-# mach kb reflect (phase 3) runs on a schedule via a systemd user timer
-# rather than a hand-rolled loop inside machd — a timer survives logouts,
-# gets Persistent=true catch-up, and needs no daemon process of its own.
-# This is a soft install: a non-systemd environment (no `systemctl`, or a
-# user session systemd doesn't manage) must not fail the whole install —
-# `mach kb reflect` still works fine run by hand or from cron in that case.
-install_reflect_timer() {
+have_user_systemd() {
+  command -v systemctl >/dev/null 2>&1 && systemctl --user list-units >/dev/null 2>&1
+}
+
+# Units from before the engrain split: engrain-reflect/-index/-backup/-health
+# replace them.
+retire_memory_units() {
   local unit_dir="$HOME/.config/systemd/user"
-  install -Dm644 "$HERE/systemd/mach-reflect.service" "$unit_dir/mach-reflect.service"
-  install -Dm644 "$HERE/systemd/mach-reflect.timer"   "$unit_dir/mach-reflect.timer"
-  echo "installed: $unit_dir/mach-reflect.{service,timer}"
-
-  if ! command -v systemctl >/dev/null 2>&1; then
-    echo "NOTE: systemctl not found — units installed but not enabled. Run 'mach kb reflect' via cron or by hand instead."
-    return
-  fi
-  if ! systemctl --user list-units >/dev/null 2>&1; then
-    echo "NOTE: no systemd --user session available here — units installed but not enabled."
-    return
-  fi
+  have_user_systemd || return 0
+  for t in mach-reflect mach-index mach-kb-backup mach-health; do
+    systemctl --user disable --now "$t.timer" >/dev/null 2>&1 || true
+    rm -f "$unit_dir/$t.timer" "$unit_dir/$t.service"
+  done
+  rm -f "$BIN_DIR/mach-kb-backup"
   systemctl --user daemon-reload
-  if systemctl --user enable --now mach-reflect.timer >/dev/null 2>&1; then
-    echo "enabled: mach-reflect.timer (daily 04:00 anchor, +10min after boot, re-arms 3h after each run, +/-15min jitter)"
-  else
-    echo "WARNING: 'systemctl --user enable --now mach-reflect.timer' failed — enable it by hand once mach is on PATH."
-  fi
 }
-install_reflect_timer
+retire_memory_units
 
-# mach kb index (code index) runs on its own nightly systemd user timer,
-# separate from mach-reflect.timer — the two write to the same kb.db, so both
-# take ~/.local/share/mach/kb-job.lock (mach-reflect via flock(1) in its
-# unit, `mach kb index` in-process) to never overlap.
-# The timer is installed but deliberately NOT enabled: the first fill of a
-# large project set is many nights of budgeted runs, so do one manual run
-# first (`mach kb index --dry-run`, then `mach kb index`), check
-# `mach kb index status`, and only then enable the timer by hand. Same soft
-# treatment as the other timers: a non-systemd environment must not fail
-# the whole install.
-install_index_timer() {
+# mach meet process files meeting facts into engrain, so it takes engrain's
+# job lock and runs on its own timer (it used to be a pre-step of the old
+# reflect unit). Plus a drop-in giving engrain-reflect this machine's extra
+# project root (this config repo) and where mach meet keeps transcripts.
+install_meet_and_engrain_dropin() {
   local unit_dir="$HOME/.config/systemd/user"
-  install -Dm644 "$HERE/systemd/mach-index.service" "$unit_dir/mach-index.service"
-  install -Dm644 "$HERE/systemd/mach-index.timer"   "$unit_dir/mach-index.timer"
-  echo "installed: $unit_dir/mach-index.{service,timer}"
-
-  if ! command -v systemctl >/dev/null 2>&1; then
-    echo "NOTE: systemctl not found — units installed but not enabled. Run 'mach kb index' via cron or by hand instead."
-    return
-  fi
-  if ! systemctl --user list-units >/dev/null 2>&1; then
-    echo "NOTE: no systemd --user session available here — units installed but not enabled."
-    return
-  fi
+  install -Dm644 "$HERE/systemd/mach-meet.service" "$unit_dir/mach-meet.service"
+  install -Dm644 "$HERE/systemd/mach-meet.timer"   "$unit_dir/mach-meet.timer"
+  install -Dm644 "$HERE/systemd/engrain-reflect.service.d/mach.conf" "$unit_dir/engrain-reflect.service.d/mach.conf"
+  echo "installed: $unit_dir/mach-meet.{service,timer}, engrain-reflect.service.d/mach.conf"
+  have_user_systemd || return 0
   systemctl --user daemon-reload
-  if systemctl --user is-enabled --quiet mach-index.timer 2>/dev/null; then
-    echo "mach-index.timer: already enabled (left as is; unit files refreshed)"
-  else
-    echo "NOTE: mach-index.timer installed but NOT enabled. After a manual first run"
-    echo "      ('mach kb index --dry-run', then 'mach kb index', then 'mach kb index status'),"
-    echo "      enable it with: systemctl --user enable --now mach-index.timer"
-  fi
+  systemctl --user enable --now mach-meet.timer >/dev/null 2>&1 \
+    && echo "enabled: mach-meet.timer" \
+    || echo "WARNING: 'systemctl --user enable --now mach-meet.timer' failed"
 }
-install_index_timer
-
-# mach kb export (phase 4 backup) — same soft-install treatment as the
-# reflect timer: a non-systemd environment must not fail the whole install,
-# `mach-kb-backup` still works run by hand or from cron in that case.
-install_kb_backup_timer() {
-  local unit_dir="$HOME/.config/systemd/user"
-  install -Dm644 "$HERE/systemd/mach-kb-backup.service" "$unit_dir/mach-kb-backup.service"
-  install -Dm644 "$HERE/systemd/mach-kb-backup.timer"   "$unit_dir/mach-kb-backup.timer"
-  echo "installed: $unit_dir/mach-kb-backup.{service,timer}"
-
-  if ! command -v systemctl >/dev/null 2>&1; then
-    echo "NOTE: systemctl not found — units installed but not enabled. Run 'mach-kb-backup' via cron or by hand instead."
-    return
-  fi
-  if ! systemctl --user list-units >/dev/null 2>&1; then
-    echo "NOTE: no systemd --user session available here — units installed but not enabled."
-    return
-  fi
-  systemctl --user daemon-reload
-  if systemctl --user enable --now mach-kb-backup.timer >/dev/null 2>&1; then
-    echo "enabled: mach-kb-backup.timer (daily 03:00, +15min after boot, +/-30min jitter)"
-  else
-    echo "WARNING: 'systemctl --user enable --now mach-kb-backup.timer' failed — enable it by hand once mach is on PATH."
-  fi
-}
-install_kb_backup_timer
-
-# mach kb health --notify (persistent-degradation notification) — same
-# soft-install treatment as the reflect/backup timers: a non-systemd
-# environment must not fail the whole install, `mach kb health` still works
-# run by hand or from cron in that case.
-install_health_timer() {
-  local unit_dir="$HOME/.config/systemd/user"
-  install -Dm644 "$HERE/systemd/mach-health.service" "$unit_dir/mach-health.service"
-  install -Dm644 "$HERE/systemd/mach-health.timer"   "$unit_dir/mach-health.timer"
-  echo "installed: $unit_dir/mach-health.{service,timer}"
-
-  if ! command -v systemctl >/dev/null 2>&1; then
-    echo "NOTE: systemctl not found — units installed but not enabled. Run 'mach kb health' via cron or by hand instead."
-    return
-  fi
-  if ! systemctl --user list-units >/dev/null 2>&1; then
-    echo "NOTE: no systemd --user session available here — units installed but not enabled."
-    return
-  fi
-  systemctl --user daemon-reload
-  if systemctl --user enable --now mach-health.timer >/dev/null 2>&1; then
-    echo "enabled: mach-health.timer (twice daily 06:47/18:47, +20min after boot, +/-20min jitter)"
-  else
-    echo "WARNING: 'systemctl --user enable --now mach-health.timer' failed — enable it by hand once mach is on PATH."
-  fi
-}
-install_health_timer
+install_meet_and_engrain_dropin
 
 # whisper.cpp (telegram voice-note transcription) — pacman first, per the
 # user's package install discipline: this script never pip/npm/cargo-installs
@@ -225,14 +124,13 @@ check_whisper() {
 }
 check_whisper
 
-# mach-telegramd (machd: telegram bridge + kb socket) — same soft-install
+# mach-telegramd (machd: telegram bridge) — same soft-install
 # treatment as the other systemd units: a non-systemd environment must not
 # fail the whole install. Unlike the reflect/backup timers this is a
 # persistent daemon (Type=simple), not a periodic oneshot, so there is
 # exactly one unit, no timer. It always starts (no ConditionPathExists) --
-# the kb socket subsystem needs no config, and the telegram subsystem
-# no-ops cleanly on its own when a real telegram.toml doesn't exist yet, so
-# enabling this before one exists is safe and expected either way.
+# the telegram subsystem no-ops cleanly on its own when a real
+# telegram.toml doesn't exist yet, so enabling it early is safe.
 install_telegramd_unit() {
   local unit_dir="$HOME/.config/systemd/user"
   install -Dm644 "$HERE/systemd/mach-telegramd.service" "$unit_dir/mach-telegramd.service"
@@ -248,23 +146,19 @@ install_telegramd_unit() {
   fi
   systemctl --user daemon-reload
   if systemctl --user enable --now mach-telegramd.service >/dev/null 2>&1; then
-    echo "enabled: mach-telegramd.service (machd — always serves the kb socket subsystem;"
-    echo "         the telegram bridge itself stays disabled until ~/.local/share/mach/telegram.toml"
-    echo "         exists — see below if it doesn't yet)"
+    echo "enabled: mach-telegramd.service (machd — the telegram bridge stays disabled until"
+    echo "         ~/.local/share/mach/telegram.toml exists — see below if it doesn't yet)"
   else
     echo "WARNING: 'systemctl --user enable --now mach-telegramd.service' failed — enable it by hand once mach is on PATH."
   fi
   # `enable --now` STARTS a stopped unit but never restarts a running one,
   # so on every reinstall after the first, machd kept serving the previous
-  # binary from memory. The kb socket lives in that process, which means
-  # the recall hook's fast path silently answered from stale code while the
-  # CLI answered from the new one -- three times in one session that had to
-  # be caught and restarted by hand. try-restart is the right verb: it
+  # binary from memory. try-restart is the right verb: it
   # restarts the unit if it is running and does nothing at all if it is
   # not, so the enable path above stays the only thing that starts it.
   if ! systemctl --user try-restart mach-telegramd.service >/dev/null 2>&1; then
     echo "WARNING: 'systemctl --user try-restart mach-telegramd.service' failed — restart it by hand,"
-    echo "         or the kb socket keeps serving the binary it started with."
+    echo "         or it keeps running the binary it started with."
   fi
 }
 install_telegramd_unit

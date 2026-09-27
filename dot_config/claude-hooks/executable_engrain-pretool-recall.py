@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
-"""kb-pretool-recall — Claude Code PreToolUse hook (Write | Edit | Bash |
+"""engrain-pretool-recall — Claude Code PreToolUse hook (Write | Edit | Bash |
 Agent | EnterPlanMode | ExitPlanMode).
 
-Tool-time recall. Per-prompt recall (kb-recall.py) is keyed on what the
+Tool-time recall. Per-prompt recall (engrain-recall.py) is keyed on what the
 user typed; the moment that actually needs memory is when the agent is
 about to create a file, plan, or delegate — that is where "audit existing
 X before building" memories earn their keep. This hook builds a query from
 the project name plus the tool's own input (file stem and directory for
 Write, the first words of an Agent prompt, "design plan" for plan mode),
-runs the same search kb-recall.py uses, and hands hits back as
+runs the same search engrain-recall.py uses, and hands hits back as
 additionalContext for the tool call.
 
 Edit and Bash are covered too (added 2026-09-08): an Edit is keyed like a
 Write (file stem + parent dir); a Bash command is keyed on its command
 words and any path stems it names, with flags and shell noise stripped.
 Bash fires constantly, so the query is deliberately narrow and the
-session dedupe window in kb-recall.py keeps a repeated hit from being
+session dedupe window in engrain-recall.py keeps a repeated hit from being
 re-injected on every call. Read is deliberately NOT covered: it is pure
 exploration and would only add latency with nothing to warn about.
 
-Reuses kb-recall.py's search, formatting, session dedupe window and recall
+Reuses engrain-recall.py's search, formatting, session dedupe window and recall
 log, so engagement-gated reinforcement sees these injections exactly like
 prompt-time ones. Memory hits keep that sliding window (`suppressed_ids`,
 `DEDUPE_WINDOW`); an entity card or the project card is different — the
@@ -40,7 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     import importlib.util
     _spec = importlib.util.spec_from_file_location(
-        "kb_recall", os.path.join(os.path.dirname(os.path.abspath(__file__)), "kb-recall.py"))
+        "engrain_recall", os.path.join(os.path.dirname(os.path.abspath(__file__)), "engrain-recall.py"))
     kb_recall = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(kb_recall)
 except Exception:
@@ -153,7 +153,7 @@ def main():
         data = json.load(sys.stdin)
     except Exception:
         return
-    if os.environ.get("MACH_KB_DIGEST") == "1":
+    if os.environ.get("ENGRAIN_DIGEST") == "1":
         return
     tool_name = data.get("tool_name") or ""
     session_id = data.get("session_id") or ""
@@ -165,7 +165,7 @@ def main():
     # project_name() (the basename) stays the fallback label folded into
     # the query text by build_query() above; `cwd` itself now also rides
     # along on the search call so the Rust side can resolve the actual
-    # session project against the `projects` registry (see kb-recall.py's
+    # session project against the `projects` registry (see engrain-recall.py's
     # own main() for the same split).
     project = project_name(cwd)
     resp = kb_recall.search_via_socket(query, project, cwd)

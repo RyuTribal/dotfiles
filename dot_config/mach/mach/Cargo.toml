@@ -5,7 +5,8 @@ edition = "2021"
 
 [dependencies]
 sweep = { package = "sweep-engine", path = "../engines/sweep" }
-kb = { package = "kb-engine", path = "../engines/kb" }
+# Memory and self-model: the standalone Engrain crate (~/programming/engrain).
+engrain = { path = "../../../programming/engrain" }
 meet = { package = "meet-engine", path = "../engines/meet" }
 
 [[bin]]

@@ -1,9 +1,9 @@
 //! The one sonnet `claude -p` call `mach meet process` makes per meeting:
 //! summary + speaker-name inference + durable-fact extraction, all from a
-//! single strictly-formatted prompt/reply -- mirrors `kb::reflect`'s
+//! single strictly-formatted prompt/reply -- mirrors `engrain::reflect`'s
 //! `ReflectLlm` trait (a call behind a trait for testability) and reuses
-//! `kb::classify::run_claude` directly for the actual subprocess spawn --
-//! same flags, same `MACH_KB_DIGEST=1` recursion guard every other
+//! `engrain::classify::run_claude` directly for the actual subprocess spawn --
+//! same flags, same `ENGRAIN_DIGEST=1` recursion guard every other
 //! non-interactive `claude -p` call in this codebase uses, rather than a
 //! second copy of that plumbing.
 //!
@@ -15,7 +15,7 @@
 //! of how this one goes).
 use std::time::Duration;
 
-use kb::classify::run_claude;
+use engrain::classify::run_claude;
 
 use crate::meeting::{Meeting, Mode};
 
@@ -241,7 +241,7 @@ fn parse_names(text: &str) -> Vec<NameMapping> {
 }
 
 /// Strips a leading list marker (`-`, `*`, `•`, or `N.`/`N)` numbering) --
-/// same tolerant shape as `kb::reflect`'s own `strip_list_marker`.
+/// same tolerant shape as `engrain::reflect`'s own `strip_list_marker`.
 fn strip_list_marker(line: &str) -> &str {
     let trimmed = line.trim_start_matches(['-', '*', '\u{2022}']).trim_start();
     if let Some(rest) = trimmed.split_once('.').or_else(|| trimmed.split_once(')')) {

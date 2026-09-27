@@ -1,28 +1,28 @@
 #!/usr/bin/env bash
-# kb-model.sh — Claude Code SessionStart hook.
+# engrain-model.sh — Claude Code SessionStart hook.
 #
-# Prints the `mach kb` mental model (all active insights/themes, tree-
+# Prints the `engrain` mental model (all active insights/themes, tree-
 # ordered, no source ids or memory leaves) once at session start. Claude
 # Code adds a SessionStart hook's plain-text stdout as additionalContext
 # automatically on exit 0 — no JSON envelope needed, same convention
-# kb-recall.sh relies on for UserPromptSubmit.
+# engrain-recall.sh relies on for UserPromptSubmit.
 #
 # Contract: this hook must NEVER block session start. No `set -e`, and
-# every path ends in `exit 0` — a missing `mach` binary, an empty store, or
+# every path ends in `exit 0` — a missing `engrain` binary, an empty store, or
 # any other failure degrades to silence, not an error.
 
-MACH_BIN="${MACH_BIN:-mach}"
+ENGRAIN_BIN="${ENGRAIN_BIN:-engrain}"
 
-# A mach-spawned `claude -p` (card, digest, judge) is not a user session:
+# A engrain-spawned `claude -p` (card, digest, judge) is not a user session:
 # it must not be handed recalled memories it never asked for, because the
 # model cannot tell them from the evidence it was told to work from, and a
 # card that cites an evidence id while restating an injected one is a
-# provenance lie. Same guard `kb-checkpoint.sh` already carries.
-[ "${MACH_KB_DIGEST:-}" = "1" ] && exit 0
+# provenance lie. Same guard `engrain-checkpoint.sh` already carries.
+[ "${ENGRAIN_DIGEST:-}" = "1" ] && exit 0
 
-command -v "$MACH_BIN" >/dev/null 2>&1 || exit 0
+command -v "$ENGRAIN_BIN" >/dev/null 2>&1 || exit 0
 
-model="$(timeout 2s "$MACH_BIN" kb model --max-chars 8000 2>/dev/null)"
+model="$(timeout 2s "$ENGRAIN_BIN" model --max-chars 8000 2>/dev/null)"
 rc=$?
 
 # An installed binary older than the --max-chars flag (see install.sh
@@ -32,7 +32,7 @@ rc=$?
 # next install. Truncation is char-based via python3 (not `head -c`, which
 # can cut mid-UTF-8-character) to match what --max-chars itself promises.
 if [ "$rc" -ne 0 ]; then
-    model="$(timeout 2s "$MACH_BIN" kb model 2>/dev/null)"
+    model="$(timeout 2s "$ENGRAIN_BIN" model 2>/dev/null)"
     rc=$?
     [ "$rc" -ne 0 ] && exit 0
     model="$(printf '%s' "$model" | python3 -c '
@@ -47,12 +47,12 @@ printf '%s\n' "What you know about this user and their world (your accumulated u
 printf '%s\n' "$model"
 
 # Index drift for the session's project, once per session. Deliberately not
-# in kb-recall (per-prompt): this is a standing condition, not a per-prompt
+# in engrain-recall (per-prompt): this is a standing condition, not a per-prompt
 # fact, and the recall path has a sub-500ms budget.
 proj="$(basename "${CLAUDE_PROJECT_DIR:-$PWD}" | tr '[:upper:]' '[:lower:]')"
 if [ -n "$proj" ]; then
-    drift="$(timeout 3s "$MACH_BIN" kb projects list 2>/dev/null | awk -v p="$proj" '$1==p && /DRIFTED|never indexed/ {print}')"
-    [ -n "$drift" ] && printf 'Project index drift: %s\nRe-index with the index-project skill, then run `mach kb projects mark-indexed %s`.\n' "$drift" "$proj"
+    drift="$(timeout 3s "$ENGRAIN_BIN" projects list 2>/dev/null | awk -v p="$proj" '$1==p && /DRIFTED|never indexed/ {print}')"
+    [ -n "$drift" ] && printf 'Project index drift: %s\nRe-index with the index-project skill, then run `engrain projects mark-indexed %s`.\n' "$drift" "$proj"
 fi
 
 exit 0

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# kb-checkpoint.sh — Claude Code Stop + PreCompact hook.
+# engrain-checkpoint.sh — Claude Code Stop + PreCompact hook.
 #
-# Mid-session capture. `mach kb ingest-sessions` used to run only at
+# Mid-session capture. `engrain ingest-sessions` used to run only at
 # SessionEnd (or the 10-minute idle sweep), so a long session's decisions
 # reached the knowledge bank hours later, after compaction had already
 # summarised them away, capped at a handful of facts. This hook runs the
 # incremental digest (`--partial`: only transcript lines since the last
-# checkpoint, see engines/kb/src/ingest.rs) on two triggers:
+# checkpoint, see src/ingest.rs) on two triggers:
 #
 #   Stop        every CHECKPOINT_EVERY_TURNS assistant turns, or once
 #               CHECKPOINT_EVERY_SECS have passed since the last checkpoint,
@@ -18,14 +18,14 @@
 # Prints nothing: stdout from a Stop hook is shown to the user, and this
 # hook has nothing to say.
 
-MACH_BIN="${MACH_BIN:-mach}"
-CHECKPOINT_EVERY_TURNS="${MACH_KB_CHECKPOINT_TURNS:-8}"
-CHECKPOINT_EVERY_SECS="${MACH_KB_CHECKPOINT_SECS:-900}"
+ENGRAIN_BIN="${ENGRAIN_BIN:-engrain}"
+CHECKPOINT_EVERY_TURNS="${ENGRAIN_CHECKPOINT_TURNS:-8}"
+CHECKPOINT_EVERY_SECS="${ENGRAIN_CHECKPOINT_SECS:-900}"
 
 # Nested automated claude runs (reflect, improve, meet) must not checkpoint
 # themselves into the bank.
-[ "${MACH_KB_DIGEST:-}" = "1" ] && exit 0
-command -v "$MACH_BIN" >/dev/null 2>&1 || exit 0
+[ "${ENGRAIN_DIGEST:-}" = "1" ] && exit 0
+command -v "$ENGRAIN_BIN" >/dev/null 2>&1 || exit 0
 
 input="$(cat)"
 
@@ -50,18 +50,18 @@ esac
 
 run_partial_detached() {
     (
-        timeout 120s "$MACH_BIN" kb ingest-sessions --session-id "$session_id" --partial >/dev/null 2>&1
+        timeout 120s "$ENGRAIN_BIN" ingest-sessions --session-id "$session_id" --partial >/dev/null 2>&1
     ) </dev/null >/dev/null 2>&1 &
     disown 2>/dev/null
 }
 
 if [ "$event" = "PreCompact" ]; then
-    timeout 90s "$MACH_BIN" kb ingest-sessions --session-id "$session_id" --partial >/dev/null 2>&1
+    timeout 90s "$ENGRAIN_BIN" ingest-sessions --session-id "$session_id" --partial >/dev/null 2>&1
     exit 0
 fi
 
 # Stop: counter file holds "<turns> <epoch-of-last-checkpoint>"
-state_dir="${XDG_RUNTIME_DIR:-/tmp}/mach-kb-checkpoint"
+state_dir="${XDG_RUNTIME_DIR:-/tmp}/engrain-checkpoint"
 mkdir -p "$state_dir" 2>/dev/null || exit 0
 state_file="$state_dir/$session_id"
 now="$(date +%s)"

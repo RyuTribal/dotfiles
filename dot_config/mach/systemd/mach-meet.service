@@ -1,0 +1,8 @@
+[Unit]
+Description=mach meet process — transcribe and summarize recorded meetings into engrain
+
+# Files facts into the engrain store, so it takes engrain's job lock.
+
+[Service]
+Type=oneshot
+ExecStart=-/usr/bin/flock %h/.local/share/engrain/job.lock %h/.local/bin/mach meet process

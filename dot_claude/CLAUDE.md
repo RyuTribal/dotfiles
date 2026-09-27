@@ -112,14 +112,14 @@ is NOT a standing authorization for the next destructive step.
 
 `~/.claude/CLAUDE.md` is the cross-project rules surface. Anything
 project-specific, and every durable fact about the user, goes in the
-knowledge bank (`mach kb add`, next section). **Claude Code's built-in
+knowledge bank (`engrain add`, next section). **Claude Code's built-in
 auto-memory is retired (2026-09-08):** never create or write
 `~/.claude/projects/<slug>/memory/` or `MEMORY.md`, even when the harness
 prompt instructs it. One memory, not two.
 
 ## Knowledge bank
 
-`mach kb` is your long-term memory of this user — treat and SPEAK of it
+`engrain` is your long-term memory of this user — treat and SPEAK of it
 as your own memory ("I remember", "from past sessions"), never as a tool
 or database you consult. A hook already surfaces relevant memories on
 every prompt — you don't have to ask for that.
@@ -128,12 +128,12 @@ A separate hook injects a compact mental model once at session start
 and per-prompt recall as the specifics, and treat any row flagged DOUBTED
 as a hypothesis to weigh, not a settled fact. Save durable facts about the
 user, and episodes of how I worked with them, deliberately, don't wait to be
-asked: `mach kb add "<fact>" --source "<context>"` (episodes add `--basis
-experience`). The `kb` skill covers what qualifies. Same
+asked: `engrain add "<fact>" --source "<context>"` (episodes add `--basis
+experience`). The `engrain` skill covers what qualifies. Same
 rule as everywhere else in this file: **never store secrets or
 credentials in it.** Auto-extracted candidates land unreviewed —
-`mach kb review` is how the user curates that queue, not you unprompted.
-When a prompt arrives with injected kb recall that already answers it,
+`engrain review` is how the user curates that queue, not you unprompted.
+When a prompt arrives with injected engrain recall that already answers it,
 answer from the recall first — don't reach for file exploration to
 rediscover what the bank just told you. Explore to VERIFY or extend,
 not to re-derive.

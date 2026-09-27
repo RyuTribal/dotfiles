@@ -1,5 +1,5 @@
 //! `meet` -- subcommand dispatch for `mach meet ...`, matching the
-//! hand-rolled arg-parsing style `sweep`/`kb` already use (no clap).
+//! hand-rolled arg-parsing style `sweep`/`engrain` already use (no clap).
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -56,7 +56,7 @@ fn home() -> io::Result<PathBuf> {
 }
 
 /// `~/.local/share/mach/meetings/` -- created on demand, same convention
-/// `kb::note::images_dir` uses for its own store directory.
+/// `engrain::note::images_dir` uses for its own store directory.
 fn meetings_root() -> io::Result<PathBuf> {
     let dir = home()?.join(".local/share/mach/meetings");
     fs::create_dir_all(&dir)?;
@@ -330,7 +330,7 @@ fn cmd_stop(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         Ok(()) => println!("  processing queued in the background (mach meet process)"),
         Err(e) => eprintln!(
             "mach meet stop: warning: could not spawn background processing ({}) -- run `mach meet process` \
-             manually, or wait for the next opportunistic `mach kb reflect` run",
+             manually, or wait for the next opportunistic `engrain reflect` run",
             e
         ),
     }

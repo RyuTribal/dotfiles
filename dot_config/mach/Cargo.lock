@@ -226,6 +226,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
+name = "engrain"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "signal-hook",
+ "toml",
+ "tree-sitter",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-glsl",
+ "tree-sitter-javascript",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+ "ureq",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -494,27 +516,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "kb-engine"
-version = "0.1.0"
-dependencies = [
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "toml",
- "tree-sitter",
- "tree-sitter-c",
- "tree-sitter-c-sharp",
- "tree-sitter-cpp",
- "tree-sitter-glsl",
- "tree-sitter-javascript",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-typescript",
- "ureq",
-]
-
-[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -571,7 +572,7 @@ dependencies = [
 name = "mach"
 version = "0.1.0"
 dependencies = [
- "kb-engine",
+ "engrain",
  "meet-engine",
  "sweep-engine",
 ]
@@ -580,7 +581,6 @@ dependencies = [
 name = "machd"
 version = "0.1.0"
 dependencies = [
- "kb-engine",
  "signal-hook",
  "telegram-engine",
 ]
@@ -589,7 +589,7 @@ dependencies = [
 name = "meet-engine"
 version = "0.1.0"
 dependencies = [
- "kb-engine",
+ "engrain",
  "libc",
  "rusqlite",
  "serde",
@@ -1068,7 +1068,7 @@ dependencies = [
 name = "telegram-engine"
 version = "0.1.0"
 dependencies = [
- "kb-engine",
+ "engrain",
  "rusqlite",
  "serde",
  "serde_json",

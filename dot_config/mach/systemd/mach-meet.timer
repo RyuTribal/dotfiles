@@ -1,0 +1,11 @@
+[Unit]
+Description=Run mach meet process periodically
+
+[Timer]
+OnBootSec=12min
+OnUnitInactiveSec=3h
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# kb-decision.sh — Claude Code UserPromptSubmit hook.
+# engrain-decision.sh — Claude Code UserPromptSubmit hook.
 #
 # Decision-cue fast path. When the user's own message reads like a decision
 # ("decision:", "let's go with X", "from now on ...", "approved"), store it
 # verbatim as an unreviewed memory right now — no model call, no waiting for
-# the session digest. `mach kb reflect`'s curation and dedupe passes
+# the session digest. `engrain reflect`'s curation and dedupe passes
 # reconcile it against whatever the digest later extracts.
 #
 # Prints nothing on purpose: a UserPromptSubmit hook's stdout becomes
 # injected context, and this hook only records. Never blocks the prompt:
-# no `set -e`, detached `mach kb add`, every path exits 0.
+# no `set -e`, detached `engrain add`, every path exits 0.
 
-MACH_BIN="${MACH_BIN:-mach}"
-MAX_CHARS="${MACH_KB_DECISION_MAX_CHARS:-600}"
+ENGRAIN_BIN="${ENGRAIN_BIN:-engrain}"
+MAX_CHARS="${ENGRAIN_DECISION_MAX_CHARS:-600}"
 
-[ "${MACH_KB_DIGEST:-}" = "1" ] && exit 0
-command -v "$MACH_BIN" >/dev/null 2>&1 || exit 0
+[ "${ENGRAIN_DIGEST:-}" = "1" ] && exit 0
+command -v "$ENGRAIN_BIN" >/dev/null 2>&1 || exit 0
 
 KB_HOOK_INPUT="$(cat)"
 export KB_HOOK_INPUT MAX_CHARS
@@ -73,11 +73,11 @@ project="$(basename "${PWD:-}" 2>/dev/null)"
 
 (
     if [ -n "$project" ]; then
-        timeout 30s "$MACH_BIN" kb add "In the $today session the user stated: $text" \
+        timeout 30s "$ENGRAIN_BIN" add "In the $today session the user stated: $text" \
             --source "decision-cue $today session $sid" --project "$project" \
             --unreviewed --no-classify --importance 6 >/dev/null 2>&1
     else
-        timeout 30s "$MACH_BIN" kb add "In the $today session the user stated: $text" \
+        timeout 30s "$ENGRAIN_BIN" add "In the $today session the user stated: $text" \
             --source "decision-cue $today session $sid" \
             --unreviewed --no-classify --importance 6 >/dev/null 2>&1
     fi

@@ -12,7 +12,7 @@
 //! a plain `Err(String)` the caller turns into "voice note (untranscribed)"
 //! rather than losing the note.
 //!
-//! Behind the `Transcriber` trait (mirrors `kb::note::NoteLlm` /
+//! Behind the `Transcriber` trait (mirrors `engrain::note::NoteLlm` /
 //! `TelegramApi`) so the degradation path is unit-testable without a real
 //! whisper.cpp binary or model file.
 use std::path::{Path, PathBuf};

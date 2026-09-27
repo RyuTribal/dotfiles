@@ -1,7 +1,7 @@
 //! Pure dispatch logic: sender allowlisting, message classification, and
 //! reply-text formatting. Kept free of any HTTP/subprocess/DB I/O so all of
 //! it is unit-testable directly -- `pipeline` is what wires this to the
-//! real `TelegramApi`, `kb` store, and `Transcriber`.
+//! real `TelegramApi`, `engrain` store, and `Transcriber`.
 //!
 //! SECURITY (hard sender allowlist): `is_allowed` is the ONE gate standing
 //! between the public internet and the user's memory store -- every update
@@ -16,7 +16,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use kb::note::Worth;
+use engrain::note::Worth;
 
 use crate::api::Message;
 
@@ -104,7 +104,7 @@ impl DropCounter {
 pub const VOICE_TRANSCRIBE_FAILURE_REPLY: &str = "couldn't transcribe — saved raw audio reference";
 
 /// Builds the confirmation reply for a filed note. `worth` (the classifier's
-/// triage verdict — see `kb::note::Worth`) is `Durable` in the ordinary case
+/// triage verdict — see `engrain::note::Worth`) is `Durable` in the ordinary case
 /// and leaves the reply exactly as before; `Dubious`/`Noise` append a plain
 /// statement that the note was demoted to the review queue instead, so the
 /// user isn't left thinking it landed as a regular reviewed memory.
@@ -113,8 +113,8 @@ pub fn format_note_confirmation(topic: &str, title: &str, fact_count: usize, wor
     let base = format!("filed {} {} under \"{}\" — refer to it as: \"{}\"", fact_count, noun, topic, title);
     match worth {
         Worth::Durable => base,
-        Worth::Dubious => format!("{} — filed to review queue (looked dubious) — `mach kb review` to promote", base),
-        Worth::Noise => format!("{} — filed to review queue (looked like noise) — `mach kb review` to promote", base),
+        Worth::Dubious => format!("{} — filed to review queue (looked dubious) — `engrain review` to promote", base),
+        Worth::Noise => format!("{} — filed to review queue (looked like noise) — `engrain review` to promote", base),
     }
 }
 
@@ -287,7 +287,7 @@ mod tests {
     fn note_confirmation_states_review_queue_demotion_plainly_when_dubious() {
         assert_eq!(
             format_note_confirmation("notes", "a vague fragment", 1, Worth::Dubious),
-            "filed 1 memory under \"notes\" — refer to it as: \"a vague fragment\" — filed to review queue (looked dubious) — `mach kb review` to promote"
+            "filed 1 memory under \"notes\" — refer to it as: \"a vague fragment\" — filed to review queue (looked dubious) — `engrain review` to promote"
         );
     }
 
@@ -295,7 +295,7 @@ mod tests {
     fn note_confirmation_states_review_queue_demotion_plainly_when_noise() {
         assert_eq!(
             format_note_confirmation("notes", "asdf test", 1, Worth::Noise),
-            "filed 1 memory under \"notes\" — refer to it as: \"asdf test\" — filed to review queue (looked like noise) — `mach kb review` to promote"
+            "filed 1 memory under \"notes\" — refer to it as: \"asdf test\" — filed to review queue (looked like noise) — `engrain review` to promote"
         );
     }
 

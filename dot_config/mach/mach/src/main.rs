@@ -13,7 +13,6 @@ fn print_help() {
     println!();
     println!("subcommands:");
     println!("  sweep [args...]   disk usage browser & staged deleter (mach sweep --help)");
-    println!("  kb [args...]      personal vectorized knowledge bank (mach kb --help)");
     println!("  note [args...]    jot a quick note (mach note --help) — also reachable as");
     println!("                    the `note` command, a symlink to this binary");
     println!("  meet [args...]    meeting recorder, capture only (mach meet --help)");
@@ -34,13 +33,12 @@ fn main() -> std::io::Result<()> {
     let mut args = all_args;
 
     if invoked_as_note(&argv0) {
-        return kb::note::run(args);
+        return engrain::note::run(args);
     }
 
     match args.next().as_deref() {
         Some("sweep") => sweep::cli::run(args),
-        Some("kb") => kb::cli::run(args),
-        Some("note") => kb::note::run(args),
+        Some("note") => engrain::note::run(args),
         Some("meet") => meet::cli::run(args),
         Some("-h") | Some("--help") => {
             print_help();

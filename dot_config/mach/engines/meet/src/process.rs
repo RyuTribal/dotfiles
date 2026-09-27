@@ -1,9 +1,9 @@
 //! Orchestrates one meeting directory through phase B:
 //! `needs-processing` -> transcribe + merge -> `needs-summary` -> summarize
 //! + extract facts -> `processed`. `process_dir` is the imperative shell
-//! (real filesystem, real subprocesses, real kb store); `run_transcribe_stage`
+//! (real filesystem, real subprocesses, real engrain store); `run_transcribe_stage`
 //! and `run_summarize_stage` are its two testable halves, taking every
-//! external dependency (transcriber, converter, claude call, kb
+//! external dependency (transcriber, converter, claude call, engrain
 //! connection, embedder) as a trait object so they run against fakes in
 //! tests -- no real whisper.cpp binary, `claude` process, or ollama
 //! connection is ever required to exercise this module's own logic.
@@ -14,8 +14,8 @@ use std::process::{Command, Stdio};
 
 use rusqlite::Connection;
 
-use kb::embed::Embedder;
-use kb::store;
+use engrain::embed::Embedder;
+use engrain::store;
 use telegram::voice::Converter;
 
 use crate::markers::{decide_stage, StageAction};
@@ -41,14 +41,14 @@ fn display_title(meeting: &Meeting) -> &str {
 }
 
 /// Sends a desktop notification -- same trait-behind-a-fake shape as
-/// `kb::note::Notifier`, but two separate summary/body arguments (this
+/// `engrain::note::Notifier`, but two separate summary/body arguments (this
 /// task's spec calls for `notify-send "<title>" "<body>"`, not the single
-/// combined string `kb::note::ProcessNotifier` sends).
+/// combined string `engrain::note::ProcessNotifier` sends).
 pub trait Notifier {
     fn notify(&self, title: &str, body: &str);
 }
 
-/// Fire-and-forget, same as `kb::note::ProcessNotifier`: a missing or
+/// Fire-and-forget, same as `engrain::note::ProcessNotifier`: a missing or
 /// failing `notify-send` must never take a meeting's processing down with
 /// it, so this never waits on or checks the child.
 pub struct ProcessNotifier;
@@ -117,7 +117,7 @@ pub struct SummarizeOutcome {
 }
 
 /// Reads `transcript.md`, runs the one sonnet call, writes `summary.md`,
-/// and files any extracted facts into the kb store (unreviewed, source
+/// and files any extracted facts into the engrain store (unreviewed, source
 /// `meeting:<dir_name>`, importance `summarize::FACT_IMPORTANCE`). A
 /// malformed/unparseable reply (`ParseOutcome::Fallback`) still writes
 /// `summary.md` (the model's raw output) and simply files zero facts --
@@ -153,7 +153,7 @@ pub fn run_summarize_stage(
                 let embedding = embedder.embed(fact).ok();
                 match store::insert(conn, fact, Some(&source), None, false, embedding.as_deref(), summarize::FACT_IMPORTANCE) {
                     Ok(_) => filed += 1,
-                    Err(e) => eprintln!("mach meet process: warning: could not file a fact into the kb ({:?}): {}", fact, e),
+                    Err(e) => eprintln!("mach meet process: warning: could not file a fact into the engrain ({:?}): {}", fact, e),
                 }
             }
             Ok(SummarizeOutcome { title, facts_filed: filed, used_fallback: false })
@@ -360,12 +360,12 @@ fn run_and_report_summary(dir: &Path, dir_name: &str, meeting: &Meeting, notifie
     let conn = match store::open() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("mach meet process: {}: could not open kb store: {}", dir_name, e);
+            eprintln!("mach meet process: {}: could not open engrain store: {}", dir_name, e);
             notifier.notify(&format!("Meeting processing failed: {}", display_title(meeting)), &format!("could not open knowledge bank: {}", e));
             return;
         }
     };
-    let embedder = kb::embed::OllamaEmbedder::new();
+    let embedder = engrain::embed::OllamaEmbedder::new();
     let llm = summarize::ProcessClaudeLlm::new();
 
     match advance_from_needs_summary(dir, dir_name, meeting, &llm, &conn, &embedder) {
@@ -404,7 +404,7 @@ pub fn process_dir(dir: &Path, notifier: &dyn Notifier) -> io::Result<()> {
     let has_np = has_marker(dir, NEEDS_PROCESSING);
     let has_ns = has_marker(dir, NEEDS_SUMMARY);
     let whisper_available = build_segment_transcriber().is_some();
-    let claude_online = kb::reflect::claude_reachable();
+    let claude_online = engrain::reflect::claude_reachable();
 
     match decide_stage(has_np, has_ns, whisper_available, claude_online) {
         StageAction::Done => {}
@@ -622,7 +622,7 @@ mod tests {
 
     struct FakeEmbedder;
     impl Embedder for FakeEmbedder {
-        fn embed(&self, _text: &str) -> Result<Vec<f32>, kb::KbError> {
+        fn embed(&self, _text: &str) -> Result<Vec<f32>, engrain::EngrainError> {
             Ok(vec![0.1, 0.2, 0.3])
         }
     }

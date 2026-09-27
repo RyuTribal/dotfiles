@@ -1,4 +1,4 @@
-//! Wires `api`/`bot`/`voice` to the real `kb` note pipeline: one update in,
+//! Wires `api`/`bot`/`voice` to the real `engrain` note pipeline: one update in,
 //! zero-or-one reply out. Every I/O boundary (Telegram HTTP, the classifier/
 //! embedder LLM calls, whisper transcription) is a trait object supplied by
 //! the caller, so `Pipeline::handle_update` is exercised in tests against
@@ -6,9 +6,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use kb::embed::Embedder;
-use kb::note::{self, NoteLlm};
-use kb::store;
+use engrain::embed::Embedder;
+use engrain::note::{self, NoteLlm};
+use engrain::store;
 use rusqlite::Connection;
 
 use crate::api::{Message, TelegramApi, Update, MAX_FILE_BYTES};
@@ -20,7 +20,7 @@ use crate::voice::Transcriber;
 /// as the "voice note (untranscribed): <path>" fallback's evidence.
 pub fn audio_store_dir() -> Result<PathBuf, String> {
     let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
-    Ok(PathBuf::from(home).join(".local/share/mach/kb-audio"))
+    Ok(PathBuf::from(home).join(".local/share/mach/voice-audio"))
 }
 
 fn save_audio_bytes(bytes: &[u8], update_id: i64, ext: &str) -> Result<PathBuf, String> {
@@ -34,7 +34,7 @@ fn save_audio_bytes(bytes: &[u8], update_id: i64, ext: &str) -> Result<PathBuf, 
 
 /// Extension inferred from a Telegram `file_path` (e.g. `voice/file_0.oga`
 /// -> `oga`), falling back to `bin` if there isn't one — mirrors
-/// `kb::note::store_image`'s own fallback.
+/// `engrain::note::store_image`'s own fallback.
 fn ext_from_file_path(file_path: &str) -> &str {
     Path::new(file_path).extension().and_then(|e| e.to_str()).unwrap_or("bin")
 }
@@ -194,7 +194,7 @@ impl<'a> Pipeline<'a> {
 mod tests {
     use super::*;
     use crate::api::{Chat, PhotoSize, User, Voice};
-    use kb::store::KbError;
+    use engrain::store::EngrainError;
     use std::cell::RefCell;
     use std::sync::Mutex;
 
@@ -239,7 +239,7 @@ mod tests {
     struct FakeEmbedder;
 
     impl Embedder for FakeEmbedder {
-        fn embed(&self, text: &str) -> Result<Vec<f32>, KbError> {
+        fn embed(&self, text: &str) -> Result<Vec<f32>, EngrainError> {
             Ok(text.bytes().map(|b| b as f32).collect())
         }
     }
@@ -364,7 +364,7 @@ mod tests {
             sent[0],
             (
                 999,
-                "filed 1 memory under \"notes\" — refer to it as: \"a title\" — filed to review queue (looked like noise) — `mach kb review` to promote"
+                "filed 1 memory under \"notes\" — refer to it as: \"a title\" — filed to review queue (looked like noise) — `engrain review` to promote"
                     .to_string()
             )
         );

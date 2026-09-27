@@ -113,7 +113,7 @@ impl Meeting {
 /// Kebab-cases a title for use in a meeting directory name: lowercase,
 /// ASCII alphanumerics kept, every run of anything else collapsed to a
 /// single `-`, no leading/trailing `-`. Same convention as
-/// `kb::note::slugify`, duplicated here (a handful of lines) rather than
+/// `engrain::note::slugify`, duplicated here (a handful of lines) rather than
 /// pulled in as a cross-engine dependency -- unlike that function, an
 /// empty/punctuation-only input returns an empty string (not a fallback
 /// word): `dir_name` below treats that as "no title given" and omits the

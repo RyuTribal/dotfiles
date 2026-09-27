@@ -1,22 +1,11 @@
 //! machd — machine daemon host process.
 //!
-//! Hosts two registered subsystems, each on its own thread, joined on the
-//! same shutdown flag below:
-//!   - kb    (engines/kb/src/socket.rs) — always runs. Serves
-//!           `$XDG_RUNTIME_DIR/mach-kb.sock` for Claude Code's
-//!           `kb-recall.sh` hook's fast path (a warm db connection + a warm
-//!           ollama HTTP agent, instead of that hook cold-starting a `mach
-//!           kb search` subprocess every prompt). Needs no config -- the kb
-//!           store always exists.
-//!   - telegram (engines/telegram) — the note bridge. No-ops cleanly (one
-//!           log line, immediate return -- see `run_telegram_subsystem`)
-//!           when `~/.local/share/mach/telegram.toml` is missing or still
-//!           holds placeholder values; this must never take the kb
-//!           subsystem down with it.
-//!
-//! There's no formal `Subsystem` trait/registry yet -- two subsystems are
-//! still few enough to just spawn by hand in `main`. If a third one shows
-//! up, that's the point to extract one.
+//! Hosts the telegram note bridge (engines/telegram) on its own thread,
+//! joined on the shutdown flag below. It no-ops cleanly (one log line,
+//! immediate return -- see `run_telegram_subsystem`) when
+//! `~/.local/share/mach/telegram.toml` is missing or still holds
+//! placeholder values. The recall socket that used to run here is
+//! `engrain serve` now, a unit of its own.
 //!
 //! Always runs in the foreground: there is no double-fork/daemonize step
 //! anywhere in this process, matching what systemd's `Type=simple` unit
@@ -33,9 +22,7 @@ fn print_help() {
     println!();
     println!("usage: machd [--foreground]");
     println!();
-    println!("Hosts two subsystems, each on its own thread:");
-    println!("  kb        always runs -- serves $XDG_RUNTIME_DIR/mach-kb.sock for Claude");
-    println!("            Code's kb-recall.sh hook (op \"search\" only). No config needed.");
+    println!("Hosts one subsystem:");
     println!("  telegram  the note bridge. No-ops cleanly (one log line, stays up) if");
     println!("            ~/.local/share/mach/telegram.toml is missing or still holds");
     println!("            placeholder values -- see install.sh's onboarding instructions.");
@@ -65,18 +52,18 @@ fn install_signal_handlers(shutdown: &Arc<AtomicBool>) {
 /// Runs the telegram subsystem in this thread until `shutdown` is set.
 /// No-ops cleanly -- one log line, immediate return, `Ok(())` -- when the
 /// config file is missing or still holds placeholder values: this must
-/// never take the whole daemon down, since the kb subsystem doesn't depend
+/// never take the whole daemon down, since the recall socket doesn't depend
 /// on Telegram being configured at all (this is exactly what used to be
 /// `machd`'s own top-level `ConditionPathExists`-backed exit, moved down
 /// into just this one subsystem). Returns `Err` only for a genuinely
 /// unexpected setup failure surfaced by `telegram::run` itself (e.g. an
-/// unwritable state path or a broken kb store) -- see that function's own
+/// unwritable state path or a broken engrain store) -- see that function's own
 /// doc comment.
 fn run_telegram_subsystem(shutdown: &AtomicBool) -> Result<(), String> {
     let cfg = match telegram::config::load() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("machd: telegram subsystem: {} -- staying disabled (kb subsystem is unaffected)", e);
+            eprintln!("machd: telegram subsystem: {} -- staying disabled ", e);
             return Ok(());
         }
     };
@@ -89,8 +76,8 @@ fn run_telegram_subsystem(shutdown: &AtomicBool) -> Result<(), String> {
 /// clean `Ok(())` (whether from a full run or an immediate no-op) doesn't.
 /// Runs one subsystem on its own thread and logs its error THE MOMENT it
 /// returns, not at process exit. `main` joins both subsystems before it
-/// reports anything, so a kb thread that died at startup (e.g. a migration
-/// race with a concurrent `mach kb` CLI call) used to stay silent for as
+/// reports anything, so a engrain thread that died at startup (e.g. a migration
+/// race with a concurrent `engrain` CLI call) used to stay silent for as
 /// long as the telegram thread kept running -- hours of "socket missing"
 /// with nothing in the journal.
 fn spawn_subsystem<F>(name: &'static str, f: F) -> thread::JoinHandle<Result<(), String>>
@@ -131,19 +118,13 @@ fn main() {
     let shutdown = Arc::new(AtomicBool::new(false));
     install_signal_handlers(&shutdown);
 
-    let kb_shutdown = Arc::clone(&shutdown);
-    let kb_thread = spawn_subsystem("kb", move || kb::socket::run(&kb_shutdown));
-
     let tg_shutdown = Arc::clone(&shutdown);
     let tg_thread = spawn_subsystem("telegram", move || run_telegram_subsystem(&tg_shutdown));
 
     // Both threads block in their own loop until `shutdown` flips (SIGTERM/
     // SIGINT) -- joining here is just waiting for that, same as the old
     // single-subsystem version blocked directly inside `telegram::run`.
-    let kb_result = kb_thread.join();
     let tg_result = tg_thread.join();
-
-    let kb_code = report("kb", kb_result);
     let tg_code = report("telegram", tg_result);
-    std::process::exit(kb_code.max(tg_code));
+    std::process::exit(tg_code);
 }

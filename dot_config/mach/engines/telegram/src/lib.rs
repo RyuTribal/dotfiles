@@ -1,5 +1,5 @@
 //! telegram — the Telegram note bridge. Long-polls a private bot for
-//! messages from one allowlisted sender and files them into the `kb` note
+//! messages from one allowlisted sender and files them into the engrain note
 //! pipeline: text becomes a note directly, voice/audio is transcribed (via
 //! whisper.cpp, when available) first, and photos reuse the image-note
 //! path. Hosted by `machd` as its one registered subsystem.
@@ -11,7 +11,7 @@
 //!   api       — the Telegram Bot HTTP client, behind `TelegramApi` for tests
 //!   voice     — whisper.cpp transcription, behind `Transcriber` for tests
 //!   bot       — pure allowlist/dispatch/reply-formatting logic
-//!   pipeline  — wires the above to a real `kb` store connection
+//!   pipeline  — wires the above to a real engrain store connection
 pub mod api;
 pub mod bot;
 pub mod config;
@@ -22,9 +22,9 @@ pub mod voice;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use kb::embed::OllamaEmbedder;
-use kb::note::ProcessNoteLlm;
-use kb::store;
+use engrain::embed::OllamaEmbedder;
+use engrain::note::ProcessNoteLlm;
+use engrain::store;
 
 use api::{HttpTelegramApi, TelegramApi};
 use bot::DropCounter;
@@ -64,7 +64,7 @@ fn sleep_interruptible(d: Duration, shutdown: &AtomicBool) {
 
 /// Runs the long-poll loop until `shutdown` is set (SIGTERM, via `machd`).
 /// Returns `Ok(())` on a clean shutdown; `Err` only for a setup failure that
-/// happens before the loop can even start (state path / kb store).
+/// happens before the loop can even start (state path / engrain store).
 pub fn run(cfg: config::Config, shutdown: &AtomicBool) -> Result<(), String> {
     let api = HttpTelegramApi::new(cfg.bot_token.clone());
     let state_path = state::state_path()?;
@@ -110,7 +110,7 @@ pub fn run(cfg: config::Config, shutdown: &AtomicBool) -> Result<(), String> {
                     }
                 }
                 // Persisted on every successful poll, even an empty one --
-                // not just when the offset actually advances. `mach kb
+                // not just when the offset actually advances. `engrain
                 // health`'s own telegram-state staleness check depends on
                 // this file's mtime meaning "the long-poll loop is alive",
                 // not merely "a message arrived recently" (a quiet personal

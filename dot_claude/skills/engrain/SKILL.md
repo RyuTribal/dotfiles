@@ -258,6 +258,17 @@ extraction, multi_session, temporal, knowledge_update, abstention. It also
 reports mean injected characters, so accuracy bought with more context is
 visible rather than hidden. Deterministic, read-only, no LLM.
 
+By default this scores the plain, uncapped ranking, the same one a bare
+`engrain search` (no `--via`) returns, not what a real session would
+actually have been shown. Add `--policy` to score through the hook recall
+policy instead (cap of 3, habituation, and the gate when one is promoted;
+see "The recall policy" below). It answers a different question, whether a
+real session would have been shown the right memory rather than whether
+the right memory can be found at all, and typically scores lower than the
+plain run for exactly that reason: a lower `--policy` number next to a
+steady plain number is the policy trading recall for precision as
+designed, not a regression.
+
 Run it before and after ANY change to ranking, fusion, graph hops, or the
 injection budget, and report both numbers. Sweep with `--min-score`,
 `--limit`, `--budget`, and the `ENGRAIN_W_SIM` / `ENGRAIN_W_RECENCY` /
@@ -275,8 +286,9 @@ written on 2026-09-09 silently starts asking about a different calendar
 day on 2026-09-10 and every day after. Give `Question` an `"as_of":
 "YYYY-MM-DD"` field (the date the question was WRITTEN, not today) and it
 anchors ONLY `store::query_date_range`'s parse of the query's relative-date
-term, via `date_anchor` threaded through `search_hits`/`search_hybrid` —
-recency and strength scoring still use the real `now`, unaffected. Standing
+term, via `date_anchor` threaded through `search_hits`/`search_hybrid` and,
+for `--policy`, through `policy_search` too -- recency and strength scoring
+still use the real `now`, unaffected. Standing
 rule: any new `temporal_relative` question gets `as_of` set to the date it
 was written, in the same edit that adds it, or it starts failing (or
 silently passing for the wrong reason) the day after. A question with no
@@ -574,6 +586,18 @@ hook, not a manual search you run yourself; reinforcement is interval-aware
 (the spacing effect), so a second touch moments after the first barely
 grows stability, while a touch after a gap at least as long as the
 memory's current stability earns the full 30% gain.
+
+Add `--via LABEL` to route the query through the same recall policy a hook
+uses instead of the plain ranking above: the cap, habituation and
+exploration described under "The recall policy" below all apply, keyed on
+LABEL (a raw hook label such as `prompt` or `pretool:Bash`, normalized
+internally). This is how you reproduce exactly what a session's hook would
+have shown, not just what a bare search surfaces. `--exclude 1,2,3` keeps
+specific ids out of that call's candidate pool, the same as a hook's own
+recent-injection dedupe; `--no-explore` turns off the exploration step for
+that one call while keeping the cap and habituation. All three are inert
+without `--via`; plain `engrain search` stays the uncapped ranking it has
+always been.
 
 ## Hard questions: `engrain ask` (since 2026-09-09; code-aware since 2026-09-23)
 
@@ -1380,6 +1404,156 @@ longer than `judge_log`'s 180-day window, since recall precision is a
 metric tracked over quarters, not weeks. `supersession_audit` is never
 pruned.
 
+## The recall policy: cap, habituation, exploration (since 2026-09-28)
+
+Every hook-driven recall call runs `search_hits`'s plain ranking through
+one more layer before anything reaches you: `engrain-recall.py`,
+`engrain-pretool-recall.py`, and a manual `engrain search --via LABEL` or
+`engrain eval --policy` all go through it; plain `engrain search` /
+`engrain eval` without those flags never do. Without a promoted gate model
+this layer is a fixed heuristic, called **R1** everywhere else it comes up
+(`engrain gate status`, `engrain train-gate`, `engrain recall-replay`):
+
+- **Cap.** At most `MAX_INJECT` (3) DIRECT memory hits per call, plus at
+  most one association hop reached from a kept direct hit; derived
+  insights pass through uncapped, since they don't compete with memories
+  for those 3 slots. Zero direct hits is a normal, expected outcome, not a
+  bug: a call whose whole candidate pool scores under the floor injects
+  nothing, and that is the policy working, not recall breaking.
+- **Habituation.** Each (memory, context) pair, where context is the
+  calling hook kind and the session project, tracks how often that memory
+  was shown there against how often it was actually used.
+  `habituation_factor` turns that ratio into a multiplier on the memory's
+  score, floored at `HAB_FLOOR` (0.3) so repeated unused showings can quiet
+  a memory down but never silence it outright: with a Beta(2,2) prior, a
+  single use raises the rate part-way back rather than fully undoing the
+  habituation, and the 0.3 floor keeps any memory recoverable no matter how
+  far it has quieted. This runs before the cap, so a habituated-down memory
+  can lose its slot to something that would otherwise have ranked lower.
+- **Exploration.** Roughly one call in ten (`EXPLORE_EPSILON`, 0.1) also
+  injects one extra candidate drawn from ranks 4 through 15, below what the
+  cap would ever show on its own. This is deliberate, not noise: it is the
+  only way a memory sitting just under the floor, or a memory habituation
+  has quieted down, ever gets a chance to be judged again. Treat a recalled
+  memory that reads as off topic or borderline, especially one shown
+  outside the usual top few hits, as probably this and not as retrieval
+  degrading. Exploration additions do not count against the cap.
+
+A promoted gate model (`engrain train-gate`) replaces the fixed habituation
+multiplier with a learned probability threshold over the same features
+(habituation's shown/used rate becomes one of the gate's own inputs,
+`hab_rate`/`hab_shown_ln`, rather than a separate post-hoc score
+adjustment); the `MAX_INJECT` (3) cap on direct hits still applies
+either way -- a gate decides ELIGIBILITY, not how many of the eligible
+hits get a slot. Exploration keeps running underneath either policy.
+`engrain gate status` reports which one is currently active.
+
+Bash recall is gated a step earlier than any of the above, before the
+search even runs: `engrain-pretool-recall.py`'s `bash_should_recall` only
+searches for a command that changes state (a fixed allowlist: `git
+push`/`commit`/`reset`, `rm`, `mv`, `sudo`, `docker`, `systemctl`, `chezmoi
+apply`, deploy and migration scripts, and similar) or the first time this
+session touches a new project root (tracked once per session via the
+recall log's `roots` field, not once per sliding window). A read-only
+command against a project already touched this session searches nothing at
+all. Measured 2026-09-28: even with this gate, Bash still produces most
+injections (about 77%) at a lower use rate (34%) than the other hooks,
+which search on every call -- the imbalance `bash_should_recall` exists to
+cut down, not one it causes.
+
+## Claim calibration: `engrain claims-stats` (since 2026-09-28)
+
+`engrain claims-stats` prints per-domain reliability, overconfidence and
+fold rate over resolved self-claims (`store::domain_calibration`), plus a
+total open-claims count — a read-only inspection table, never injected
+into anything Claude sees.
+
+## The recall gate: `engrain train-gate` / `engrain gate status|rollback` (since 2026-09-29)
+
+```
+engrain train-gate [--force] [--dry-run]
+engrain gate [status|rollback] [--dir DIR]
+```
+
+`train-gate` retrains a logistic relevance gate from scratch on the
+recorded engagement record (`recall_engagement` plus the features recall
+logged at injection time) and promotes it only if it beats the currently
+active model — or the R1 heuristic policy, if none is active yet — on a
+held-out newest-20% split. "Beats" means a `PROMOTE_MARGIN` (0.02) or
+greater improvement on that same split: higher recall at equal precision,
+or higher precision at equal recall. The champion is never judged by its
+own stored `val_precision`/`val_recall` here, since those were measured on
+an older split; it is re-scored on this challenger's validation split so
+both numbers come from the same data. It skips when fewer than 1000
+feature rows fall in the training window, or fewer than 150 new verdicts
+have accrued since the last training attempt (`--force` bypasses that
+second gate);
+`--dry-run` trains and prints the verdict without writing anything.
+
+`engrain gate status` prints the active model's id, validation precision
+and recall, the baseline it beat, both thresholds (tau / tau_guard), when
+it was created, how many rows it trained on, and the last `train-gate`
+record (result and when) — or says R1 is active when there's no promoted
+model. Same as `claims-stats`: a read-only inspection table, never injected
+into anything Claude sees.
+
+`engrain gate rollback` re-points the `current` model symlink at the
+previous promoted model. With nothing older to fall back to, it prints an
+error and exits non-zero instead of quietly no-op'ing. Both subcommands
+take an optional `--dir` to point at a different models directory.
+
+`engrain serve` picks up a promotion or rollback without a restart: the
+warm daemon rechecks where the `current` symlink points on every search
+request and reloads only when that changed (`gate::save_model` gives every
+model a fresh, timestamped filename, so a real promotion always changes
+the target), so a nightly retrain (or a manual rollback) takes effect on
+the next recall.
+
+Two different things can make `current`'s target change, and the daemon
+treats them differently. A target that changed to a new file but fails to
+load — missing, corrupt, or numerically unsound — never breaks a request
+and never drops a working gate over one bad promotion: recall keeps
+serving whatever model was cached before. But **deleting
+`~/.local/share/engrain/models/current` outright is the emergency way to
+disable a bad gate** — `rm ~/.local/share/engrain/models/current` — and is
+read as a deliberate switch to R1, not an accident: it takes effect
+immediately, on the daemon's very next search request, no restart needed.
+Promoting a model again afterward (`engrain train-gate`, or hand-repointing
+`current`) brings the gate back the same way.
+
+## Recall replay: `engrain recall-replay` (since 2026-09-29)
+
+```
+engrain recall-replay [--days N] [--model ID] [--dir DIR]
+```
+
+Re-scores logged, judged injections (`recall_engagement`'s v41 feature
+columns) under three policies, without touching the database or the
+models directory. `logged` is the current no-policy baseline: everything
+actually shown counts as kept. `r1` is the hooks' own `score *
+habituation_factor` against the 0.45 floor. When a gate model is active,
+or named with `--model`, its own tau/tau_guard decision is the third.
+`--dir` points at a different models directory (mainly for testing);
+`--model` loads a specific saved model by id, current or not.
+
+For each policy it reports how many injections it would have kept out of
+the total, precision and recall of used memories (against the durable
+`engaged` verdict), and injections kept per session, first overall, then
+broken down by hook kind (`via`). It uses the same leak-free habituation
+and feature computation `train-gate` uses, over the same 180-day training
+window plus its 180-day habituation pre-window; nothing here re-derives
+that math.
+
+The default window is the last 30 days (`--days`). With zero feature rows
+in it, the command says so plainly instead of dividing by zero.
+
+Two honest limits print with every run. This can only judge filtering or
+reordering of what was actually logged as shown; it can't judge a
+candidate that was never shown at all. It also reports how many
+exploration rows (`feat.explore`) fall in the window, the only rows that
+carry a below-the-gate candidate, and so the only ones that speak to that
+blind spot.
+
 ## Second-guessing automatic supersession: `engrain audit-supersessions` (since 2026-09-23)
 
 ```
@@ -1645,6 +1819,10 @@ assume nothing is being saved:
   context. This is where "audit existing X before building", deploy
   guardrails, and per-file conventions are meant to reach you; read them
   before proceeding. Read is deliberately not covered (pure exploration).
+  Bash specifically searches only for a command that changes state or the
+  first time this session touches a new project root, so it stays silent
+  on most calls rather than firing on every one; see "The recall policy"
+  above for what counts and why.
   An entity card or the project card is injected by this hook at most once
   per session (since 2026-09-23): once either has appeared anywhere in the
   session's recall log — a prompt-time line or an earlier tool-time one —
@@ -1757,9 +1935,19 @@ would send without spawning anything. Thresholds and model:
 
 `engrain health` (also run twice daily by `engrain-health.timer`, notifying on
 failure) is the operational self-check — ollama, engrain.db, the engrain socket,
-reflect cadence, improve cadence and failure streak, disk headroom, and
-more. Reach for it, not exploration, when asked something like "is the
-knowledge bank working" or "why hasn't reflect run."
+reflect cadence, improve cadence and failure streak, disk headroom, gate
+drift, and more. Reach for it, not exploration, when asked something like
+"is the knowledge bank working" or "why hasn't reflect run."
+
+Gate drift compares the active gate model's live 7-day used rate against
+the precision it validated at when promoted (`store::gate_live_stats`,
+exploration rows excluded); a drop of more than `GATE_DRIFT_POINTS` (10
+points) means the world moved on since training, and it's time for
+`engrain gate rollback` or a retrain. Below `GATE_DRIFT_MIN_ROWS` (50)
+judged injections in the window it reports `[OK]` rather than failing,
+since there isn't yet enough signal to say anything. With no promoted
+model it reads `[OK] gate drift: no active gate model (R1 policy)` and
+never fails, since R1 has no validated baseline to drift from.
 
 The `improve` line's detail changes shape when the last `HEALTH_FAIL_STREAK`
 (3) runs all failed on the SAME one of the two chezmoi preflight guards

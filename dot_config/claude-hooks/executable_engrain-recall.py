@@ -44,6 +44,12 @@ TOKEN_BUDGET = 400
 SOCKET_TIMEOUT = 0.5
 SUBPROCESS_TIMEOUT = 2.0
 DEDUPE_WINDOW = 10
+# Final cap on rendered DIRECT memory hits per prompt (association hops,
+# derived insights and exploration all sit outside this count -- see
+# `select_hits`). The Rust policy's apply_policy caps each search this way,
+# but this hook merges two (query expansion), so the same rule is
+# re-applied after merging.
+MAX_INJECT = 3
 
 # Sentinel card key logged in the same "cards" log field as real entity-card
 # names, whenever a project card is shown — reserved so it can never
@@ -101,20 +107,24 @@ def project_name(cwd):
     return base
 
 
-def search(query, project=None, cwd=None):
-    resp = search_via_socket(query, project, cwd)
+def search(query, project=None, cwd=None, via="prompt", exclude=(), explore=True):
+    resp = search_via_socket(query, project, cwd, via, exclude, explore)
     if resp is None:
-        resp = search_via_subprocess(query, project, cwd)
+        resp = search_via_subprocess(query, project, cwd, via, exclude, explore)
     return resp
 
 
 def merge_responses(primary, secondary):
     """Union of two search responses, primary order first, deduped by memory
     id (or by content for derived rows, which carry insight ids in the same
-    `id` space). Either side may be None."""
+    `id` space). Either side may be None. `gate` (the recall policy's model
+    id, if any) rides along from the primary response only -- it names one
+    model version, and the two searches ran the same request through it, so
+    there is nothing to union."""
     if not primary and not secondary:
         return None
     out = {"hits": [], "connections": [], "cards": [], "project_card": None, "goals": []}
+    out["gate"] = (primary or {}).get("gate")
     seen_ids, seen_text, seen_conn, seen_cards = set(), set(), set(), set()
     for resp in (primary, secondary):
         if not resp:
@@ -160,7 +170,7 @@ def _valid_response(data):
     return data if isinstance(data, dict) and isinstance(data.get("hits"), list) else None
 
 
-def search_via_socket(query, project=None, cwd=None):
+def search_via_socket(query, project=None, cwd=None, via="prompt", exclude=(), explore=True):
     """the `engrain serve` socket (src/socket.rs) keeps a warm
     db connection + a warm ollama HTTP agent alive. Tried first; ANY failure
     (daemon down, socket missing, timeout, error response) returns None and
@@ -193,6 +203,13 @@ def search_via_socket(query, project=None, cwd=None):
         # is an actual claim of identity, a basename is only a guess.
         if cwd:
             payload["cwd"] = cwd
+        # `via` switches on the Rust recall policy (habituation, cap, gate,
+        # exploration). An older binary ignores unknown keys, so this is safe
+        # in either rollout order.
+        if via:
+            payload["via"] = via
+            payload["exclude"] = sorted(int(i) for i in exclude)
+            payload["explore"] = bool(explore)
         req = json.dumps(payload) + "\n"
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(SOCKET_TIMEOUT)
@@ -211,8 +228,8 @@ def search_via_socket(query, project=None, cwd=None):
         return None
 
 
-def search_via_subprocess(query, project=None, cwd=None):
-    def build_argv(include_cwd):
+def search_via_subprocess(query, project=None, cwd=None, via="prompt", exclude=(), explore=True):
+    def build_argv(include_new):
         argv = [ENGRAIN_BIN, "search", query,
                 "--limit", str(SEARCH_LIMIT), "--json",
                 "--min-score", str(SCORE_THRESHOLD),
@@ -226,8 +243,14 @@ def search_via_subprocess(query, project=None, cwd=None):
         # fallback: `engrain search --cwd PATH` resolves it against the
         # `projects` registry and, on a match, uses it as the session
         # project instead of `--project`.
-        if include_cwd and cwd:
+        if include_new and cwd:
             argv += ["--cwd", cwd]
+        if include_new and via:
+            argv += ["--via", via]
+            if exclude:
+                argv += ["--exclude", ",".join(str(int(i)) for i in sorted(exclude))]
+            if not explore:
+                argv += ["--no-explore"]
         return argv
 
     try:
@@ -237,11 +260,12 @@ def search_via_subprocess(query, project=None, cwd=None):
         )
     except Exception:
         return None
-    if proc.returncode != 0 and cwd:
-        # An installed binary older than --cwd (rollout gap between this
-        # change landing and the next install.sh) rejects it outright as an
-        # unknown argument -- retry once without it rather than losing
-        # subprocess-fallback recall entirely until the next install.
+    if proc.returncode != 0 and (cwd or via):
+        # An installed binary older than --cwd/--via (rollout gap between
+        # this change landing and the next install.sh) rejects them
+        # outright as unknown arguments -- retry once without either rather
+        # than losing subprocess-fallback recall entirely until the next
+        # install.
         try:
             proc = subprocess.run(
                 build_argv(False),
@@ -542,6 +566,101 @@ def connection_line(c):
     return "- [connection] {} —{}→ {}{}".format(src, predicate, dst, when)
 
 
+def feature_entry(h):
+    """The per-id features this injection was ranked on, logged for
+    `engrain ingest-sessions` to copy into recall_engagement (the gate's
+    training set). Keys are short on purpose: one line per prompt."""
+    def f(k):
+        try:
+            return round(float(h.get(k) or 0), 3)
+        except (TypeError, ValueError):
+            return 0.0
+    return {"sim": f("sim"), "rec": f("recency"), "str": f("strength"), "score": f("score"),
+            "lex": f("lexical"), "rank": int(h.get("rank") or 0),
+            "assoc": 1 if isinstance(h.get("via_assoc"), int) else 0}
+
+
+def select_hits(hits, suppressed, max_inject=MAX_INJECT, gated=False):
+    """Merged hits -> what renders, mirroring the Rust recall policy's own
+    `apply_policy` rule (this hook merges two searches for query expansion,
+    so the same rule has to be re-applied afterward): suppressed memory ids
+    are dropped first, then (when not `gated`) anything below
+    SCORE_THRESHOLD (exploration hits are exempt from both the threshold
+    and every cap below -- they are below the policy's cut by construction,
+    which is the point of them). What's left splits into three kinds, each
+    with its own rule:
+
+    - DIRECT memory hits (no `via_assoc`) are capped at `max_inject`,
+      keeping the highest-scoring ones -- this is the only cap `MAX_INJECT`
+      actually names.
+    - ASSOCIATION hops (`via_assoc` set) keep at most the single
+      best-scoring hop whose `via_assoc` seed id survived into the kept
+      direct hits above. A hop reached from a hit the cap just cut is
+      dropped -- "recalled by association" makes no sense pointing at
+      something that isn't shown.
+    - DERIVED insights (reflect's own themes/beliefs, not memories) pass
+      through uncapped, exactly as before -- they don't compete with
+      memories for these three slots at all.
+
+    `gated` is true when the search response carried a gate id
+    (`resp.get("gate")` set): the Rust-side recall policy already ran a
+    learned gate over every non-derived hit (`cli::policy_search` /
+    `recall_policy::apply_policy`) and stamped its own probability onto
+    `gate_p`, so a hit surviving that far already cleared the gate's own
+    decision -- re-dropping it here by the raw retrieval `score` would
+    silently override a decision the gate exists to make (habituation can
+    push an eligible hit's raw score below SCORE_THRESHOLD on purpose).
+    Derived insights are never scored by the gate (the Rust side always
+    scores them by plain score), so they keep the threshold either way.
+    When `gated`, direct hits are also ranked by `gate_p` rather than raw
+    `score` before the cap -- once the gate decided eligibility, its own
+    probability is the ranking that matters."""
+    direct, hops, derived, explore = [], [], [], []
+    for h in hits:
+        if not isinstance(h, dict):
+            continue
+        mem_id = h.get("id")
+        if not h.get("derived") and isinstance(mem_id, int) and mem_id in suppressed:
+            continue
+        if h.get("explore"):
+            explore.append(h)
+            continue
+        try:
+            score = float(h.get("score", 0))
+        except (TypeError, ValueError):
+            continue
+        is_derived = bool(h.get("derived"))
+        if score < SCORE_THRESHOLD and not (gated and not is_derived):
+            continue
+        if is_derived:
+            derived.append(h)
+        elif isinstance(h.get("via_assoc"), int):
+            hops.append(h)
+        else:
+            direct.append(h)
+
+    def hit_score(h):
+        try:
+            return float(h.get("score", 0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def hit_gate_p(h):
+        try:
+            return float(h.get("gate_p", 0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    direct_key = hit_gate_p if gated else hit_score
+    kept_direct = sorted(direct, key=direct_key, reverse=True)[:max_inject]
+    kept_direct_ids = {h.get("id") for h in kept_direct if isinstance(h.get("id"), int)}
+
+    eligible_hops = [h for h in hops if h.get("via_assoc") in kept_direct_ids]
+    kept_hop = [max(eligible_hops, key=hit_score)] if eligible_hops else []
+
+    return kept_direct + kept_hop + derived + explore[:1]
+
+
 def main():
     prompt, session_id, cwd = read_input()
     if not prompt or len(prompt) < MIN_PROMPT_LEN or prompt.startswith("/"):
@@ -553,14 +672,21 @@ def main():
     # project against the `projects` registry rather than trusting a
     # basename guess (see `search_via_socket`/`search_via_subprocess`).
     project = project_name(cwd)
-    resp = search(prompt, project, cwd)
+    log_path = os.path.join(RECALL_LOG_DIR, session_id + ".jsonl") if session_id else ""
+    # Computed before the first search (not after, as before) so the ids
+    # already shown this session can be sent as `exclude` -- the Rust side
+    # can then spend its own per-search cap on ids that aren't about to be
+    # suppressed here anyway (see `select_hits`).
+    suppressed = suppressed_ids(log_path)
+    suppressed_conn_keys = suppressed_conns(log_path)
+    suppressed_card_keys = suppressed_cards(log_path)
+
+    resp = search(prompt, project, cwd, "prompt", suppressed, True)
     # Query expansion: the same prompt anchored to the project the session
     # runs in, so "fix the tutorial drift" inside ~/programming/umoja also
     # pulls Umoja-specific memories the bare prompt does not embed near.
     if project and project.lower() not in prompt.lower():
-        resp = merge_responses(resp, search("{} {}".format(project, prompt), project, cwd))
-
-    log_path = os.path.join(RECALL_LOG_DIR, session_id + ".jsonl") if session_id else ""
+        resp = merge_responses(resp, search("{} {}".format(project, prompt), project, cwd, "prompt", suppressed, False))
 
     if resp is None:
         # Both socket and subprocess search failed outright -- an
@@ -580,9 +706,6 @@ def main():
         # thing that can still be shown.
         emit_no_match(project, log_path)
         return
-    suppressed = suppressed_ids(log_path)
-    suppressed_conn_keys = suppressed_conns(log_path)
-    suppressed_card_keys = suppressed_cards(log_path)
 
     lines = []
     ids = []
@@ -591,14 +714,18 @@ def main():
     # search (evolutionary or otherwise) will be fitted against, paired with
     # ingest-sessions' engaged/shown verdicts
     scores = {}
-    for h in hits:
+    # `feat`/`explore` twins of `scores`/`ids` above, in the compact shape
+    # `feature_entry`/`select_hits` and ingest.rs's `parse_recall_log_features`
+    # agree on -- see the log block below.
+    feats = {}
+    explore_ids = []
+    gated = bool((resp or {}).get("gate"))
+    for h in select_hits(hits, suppressed, gated=gated):
         if not isinstance(h, dict):
             continue
         try:
             score = float(h.get("score", 0))
         except (TypeError, ValueError):
-            continue
-        if score < SCORE_THRESHOLD:
             continue
         content = (h.get("content") or "").strip()
         if not content:
@@ -618,8 +745,6 @@ def main():
             lines.append("- [{}, {}]{} {}".format(label, date, conf, content))
         else:
             mem_id = h.get("id")
-            if isinstance(mem_id, int) and mem_id in suppressed:
-                continue
             via = h.get("via_assoc")
             how = source_phrase(h.get("source"), h.get("basis"))
             if isinstance(via, int):
@@ -641,6 +766,9 @@ def main():
                     round(float(h.get("strength") or 0), 3),
                     round(score, 3),
                 ] + ([via] if isinstance(via, int) else [])
+                feats[str(mem_id)] = feature_entry(h)
+                if h.get("explore"):
+                    explore_ids.append(mem_id)
 
     # Same sliding-window session dedupe as memory hits (`suppressed`,
     # above), now applied to connections too via their own rendered key —
@@ -773,6 +901,15 @@ def main():
                 entry["conn"] = conn_keys
             if card_keys:
                 entry["cards"] = card_keys
+            entry["via"] = "prompt"
+            if cwd:
+                entry["cwd"] = cwd
+            if feats:
+                entry["feat"] = feats
+            if explore_ids:
+                entry["explore"] = explore_ids
+            if (resp or {}).get("gate"):
+                entry["gate"] = resp["gate"]
             with open(log_path, "a") as f:
                 f.write(json.dumps(entry) + "\n")
         except Exception:

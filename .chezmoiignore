@@ -17,3 +17,6 @@
 # fresh machine while the live file is left alone.
 .config/fcitx5/profile
 .config/fcitx5/conf/notifications.conf
+
+# Hook unit tests live next to the hook sources but never deploy.
+.config/claude-hooks/tests

@@ -34,6 +34,12 @@ if not isinstance(p, str) or not isinstance(sid, str):
 text = p.strip()
 if len(text) < 12 or text.startswith("/"):
     sys.exit(0)
+# Harness-delivered turns (subagent hand-backs, cross-session messages,
+# task notifications, system reminders) arrive as user prompts but are not
+# the user's words; recording them as "the user stated" misattributes model
+# output to the user.
+if re.match(r"<(agent-message|cross-session-message|task-notification|system-reminder)\b", text):
+    sys.exit(0)
 low = text.lower()
 # a secret pasted next to a decision must never land in the bank
 if re.search(r"(sk-[a-z0-9]{8,}|ghp_[a-z0-9]{8,}|akia[a-z0-9]{12,}|-----begin|password\s*[:=]|token\s*[:=]|secret\s*[:=]|[a-z0-9+/]{40,}={0,2})", low):

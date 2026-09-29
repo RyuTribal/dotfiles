@@ -162,6 +162,20 @@ unless the user explicitly asked for a persisted doc. The user has
 said this directly and emphatically — this is a hard rule, not a
 style preference.
 
+## UI mockups and frontends: invoke /impeccable first
+
+Before building any UI mockup, artifact, or frontend (throwaway mockups
+included), invoke the `impeccable:impeccable` skill and follow it. The user
+rejected a stock card-dashboard mockup as "generic dashboard soup" and "too
+AI coded"; design from the actual workflow and mechanics of the thing, not
+from a template.
+
+## Factual questions: search before answering
+
+For factual lookups (game keybinds, specs, versions, docs), use web search
+before answering rather than saying "I'm not sure, check the menu". Hedge
+only on what remains uncertain after searching.
+
 ## Route free-form prose through the humanizer skill
 
 Before writing docs, comments, or any other prose meant to read as

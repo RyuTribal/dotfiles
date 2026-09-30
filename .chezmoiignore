@@ -8,6 +8,11 @@
 .local/share/mach/telegram.toml
 .local/share/mach/telegram-state.json
 
+# OpenAI API key for `engrain bench` (GPT-4o answer/judge runs). It sits in
+# ~/.config/engrain next to the managed nature.toml, so a `chezmoi add` of
+# that directory would otherwise sweep the key into this repo.
+.config/engrain/openai.key
+
 # fcitx5 rewrites these on every input-method switch, so they can never
 # stay in sync: DefaultIM and the per-item Layout= lines churn whenever the
 # keyboard group changes. Managing them guaranteed a permanently non-empty

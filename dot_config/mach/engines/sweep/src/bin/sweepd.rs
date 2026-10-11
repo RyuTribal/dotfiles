@@ -6,9 +6,14 @@
 //!            {"op":"mark","id":3} {"op":"unmark","id":3} {"op":"restore_all"}
 //!            {"op":"commit"} {"op":"quit"}
 //! Every response is a single JSON line with "ok": true/false.
+//!
+//! Runs only under systemd socket activation (sweepd.socket): systemd owns
+//! the socket file from session start, so clients never race the daemon's
+//! startup, and a crashed daemon is restarted by the next connect.
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::io::FromRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,19 +39,10 @@ struct State {
     scan_path: Option<PathBuf>,
 }
 
+// Must match ListenStream= in sweepd.socket.
 fn socket_path() -> PathBuf {
-    if let Ok(dir) = env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(dir).join("sweep.sock")
-    } else {
-        PathBuf::from(format!("/tmp/sweep-{}.sock", libc_geteuid()))
-    }
+    PathBuf::from(env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR unset")).join("sweep.sock")
 }
-
-// avoid a libc dependency for one call
-fn libc_geteuid() -> u32 {
-    fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(0)
-}
-use std::os::unix::fs::MetadataExt;
 
 fn trash_dir() -> PathBuf {
     let home = env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -294,14 +290,25 @@ fn client_loop(stream: UnixStream, st: Arc<Mutex<State>>, prog: Arc<Progress>, t
     false
 }
 
+// The listening socket systemd passed in (sd_listen_fds protocol: one fd,
+// starting at 3, addressed to this pid).
+fn activated_listener() -> Option<UnixListener> {
+    let pid: u32 = env::var("LISTEN_PID").ok()?.parse().ok()?;
+    let fds: u32 = env::var("LISTEN_FDS").ok()?.parse().ok()?;
+    if pid != std::process::id() || fds != 1 {
+        return None;
+    }
+    Some(unsafe { UnixListener::from_raw_fd(3) })
+}
+
 fn main() {
-    let sock = socket_path();
-    let _ = fs::remove_file(&sock);
+    let Some(listener) = activated_listener() else {
+        eprintln!("sweepd: no socket from systemd; start it with: systemctl --user start sweepd.socket");
+        std::process::exit(1);
+    };
     let trash = trash_dir();
     fs::create_dir_all(&trash).expect("cannot create trash dir");
-
-    let listener = UnixListener::bind(&sock).expect("cannot bind socket");
-    eprintln!("sweepd listening on {}", sock.display());
+    eprintln!("sweepd serving {}", socket_path().display());
 
     let st = Arc::new(Mutex::new(State { store: None, scanning: false, scan_path: None }));
     let prog = Arc::new(Progress::default());
@@ -331,6 +338,5 @@ fn main() {
             break;
         }
     }
-    let _ = fs::remove_file(&sock);
     let _ = fs::remove_dir_all(&trash);
 }

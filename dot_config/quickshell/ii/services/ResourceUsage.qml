@@ -87,10 +87,10 @@ Singleton {
     }
 
     // Disk polling: always on, but on a slower 60s cadence. Sourced from
-    // sweepd (the sweep disk-tool daemon, ~/.config/sweep) over its Unix
+    // sweepd (the sweep disk-tool daemon in ~/.config/mach) over its Unix
     // socket instead of spawning df — one shared backend for the bar's disk
-    // stats and the SweepPanel inspector. Falls back to spawning the daemon
-    // if it isn't running yet.
+    // stats and the SweepPanel inspector. systemd's sweepd.socket owns the
+    // socket and starts the daemon on connect, so this never spawns it.
     Timer {
         interval: 60000
         running: true
@@ -106,15 +106,9 @@ Singleton {
         }
     }
 
-    Process {
-        id: sweepdProc
-        command: ["sweepd"]
-        running: false
-    }
-
     Timer {
         id: sweepRetryTimer
-        interval: 700
+        interval: 1000
         onTriggered: sweepSock.connected = true
     }
 
@@ -136,16 +130,18 @@ Singleton {
                 }));
             }
         }
+        // Quickshell never reconnects a socket on its own once it has
+        // connected, so a dropped connection (daemon restarted) is retried
+        // here, as is a failed connect (sweepd.socket not running).
         onConnectionStateChanged: {
             if (connected) {
                 sweepSock.write('{"op":"mounts"}\n');
                 sweepSock.flush();
+            } else {
+                sweepRetryTimer.start();
             }
         }
-        onError: {
-            sweepdProc.running = true;
-            sweepRetryTimer.start();
-        }
+        onError: sweepRetryTimer.start()
     }
 
     // Prefers the hwmon device actually named "coretemp" (Intel) or
@@ -169,6 +165,4 @@ Singleton {
             }
         }
     }
-
-    // (df-based diskProc removed — mounts now come from sweepd above.)
 }

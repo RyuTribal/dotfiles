@@ -29,8 +29,8 @@ MouseArea {
     implicitHeight: Appearance.sizes.barHeight
     hoverEnabled: true
 
-    // The "/" mount, if df reported one — rootMount.pcent already tracks the
-    // Config.options.bar polling cadence set up in ResourceUsage.qml.
+    // The "/" mount, once sweepd has reported one. Until then the disk stat
+    // shows "—", never a made-up 0%.
     readonly property var rootMount: ResourceUsage.mounts.find(m => m.target === "/")
 
     function formatPct(fraction) {
@@ -162,7 +162,7 @@ MouseArea {
         StatItem {
             id: diskStat
             icon: "storage"
-            valueText: `${root.rootMount?.pcent ?? 0}%`
+            valueText: root.rootMount ? `${root.rootMount.pcent}%` : "—"
         }
     }
 
@@ -274,11 +274,11 @@ MouseArea {
             }
             StatPopupRow {
                 label: Translation.tr("Used:")
-                value: `${root.rootMount?.pcent ?? 0}%`
+                value: root.rootMount ? `${root.rootMount.pcent}%` : "—"
             }
             StatPopupRow {
                 label: Translation.tr("Free:")
-                value: StringUtils.formatAvail(root.rootMount?.avail ?? 0)
+                value: root.rootMount ? StringUtils.formatAvail(root.rootMount.avail) : "—"
             }
         }
     }

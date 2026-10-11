@@ -39,13 +39,6 @@ Scope {
         if (panelVisible && !sock.connected) sock.connected = true;
     }
 
-    // Start daemon if it is not running yet.
-    Process {
-        id: daemonProc
-        command: ["sweepd"]
-        running: false
-    }
-
     Socket {
         id: sock
         path: Quickshell.env("XDG_RUNTIME_DIR") + "/sweep.sock"
@@ -59,10 +52,10 @@ Scope {
                 rootScope.send({ op: "status" });
             }
         }
+        // sweepd.socket (systemd) owns the socket and starts the daemon on
+        // connect, so a failure here means that unit isn't running.
         onError: {
-            // daemon probably not running — spawn it and retry
-            rootScope.status = "starting daemon…";
-            daemonProc.running = true;
+            rootScope.status = "can't reach sweepd (systemctl --user status sweepd.socket)";
             retryTimer.start();
         }
     }

@@ -61,7 +61,7 @@ Quickshell integration
          SweepPanel {}
      }
 
-3. Toggle it (the panel auto-starts sweepd if needed):
+3. Toggle it (sweepd.socket, installed by install.sh, starts sweepd on connect):
      qs ipc call sweep toggle
 
 4. Hyprland keybind (hyprland.conf):

@@ -41,10 +41,23 @@ if ! "$BIN_DIR/sweep" --help >/dev/null 2>&1; then
   install_bins
 fi
 
-case ":$PATH:" in
-  *":$BIN_DIR:"*) ;;
-  *) echo "NOTE: $BIN_DIR is not on your PATH — add it or the panel can't spawn sweepd." ;;
-esac
+# sweepd runs only under socket activation: sweepd.socket holds
+# $XDG_RUNTIME_DIR/sweep.sock from session start and starts the daemon on the
+# first connect, so the Quickshell bar and sweep panel never spawn it.
+install_sweepd_units() {
+  local unit_dir="$HOME/.config/systemd/user"
+  install -Dm644 "$HERE/systemd/sweepd.socket"  "$unit_dir/sweepd.socket"
+  install -Dm644 "$HERE/systemd/sweepd.service" "$unit_dir/sweepd.service"
+  echo "installed: $unit_dir/sweepd.{socket,service}"
+  have_user_systemd || return 0
+  systemctl --user daemon-reload
+  systemctl --user enable --now sweepd.socket >/dev/null 2>&1 \
+    && echo "enabled: sweepd.socket" \
+    || echo "WARNING: 'systemctl --user enable --now sweepd.socket' failed"
+  # Same reason as mach-telegramd below: a running daemon keeps the old binary.
+  systemctl --user try-restart sweepd.service >/dev/null 2>&1 \
+    || echo "WARNING: 'systemctl --user try-restart sweepd.service' failed"
+}
 
 # Memory lives in engrain (~/programming/engrain), a separate project with
 # its own installer and units. mach only depends on it (meet and telegram
@@ -71,6 +84,7 @@ retire_memory_units() {
   systemctl --user daemon-reload
 }
 retire_memory_units
+install_sweepd_units
 
 # mach meet process files meeting facts into engrain, so it takes engrain's
 # job lock and runs on its own timer (it used to be a pre-step of the old

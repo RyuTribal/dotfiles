@@ -91,6 +91,25 @@ pub fn run_transcribe_stage(dir: &Path, meeting: &Meeting, converter: &dyn Conve
     }
 }
 
+/// The meeting as an engrain source document (`engrain sources`): front
+/// matter engrain reads (title, date, speakers, labels), then the
+/// transcript verbatim. Written next to `transcript.md`; the meetings root
+/// is registered once with `engrain sources add <root> --name meetings
+/// --include "*/document.md"`.
+pub fn render_document_md(meeting: &Meeting, transcript: &str) -> String {
+    let speakers = match meeting.mode {
+        Mode::Dual => "[You, Them]",
+        Mode::Solo => "[You]",
+    };
+    format!(
+        "---\ntitle: {}\ndate: {}\nspeakers: {}\nlabels: [meeting, machine-transcribed]\n---\n{}",
+        display_title(meeting),
+        &meeting.started_at[..10.min(meeting.started_at.len())],
+        speakers,
+        transcript
+    )
+}
+
 fn render_summary_md(title: &str, started_at: &str, parsed: &ParsedSummary) -> String {
     let mut s = String::new();
     s.push_str(&format!("# {} ({})\n\n", title, started_at));
@@ -152,7 +171,15 @@ pub fn run_summarize_stage(
             for fact in &parsed.facts {
                 let embedding = embedder.embed(fact).ok();
                 match store::insert(conn, fact, Some(&source), None, false, embedding.as_deref(), summarize::FACT_IMPORTANCE) {
-                    Ok(_) => filed += 1,
+                    Ok(id) => {
+                        filed += 1;
+                        // The fact cites the meeting's engrain document
+                        // (render_document_md), synced from the registered
+                        // "meetings" collection.
+                        if let Err(e) = store::set_provenance(conn, id, "document", &format!("meetings/{}/document.md", dir_name), "exact") {
+                            eprintln!("mach meet process: warning: could not link a fact to its meeting document: {}", e);
+                        }
+                    }
                     Err(e) => eprintln!("mach meet process: warning: could not file a fact into the engrain ({:?}): {}", fact, e),
                 }
             }
@@ -185,6 +212,8 @@ fn build_segment_transcriber() -> Option<Box<dyn SegmentTranscriber>> {
 fn advance_from_needs_processing(dir: &Path, meeting: &Meeting, converter: &dyn Converter, transcriber: &dyn SegmentTranscriber) -> Result<String, String> {
     let transcript = run_transcribe_stage(dir, meeting, converter, transcriber)?;
     fs::write(dir.join("transcript.md"), &transcript).map_err(|e| format!("could not write transcript.md: {}", e))?;
+    fs::write(dir.join("document.md"), render_document_md(meeting, &transcript))
+        .map_err(|e| format!("could not write document.md: {}", e))?;
     let _ = fs::remove_file(marker_path(dir, NEEDS_PROCESSING));
     fs::write(marker_path(dir, NEEDS_SUMMARY), b"").map_err(|e| format!("could not write needs-summary marker: {}", e))?;
     Ok(transcript)
@@ -557,6 +586,19 @@ mod tests {
     }
 
     #[test]
+    fn the_engrain_document_carries_front_matter_and_the_transcript() {
+        let mut m = sample_meeting(Mode::Dual);
+        m.title = Some("Standup".into());
+        let d = render_document_md(&m, "**You** (00:00): hi\n");
+        assert!(d.starts_with("---\ntitle: Standup\ndate: "), "{d}");
+        assert!(d.contains("speakers: [You, Them]\nlabels: [meeting, machine-transcribed]\n---\n**You** (00:00): hi"), "{d}");
+        let mut solo_m = sample_meeting(Mode::Solo);
+        solo_m.title = None;
+        let solo = render_document_md(&solo_m, "x");
+        assert!(solo.contains("title: untitled meeting") && solo.contains("speakers: [You]\n"), "{solo}");
+    }
+
+    #[test]
     fn run_transcribe_stage_dual_merges_both_tracks() {
         let dir = temp_dir("dual");
         let meeting = sample_meeting(Mode::Dual);
@@ -655,6 +697,11 @@ mod tests {
         assert_eq!(filed[0].source.as_deref(), Some("meeting:2026-09-07-1733-weekly-standup"));
         assert_eq!(filed[0].importance, summarize::FACT_IMPORTANCE);
         assert!(!filed[0].reviewed);
+        assert_eq!(
+            store::provenance(&conn, filed[0].id).unwrap(),
+            Some(("document".into(), "meetings/2026-09-07-1733-weekly-standup/document.md".into(), "exact".into())),
+            "each fact cites the meeting's engrain document"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -12,6 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 term_alpha=100 #Set this to < 100 make all your terminals transparent
 terminal_palette_path="$STATE_DIR/user/generated/terminal_palette.json"
 terminal_sequences_path="$STATE_DIR/user/generated/terminal/sequences.txt"
+kitty_colors_path="$STATE_DIR/user/generated/terminal/kitty-colors.conf"
 # sleep 0 # idk i wanted some delay or colors dont get applied properly
 if [ ! -d "$STATE_DIR"/user/generated ]; then
   mkdir -p "$STATE_DIR"/user/generated
@@ -29,6 +30,9 @@ apply_term() {
 
   if [ -f "$terminal_palette_path" ]; then
     render_terminal_sequences_file "$terminal_palette_path" "$SCRIPT_DIR/terminal/sequences.txt" "$terminal_sequences_path" "$term_alpha"
+    if render_kitty_colors_file "$terminal_palette_path" "$kitty_colors_path"; then
+      pidof kitty | xargs -r kill -SIGUSR1 # reload config so OSC 104 resets land on this palette
+    fi
   elif [ -f "$STATE_DIR/user/generated/material_colors.scss" ]; then
     echo "[applycolor.sh] Warning: Falling back to legacy material_colors.scss terminal palette." >&2
     local colornames=''

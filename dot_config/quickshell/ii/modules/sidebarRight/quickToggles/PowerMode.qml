@@ -7,26 +7,24 @@ import Quickshell
 
 QuickToggleButton {
     id: root
-    property string mode: "auto"
+    property string mode: "balanced"
     property int watts: 0
     readonly property var modeIcons: ({
-        "auto": "hdr_auto",
         "lap": "airline_seat_recline_normal",
-        "desk": "desktop_windows",
-        "custom": "tune"
+        "balanced": "balance",
+        "max": "local_fire_department"
     })
     readonly property var nextMode: ({
-        "auto": "lap",
-        "lap": "desk",
-        "desk": "auto",
-        "custom": "auto"
+        "lap": "balanced",
+        "balanced": "max",
+        "max": "lap"
     })
 
-    buttonIcon: modeIcons[root.mode] ?? "tune"
-    toggled: root.mode !== "auto"
+    buttonIcon: modeIcons[root.mode]
+    toggled: root.mode !== "balanced"
 
     onClicked: {
-        modeProc.command = ["/home/ryutribal/.local/bin/powermode", nextMode[root.mode] ?? "auto"]
+        modeProc.command = ["/home/ryutribal/.local/bin/powermode", nextMode[root.mode]]
         modeProc.running = true
     }
 
@@ -46,8 +44,8 @@ QuickToggleButton {
         }
     }
 
-    // Poll so the button follows external changes (EC re-clamping,
-    // dytc_lapmode flips while in auto, manual sysfs writes).
+    // Poll so the chosen mode is re-applied when the EC or firmware moves
+    // PL1 or the platform profile (dytc_lapmode flips, EC re-clamping).
     Process {
         id: syncProc
         command: ["/home/ryutribal/.local/bin/powermode", "sync"]

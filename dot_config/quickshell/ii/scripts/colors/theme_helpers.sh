@@ -245,6 +245,32 @@ render_terminal_sequences_file() {
     mv "$tmp_path" "$output_path"
 }
 
+# kitty's config palette is what ncurses apps restore with OSC 104 on startup,
+# so it must match the live palette or they snap back to the static theme.
+render_kitty_colors_file() {
+    local palette_json_path="$1"
+    local output_path="$2"
+    local tmp_path="${output_path}.tmp"
+
+    mkdir -p "$(dirname "$output_path")"
+    if ! jq -r '
+        . as $p
+        | if all(range(0;16); ($p["term\(.)"] // "") | test("^#[0-9A-Fa-f]{6}$")) then . else error("missing or invalid termN") end
+        | (range(0;16) as $i | "color\($i) \(.["term\($i)"])"),
+          "foreground \(.term7)",
+          "background \(.term0)",
+          "cursor \(.term7)",
+          "cursor_text_color \(.term0)",
+          "selection_foreground \(.term0)",
+          "selection_background \(.term7)"
+    ' "$palette_json_path" > "$tmp_path"; then
+        rm -f "$tmp_path"
+        echo "[theme_helpers.sh] Error: Could not render kitty colors from $palette_json_path." >&2
+        return 1
+    fi
+    mv "$tmp_path" "$output_path"
+}
+
 write_terminal_palette_json_from_theme() {
     local output_path="$1"
     local image_path="$2"

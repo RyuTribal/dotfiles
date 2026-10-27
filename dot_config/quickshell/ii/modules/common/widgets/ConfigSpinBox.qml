@@ -11,9 +11,8 @@ RowLayout {
     property alias stepSize: spinBoxWidget.stepSize
     property alias from: spinBoxWidget.from
     property alias to: spinBoxWidget.to
-    // Emitted only when the user changes the value with the buttons, the wheel or the arrow keys,
-    // never when the `value` binding updates. Typing in the field does not emit it (StyledSpinBox's
-    // field sets `value` directly).
+    // Emitted only when the user changes the value with the buttons, the wheel, the arrow keys or by
+    // typing in the field, never when `value` is set from code or a binding.
     signal valueModified
     spacing: 10
     Layout.leftMargin: 8

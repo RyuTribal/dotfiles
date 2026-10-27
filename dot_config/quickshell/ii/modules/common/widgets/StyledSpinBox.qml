@@ -33,6 +33,13 @@ SpinBox {
             onTextChanged: {
                 root.value = parseFloat(text);
             }
+            // Qt emits valueModified only for its own buttons, wheel and arrow keys, not when this
+            // field sets `value`, so typed input emits it here. textEdited fires for user edits only,
+            // never when the `text` binding follows `value`.
+            onTextEdited: {
+                root.value = parseFloat(text);
+                root.valueModified();
+            }
         }
     }
 

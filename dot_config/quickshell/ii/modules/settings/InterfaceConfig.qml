@@ -23,14 +23,6 @@ ContentPage {
         ContentSubsection {
             title: Translation.tr("Wallpaper parallax")
 
-            ConfigSwitch {
-                text: Translation.tr("Vertical")
-                checked: Config.options.background.parallax.vertical
-                onCheckedChanged: {
-                    Config.options.background.parallax.vertical = checked;
-                }
-            }
-
             ConfigRow {
                 uniform: true
                 ConfigSwitch {

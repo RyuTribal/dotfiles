@@ -16,7 +16,6 @@ import qs.modules.lock
 import qs.modules.mediaControls
 import qs.modules.notificationPopup
 import qs.modules.onScreenDisplay
-import qs.modules.onScreenKeyboard
 import qs.modules.overview
 import qs.modules.screenCorners
 import qs.modules.sessionScreen
@@ -44,7 +43,6 @@ ShellRoot {
     property bool enableNotificationPopup: true
     property bool enableOnScreenDisplayBrightness: true
     property bool enableOnScreenDisplayVolume: true
-    property bool enableOnScreenKeyboard: true
     property bool enableOverview: true
     property bool enableReloadPopup: true
     property bool enableScreenCorners: true
@@ -59,7 +57,6 @@ ShellRoot {
     Component.onCompleted: {
         MaterialThemeLoader.reapplyTheme()
         Hyprsunset.load()
-        FirstRunExperience.load()
         ConflictKiller.load()
         Cliphist.refresh()
         Idle.load()
@@ -77,7 +74,6 @@ ShellRoot {
     LazyLoader { active: enableNotificationPopup; component: NotificationPopup {} }
     LazyLoader { active: enableOnScreenDisplayBrightness; component: OnScreenDisplayBrightness {} }
     LazyLoader { active: enableOnScreenDisplayVolume; component: OnScreenDisplayVolume {} }
-    LazyLoader { active: enableOnScreenKeyboard; component: OnScreenKeyboard {} }
     LazyLoader { active: enableOverview; component: Overview {} }
     LazyLoader { active: enableReloadPopup; component: ReloadPopup {} }
     LazyLoader { active: enableScreenCorners; component: ScreenCorners {} }

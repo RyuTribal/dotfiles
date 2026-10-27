@@ -165,12 +165,6 @@ Item { // Wrapper
             }
         },
         {
-            action: "konachanwallpaper",
-            execute: () => {
-                Quickshell.execDetached([Quickshell.shellPath("scripts/colors/random_konachan_wall.sh")]);
-            }
-        },
-        {
             action: "light",
             execute: () => {
                 Quickshell.execDetached([Directories.wallpaperSwitchScriptPath, "--mode", "light", "--noswitch"]);

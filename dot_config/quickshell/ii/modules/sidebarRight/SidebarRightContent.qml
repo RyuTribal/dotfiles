@@ -141,8 +141,6 @@ Item {
                 GameMode {}
                 PowerMode {}
                 IdleInhibitor {}
-                EasyEffectsToggle {}
-                CloudflareWarp {}
             }
 
             ColumnLayout {

@@ -175,12 +175,12 @@ ContentPage {
         ConfigSpinBox {
             icon: "touch_long"
             text: Translation.tr("Number show delay when pressing Super (ms)")
-            value: Config.options.bar.workspaces.showNumberDelay
+            value: Config.options.bar.autoHide.showWhenPressingSuper.delay
             from: 0
             to: 1000
             stepSize: 50
-            onValueChanged: {
-                Config.options.bar.workspaces.showNumberDelay = value;
+            onValueModified: {
+                Config.options.bar.autoHide.showWhenPressingSuper.delay = value;
             }
         }
     }
@@ -210,14 +210,6 @@ ContentPage {
         }
         ConfigRow {
             uniform: true
-            ConfigSwitch {
-                buttonIcon: "keyboard"
-                text: Translation.tr("Keyboard toggle")
-                checked: Config.options.bar.utilButtons.showKeyboardToggle
-                onCheckedChanged: {
-                    Config.options.bar.utilButtons.showKeyboardToggle = checked;
-                }
-            }
             ConfigSwitch {
                 buttonIcon: "mic"
                 text: Translation.tr("Mic toggle")

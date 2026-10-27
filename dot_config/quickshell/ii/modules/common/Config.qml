@@ -22,8 +22,8 @@ Singleton {
     // made in that same window is lost; the hand save wins.
     readonly property bool _canWrite: _fileValid && !reloadTimer.running
 
-    // Writes a change that is still waiting in the debounce now. The settings, welcome and conflict
-    // windows call it before Qt.quit(), which would otherwise drop the last 100 ms of edits.
+    // Writes a change that is still waiting in the debounce now. The settings and conflict windows call
+    // it before Qt.quit(), which would otherwise drop the last 100 ms of edits.
     function flush() {
         if (writeTimer.running && root._canWrite) {
             writeTimer.stop();
@@ -91,10 +91,6 @@ Singleton {
 
         JsonAdapter {
             id: configOptionsJsonAdapter
-            property JsonObject policies: JsonObject {
-                property int weeb: 1 // 0: No | 1: Open | 2: Closet
-            }
-
             property JsonObject appearance: JsonObject {
                 property bool extraBackgroundTint: true
                 property int fakeScreenRounding: 2 // 0: None | 1: Always | 2: When not fullscreen
@@ -134,7 +130,7 @@ Singleton {
                 property string bluetooth: "kcmshell6 kcm_bluetooth"
                 property string network: "kitty -1 fish -c nmtui"
                 property string networkEthernet: "kcmshell6 kcm_networkmanagement"
-                property string taskManager: "plasma-systemmonitor --page-name Processes"
+                property string taskManager: "kitty -1 btop"
                 property string terminal: "kitty -1" // This is only for shell actions
             }
 
@@ -146,8 +142,6 @@ Singleton {
                 property string wallpaperPath: ""
                 property string thumbnailPath: ""
                 property JsonObject parallax: JsonObject {
-                    property bool vertical: false
-                    property bool autoVertical: false
                     property bool enableWorkspace: true
                     property real workspaceZoom: 1.07 // Relative to your screen, not wallpaper size
                     property bool enableSidebar: true
@@ -168,13 +162,10 @@ Singleton {
                 property bool bottom: false // Instead of top
                 property int cornerStyle: 0 // 0: Hug | 1: Float | 2: Plain rectangle
                 property bool borderless: false // true for no grouping of items
-                property string topLeftIcon: "spark" // Options: "distro" or any icon name in ~/.config/quickshell/ii/assets/icons
                 property bool showBackground: true
                 property bool verbose: true
                 property bool vertical: false
                 property JsonObject resources: JsonObject {
-                    property bool alwaysShowSwap: true
-                    property bool alwaysShowCpu: true
                     property int memoryWarningThreshold: 95
                     property int swapWarningThreshold: 85
                     property int cpuWarningThreshold: 90
@@ -184,7 +175,6 @@ Singleton {
                     property bool showScreenSnip: true
                     property bool showColorPicker: false
                     property bool showMicToggle: false
-                    property bool showKeyboardToggle: true
                     property bool showDarkModeToggle: true
                     property bool showPerformanceProfileToggle: false
                 }
@@ -199,7 +189,6 @@ Singleton {
                     property int shown: 10
                     property bool showAppIcons: true
                     property bool alwaysShowNumbers: false
-                    property int showNumberDelay: 300 // milliseconds
                     property list<string> numberMap: ["1", "2"] // Characters to show instead of numbers on workspace indicator
                     property bool useNerdFont: false
                 }
@@ -283,11 +272,6 @@ Singleton {
                 property int timeout: 1000
             }
 
-            property JsonObject osk: JsonObject {
-                property string layout: "qwerty_full"
-                property bool pinnedOnStartup: false
-            }
-
             property JsonObject overview: JsonObject {
                 property bool enable: true
                 property real scale: 0.18 // Relative to screen size
@@ -319,14 +303,6 @@ Singleton {
 
             property JsonObject sidebar: JsonObject {
                 property bool keepRightSidebarLoaded: true
-                property JsonObject booru: JsonObject {
-                    property bool allowNsfw: false
-                    property string defaultProvider: "yandere"
-                    property int limit: 20
-                    property JsonObject zerochan: JsonObject {
-                        property string username: "[unset]"
-                    }
-                }
                 property JsonObject cornerOpen: JsonObject {
                     property bool enable: true
                     property bool bottom: false

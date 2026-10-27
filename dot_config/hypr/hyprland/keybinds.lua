@@ -31,12 +31,10 @@ hl.bind("SUPER + Comma", hl.dsp.global("quickshell:overviewGlyphToggle"), { desc
 hl.bind("SUPER + N", hl.dsp.global("quickshell:sidebarRightToggle"), { description = "Toggle right sidebar" }) -- Toggle right sidebar
 hl.bind("SUPER + A", hl.dsp.global("quickshell:topMenuToggle"), { description = "Toggle top menu" }) -- Toggle top menu
 hl.bind("SUPER + H", hl.dsp.global("quickshell:cheatsheetToggle"), { description = "Toggle cheatsheet" }) -- Toggle cheatsheet
-hl.bind("SUPER + K", hl.dsp.global("quickshell:oskToggle"), { description = "Toggle on-screen keyboard" }) -- Toggle on-screen keyboard
 hl.bind("SUPER + P", hl.dsp.global("quickshell:mediaControlsToggle"), { description = "Toggle media controls" }) -- Toggle media controls
 hl.bind("CTRL+ALT + Delete", hl.dsp.global("quickshell:sessionToggle"), { description = "Toggle session menu" }) -- Toggle session menu
 hl.bind("SUPER+SHIFT + B", hl.dsp.global("quickshell:barToggle"), { description = "Toggle bar" }) -- Toggle bar
 hl.bind("CTRL+ALT + Delete", hl.dsp.exec_cmd("qs -c $qsConfig ipc call TEST_ALIVE || pkill wlogout || wlogout -p layer-shell")) -- [hidden] Session menu (fallback)
-hl.bind("SHIFT+SUPER+ALT + Slash", hl.dsp.exec_cmd("qs -p ~/.config/quickshell/$qsConfig/welcome.qml")) -- [hidden] Launch welcome app
 
 hl.bind("XF86MonBrightnessUp", hl.dsp.exec_cmd("qs -c $qsConfig ipc call brightness increment || brightnessctl s 5%+"), { locked = true, repeating = true }) -- [hidden]
 hl.bind("XF86MonBrightnessDown", hl.dsp.exec_cmd("qs -c $qsConfig ipc call brightness decrement || brightnessctl s 5%-"), { locked = true, repeating = true }) -- [hidden]

@@ -3,26 +3,13 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import Qt5Compat.GraphicalEffects
 import Quickshell
-import Quickshell.Io
 import qs
 import qs.services
 import qs.modules.common
 import qs.modules.common.widgets
-import qs.modules.common.functions
 
 ContentPage {
     forceWidth: true
-
-    Process {
-        id: konachanWallProc
-        property string status: ""
-        command: ["bash", "-c", FileUtils.trimFileProtocol(`${Directories.scriptPath}/colors/random_konachan_wall.sh`)]
-        stdout: SplitParser {
-            onRead: data => {
-                konachanWallProc.status = data.trim();
-            }
-        }
-    }
 
     component SmallLightDarkPreferenceButton: RippleButton {
         id: smallLightDarkPreferenceButton
@@ -88,20 +75,6 @@ ContentPage {
             }
 
             ColumnLayout {
-                RippleButtonWithIcon {
-                    id: rndWallBtn
-                    visible: Config.options.policies.weeb === 1
-                    Layout.fillWidth: true
-                    buttonRadius: Appearance.rounding.small
-                    materialIcon: "wallpaper"
-                    mainText: konachanWallProc.running ? Translation.tr("Be patient...") : Translation.tr("Random: Konachan")
-                    onClicked: {
-                        konachanWallProc.running = true;
-                    }
-                    StyledToolTip {
-                        content: Translation.tr("Random SFW Anime wallpaper from Konachan\nImage is saved to ~/Pictures/Wallpapers")
-                    }
-                }
                 RippleButtonWithIcon {
                     Layout.fillWidth: true
                     materialIcon: "wallpaper"
@@ -308,18 +281,6 @@ ContentPage {
                     ]
                 }
             }
-        }
-    }
-
-    SelectionDialog {
-        id: astronautPicker
-        visible: false
-        titleText: Translation.tr("Choose astronaut sub-theme")
-        onCanceled: visible = false
-        onSelected: picked => {
-            visible = false;
-            if (picked)
-                astroCtl.setSubTheme(picked);
         }
     }
 

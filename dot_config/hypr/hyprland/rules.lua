@@ -154,13 +154,6 @@ hl.window_rule({
 
 hl.window_rule({
     match = {
-        title = ".*Welcome",
-    },
-    float = true,
-})
-
-hl.window_rule({
-    match = {
         title = "^(illogical-impulse Settings)$",
     },
     float = true,
@@ -275,7 +268,6 @@ hl.layer_rule({ match = { namespace = "^(selection)$" }, no_anim = true })
 hl.layer_rule({ match = { namespace = "^(overview)$" }, no_anim = true })
 hl.layer_rule({ match = { namespace = "^(anyrun)$" }, no_anim = true })
 hl.layer_rule({ match = { namespace = "indicator.*" }, no_anim = true })
-hl.layer_rule({ match = { namespace = "^(osk)$" }, no_anim = true })
 hl.layer_rule({ match = { namespace = "^(hyprpicker)$" }, no_anim = true })
 hl.layer_rule({ match = { namespace = "^(noanim)$" }, no_anim = true })
 hl.layer_rule({ match = { namespace = "^(gtk-layer-shell)$" }, blur = true })
@@ -304,8 +296,6 @@ hl.layer_rule({ match = { namespace = "sideright[0-9]*" }, blur = true })
 hl.layer_rule({ match = { namespace = "sideright[0-9]*" }, ignore_alpha = 0.6 })
 hl.layer_rule({ match = { namespace = "sideleft[0-9]*" }, blur = true })
 hl.layer_rule({ match = { namespace = "sideleft[0-9]*" }, ignore_alpha = 0.6 })
-hl.layer_rule({ match = { namespace = "osk[0-9]*" }, blur = true })
-hl.layer_rule({ match = { namespace = "osk[0-9]*" }, ignore_alpha = 0.6 })
 hl.layer_rule({ match = { namespace = "quickshell:.*" }, blur_popups = true })
 hl.layer_rule({ match = { namespace = "quickshell:.*" }, blur = true })
 hl.layer_rule({ match = { namespace = "quickshell:.*" }, ignore_alpha = 0.79 })
@@ -314,7 +304,6 @@ hl.layer_rule({ match = { namespace = "quickshell:verticalBar" }, animation = "s
 hl.layer_rule({ match = { namespace = "quickshell:screenCorners" }, animation = "fade" })
 hl.layer_rule({ match = { namespace = "quickshell:sidebarRight" }, animation = "slide right" })
 hl.layer_rule({ match = { namespace = "quickshell:wallpaperSelector" }, animation = "slide top" })
-hl.layer_rule({ match = { namespace = "quickshell:osk" }, animation = "slide bottom" })
 hl.layer_rule({ match = { namespace = "quickshell:dock" }, animation = "slide bottom" })
 hl.layer_rule({ match = { namespace = "quickshell:cheatsheet" }, animation = "slide bottom" })
 hl.layer_rule({ match = { namespace = "quickshell:session" }, blur = true })

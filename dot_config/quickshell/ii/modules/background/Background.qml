@@ -185,7 +185,7 @@ Variants {
             property int range: upper - lower;
             property real valueX: {
                 let result = 0.5;
-                if (Config.options.background.parallax.enableWorkspace && !bgRoot.verticalParallax) {
+                if (Config.options.background.parallax.enableWorkspace) {
                     result = ((bgRoot.monitor.activeWorkspace?.id - lower) / range);
                 }
                 if (Config.options.background.parallax.enableSidebar) {
@@ -193,13 +193,7 @@ Variants {
                 }
                 return result;
             }
-            property real valueY: {
-                let result = 0.5;
-                if (Config.options.background.parallax.enableWorkspace && bgRoot.verticalParallax) {
-                    result = ((bgRoot.monitor.activeWorkspace?.id - lower) / range);
-                }
-                return result;
-            }
+            property real valueY: 0.5
             property real effectiveValueX: Math.max(0, Math.min(1, valueX))
             property real effectiveValueY: Math.max(0, Math.min(1, valueY))
             x: -(bgRoot.movableXSpace) - (effectiveValueX - 0.5) * 2 * bgRoot.movableXSpace

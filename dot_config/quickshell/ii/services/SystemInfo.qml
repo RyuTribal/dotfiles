@@ -3,112 +3,87 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import Quickshell
-import Quickshell.Io
 
 /**
- * Provides some system info: distro, username.
+ * Distro and user facts, a thin client of axon's `system` topic (section 30,
+ * "system"). axon reads /etc/os-release and the passwd entry once; this
+ * singleton only turns those fields into the names the widgets bind.
  */
 Singleton {
     id: root
-    property string distroName: "Unknown"
-    property string distroId: "unknown"
-    property string distroIcon: "linux-symbolic"
-    property string username: "user"
-    property string homeUrl: ""
-    property string documentationUrl: ""
-    property string supportUrl: ""
-    property string bugReportUrl: ""
-    property string privacyPolicyUrl: ""
-    property string logo: ""
-    property string desktopEnvironment: ""
-    property string windowingSystem: ""
 
-    Timer {
-        triggeredOnStart: true
-        interval: 1
-        running: true
-        repeat: false
-        onTriggered: {
-            getUsername.running = true
-            fileOsRelease.reload()
-            const textOsRelease = fileOsRelease.text()
+    readonly property BackendTopic topic: BackendTopic {
+        name: "system"
+        onSnapshot: data => root._apply(data)
+    }
 
-            // Extract the friendly name (PRETTY_NAME field, fallback to NAME)
-            const prettyNameMatch = textOsRelease.match(/^PRETTY_NAME="(.+?)"/m)
-            const nameMatch = textOsRelease.match(/^NAME="(.+?)"/m)
-            distroName = prettyNameMatch ? prettyNameMatch[1] : (nameMatch ? nameMatch[1].replace(/Linux/i, "").trim() : "Unknown")
+    readonly property string distroName: _distroName
+    readonly property string distroIcon: _distroIcon
+    readonly property string logo: _logo
+    readonly property string homeUrl: _homeUrl
+    readonly property string documentationUrl: _documentationUrl
+    readonly property string supportUrl: _supportUrl
+    readonly property string bugReportUrl: _bugReportUrl
+    readonly property string privacyPolicyUrl: _privacyPolicyUrl
+    readonly property string username: _username
 
-            // Extract the ID
-            const idMatch = textOsRelease.match(/^ID="?(.+?)"?$/m)
-            distroId = idMatch ? idMatch[1] : "unknown"
+    property string _distroName: "Unknown"
+    property string _distroIcon: "linux-symbolic"
+    property string _logo: ""
+    property string _homeUrl: ""
+    property string _documentationUrl: ""
+    property string _supportUrl: ""
+    property string _bugReportUrl: ""
+    property string _privacyPolicyUrl: ""
+    property string _username: ""
 
-            // Extract additional URLs and logo
-            const homeUrlMatch = textOsRelease.match(/^HOME_URL="(.+?)"/m)
-            homeUrl = homeUrlMatch ? homeUrlMatch[1] : ""
-            const documentationUrlMatch = textOsRelease.match(/^DOCUMENTATION_URL="(.+?)"/m)
-            documentationUrl = documentationUrlMatch ? documentationUrlMatch[1] : ""
-            const supportUrlMatch = textOsRelease.match(/^SUPPORT_URL="(.+?)"/m)
-            supportUrl = supportUrlMatch ? supportUrlMatch[1] : ""
-            const bugReportUrlMatch = textOsRelease.match(/^BUG_REPORT_URL="(.+?)"/m)
-            bugReportUrl = bugReportUrlMatch ? bugReportUrlMatch[1] : ""
-            const privacyPolicyUrlMatch = textOsRelease.match(/^PRIVACY_POLICY_URL="(.+?)"/m)
-            privacyPolicyUrl = privacyPolicyUrlMatch ? privacyPolicyUrlMatch[1] : ""
-            const logoFieldMatch = textOsRelease.match(/^LOGO="?(.+?)"?$/m)
-            logo = logoFieldMatch ? logoFieldMatch[1] : ""
-
-            // Update the distroIcon property based on distroId
-            switch (distroId) {
-                case "arch": distroIcon = "arch-symbolic"; break;
-                case "endeavouros": distroIcon = "endeavouros-symbolic"; break;
-                case "cachyos": distroIcon = "cachyos-symbolic"; break;
-                case "nixos": distroIcon = "nixos-symbolic"; break;
-                case "fedora": distroIcon = "fedora-symbolic"; break;
-                case "linuxmint":
-                case "ubuntu":
-                case "zorin":
-                case "popos": distroIcon = "ubuntu-symbolic"; break;
-                case "debian":
-                case "raspbian":
-                case "kali": distroIcon = "debian-symbolic"; break;
-                default: distroIcon = "linux-symbolic"; break;
-            }
-            if (textOsRelease.toLowerCase().includes("nyarch")) {
-                distroIcon = "nyarch-symbolic"
-            }
-
-            if (logo.trim().length === 0) {
-                logo = distroIcon
-            }
-
+    function _iconForDistro(os) {
+        const names = [os.id, os.name, os.pretty_name];
+        if (names.some(name => (name ?? "").toLowerCase().includes("nyarch")))
+            return "nyarch-symbolic";
+        switch (os.id) {
+        case "arch":
+            return "arch-symbolic";
+        case "endeavouros":
+            return "endeavouros-symbolic";
+        case "cachyos":
+            return "cachyos-symbolic";
+        case "nixos":
+            return "nixos-symbolic";
+        case "fedora":
+            return "fedora-symbolic";
+        case "linuxmint":
+        case "ubuntu":
+        case "zorin":
+        case "popos":
+            return "ubuntu-symbolic";
+        case "debian":
+        case "raspbian":
+        case "kali":
+            return "debian-symbolic";
+        default:
+            return "linux-symbolic";
         }
     }
 
-    Process {
-        id: getUsername
-        command: ["whoami"]
-        stdout: SplitParser {
-            onRead: data => {
-                root.username = data.trim()
-            }
-        }
+    function _nameOfDistro(os) {
+        if (os.pretty_name)
+            return os.pretty_name;
+        if (os.name)
+            return os.name.replace(/Linux/i, "").trim();
+        return "Unknown";
     }
 
-    Process {
-        id: getDesktopEnvironment
-        running: true
-        command: ["bash", "-c", "echo $XDG_CURRENT_DESKTOP,$WAYLAND_DISPLAY"]
-        stdout: StdioCollector {
-            id: deCollector
-            onStreamFinished: {
-                const [desktop, wayland] = deCollector.text.split(",")
-                root.desktopEnvironment = desktop.trim()
-                root.windowingSystem = wayland.trim().length > 0 ? "Wayland" : "X11" // Are there others? 🤔
-            }
-        }
-    }
-
-    FileView {
-        id: fileOsRelease
-        path: "/etc/os-release"
+    function _apply(data) {
+        const os = data.os ?? {};
+        _distroName = _nameOfDistro(os);
+        _distroIcon = _iconForDistro(os);
+        _logo = (os.logo ?? "").trim() || _distroIcon;
+        _homeUrl = os.home_url ?? "";
+        _documentationUrl = os.documentation_url ?? "";
+        _supportUrl = os.support_url ?? "";
+        _bugReportUrl = os.bug_report_url ?? "";
+        _privacyPolicyUrl = os.privacy_policy_url ?? "";
+        _username = data.user ?? "";
     }
 }

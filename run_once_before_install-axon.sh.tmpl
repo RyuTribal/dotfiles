@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Fresh-machine bootstrap for axon. chezmoi runs it before it writes any file.
+# chezmoi builds axon only to follow the pin (axon-sync.sh). After changing the code, run ~/programming/axon/install.sh (the development checkout; chezmoi never touches it).
+set -euo pipefail
+[ -x "$HOME/.local/bin/axon" ] && exit 0
+
+{{ if not (regexMatch "^[0-9a-f]{40}$" .axon.rev) }}{{ fail "axon pin is not a full 40-hex commit" }}{{ end }}
+pin={{ .axon.rev | squote }}
+repo="$HOME/.local/share/axon/deploy"   # deploy clone, never the development checkout in ~/programming/axon
+repo_url="git@github.com:RyuTribal/axon.git"   # private, over SSH (ledger §13 A10)
+if [[ ! $pin =~ ^[0-9a-f]{40}$ ]]; then
+    echo "axon bootstrap: the pin in .chezmoidata/axon.toml is not a full commit: $pin" >&2
+    exit 1
+fi
+
+missing=()
+for tool in git cargo clang pkgconf; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+done
+if command -v pkgconf >/dev/null 2>&1 && ! pkgconf --exists libpipewire-0.3; then missing+=("libpipewire"); fi
+if [ "${#missing[@]}" -gt 0 ]; then
+    echo "axon bootstrap: missing ${missing[*]}." >&2
+    echo "Run: sudo pacman -S --needed git rust clang pkgconf libpipewire, then chezmoi apply again." >&2
+    exit 1
+fi
+if [ ! -d "$repo/.git" ]; then
+    mkdir -p "$(dirname "$repo")"
+    if ! git clone "$repo_url" "$repo"; then
+        echo "axon bootstrap: could not clone $repo_url." >&2
+        echo "Clone axon into $repo by hand, then run chezmoi apply again." >&2
+        exit 1
+    fi
+fi
+dirty=$(git -C "$repo" status --porcelain) || { echo "axon bootstrap: git status failed in $repo." >&2; exit 1; }
+if [ -n "$dirty" ]; then
+    echo "axon bootstrap: $repo has local changes; commit or stash them, then run chezmoi apply again." >&2
+    exit 1
+fi
+if ! { git -C "$repo" fetch --quiet origin && git -C "$repo" checkout --quiet --detach "$pin"; }; then
+    echo "axon bootstrap: could not fetch or check out $pin from $repo_url; run chezmoi apply again when it is reachable." >&2
+    exit 1
+fi
+exec "$repo/install.sh"

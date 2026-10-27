@@ -1,0 +1,8 @@
+module Quickshell.Io
+Socket 1.0 Socket.qml
+SplitParser 1.0 SplitParser.qml
+FileView 1.0 FileView.qml
+JsonAdapter 1.0 JsonAdapter.qml
+JsonObject 1.0 JsonObject.qml
+singleton FileViewError 1.0 FileViewError.qml
+singleton FileViewProbe 1.0 FileViewProbe.qml

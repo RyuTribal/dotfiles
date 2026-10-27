@@ -10,44 +10,81 @@ Singleton {
     property alias options: configOptionsJsonAdapter
     property bool ready: false
 
-    function setNestedValue(nestedKey, value) {
-        let keys = nestedKey.split(".");
-        let obj = root.options;
-        let parents = [obj];
+    // False while config.json does not hold a JSON object: nothing is written then, so a hand edit with a
+    // typo is not overwritten from memory. True before the first load so no error shows at shell start.
+    readonly property bool fileValid: _fileValid
+    readonly property string parseError: _parseError
+    property bool _fileValid: true
+    property string _parseError: ""
 
-        // Traverse and collect parent objects
-        for (let i = 0; i < keys.length - 1; ++i) {
-            if (!obj[keys[i]] || typeof obj[keys[i]] !== "object") {
-                obj[keys[i]] = {};
-            }
-            obj = obj[keys[i]];
-            parents.push(obj);
+    // A write goes out only while the file is valid and no reload is pending, so a hand save made in the
+    // ~100 ms before a shell-side change is read back instead of being overwritten. A shell-side change
+    // made in that same window is lost; the hand save wins.
+    readonly property bool _canWrite: _fileValid && !reloadTimer.running
+
+    // Writes a change that is still waiting in the debounce now. The settings, welcome and conflict
+    // windows call it before Qt.quit(), which would otherwise drop the last 100 ms of edits.
+    function flush() {
+        if (writeTimer.running && root._canWrite) {
+            writeTimer.stop();
+            configFileView.writeAdapter();
         }
+    }
 
-        // Convert value to correct type using JSON.parse when safe
-        let convertedValue = value;
-        if (typeof value === "string") {
-            let trimmed = value.trim();
-            if (trimmed === "true" || trimmed === "false" || !isNaN(Number(trimmed))) {
-                try {
-                    convertedValue = JSON.parse(trimmed);
-                } catch (e) {
-                    convertedValue = value;
-                }
-            }
+    // The error text for a file that is not usable, or "" when it is. JsonAdapter reads only a JSON
+    // object and keeps its old values for anything else, so [] or null count as errors too.
+    function errorOf(text) {
+        try {
+            const parsed = JSON.parse(text);
+            if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
+                return "the top level must be a JSON object";
+            return "";
+        } catch (error) {
+            return error.message || "the file is not valid JSON";
         }
+    }
 
-        obj[keys[keys.length - 1]] = convertedValue;
+    // Same 100 ms debounce as the reload and write timers in Persistent.qml.
+    Timer {
+        id: reloadTimer
+        interval: 100
+        repeat: false
+        onTriggered: configFileView.reload()
+    }
+
+    Timer {
+        id: writeTimer
+        interval: 100
+        repeat: false
+        onTriggered: {
+            if (root._canWrite)
+                configFileView.writeAdapter();
+        }
     }
 
     FileView {
+        id: configFileView
         path: root.filePath
         watchChanges: true
-        onFileChanged: reload()
-        onAdapterUpdated: writeAdapter()
-        onLoaded: root.ready = true
+        onFileChanged: reloadTimer.restart()
+        onAdapterUpdated: writeTimer.restart()
+        onLoaded: {
+            const message = root.errorOf(text());
+            // The text goes in before the file turns invalid, so the toast is created with its message;
+            // on a good load it is cleared after the file turns valid, so the toast never shows it empty.
+            if (message !== "") {
+                root._parseError = message;
+                root._fileValid = false;
+            } else {
+                root._fileValid = true;
+                root._parseError = "";
+            }
+            root.ready = true;
+        }
         onLoadFailed: error => {
             if (error == FileViewError.FileNotFound) {
+                root._fileValid = true;
+                root._parseError = "";
                 writeAdapter();
             }
         }

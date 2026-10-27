@@ -19,7 +19,7 @@ ContentPage {
             placeholderText: Translation.tr("User agent (for services that require it)")
             text: Config.options.networking.userAgent
             wrapMode: TextEdit.Wrap
-            onTextChanged: {
+            onEditingFinished: {
                 Config.options.networking.userAgent = text;
             }
         }
@@ -58,7 +58,7 @@ ContentPage {
             placeholderText: Translation.tr("Default sound name or absolute file path")
             text: Config.options.notifications.sounds.defaultSound
             wrapMode: TextEdit.Wrap
-            onTextChanged: {
+            onEditingFinished: {
                 Config.options.notifications.sounds.defaultSound = text;
             }
         }
@@ -76,7 +76,7 @@ ContentPage {
             placeholderText: Translation.tr("[\n  {\"desktopEntry\": \"discord\", \"sound\": \"message-new-instant\"}\n]")
             text: JSON.stringify(Config.options.notifications.sounds.overrides, null, 2)
             wrapMode: TextEdit.Wrap
-            onTextChanged: {
+            onEditingFinished: {
                 try {
                     const parsed = JSON.parse(text);
                     if (Array.isArray(parsed)) {
@@ -119,7 +119,7 @@ ContentPage {
                     placeholderText: Translation.tr("Action")
                     text: Config.options.search.prefix.action
                     wrapMode: TextEdit.Wrap
-                    onTextChanged: {
+                    onEditingFinished: {
                         Config.options.search.prefix.action = text;
                     }
                 }
@@ -128,7 +128,7 @@ ContentPage {
                     placeholderText: Translation.tr("Clipboard")
                     text: Config.options.search.prefix.clipboard
                     wrapMode: TextEdit.Wrap
-                    onTextChanged: {
+                    onEditingFinished: {
                         Config.options.search.prefix.clipboard = text;
                     }
                 }
@@ -137,7 +137,7 @@ ContentPage {
                     placeholderText: Translation.tr("Emojis")
                     text: Config.options.search.prefix.emojis
                     wrapMode: TextEdit.Wrap
-                    onTextChanged: {
+                    onEditingFinished: {
                         Config.options.search.prefix.emojis = text;
                     }
                 }
@@ -150,7 +150,7 @@ ContentPage {
                     placeholderText: Translation.tr("Math")
                     text: Config.options.search.prefix.math
                     wrapMode: TextEdit.Wrap
-                    onTextChanged: {
+                    onEditingFinished: {
                         Config.options.search.prefix.math = text;
                     }
                 }
@@ -159,7 +159,7 @@ ContentPage {
                     placeholderText: Translation.tr("Shell command")
                     text: Config.options.search.prefix.shellCommand
                     wrapMode: TextEdit.Wrap
-                    onTextChanged: {
+                    onEditingFinished: {
                         Config.options.search.prefix.shellCommand = text;
                     }
                 }
@@ -168,7 +168,7 @@ ContentPage {
                     placeholderText: Translation.tr("Web search")
                     text: Config.options.search.prefix.webSearch
                     wrapMode: TextEdit.Wrap
-                    onTextChanged: {
+                    onEditingFinished: {
                         Config.options.search.prefix.webSearch = text;
                     }
                 }
@@ -181,7 +181,7 @@ ContentPage {
                 placeholderText: Translation.tr("Base URL")
                 text: Config.options.search.engineBaseUrl
                 wrapMode: TextEdit.Wrap
-                onTextChanged: {
+                onEditingFinished: {
                     Config.options.search.engineBaseUrl = text;
                 }
             }

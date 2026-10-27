@@ -194,6 +194,10 @@ Item { // Bar content region
                     Layout.fillWidth: true
                 }
 
+                AxonDownIndicator {
+                    Layout.alignment: Qt.AlignVCenter
+                }
+
                 RecordingIndicator {
                     Layout.alignment: Qt.AlignVCenter
                 }

@@ -25,3 +25,8 @@
 
 # Hook unit tests live next to the hook sources but never deploy.
 .config/claude-hooks/tests
+
+# axon writes axon.toml itself (config.set, config.unset) and hand edits stay local.
+.config/axon/axon.toml
+# axon's machine data, including the deploy clone the bootstrap and sync scripts build from.
+.local/share/axon

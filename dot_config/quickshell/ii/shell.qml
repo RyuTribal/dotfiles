@@ -68,6 +68,7 @@ ShellRoot {
     LazyLoader { active: enableBar && Config.ready && !Config.options.bar.vertical; component: Bar {} }
     LazyLoader { active: enableBackground; component: Background {} }
     LazyLoader { active: enableCheatsheet; component: Cheatsheet {} }
+    LazyLoader { active: true; component: ConfigErrorPopup {} }
     LazyLoader { active: enableDock && Config.options.dock.enable; component: Dock {} }
     LazyLoader { active: enableLock; component: Lock {} }
     LazyLoader { active: enableMediaControls; component: MediaControls {} }

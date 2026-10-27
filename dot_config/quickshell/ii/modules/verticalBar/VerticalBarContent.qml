@@ -231,6 +231,20 @@ Item { // Bar content region
                     property real realSpacing: 6
                     spacing: 0
 
+                    Revealer { // axon-down icon; the vertical bar has no popup for it
+                        vertical: true
+                        reveal: Backend.downShown
+                        Layout.fillWidth: true
+                        Layout.bottomMargin: reveal ? indicatorsColumnLayout.realSpacing : 0
+                        Behavior on Layout.bottomMargin {
+                            animation: Appearance.animation.elementMoveFast.numberAnimation.createObject(this)
+                        }
+                        MaterialSymbol {
+                            text: "link_off"
+                            iconSize: Appearance.font.pixelSize.larger
+                            color: rightSidebarButton.colText
+                        }
+                    }
                     Revealer {
                         vertical: true
                         reveal: Audio.sink?.audio?.muted ?? false

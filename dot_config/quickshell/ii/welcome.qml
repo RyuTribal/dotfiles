@@ -27,6 +27,8 @@ ApplicationWindow {
     visible: true
     onClosing: {
         Quickshell.execDetached(["notify-send", Translation.tr("Welcome app"), Translation.tr("Enjoy! You can reopen the welcome app any time with <tt>Super+Shift+Alt+/</tt>. To open the settings app, hit <tt>Super+I</tt>"), "-a", "Shell"]);
+        contentItem.forceActiveFocus(); // ends a field edit so its editingFinished fires
+        Config.flush();
         Qt.quit();
     }
     title: Translation.tr("illogical-impulse Welcome")

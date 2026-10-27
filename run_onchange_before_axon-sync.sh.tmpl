@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Keeps axon on the commit these dotfiles were cut over with. chezmoi runs it before it writes any
+# file, and again each time the pin in .chezmoidata/axon.toml changes.
+set -euo pipefail
+{{ if not (regexMatch "^[0-9a-f]{40}$" .axon.rev) }}{{ fail "axon pin is not a full 40-hex commit" }}{{ end }}
+pin={{ .axon.rev | squote }}
+repo="$HOME/.local/share/axon/deploy"   # deploy clone, never the development checkout in ~/programming/axon
+repo_url="git@github.com:RyuTribal/axon.git"   # private, over SSH (ledger §13 A10)
+axon="$HOME/.local/bin/axon"
+if [[ ! $pin =~ ^[0-9a-f]{40}$ ]]; then
+    echo "axon sync: the pin in .chezmoidata/axon.toml is not a full commit: $pin" >&2
+    exit 1
+fi
+
+# No axon yet: install-axon.sh, which runs right after this script, installs the pinned commit.
+[ -x "$axon" ] || exit 0
+read -r _ _ installed < <("$axon" version) || installed=""
+[ "$installed" = "$pin" ] && exit 0
+
+# axon was installed from the development checkout, so the deploy clone may not exist yet: create it the way the bootstrap does.
+if [ ! -d "$repo/.git" ]; then
+    mkdir -p "$(dirname "$repo")"
+    if ! git clone "$repo_url" "$repo"; then
+        echo "axon sync: could not clone $repo_url." >&2
+        echo "Clone axon into $repo by hand, then run chezmoi apply again." >&2
+        exit 1
+    fi
+fi
+dirty=$(git -C "$repo" status --porcelain) || { echo "axon sync: $repo is not a git checkout." >&2; exit 1; }
+if [ -n "$dirty" ]; then
+    echo "axon sync: axon is at ${installed:-an unknown commit}, these dotfiles want $pin, and $repo has local changes." >&2
+    echo "Commit or stash them, then run chezmoi apply again." >&2
+    exit 1
+fi
+if ! { git -C "$repo" fetch --quiet origin && git -C "$repo" checkout --quiet --detach "$pin"; }; then
+    echo "axon sync: could not fetch or check out $pin; run chezmoi apply again when the remote is reachable." >&2
+    exit 1
+fi
+exec "$repo/install.sh"

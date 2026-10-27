@@ -31,7 +31,9 @@ ApplicationWindow {
     property real contentPadding: 8
     visible: true
     onClosing: {
-        Qt.quit()
+        contentItem.forceActiveFocus(); // ends a field edit so its editingFinished fires
+        Config.flush();
+        Qt.quit();
     }
     title: Translation.tr("Shell conflicts killer")
 
@@ -91,8 +93,9 @@ ApplicationWindow {
                 }
                 onClicked: {
                     Quickshell.execDetached(["killall", ...conflictGroup.programs])
-                    conflictGroup.visible = false
+                    // Before hiding: hiding the last group closes the window, and Config must be set by then.
                     conflictGroup.alwaysSelected()
+                    conflictGroup.visible = false
                 }
             }
             RippleButton {

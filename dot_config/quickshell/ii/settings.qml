@@ -64,10 +64,15 @@ ApplicationWindow {
     property int currentPage: 0
 
     visible: true
-    onClosing: Qt.quit()
+    onClosing: {
+        contentItem.forceActiveFocus(); // ends a field edit so its editingFinished fires
+        Config.flush();
+        Qt.quit();
+    }
     title: "illogical-impulse Settings"
 
     Component.onCompleted: {
+        Backend.clientName = "ii-settings"
         MaterialThemeLoader.reapplyTheme()
     }
 

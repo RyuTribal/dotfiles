@@ -12,6 +12,7 @@
 # temporary module, ShellUnderTest, each run. tst_system_clients.qml loads SystemInfo.qml and
 # DateTime.qml from the same module; DateTime's Config comes from fakes/qs/modules/common.
 # tst_config_error_toast.qml loads ConfigErrorToast.qml from the same module, with the same Config.
+# tst_favicon_cache.qml loads FaviconCache.qml from it too, over fakes/Quickshell/Io/Process.qml.
 # tst_config.qml tests the real modules/common/Config.qml, so it gets its own module, ConfigUnderTest:
 # Config.qml sits there beside fakes/Directories.qml, over the stand-in FileView of fakes/Quickshell/Io.
 
@@ -25,7 +26,7 @@ trap 'rm -rf "$imports"' EXIT
 module="$imports/ShellUnderTest"
 mkdir "$module"
 cp "$services/BackendTopic.qml" "$services/BackendList.qml" "$services/SystemInfo.qml" "$services/DateTime.qml" \
-    "$services/backend.js" "$here/../../ConfigErrorToast.qml" "$module/"
+    "$services/FaviconCache.qml" "$services/backend.js" "$here/../../ConfigErrorToast.qml" "$module/"
 cp "$here/fakes/Backend.qml" "$module/"
 cat > "$module/qmldir" <<'EOF'
 module ShellUnderTest
@@ -35,6 +36,7 @@ BackendList 1.0 BackendList.qml
 ConfigErrorToast 1.0 ConfigErrorToast.qml
 singleton SystemInfo 1.0 SystemInfo.qml
 singleton DateTime 1.0 DateTime.qml
+singleton FaviconCache 1.0 FaviconCache.qml
 EOF
 
 config_module="$imports/ConfigUnderTest"
@@ -46,8 +48,29 @@ singleton Config 1.0 Config.qml
 singleton Directories 1.0 Directories.qml
 EOF
 
+# tst_spin_box.qml loads the real StyledSpinBox.qml and StyledTextInput.qml from SpinBoxUnderTest, beside
+# fakes/spinbox/MaterialSymbol.qml, with the real ColorUtils.qml as qs.modules.common.functions and
+# Appearance from fakes/qs/modules/common.
+spinbox_module="$imports/SpinBoxUnderTest"
+mkdir "$spinbox_module"
+cp "$here/../../modules/common/widgets/StyledSpinBox.qml" "$here/../../modules/common/widgets/StyledTextInput.qml" \
+    "$here/fakes/spinbox/MaterialSymbol.qml" "$spinbox_module/"
+cat > "$spinbox_module/qmldir" <<'EOF'
+module SpinBoxUnderTest
+StyledSpinBox 1.0 StyledSpinBox.qml
+StyledTextInput 1.0 StyledTextInput.qml
+MaterialSymbol 1.0 MaterialSymbol.qml
+EOF
+functions_module="$imports/qs/modules/common/functions"
+mkdir -p "$functions_module"
+cp "$here/../../modules/common/functions/ColorUtils.qml" "$functions_module/"
+cat > "$functions_module/qmldir" <<'EOF'
+module qs.modules.common.functions
+singleton ColorUtils 1.0 ColorUtils.qml
+EOF
+
 status=0
-for test in tst_backend.qml tst_backend_connection.qml tst_backend_behaviour.qml tst_system_clients.qml tst_config_error_toast.qml tst_config.qml; do
+for test in tst_backend.qml tst_backend_connection.qml tst_backend_behaviour.qml tst_system_clients.qml tst_config_error_toast.qml tst_config.qml tst_spin_box.qml tst_favicon_cache.qml; do
     QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -import "$here/fakes" -import "$imports" \
         -input "$here/$test" || status=1
 done

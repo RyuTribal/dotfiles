@@ -197,18 +197,18 @@ TestCase {
             clock_changed_at: null
         };
         sendTimes(times);
-        const afterResume = DateTime.minuteTicks;
+        const afterResume = DateTime._ticks;
         sendTimes(times);
-        compare(DateTime.minuteTicks, afterResume, "an unchanged snapshot must not re-arm");
+        compare(DateTime._ticks, afterResume, "an unchanged snapshot must not re-arm");
         times.clock_changed_at = 6;
         sendTimes(times);
-        compare(DateTime.minuteTicks, afterResume + 1, "a clock step must re-arm");
+        compare(DateTime._ticks, afterResume + 1, "a clock step must re-arm");
         times.boot_at = 1000;
         sendTimes(times);
-        compare(DateTime.minuteTicks, afterResume + 1, "a boot_at change alone must not re-arm");
+        compare(DateTime._ticks, afterResume + 1, "a boot_at change alone must not re-arm");
         times.resumed_at = 7;
         sendTimes(times);
-        compare(DateTime.minuteTicks, afterResume + 2, "a second resume must re-arm");
+        compare(DateTime._ticks, afterResume + 2, "a second resume must re-arm");
         compare(DateTime.time, Qt.locale().toString(DateTime.clock.date, "hh:mm"));
     }
 }

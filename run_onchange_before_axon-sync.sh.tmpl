@@ -12,7 +12,12 @@ if [[ ! $pin =~ ^[0-9a-f]{40}$ ]]; then
     exit 1
 fi
 
-# No axon yet: install-axon.sh, which runs right after this script, installs the pinned commit.
+# No axon yet: install-axon.sh, which runs right after this script, installs the pinned commit. It runs once
+# per machine, so after removing axon by hand run ~/.local/share/axon/deploy/install.sh, or let chezmoi run it
+# again by forgetting its state (the key is the SHA256 of the rendered script; deleting the whole scriptState
+# bucket would re-run every run_once script):
+#   chezmoi state delete --bucket=scriptState --key="$(chezmoi execute-template \
+#       < "$(chezmoi source-path)/run_once_before_install-axon.sh.tmpl" | sha256sum | cut -d' ' -f1)"
 [ -x "$axon" ] || exit 0
 read -r _ _ installed < <("$axon" version) || installed=""
 [ "$installed" = "$pin" ] && exit 0

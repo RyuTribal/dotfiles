@@ -19,15 +19,26 @@ Singleton {
 
     // A write goes out only while the file is valid and no reload is pending, so a hand save made in the
     // ~100 ms before a shell-side change is read back instead of being overwritten. A shell-side change
-    // made in that same window is lost; the hand save wins.
+    // made in that same window is lost; the hand save wins. Our own write is not a hand save and arms no
+    // reload (see _ownWrite).
     readonly property bool _canWrite: _fileValid && !reloadTimer.running
+
+    // True from our own writeAdapter() until FileView reports saved or saveFailed. The write replaces
+    // config.json (QSaveFile renames over it), so FileView sends a fileChanged before saved; that one is
+    // ignored. When the save completes FileView builds a new watcher, so any change after it is foreign.
+    property bool _ownWrite: false
+
+    function _write() {
+        root._ownWrite = true;
+        configFileView.writeAdapter();
+    }
 
     // Writes a change that is still waiting in the debounce now. The settings and conflict windows call
     // it before Qt.quit(), which would otherwise drop the last 100 ms of edits.
     function flush() {
         if (writeTimer.running && root._canWrite) {
             writeTimer.stop();
-            configFileView.writeAdapter();
+            root._write();
         }
     }
 
@@ -58,7 +69,7 @@ Singleton {
         repeat: false
         onTriggered: {
             if (root._canWrite)
-                configFileView.writeAdapter();
+                root._write();
         }
     }
 
@@ -66,7 +77,12 @@ Singleton {
         id: configFileView
         path: root.filePath
         watchChanges: true
-        onFileChanged: reloadTimer.restart()
+        onFileChanged: {
+            if (!root._ownWrite)
+                reloadTimer.restart();
+        }
+        onSaved: root._ownWrite = false
+        onSaveFailed: root._ownWrite = false
         onAdapterUpdated: writeTimer.restart()
         onLoaded: {
             const message = root.errorOf(text());
@@ -85,7 +101,7 @@ Singleton {
             if (error == FileViewError.FileNotFound) {
                 root._fileValid = true;
                 root._parseError = "";
-                writeAdapter();
+                root._write();
             }
         }
 

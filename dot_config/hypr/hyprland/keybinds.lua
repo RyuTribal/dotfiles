@@ -48,7 +48,7 @@ hl.bind("XF86AudioMicMute", hl.dsp.exec_cmd("wpctl set-mute @DEFAULT_SOURCE@ tog
 hl.bind("SUPER+ALT + M", hl.dsp.exec_cmd("wpctl set-mute @DEFAULT_SOURCE@ toggle"), { locked = true, description = "Toggle mic" }) -- [hidden]
 hl.bind("CTRL+SUPER + T", hl.dsp.global("quickshell:wallpaperSelectorToggle"), { description = "Toggle wallpaper selector" }) -- Wallpaper selector
 hl.bind("CTRL+SUPER + T", hl.dsp.exec_cmd("qs -c $qsConfig ipc call TEST_ALIVE || ~/.config/quickshell/$qsConfig/scripts/colors/switchwall.sh"), { description = "Change wallpaper" }) -- [hidden] Change wallpaper (fallback)
-hl.bind("CTRL+SUPER + R", hl.dsp.exec_cmd("killall ags agsv1 gjs ydotool qs quickshell; qs -c $qsConfig &")) -- Restart widgets
+hl.bind("CTRL+SUPER + R", hl.dsp.exec_cmd("killall ags agsv1 gjs qs quickshell; qs -c $qsConfig &")) -- Restart widgets
 
 --#! Utilities
 -- Screenshot, Record, OCR, Color picker, Clipboard history

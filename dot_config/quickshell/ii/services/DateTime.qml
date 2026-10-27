@@ -35,12 +35,11 @@ Singleton {
     readonly property string collapsedCalendarFormat: Qt.locale().toString(_minute, "dd MMMM yyyy")
     readonly property string uptime: _uptime // "--" until axon knows the boot instant
 
-    // Counts re-arms of the minute timer. Tests read it to see that a resume or a clock step re-arms it.
-    readonly property int minuteTicks: _ticks
-
     readonly property int _minuteMs: 60000
 
     property date _minute: new Date(0)
+    // Counts re-arms of the minute timer. Only tst_system_clients.qml reads it, to see that a resume or a
+    // clock step re-arms the timer; it is private so the facade other cutovers copy has no test counter.
     property int _ticks: 0
     property string _uptime: "--"
     property double _bootAt: NaN

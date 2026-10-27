@@ -30,14 +30,21 @@ SpinBox {
             color: Appearance.colors.colOnLayer2
             font.pixelSize: Appearance.font.pixelSize.small
             validator: root.validator
-            onTextChanged: {
-                root.value = parseFloat(text);
-            }
-            // Qt emits valueModified only for its own buttons, wheel and arrow keys, not when this
-            // field sets `value`, so typed input emits it here. textEdited fires for user edits only,
-            // never when the `text` binding follows `value`.
+            // True from the first typed key until the entry is finished, so leaving the field without
+            // typing modifies nothing.
+            property bool typed: false
+            // Qt emits valueModified only for its own buttons, wheel and arrow keys, not when this field
+            // sets `value`. Typing previews each value at once, and the typed entry is one modification
+            // when it is finished (Return, Enter or leaving the field), so a typed 500 is one write, not
+            // 5, 50 and 500. textEdited fires for user edits only, never when `text` follows `value`.
             onTextEdited: {
                 root.value = parseFloat(text);
+                typed = true;
+            }
+            onEditingFinished: {
+                if (!typed)
+                    return;
+                typed = false;
                 root.valueModified();
             }
         }

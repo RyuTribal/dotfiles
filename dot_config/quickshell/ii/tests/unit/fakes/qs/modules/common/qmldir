@@ -1,2 +1,4 @@
 module qs.modules.common
 singleton Config 1.0 Config.qml
+singleton Appearance 1.0 Appearance.qml
+singleton Directories 1.0 Directories.qml

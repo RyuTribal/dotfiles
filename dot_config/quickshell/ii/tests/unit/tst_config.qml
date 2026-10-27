@@ -18,6 +18,7 @@ TestCase {
         wait(150); // lets the debounce timers of an earlier test run out
         view.content = "{}";
         view.loaded();
+        view.saved(); // ends a write an earlier test left in flight, as the real FileView always does
         view.writes = 0;
         view.reloads = 0;
     }
@@ -100,6 +101,38 @@ TestCase {
         Config.flush();
         wait(150);
         compare(view.writes, 0);
+    }
+
+    // Our own write replaces config.json (QSaveFile renames over it), and the real FileView reports that as a
+    // fileChanged about 3 ms later, before saved. It is not a hand save: it must not reload the file, and a
+    // change made right after the write must still be written.
+    function test_ownWriteIsNotReadBackAndTheNextChangeIsWritten() {
+        view.adapterUpdated();
+        tryCompare(view, "writes", 1);
+        view.adapterUpdated(); // a second change at once after the write
+        wait(3);
+        view.fileChanged(); // the write's own rename
+        view.saved();
+        tryCompare(view, "writes", 2);
+        wait(150);
+        compare(view.reloads, 0);
+    }
+
+    function test_aHandSaveAfterTheOwnWriteFinishedIsReadBack() {
+        view.adapterUpdated();
+        tryCompare(view, "writes", 1);
+        view.fileChanged();
+        view.saved();
+        view.fileChanged(); // a hand save once the write is done
+        tryCompare(view, "reloads", 1);
+    }
+
+    function test_aFailedWriteDoesNotHideTheNextHandSave() {
+        view.adapterUpdated();
+        tryCompare(view, "writes", 1);
+        view.saveFailed(1);
+        view.fileChanged();
+        tryCompare(view, "reloads", 1);
     }
 
     function test_aPendingReloadHoldsBackTheWrite() {

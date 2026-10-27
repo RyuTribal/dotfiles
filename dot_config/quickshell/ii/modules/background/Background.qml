@@ -193,11 +193,9 @@ Variants {
                 }
                 return result;
             }
-            property real valueY: 0.5
             property real effectiveValueX: Math.max(0, Math.min(1, valueX))
-            property real effectiveValueY: Math.max(0, Math.min(1, valueY))
             x: -(bgRoot.movableXSpace) - (effectiveValueX - 0.5) * 2 * bgRoot.movableXSpace
-            y: -(bgRoot.movableYSpace) - (effectiveValueY - 0.5) * 2 * bgRoot.movableYSpace
+            y: -bgRoot.movableYSpace
             source: bgRoot.wallpaperPath
             fillMode: Image.PreserveAspectCrop
             Behavior on x {

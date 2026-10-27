@@ -25,6 +25,9 @@
 
 # Hook unit tests live next to the hook sources but never deploy.
 .config/claude-hooks/tests
+# The shell's tests and their stand-in Quickshell modules (one qmldir declares `module Quickshell`) run from
+# this source tree and never deploy next to the running shell.
+.config/quickshell/ii/tests
 
 # axon writes axon.toml itself (config.set, config.unset) and hand edits stay local.
 .config/axon/axon.toml

@@ -25,8 +25,10 @@ Singleton {
     // Optional: pass a font filter regex like --font "Symbols Nerd"
     property string fontRegex: ""
 
-    // Data (one string per line)
-    property list<var> list: []
+    // Data (one string per line). A plain JS array, not list<var>: QML rebuilds a list<var>
+    // property whole on every element read from JS, which makes preparedEntries' list.map
+    // quadratic (about 6 s for 11k glyphs).
+    property var list: []
     property bool loading: false
     property string lastError: ""
 
@@ -73,7 +75,6 @@ Singleton {
         glyphProc.running = true;
         loading = true;
         lastError = "";
-        glyphProcBuffer = "";
     }
 
     // Back-compat helper: if you still keep a legacy file with ### DATA ###,
@@ -88,16 +89,13 @@ Singleton {
         root.list = lines.slice(i + 1).map(l => l.trim()).filter(Boolean);
     }
 
-    // Internal: accumulate stdout and commit to `list`
-    property string glyphProcBuffer: ""
-
     Process {
         id: glyphProc
         command: [glyphScriptExecPath, "--dump"] // will be overwritten in load()
-        stdout: SplitParser {
-            onRead: data => {
-                root.glyphProcBuffer += data + "\n";
-            }
+        // Collected in C++: appending each line to a string property from JS is quadratic
+        // (about 4 s for 11k lines).
+        stdout: StdioCollector {
+            id: glyphOut
         }
         onExited: code => {
             root.loading = false;
@@ -106,9 +104,8 @@ Singleton {
                 console.warn(root.lastError);
                 return;
             }
-            const lines = root.glyphProcBuffer.split("\n").map(l => l.trim()).filter(l => l.length > 0);
+            const lines = glyphOut.text.split("\n").map(l => l.trim()).filter(l => l.length > 0);
             root.list = lines;
-            root.glyphProcBuffer = "";
         }
     }
 

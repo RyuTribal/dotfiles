@@ -184,6 +184,49 @@ TestCase {
         compare(field().text, "3300");
     }
 
+    function test_anEntryEndingAsTheValueBeforeItWritesNothing_data() {
+        return [
+            {
+                tag: "emptied",
+                keys: [Qt.Key_Backspace]
+            },
+            {
+                tag: "the same number",
+                keys: "3000"
+            }
+        ];
+    }
+
+    // Typing drops the value's binding to the topic, and an entry that ends as the value from
+    // before it writes nothing, so no reply binds it again. The control follows the topic all the
+    // same.
+    function test_anEntryEndingAsTheValueBeforeItWritesNothing(data) {
+        typeEntry(data.keys);
+        compare(Backend.calls.length, 0);
+        compare(field().text, "3000");
+        config(4000);
+        compare(field().text, "4000");
+    }
+
+    // A step's write is pending when an entry ends as the value it shows. That write stays shown
+    // without the topic's older value coming back, and its reply and snapshot bind the control
+    // again.
+    function test_anUnchangedEntryKeepsAPendingWriteShown() {
+        field().forceActiveFocus();
+        keyClick(Qt.Key_Up);
+        compare(lastCall().args.value, 3100);
+        typeDigits("3100");
+        const shown = shownWhile(() => {
+            keyClick(Qt.Key_Return);
+            accept();
+            config(3100);
+        });
+        compare(shown, []);
+        compare(Backend.calls.length, 1);
+        config(3200);
+        compare(field().text, "3200");
+    }
+
     // Someone else set the key before axon published this control's write: axon's value shows.
     function test_anotherWriteToTheKeyShows() {
         typeEntry("2500");

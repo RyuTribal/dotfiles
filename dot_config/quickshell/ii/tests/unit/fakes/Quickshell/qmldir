@@ -1,3 +1,7 @@
 module Quickshell
 singleton Quickshell 1.0 Quickshell.qml
 Singleton 1.0 Singleton.qml
+Scope 1.0 Scope.qml
+LazyLoader 1.0 LazyLoader.qml
+FloatingWindow 1.0 FloatingWindow.qml
+ScriptModel 1.0 ScriptModel.qml

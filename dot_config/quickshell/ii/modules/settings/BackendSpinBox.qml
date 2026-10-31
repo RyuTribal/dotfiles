@@ -9,8 +9,10 @@ import QtQuick
  * the user picks with `config.set`. A written value stays shown until the
  * topic shows it, so the old value never comes back for the moment between
  * axon's reply and its next snapshot. A refused write snaps back to the topic
- * at once, and the reply's error shows beside it. Until the first `config`
- * snapshot it shows "--" and "axon unreachable", never a default.
+ * at once, and the reply's error shows beside it. An entry typed back to the
+ * value it started from writes nothing: the control follows the topic again,
+ * or keeps showing a write that still waits for its reply. Until the first
+ * `config` snapshot it shows "--" and "axon unreachable", never a default.
  */
 ConfigSpinBox {
     id: root
@@ -27,6 +29,13 @@ ConfigSpinBox {
     value: root._topicValue()
     textFromValue: number => AxonConfig.known ? String(number) : "--"
     onValueModified: root._write(root.value)
+    // Typing drops the value's binding to the topic. An entry that ends unchanged writes nothing,
+    // so no reply comes to bind it again: this handler does. While a write is pending the control
+    // keeps showing that write, and its reply binds it.
+    onEntryEndedUnchanged: {
+        if (root._writes.length === 0)
+            root._followTopic();
+    }
 
     // `from` stands in until the first snapshot, shown as "--".
     function _topicValue() {

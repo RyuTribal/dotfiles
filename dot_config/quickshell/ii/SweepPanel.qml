@@ -12,11 +12,32 @@ Scope {
     id: rootScope
 
     property bool panelVisible: false
+    // True once the panel's window drew a frame since it opened. A toggle before that closes
+    // nothing anyone saw: it is a second press that waited behind a busy shell, which then runs
+    // both presses back to back (ruling, 2026-10-31). hide and closing the window still close it.
+    property bool panelShown: false
     property bool confirming: false
+
+    onPanelVisibleChanged: {
+        if (!panelVisible)
+            panelShown = false;
+    }
+
+    // `window` drew a frame. Frames arrive queued from the render thread, so one a window drew just
+    // before a close can arrive after it: only a frame of the loader's current window shows the
+    // panel (a closed panel has none).
+    function frameDrawn(window): void {
+        if (loader.item === window)
+            panelShown = true;
+    }
 
     IpcHandler {
         target: "sweep"
         function toggle(): void {
+            if (rootScope.panelVisible && !rootScope.panelShown) {
+                console.info("sweep: toggle ignored, the panel has not shown yet");
+                return;
+            }
             rootScope.panelVisible = !rootScope.panelVisible;
         }
         function show(): void { rootScope.panelVisible = true; }
@@ -31,10 +52,12 @@ Scope {
     }
 
     LazyLoader {
+        id: loader
         active: rootScope.panelVisible
 
         FloatingWindow {
             id: panel
+            objectName: "panelWindow" // the tests find the window and buttons by these names
             title: "sweep"
             implicitWidth: 760
             implicitHeight: 540
@@ -42,7 +65,17 @@ Scope {
             visible: true
             onVisibleChanged: if (!visible) rootScope.panelVisible = false
 
+            // The window's first frame since the panel opened shows it.
+            Connections {
+                target: body.Window.window
+                enabled: !rootScope.panelShown
+                function onFrameSwapped() {
+                    rootScope.frameDrawn(panel);
+                }
+            }
+
             ColumnLayout {
+                id: body
                 anchors.fill: parent
                 anchors.margins: 18
                 spacing: 10
@@ -81,6 +114,7 @@ Scope {
                         onClicked: Sweep.up()
                     }
                     SweepButton {
+                        objectName: "rescanButton"
                         label: "rescan"
                         onClicked: Sweep.scan(Sweep.scanPath)
                     }
@@ -91,6 +125,7 @@ Scope {
                     }
                     Item { Layout.fillWidth: true }
                     SweepButton {
+                        objectName: "deleteButton"
                         label: Sweep.stagedCount > 0
                             ? "delete " + Sweep.stagedCount + " (" + Sweep.stagedHuman + ")"
                             : "nothing staged"
@@ -255,6 +290,7 @@ Scope {
                             Layout.alignment: Qt.AlignHCenter
                             spacing: 12
                             SweepButton {
+                                objectName: "cancelButton"
                                 label: "cancel"
                                 onClicked: rootScope.confirming = false
                             }
@@ -268,6 +304,18 @@ Scope {
                             }
                         }
                     }
+                }
+            }
+
+            // Every click in the panel dismisses this view's failure (section 33.0). This lies over
+            // everything else, takes the press first and passes it on, so the control under it
+            // still gets its click.
+            MouseArea {
+                anchors.fill: parent
+                acceptedButtons: Qt.AllButtons
+                onPressed: mouse => {
+                    Sweep.dismissFailure();
+                    mouse.accepted = false;
                 }
             }
         }

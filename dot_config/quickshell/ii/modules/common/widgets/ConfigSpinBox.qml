@@ -12,10 +12,14 @@ RowLayout {
     property alias from: spinBoxWidget.from
     property alias to: spinBoxWidget.to
     property alias textFromValue: spinBoxWidget.textFromValue
-    // Emitted only when the user changes the value with the buttons, the wheel or the arrow keys, or
-    // finishes a typed entry (Return, Enter or leaving the field), never when `value` is set from code
-    // or a binding. A typed number is one emission, however many keys it took.
+    // Emitted only when the user changes the value with the buttons, the wheel or the arrow keys,
+    // or finishes a typed entry (Return, Enter or leaving the field) as another value, never when
+    // `value` is set from code or a binding. A typed number is one emission, however many keys it
+    // took.
     signal valueModified
+    // Emitted instead when a typed entry ends as the value from before it (StyledSpinBox's
+    // entryEndedUnchanged).
+    signal entryEndedUnchanged
     spacing: 10
     Layout.leftMargin: 8
     Layout.rightMargin: 8
@@ -39,5 +43,6 @@ RowLayout {
         Layout.fillWidth: false
         value: root.value
         onValueModified: root.valueModified()
+        onEntryEndedUnchanged: root.entryEndedUnchanged()
     }
 }

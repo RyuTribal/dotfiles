@@ -23,6 +23,12 @@ Singleton {
         active: root.panelOpen
         onSnapshot: data => root._onSnapshot(data)
         onReset: root._onReset()
+        // A subscription's first frame syncs the topic only after its snapshot was applied, so the
+        // auto-scan is checked again here.
+        onSyncedChanged: {
+            if (synced)
+                root._autoScanIfWanted();
+        }
     }
 
     readonly property bool scanning: _scanOp !== null
@@ -54,10 +60,14 @@ Singleton {
     property string _message: ""
     // The message of this view's own failed or refused call or op. The footer shows it over the
     // staged line, since a failed commit or restore_all can leave items staged, until the next
-    // click (every function the panel's buttons and rows call clears it) or scan (ruling,
-    // 2026-10-31).
+    // click in the panel (dismissFailure, and every function the panel's buttons and rows call
+    // clears it too) or scan (ruling, 2026-10-31).
     property string _failure: ""
     property bool _autoScanned: false // set by the auto-scan, so a failing scan does not run again and again
+    // True while the auto-scan's sweep.scan waits for its reply. axon lists a scan's op before it
+    // replies, so until then a new subscription's frame can be older than the scan, showing no tree and
+    // no op: a close keeps _autoScanned set, and the reply clears it if the panel is closed then.
+    property bool _autoScanReplyDue: false
     property var _followers: [] // { id, ended } per op this view started and waits for
     property var _entries: []
     property var _entryIndex: ({})
@@ -69,18 +79,22 @@ Singleton {
     readonly property bool _backendUp: Backend.up
     readonly property string _backendInstance: Backend.instance
 
-    // Scans `path`, restoring every staged item first. `done(op)` gets the op once it ended.
-    function scan(path, done) {
+    // Scans `path`, restoring every staged item first. `done(op)` gets the op once it ended, and
+    // `replied()` runs at the call's reply, whatever it says.
+    function scan(path, done, replied) {
         _message = "";
         _failure = "";
         Backend.call("sweep.scan", {
             path: path,
             restore: true
-        }, reply => root._follow(reply, op => {
+        }, reply => {
+            replied?.();
+            root._follow(reply, op => {
                 if (op.state === "failed")
                     root._fail(op.error.message);
                 done?.(op);
-            }));
+            });
+        });
     }
 
     function open(id) {
@@ -136,6 +150,11 @@ Singleton {
         listing.fetchMore();
     }
 
+    // The panel calls this on every click, also on one that calls nothing else here.
+    function dismissFailure() {
+        _failure = "";
+    }
+
     function human(bytes) {
         return S.human(bytes);
     }
@@ -150,9 +169,9 @@ Singleton {
         return false;
     }
 
-    // A failure of this view's own call or op: the status line and the footer show its message.
+    // A failure of this view's own call or op. The footer shows its message, and the status does not,
+    // so a failure is shown once and leaves no text behind once it is dismissed (section 33.0).
     function _fail(message) {
-        _message = message;
         _failure = message;
     }
 
@@ -234,19 +253,30 @@ Singleton {
     }
 
     // reset() fires before the new instance's first frame is applied: the status, ops and tree here are
-    // still the old instance's. So the auto-scan is checked once that frame is in, and the tree comes
-    // with the frame's snapshot. The listed node went at the new instance's hello.
+    // still the old instance's. So the auto-scan is checked once that frame is in, by
+    // topic.onSyncedChanged: a new instance arrives only after axon was down or the topic inactive, and
+    // both leave the topic unsynced until that frame. The tree comes with the frame's snapshot. The
+    // listed node went at the new instance's hello.
     function _onReset() {
         _dropFollowers();
         _autoScanned = false;
-        Qt.callLater(root._autoScanIfWanted);
     }
 
     function _autoScanIfWanted() {
-        if (!S.autoScanWanted(panelOpen, topic.status, _tree, _scanOp, _autoScanned))
+        if (!S.autoScanWanted(panelOpen, topic.synced, topic.status, _tree, _scanOp, _autoScanned))
             return;
         _autoScanned = true;
-        scan(scanPath, null);
+        _autoScanReplyDue = true;
+        scan(scanPath, null, root._autoScanReplied);
+    }
+
+    // A close while the auto-scan's reply was due left _autoScanned set. Once the reply is in, a new
+    // subscription's frame shows that scan's op or what it left, so a panel still closed clears it as
+    // the close would have. A reopened panel keeps it: that scan is its auto-scan.
+    function _autoScanReplied() {
+        _autoScanReplyDue = false;
+        if (!panelOpen)
+            _autoScanned = false;
     }
 
     // The listing's rows with their size for people. A row keeps its object while id and rev match, so
@@ -263,10 +293,11 @@ Singleton {
 
     on_ListingCurrentChanged: _applyEntries()
 
+    // Opening the panel checks no auto-scan: the topic is not synced yet, so what the view holds is
+    // from before it closed. The subscription's frame checks it (topic.onSyncedChanged). Closing it
+    // lets the next open scan again, unless the auto-scan's reply is still due (_autoScanReplyDue).
     onPanelOpenChanged: {
-        if (panelOpen)
-            _autoScanIfWanted();
-        else
+        if (!panelOpen && !_autoScanReplyDue)
             _autoScanned = false;
     }
 

@@ -162,7 +162,7 @@ TestCase {
                     message: "/root: Permission denied (os error 13)"
                 }
             })]);
-        compare(sweep.status, "/root: Permission denied (os error 13)");
+        compare(sweep.footer, "/root: Permission denied (os error 13)");
         frame(sweep, "ok", topicData(null), [op("sweep.scan-1", "sweep.scan", "failed", {
                 error: {
                     code: "permission_denied",
@@ -175,7 +175,14 @@ TestCase {
         sweep.panelOpen = false;
         compare(Backend.attachments, ["+sweep", "-sweep"]);
         sweep.panelOpen = true;
-        compare(callsOf("sweep.scan").length, 2, "closing cleared the flag; the held state shows nothing loaded");
+        compare(callsOf("sweep.scan").length, 1, "nothing on the held state before the subscription's frame");
+        frame(sweep, "ok", topicData(null), [op("sweep.scan-1", "sweep.scan", "failed", {
+                error: {
+                    code: "permission_denied",
+                    message: "/root: Permission denied (os error 13)"
+                }
+            })]);
+        compare(callsOf("sweep.scan").length, 2, "closing cleared the flag; the frame shows nothing loaded");
     }
 
     function test_reopenAfterReleaseScansFromTheFreshSnapshot() {
@@ -190,6 +197,100 @@ TestCase {
         compare(callsOf("sweep.scan").length, 1, "the fresh snapshot shows the release");
         compare(sweep.curId, "");
         compare(sweep.entries, []);
+    }
+
+    // The panel opened on a released tree and closed before a frame showed its auto-scan, and that
+    // scan then loaded a tree. At the reopen the view holds no tree and no running scan, which is not
+    // what axon has: it scans nothing until the subscription's frame, which brings that tree.
+    function test_aReopenScansNothingBeforeTheSubscriptionsFrame() {
+        const sweep = createTemporaryObject(sweepComponent, tc);
+        sweep.panelOpen = true;
+        frame(sweep, "ok", topicData(null));
+        compare(callsOf("sweep.scan").length, 1, "the auto-scan of the released tree");
+        sweep.panelOpen = false;
+        sweep.panelOpen = true;
+        compare(callsOf("sweep.scan").length, 1, "nothing scanned on the held state");
+        frame(sweep, "ok", topicData(tree(3, 1)), [op("sweep.scan-1", "sweep.scan", "done")]);
+        wait(20);
+        compare(callsOf("sweep.scan").length, 1, "the frame brings the tree that scan loaded");
+        compare(callsOf("sweep.list").map(call => call.args.node), ["3:0"]);
+        compare(sweep.curId, "3:0");
+    }
+
+    // axon lists a scan's op before it replies to sweep.scan, so a subscription made before the
+    // auto-scan's reply can get a frame older than the scan: no tree and no op. A close and a reopen
+    // in that time send no second sweep.scan, which axon would refuse while the first runs.
+    function test_aReopenBeforeTheAutoScansReplySendsNoSecondScan() {
+        const sweep = createTemporaryObject(sweepComponent, tc);
+        sweep.panelOpen = true;
+        frame(sweep, "ok", topicData(null));
+        compare(callsOf("sweep.scan").length, 1, "the auto-scan of the released tree");
+        sweep.panelOpen = false;
+        sweep.panelOpen = true;
+        frame(sweep, "ok", topicData(null));
+        wait(20);
+        compare(callsOf("sweep.scan").length, 1, "the frame is older than the scan");
+
+        replyOp(callsOf("sweep.scan")[0], "sweep.scan-1");
+        frame(sweep, "ok", topicData(null), [op("sweep.scan-1", "sweep.scan", "running")]);
+        verify(sweep.scanning);
+        frame(sweep, "ok", topicData(tree(3, 1)), [op("sweep.scan-1", "sweep.scan", "done")]);
+        compare(sweep.status, "ready");
+        compare(callsOf("sweep.scan").length, 1);
+
+        sweep.panelOpen = false;
+        sweep.panelOpen = true;
+        frame(sweep, "ok", topicData(null), [op("sweep.scan-1", "sweep.scan", "done")]);
+        compare(callsOf("sweep.scan").length, 2, "as before: a reopen on a released tree scans once");
+    }
+
+    // The reopened panel takes the auto-scan still waiting for its reply as its own: when that scan
+    // fails, the failure shows and nothing scans again.
+    function test_aReopenBeforeTheAutoScansReplyThenAFailureScansNoMore() {
+        const sweep = createTemporaryObject(sweepComponent, tc);
+        sweep.panelOpen = true;
+        frame(sweep, "ok", topicData(null));
+        sweep.panelOpen = false;
+        sweep.panelOpen = true;
+        frame(sweep, "ok", topicData(null));
+        replyOp(callsOf("sweep.scan")[0], "sweep.scan-1");
+        frame(sweep, "ok", topicData(null), [op("sweep.scan-1", "sweep.scan", "failed", {
+                error: {
+                    code: "permission_denied",
+                    message: "/root: Permission denied (os error 13)"
+                }
+            })]);
+        wait(20);
+        compare(sweep.footer, "/root: Permission denied (os error 13)");
+        compare(callsOf("sweep.scan").length, 1, "no second auto-scan");
+    }
+
+    // A call that ends while the panel is closed ends the wait: the reopen is a new open and scans
+    // the tree it finds released.
+    function test_anAutoScanRefusedWhileClosedLeavesTheReopenToScan() {
+        const sweep = createTemporaryObject(sweepComponent, tc);
+        sweep.panelOpen = true;
+        frame(sweep, "ok", topicData(null));
+        sweep.panelOpen = false;
+        fail(callsOf("sweep.scan")[0], "timeout", "no reply from axon in 12 s");
+        sweep.panelOpen = true;
+        frame(sweep, "ok", topicData(null));
+        compare(callsOf("sweep.scan").length, 2);
+    }
+
+    // The panel closed while its auto-scan ran and stayed closed: the scan ended, axon dropped the
+    // ended op after 5 minutes and released the tree. The reopen scans the released tree, as every
+    // open on one does, although this view never saw that op end.
+    function test_aReopenLongAfterTheAutoScanEndedScansTheReleasedTree() {
+        const sweep = createTemporaryObject(sweepComponent, tc);
+        sweep.panelOpen = true;
+        frame(sweep, "ok", topicData(null));
+        replyOp(callsOf("sweep.scan")[0], "sweep.scan-1");
+        frame(sweep, "ok", topicData(null), [op("sweep.scan-1", "sweep.scan", "running")]);
+        sweep.panelOpen = false;
+        sweep.panelOpen = true;
+        frame(sweep, "ok", topicData(null));
+        compare(callsOf("sweep.scan").length, 2);
     }
 
     function test_anotherClientsScanIsNoReasonToScanAndClearsTheMessage() {
@@ -255,7 +356,7 @@ TestCase {
         frame(sweep, "ok", topicData(tree(3, 3), null, lastCommit), [doneOp]);
         compare(ended.length, 1);
         compare(ended[0].state, "done");
-        compare(sweep.status, "freed 0 B · 1 failed: Permission denied (os error 13)");
+        compare(sweep.footer, "freed 0 B · 1 failed: Permission denied (os error 13)");
         compare(sweep.stagedCount, 0);
         frame(sweep, "ok", topicData(tree(3, 3), null, lastCommit), [doneOp]);
         compare(ended.length, 1, "called once");
@@ -299,7 +400,6 @@ TestCase {
                     message: "/state/journal.json: No space left on device (os error 28)"
                 }
             })]);
-        compare(sweep.status, "/state/journal.json: No space left on device (os error 28)");
         compare(sweep.footer, "/state/journal.json: No space left on device (os error 28)");
     }
 
@@ -319,6 +419,36 @@ TestCase {
         compare(sweep.footer, tc.twoStaged, "the next click");
     }
 
+    // A failure is shown once (section 33.0): in the footer, never as the status too, so once a click
+    // dismissed it and the other client's commit took the staged line away, the footer shows the real
+    // status.
+    function test_aDismissedFailureLeavesNoStatusBehind() {
+        const sweep = createTemporaryObject(sweepComponent, tc);
+        sweep.panelOpen = true;
+        frame(sweep, "ok", twoStagedData(), [op("sweep.commit-7", "sweep.commit", "running")]);
+        sweep.commit(null);
+        fail(callsOf("sweep.commit")[0], "conflict", "a commit is running");
+        compare(sweep.footer, "a commit is running");
+        compare(sweep.status, "ready", "shown once, in the footer");
+        sweep.open("3:1");
+        compare(sweep.footer, tc.twoStaged, "the next click");
+        frame(sweep, "ok", topicData(tree(3, 2), null, {
+            deleted: 2,
+            failed: 0,
+            freed_bytes: 1280,
+            errors: [],
+            finished_at: 2
+        }), [op("sweep.commit-7", "sweep.commit", "done", {
+                result: {
+                    deleted: 2,
+                    failed: 0,
+                    freed_bytes: 1280
+                }
+            })]);
+        compare(sweep.status, "ready");
+        compare(sweep.footer, "ready");
+    }
+
     // restore_all restores what it can and names the first item it could not restore, which stays
     // staged.
     function test_aPartlyFailedRestoreAllShowsItsMessageUntilTheNextClick() {
@@ -333,7 +463,6 @@ TestCase {
             bytes: 1024
         }));
         compare(sweep.footer, message);
-        compare(sweep.status, message);
         sweep.mark("3:2");
         compare(sweep.footer, "1 staged (1.0 K) — in trash until you delete", "the next click");
     }
@@ -446,7 +575,7 @@ TestCase {
     }
 
     // The new instance's first frame carries only the envelope, with a status that allows a scan.
-    // reset()'s auto-scan check runs once that frame is in, and only the tree held from the old
+    // The auto-scan is checked once that frame syncs the topic, and only the tree held from the old
     // instance keeps it from scanning: the data stays until a snapshot replaces it (section 20).
     function test_resetDropsPendingDoneAndKeepsTheHeldTreeUntilTheNewSnapshot() {
         const sweep = createTemporaryObject(sweepComponent, tc);
@@ -455,12 +584,15 @@ TestCase {
         const ended = [];
         sweep.scan("/home/test", endedOp => ended.push(endedOp));
         replyOp(callsOf("sweep.scan")[0], "sweep.scan-1");
-        Backend.instance = "two";
+        Backend.up = false;
+        Backend.instance = "two"; // the new instance's hello, then up
+        Backend.up = true;
         compare(sweep.curId, "", "node ids of the old instance are void");
         tc.rev = 0;
         frame(sweep, "ok", null);
+        verify(sweep.topic.synced);
         wait(20);
-        compare(callsOf("sweep.scan").length, 1, "reset() sees the tree held from before the restart");
+        compare(callsOf("sweep.scan").length, 1, "the synced check sees the tree held from before the restart");
         verify(sweep.ready);
         frame(sweep, "starting", null);
         compare(sweep.status, "restoring staged items");
@@ -470,7 +602,7 @@ TestCase {
         compare(sweep.curId, "");
     }
 
-    function test_callFailuresBecomeTheMessageExceptDisconnected() {
+    function test_callFailuresShowInTheFooterExceptDisconnected() {
         const sweep = createTemporaryObject(sweepComponent, tc);
         sweep.panelOpen = true;
         frame(sweep, "ok", topicData(tree(3, 1)));
@@ -479,13 +611,12 @@ TestCase {
             id: "3:5"
         });
         fail(callsOf("sweep.mark")[0], "disconnected", "axon is not connected");
-        compare(sweep.status, "ready");
+        compare(sweep.footer, "ready");
         sweep.unmark("3:5");
         fail(callsOf("sweep.unmark")[0], "conflict", "id is from scan 2, current scan is 3");
-        compare(sweep.status, "id is from scan 2, current scan is 3");
+        compare(sweep.footer, "id is from scan 2, current scan is 3");
         sweep.scan("/home/test", null);
-        compare(sweep.status, "ready", "a scan starting clears the message");
-        compare(sweep.footer, "ready", "and the footer's");
+        compare(sweep.footer, "ready", "a scan starting clears the failure");
     }
 
     function test_listingFollowsCurIdAndResetsOnErrors() {
@@ -722,9 +853,12 @@ TestCase {
             })]);
         compare(callsOf("sweep.scan").length, 1);
 
-        Backend.instance = "two";
+        Backend.up = false;
+        Backend.instance = "two"; // the new instance's hello, then up
+        Backend.up = true;
         tc.rev = 0;
         frame(sweep, "starting", null);
+        verify(sweep.topic.synced);
         wait(20);
         compare(callsOf("sweep.scan").length, 1, "the new instance is starting");
         compare(sweep.status, "restoring staged items");

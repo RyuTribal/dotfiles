@@ -39,6 +39,12 @@ TestCase {
         signalName: "valueModified"
     }
 
+    SignalSpy {
+        id: intervalUnchanged
+        target: intervalSpin
+        signalName: "entryEndedUnchanged"
+    }
+
     // The numbers of the audio protection's maxAllowed box (GeneralConfig).
     StyledSpinBox {
         id: volumeSpin
@@ -72,6 +78,7 @@ TestCase {
 
     function init() {
         startEntry(spin, 100, modified);
+        intervalUnchanged.clear();
     }
 
     // Typing 500 previews each value at once but is one modification, when the entry is finished, so
@@ -136,6 +143,7 @@ TestCase {
         compare(fieldOf(intervalSpin).text, "100");
         compare(intervalSpin.value, 100);
         compare(intervalModified.count, 1);
+        compare(intervalUnchanged.count, 0);
         intervalSpin.value = 4000;
         compare(fieldOf(intervalSpin).text, "4000");
     }
@@ -164,15 +172,16 @@ TestCase {
         compare(intervalModified.count, 1);
     }
 
-    // An emptied field is no number, so the entry leaves the value as it was. It is still one
-    // modification, like every finished entry.
+    // An emptied field is no number, so the entry ends as the value from before it, which is no
+    // modification.
     function test_anEmptiedFieldKeepsTheValue() {
         startEntry(intervalSpin, 3000, intervalModified);
         keyClick(Qt.Key_Backspace);
         keyClick(Qt.Key_Return);
         compare(fieldOf(intervalSpin).text, "3000");
         compare(intervalSpin.value, 3000);
-        compare(intervalModified.count, 1);
+        compare(intervalModified.count, 0);
+        compare(intervalUnchanged.count, 1);
     }
 
     // Deleting 3000 key by key passes 300, which lies within from..to. Once the text leaves
@@ -190,7 +199,49 @@ TestCase {
         keyClick(Qt.Key_Return);
         compare(fieldOf(intervalSpin).text, "3000");
         compare(intervalSpin.value, 3000);
-        compare(intervalModified.count, 1);
+        compare(intervalModified.count, 0);
+        compare(intervalUnchanged.count, 1);
+    }
+
+    function test_theSameNumberRetypedIsNoModification_data() {
+        return [
+            {
+                tag: "Return",
+                finish: () => keyClick(Qt.Key_Return)
+            },
+            {
+                tag: "leaving the field",
+                finish: () => tc.forceActiveFocus()
+            }
+        ];
+    }
+
+    // Retyping 3000 previews 300 on the way, since 300 lies within from..to, and the entry still
+    // ends as the value from before it.
+    function test_theSameNumberRetypedIsNoModification(data) {
+        startEntry(intervalSpin, 3000, intervalModified);
+        for (const key of [Qt.Key_3, Qt.Key_0, Qt.Key_0])
+            keyClick(key);
+        compare(intervalSpin.value, 300);
+        keyClick(Qt.Key_0);
+        data.finish();
+        compare(fieldOf(intervalSpin).text, "3000");
+        compare(intervalSpin.value, 3000);
+        compare(intervalModified.count, 0);
+        compare(intervalUnchanged.count, 1);
+    }
+
+    // A typed 50 ends as 100 once SpinBox clamps it into 100..10000. Over 100 that is the value
+    // from before the entry, so it is no modification.
+    function test_anEntryClampedToTheValueBeforeItIsNoModification() {
+        startEntry(intervalSpin, 100, intervalModified);
+        keyClick(Qt.Key_5);
+        keyClick(Qt.Key_0);
+        keyClick(Qt.Key_Return);
+        compare(fieldOf(intervalSpin).text, "100");
+        compare(intervalSpin.value, 100);
+        compare(intervalModified.count, 0);
+        compare(intervalUnchanged.count, 1);
     }
 
     // While 200 is typed into 0..154, the step starts from 100, the value before the entry, not
@@ -220,6 +271,7 @@ TestCase {
         tc.forceActiveFocus(); // focus moves elsewhere
         compare(intervalSpin.value, 350);
         compare(intervalModified.count, 1);
+        compare(intervalUnchanged.count, 0);
     }
 
     // The field's validator reads the text by the spin box's locale, and en_US takes a group

@@ -38,11 +38,13 @@ function scanOp(ops) {
     return ops.find(op => op.method === "sweep.scan" && (op.state === "queued" || op.state === "running")) ?? null;
 }
 
-// Whether the view starts its own scan: the panel is open, the engine can scan, nothing is loaded and
-// no scan runs, and the auto-scan has not already run since the panel opened or a tree loaded.
-function autoScanWanted(panelOpen, topicStatus, tree, scanOp, autoScanned) {
+// Whether the view starts its own scan: the panel is open, the topic is synced, the engine can scan,
+// nothing is loaded and no scan runs, and the auto-scan has not already run since the panel opened or
+// a tree loaded. Until the topic is synced, the status, tree and ops are what the view held before a
+// reopen or a reconnect, and axon may have loaded a tree or started a scan since (BackendTopic.synced).
+function autoScanWanted(panelOpen, synced, topicStatus, tree, scanOp, autoScanned) {
     const canScan = topicStatus === "ok" || topicStatus === "error";
-    return panelOpen && canScan && tree === null && scanOp === null && !autoScanned;
+    return panelOpen && synced && canScan && tree === null && scanOp === null && !autoScanned;
 }
 
 // The panel's status line. The first case that applies wins.

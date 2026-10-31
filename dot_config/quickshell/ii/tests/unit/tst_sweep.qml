@@ -73,30 +73,39 @@ TestCase {
     }
 
     function test_autoScanWanted() {
-        verify(S.autoScanWanted(true, "ok", null, null, false), "everything clear");
-        verify(S.autoScanWanted(true, "error", null, null, false), "a journal error still allows a scan");
-        verify(!S.autoScanWanted(false, "ok", null, null, false), "the panel is closed");
-        verify(!S.autoScanWanted(true, "starting", null, null, false), "the journal replay runs");
-        verify(!S.autoScanWanted(true, "waiting", null, null, false), "no snapshot yet");
-        verify(!S.autoScanWanted(true, "unconfigured", null, null, false), "the engine is disabled");
-        verify(!S.autoScanWanted(true, "failed", null, null, false), "the engine failed");
-        verify(!S.autoScanWanted(true, "ok", tree, null, false), "a tree is loaded");
-        verify(!S.autoScanWanted(true, "ok", null, runningScan, false), "another client's scan dropped the tree and runs");
-        verify(!S.autoScanWanted(true, "ok", null, null, true), "the auto-scan already ran");
+        verify(S.autoScanWanted(true, true, "ok", null, null, false), "everything clear");
+        verify(S.autoScanWanted(true, true, "error", null, null, false), "a journal error still allows a scan");
+        verify(!S.autoScanWanted(false, true, "ok", null, null, false), "the panel is closed");
+        verify(!S.autoScanWanted(true, false, "ok", null, null, false), "not synced: a reopen holds what the view saw before it closed");
+        verify(!S.autoScanWanted(true, false, "ok", null, null, true), "not synced, and the auto-scan already ran");
+        verify(!S.autoScanWanted(true, true, "starting", null, null, false), "the journal replay runs");
+        verify(!S.autoScanWanted(true, true, "waiting", null, null, false), "no snapshot yet");
+        verify(!S.autoScanWanted(true, true, "unconfigured", null, null, false), "the engine is disabled");
+        verify(!S.autoScanWanted(true, true, "failed", null, null, false), "the engine failed");
+        verify(!S.autoScanWanted(true, true, "ok", tree, null, false), "a tree is loaded");
+        verify(!S.autoScanWanted(true, true, "ok", null, runningScan, false), "another client's scan dropped the tree and runs");
+        verify(!S.autoScanWanted(true, true, "ok", null, null, true), "the auto-scan already ran");
     }
 
-    // The evaluations Sweep.qml makes, in the order they happen.
+    // The evaluations Sweep.qml makes, in the order they happen. Opening the panel evaluates nothing.
+    // A subscription's first snapshot is applied before the topic is synced, and the topic syncing
+    // evaluates again.
     function test_autoScanWanted_on_open_and_reopen() {
-        // First open: the panel becomes visible while the view holds BackendTopic's `waiting`.
-        verify(!S.autoScanWanted(true, "waiting", null, null, false), "first open, at visibility");
-        verify(S.autoScanWanted(true, "ok", null, null, false), "first open, the first snapshot");
+        // First open on a released tree.
+        verify(!S.autoScanWanted(true, false, "ok", null, null, false), "first open, the first snapshot");
+        verify(S.autoScanWanted(true, true, "ok", null, null, false), "first open, synced");
 
-        // Reopen after the release: the view still holds the tree from before the panel closed.
-        verify(!S.autoScanWanted(true, "ok", tree, null, false), "reopen, at visibility");
-        verify(S.autoScanWanted(true, "ok", null, null, false), "reopen, the fresh snapshot; closing cleared the flag");
+        // Reopen after the release: the view held the tree from before the panel closed.
+        verify(!S.autoScanWanted(true, false, "ok", null, null, false), "reopen, the fresh snapshot");
+        verify(S.autoScanWanted(true, true, "ok", null, null, false), "reopen, synced; closing cleared the flag");
+
+        // Reopen after an auto-scan the view never saw run: it held no tree and no scan, and the
+        // subscription's frame brings the tree that scan loaded.
+        verify(!S.autoScanWanted(true, false, "ok", tree, null, false), "reopen, the frame's snapshot");
+        verify(!S.autoScanWanted(true, true, "ok", tree, null, false), "reopen, synced");
 
         // The auto-scan set the flag, and its op failed.
-        verify(!S.autoScanWanted(true, "ok", null, S.scanOp([failedScan]), true), "after the auto-scan failed");
+        verify(!S.autoScanWanted(true, true, "ok", null, S.scanOp([failedScan]), true), "after the auto-scan failed");
     }
 
     function test_statusText() {

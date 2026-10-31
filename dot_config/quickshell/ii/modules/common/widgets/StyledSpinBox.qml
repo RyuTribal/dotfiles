@@ -17,6 +17,11 @@ SpinBox {
     // Without one of its own it is the plain number: Qt's default groups digits by locale (1,000,
     // not 1000).
     textFromValue: (value, locale) => String(value)
+    // Emitted instead of valueModified when a typed entry ends as the value from before it: an
+    // emptied field, the same number typed again, or a number the clamp brings back to it. Typing
+    // previews each number by setting `value`, which drops a binding on it, so a control that binds
+    // `value` can bind it again here.
+    signal entryEndedUnchanged
     // A step of SpinBox's own (its buttons, the wheel, the arrow keys) during a typed entry ends
     // the entry and is its one modification, so finishing the entry later modifies nothing more.
     onValueModified: {
@@ -97,7 +102,12 @@ SpinBox {
                 const typedValue = typedNumber(text);
                 root.value = isNaN(typedValue) ? valueBeforeEntry : typedValue;
                 endEntry();
-                root.valueModified();
+                // `value` reads the number after the clamp, so an entry the clamp brings back to
+                // the value from before it is no modification either.
+                if (root.value !== valueBeforeEntry)
+                    root.valueModified();
+                else
+                    root.entryEndedUnchanged();
             }
 
             // Ends the entry with no modification of its own. The field shows the value again

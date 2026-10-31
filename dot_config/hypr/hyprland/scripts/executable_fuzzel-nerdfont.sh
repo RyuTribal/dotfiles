@@ -39,14 +39,14 @@ JSON_URL="https://raw.githubusercontent.com/ryanoasis/nerd-fonts/HEAD/glyphnames
 
 mkdir -p "$CACHE_DIR"
 
-# 1) Download metadata only if newer (or first time / --update)
+# 1) Download the metadata only when it is missing or empty, or on --update. There is no
+# conditional GET because raw.githubusercontent.com sends an ETag but no Last-Modified, so curl -z
+# would fetch it on every run, and a fresh copy is newer than the list, which forces the rebuild
+# below. The download goes through a temp file so a failed one never leaves a truncated json.
 if [[ "$UPDATE" == "true" || ! -s "$META_JSON" ]]; then
-  curl -fsSL "$JSON_URL" -o "$META_JSON"
-else
-  # conditional GET: only writes if remote is newer, preserves time
-  curl -fsSL -z "$META_JSON" "$JSON_URL" -o "$META_JSON"
+  curl -fsSL "$JSON_URL" -o "$META_JSON".tmp
+  mv "$META_JSON".tmp "$META_JSON"
 fi
-# (curl --time-cond / -z: only transfer if remote is newer. )  :contentReference[oaicite:0]{index=0}
 
 # 2) Gather installed Nerd Font files
 mapfile -t NF_FILES < <(fc-list : file family | awk -v re="$FONT_RE" 'BEGIN{FS=":"} $0~re {gsub(/^ +| +$/,"",$1); print $1}' | sort -u)

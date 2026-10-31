@@ -5,9 +5,10 @@
 const UNITS = ["B", "K", "M", "G", "T", "P"];
 const NOT_REACHABLE = "axon not reachable";
 
-// A byte count as sweepd wrote it and the sweep engine's own human() writes it: "<n> B" below 1 KiB,
-// else 1024-based with one decimal and a unit letter, "498.3 G". Rust's {:.1} rounds an exact tie to
-// even (1280 B is "1.2 K"), while toFixed rounds it up, so a tie is rounded here first.
+// A byte count as the sweep engine's own human() writes it, and mach's old daemon before it:
+// "<n> B" below 1 KiB, else 1024-based with one decimal and a unit letter, "498.3 G". Rust's
+// {:.1} rounds an exact tie to even (1280 B is "1.2 K"), while toFixed rounds it up, so a tie is
+// rounded here first.
 function human(bytes) {
     if (bytes < 1024)
         return bytes + " B";

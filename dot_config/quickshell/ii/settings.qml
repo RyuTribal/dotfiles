@@ -14,6 +14,8 @@ import qs
 import qs.services
 import qs.modules.common
 import qs.modules.common.widgets
+// Pages load by path, so only this import registers modules/settings' own types (BackendSpinBox).
+import qs.modules.settings
 
 ApplicationWindow {
     id: root

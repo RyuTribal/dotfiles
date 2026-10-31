@@ -226,7 +226,6 @@ Singleton {
 
             property JsonObject conflictKiller: JsonObject {
                 property bool autoKillNotificationDaemons: false
-                property bool autoKillTrays: false
             }
 
             property JsonObject dock: JsonObject {

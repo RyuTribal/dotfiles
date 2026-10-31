@@ -1,168 +1,88 @@
 pragma Singleton
 pragma ComponentBehavior: Bound
 
-import qs.modules.common
+import "backend.js" as B
 import QtQuick
 import Quickshell
-import Quickshell.Io
 
 /**
- * Simple polled resource usage service with RAM, Swap, and CPU usage.
+ * CPU, memory, swap and disk usage, a thin client of axon's `resources` topic
+ * (section 32, "resources"). axon samples /proc and hwmon only while the topic
+ * has a subscriber, and the bar always is one. The properties keep the names
+ * and units the widgets bound before axon: memory and swap in kB, shares as
+ * fractions, temperatures in °C. Until the first sample arrives they hold the
+ * old service's initial values.
  */
 Singleton {
-	property double memoryTotal: 1
-	property double memoryFree: 1
-	property double memoryUsed: memoryTotal - memoryFree
-    property double memoryUsedPercentage: memoryUsed / memoryTotal
-    property double swapTotal: 1
-	property double swapFree: 1
-	property double swapUsed: swapTotal - swapFree
-    property double swapUsedPercentage: swapTotal > 0 ? (swapUsed / swapTotal) : 0
-    property double cpuUsage: 0
-    property var previousCpuStats
+    id: root
 
-    // Temperature and disk usage. Both are heavier to gather (spawn a
-    // shell/df process) than the /proc reads above, but the bar's stat
-    // circles (batch 2) need them live even with the top menu closed, so
-    // both now poll unconditionally instead of being gated to the Stats tab
-    // being visible — temp every 5s (cheap sysfs reads), disk every 60s
-    // (df is heavier and doesn't need to be nearly as fresh).
-    property real cpuTempC: 0
-    // True when cpuTempC came from a named CPU sensor (coretemp/k10temp);
-    // false means no such sensor exists and cpuTempC is the fallback
-    // max-of-all-hwmon reading, which may not actually be the CPU (could be
-    // nvme, a RAM DIMM, wifi, etc.) — SystemPanel labels the row
-    // accordingly ("CPU temp" vs "Peak temp").
-    property bool cpuTempNamed: true
-    property var mounts: [] // [{target, pcent, avail}]
-
-	Timer {
-		interval: 1
-        running: true 
-        repeat: true
-		onTriggered: {
-            // Reload files
-            fileMeminfo.reload()
-            fileStat.reload()
-
-            // Parse memory and swap usage
-            const textMeminfo = fileMeminfo.text()
-            memoryTotal = Number(textMeminfo.match(/MemTotal: *(\d+)/)?.[1] ?? 1)
-            memoryFree = Number(textMeminfo.match(/MemAvailable: *(\d+)/)?.[1] ?? 0)
-            swapTotal = Number(textMeminfo.match(/SwapTotal: *(\d+)/)?.[1] ?? 1)
-            swapFree = Number(textMeminfo.match(/SwapFree: *(\d+)/)?.[1] ?? 0)
-
-            // Parse CPU usage
-            const textStat = fileStat.text()
-            const cpuLine = textStat.match(/^cpu\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/)
-            if (cpuLine) {
-                const stats = cpuLine.slice(1).map(Number)
-                const total = stats.reduce((a, b) => a + b, 0)
-                const idle = stats[3]
-
-                if (previousCpuStats) {
-                    const totalDiff = total - previousCpuStats.total
-                    const idleDiff = idle - previousCpuStats.idle
-                    cpuUsage = totalDiff > 0 ? (1 - idleDiff / totalDiff) : 0
-                }
-
-                previousCpuStats = { total, idle }
-            }
-            interval = Config.options?.resources?.updateInterval ?? 3000
-        }
-	}
-
-	FileView { id: fileMeminfo; path: "/proc/meminfo" }
-    FileView { id: fileStat; path: "/proc/stat" }
-
-    // Temp polling: always on, 5s cadence (matches the CPU/RAM timer's
-    // ballpark) — the bar's CPU-temp circle needs this even when the top
-    // menu is closed.
-    Timer {
-        interval: 5000
-        running: true
-        repeat: true
-        triggeredOnStart: true
-        onTriggered: tempProc.running = true
+    readonly property BackendTopic topic: BackendTopic {
+        name: "resources"
+        onSnapshot: data => root._apply(data)
     }
 
-    // Disk polling: always on, but on a slower 60s cadence. Sourced from
-    // sweepd (the sweep disk-tool daemon in ~/.config/mach) over its Unix
-    // socket instead of spawning df — one shared backend for the bar's disk
-    // stats and the SweepPanel inspector. systemd's sweepd.socket owns the
-    // socket and starts the daemon on connect, so this never spawns it.
-    Timer {
-        interval: 60000
-        running: true
-        repeat: true
-        triggeredOnStart: true
-        onTriggered: {
-            if (sweepSock.connected) {
-                sweepSock.write('{"op":"mounts"}\n');
-                sweepSock.flush();
-            } else {
-                sweepSock.connected = true;
-            }
-        }
+    readonly property double memoryTotal: _memoryTotal // kB
+    readonly property double memoryFree: _memoryFree // kB, MemAvailable
+    readonly property double memoryUsed: _memoryUsed // kB
+    readonly property double memoryUsedPercentage: _memoryUsedPercentage // fraction
+    readonly property double swapTotal: _swapTotal // kB
+    readonly property double swapFree: _swapFree // kB
+    readonly property double swapUsed: _swapUsed // kB
+    readonly property double swapUsedPercentage: _swapUsedPercentage // fraction
+    readonly property double cpuUsage: _cpuUsage // fraction
+    readonly property real cpuTempC: _cpuTempC // °C, 0 when there is no sensor
+    // True when cpuTempC comes from the CPU's own sensor (coretemp or k10temp).
+    // False means it is the hottest of all hwmon sensors, which may be the nvme,
+    // a RAM DIMM or the wifi card, or that there is no sensor at all; the
+    // widgets label it "Peak temp" instead of "CPU temp".
+    readonly property bool cpuTempNamed: _cpuTempNamed
+    readonly property var mounts: _mounts // [{ id, rev, target, pcent, avail (kB) }]
+
+    property double _memoryTotal: 1
+    property double _memoryFree: 1
+    property double _memoryUsed: 0
+    property double _memoryUsedPercentage: 0
+    property double _swapTotal: 1
+    property double _swapFree: 1
+    property double _swapUsed: 0
+    property double _swapUsedPercentage: 0
+    property double _cpuUsage: 0
+    property real _cpuTempC: 0
+    property bool _cpuTempNamed: true
+    property var _mounts: []
+    property var _mountIndex: ({})
+
+    function _apply(data) {
+        _memoryTotal = data.memory.total_bytes / 1024;
+        _memoryFree = data.memory.available_bytes / 1024;
+        _memoryUsed = data.memory.used_bytes / 1024;
+        _memoryUsedPercentage = data.memory.used_pct / 100;
+        _swapTotal = data.swap.total_bytes / 1024;
+        _swapFree = data.swap.free_bytes / 1024;
+        _swapUsed = data.swap.used_bytes / 1024;
+        _swapUsedPercentage = data.swap.used_pct / 100;
+        _cpuUsage = data.cpu.usage_pct / 100;
+        _cpuTempC = data.cpu.temp_c ?? 0;
+        _cpuTempNamed = data.cpu.temp_sensor === "coretemp" || data.cpu.temp_sensor === "k10temp";
+        _applyMounts(data.mounts);
     }
 
-    Timer {
-        id: sweepRetryTimer
-        interval: 1000
-        onTriggered: sweepSock.connected = true
-    }
-
-    Socket {
-        id: sweepSock
-        path: Quickshell.env("XDG_RUNTIME_DIR") + "/sweep.sock"
-        connected: false
-        parser: SplitParser {
-            onRead: msg => {
-                let r;
-                try { r = JSON.parse(msg); } catch (e) { return; }
-                if (r.mounts === undefined) return; // not for us
-                // Map daemon bytes to the df-shaped {target, pcent, avail(KB)}
-                // rows the bar/Stats consumers already expect.
-                mounts = r.mounts.map(m => ({
-                    target: m.target,
-                    pcent: m.pcent,
-                    avail: m.avail / 1024
+    // The mount rows change only when axon reads the mounts again (every 60 s
+    // and on a mount table change), not on every sample, so the array is kept
+    // while every row is the same object. SystemPanel's Repeater takes `mounts`
+    // as a plain array and would otherwise rebuild its rows on each sample.
+    function _applyMounts(wireRows) {
+        const rows = wireRows.map(row => ({
+                    id: row.id,
+                    rev: row.rev,
+                    target: row.target,
+                    pcent: row.used_pct,
+                    avail: row.avail_bytes / 1024
                 }));
-            }
-        }
-        // Quickshell never reconnects a socket on its own once it has
-        // connected, so a dropped connection (daemon restarted) is retried
-        // here, as is a failed connect (sweepd.socket not running).
-        onConnectionStateChanged: {
-            if (connected) {
-                sweepSock.write('{"op":"mounts"}\n');
-                sweepSock.flush();
-            } else {
-                sweepRetryTimer.start();
-            }
-        }
-        onError: sweepRetryTimer.start()
-    }
-
-    // Prefers the hwmon device actually named "coretemp" (Intel) or
-    // "k10temp" (AMD) — that device's temp1_input is the CPU package temp
-    // (confirmed via temp1_label on this machine: "Package id 0"). Only
-    // when neither exists does this fall back to the old max-of-all-hwmon
-    // reading, which isn't guaranteed to be the CPU (nvme/RAM/wifi sensors
-    // can read hotter). Output is "named:<millidegrees>" or
-    // "fallback:<millidegrees>" so the QML side knows which case fired.
-    Process {
-        id: tempProc
-        command: ["bash", "-c", "for d in /sys/class/hwmon/hwmon*; do n=$(cat \"$d/name\" 2>/dev/null); if [ \"$n\" = coretemp ] || [ \"$n\" = k10temp ]; then v=$(cat \"$d/temp1_input\" 2>/dev/null); if [ -n \"$v\" ]; then echo \"named:$v\"; exit 0; fi; fi; done; v=$(cat /sys/class/hwmon/hwmon*/temp1_input 2>/dev/null | sort -rn | head -1); echo \"fallback:$v\""]
-        stdout: StdioCollector {
-            id: tempCollector
-            onStreamFinished: {
-                const match = tempCollector.text.trim().match(/^(named|fallback):(\d+)$/)
-                if (match) {
-                    cpuTempNamed = match[1] === "named"
-                    cpuTempC = Number(match[2]) / 1000
-                }
-            }
-        }
+        const reused = B.reuseRows(_mountIndex, rows);
+        _mountIndex = reused.index;
+        const unchanged = reused.rows.length === _mounts.length && reused.rows.every((row, index) => row === _mounts[index]);
+        if (!unchanged)
+            _mounts = reused.rows;
     }
 }

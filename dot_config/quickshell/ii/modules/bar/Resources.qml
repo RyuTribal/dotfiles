@@ -29,7 +29,7 @@ MouseArea {
     implicitHeight: Appearance.sizes.barHeight
     hoverEnabled: true
 
-    // The "/" mount, once sweepd has reported one. Until then the disk stat
+    // The "/" mount, once the resources topic has reported one. Until then the disk stat
     // shows "—", never a made-up 0%.
     readonly property var rootMount: ResourceUsage.mounts.find(m => m.target === "/")
 

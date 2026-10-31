@@ -1,9 +1,0 @@
-[Unit]
-Description=sweepd — disk stats and sweep panel backend for Quickshell
-Requires=sweepd.socket
-
-[Service]
-Type=simple
-ExecStart=%h/.local/bin/sweepd
-Restart=on-failure
-RestartSec=1

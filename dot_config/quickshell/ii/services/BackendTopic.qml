@@ -26,6 +26,10 @@ QtObject {
     readonly property double knownAt: !Backend.up && _status === "ok"
         ? Math.max(_observedAt, Backend.downSince) : _observedAt
     readonly property double ageMs: _hasData ? Backend.now - knownAt : 0
+    // The data is as new as axon's: true from the first frame of the current subscription, applied
+    // or dropped as not newer; false while the topic is inactive or axon is down. A service that
+    // asks axon about something taken from the data, such as a node id, waits for it.
+    readonly property bool synced: _synced
 
     signal snapshot(var data)
     signal reset() // a new daemon instance: drop lazy pages, op ids and node ids
@@ -40,7 +44,9 @@ QtObject {
     property var _ops: []
     property double _rev: 0
     property string _instance: "" // the daemon instance _rev counts in
+    property bool _synced: false
     property bool _completed: false
+    readonly property bool _backendUp: Backend.up
 
     // Called by Backend with every snapshot frame of this topic. A frame whose
     // rev is not newer than the last one applied from the same instance is
@@ -54,20 +60,23 @@ QtObject {
             if (restarted)
                 reset();
         }
-        if (frame.rev <= _rev)
-            return;
-        _rev = frame.rev;
-        _status = frame.status;
-        _source = frame.source;
-        _observedAt = frame.observed_at ?? 0;
-        _errorCode = frame.error?.code ?? "";
-        _errorMessage = frame.error?.message ?? "";
-        _errorReason = frame.error?.details?.reason ?? "";
-        _ops = frame.ops ?? [];
-        if (frame.data !== null && frame.data !== undefined) {
-            snapshot(frame.data);
-            _hasData = true; // after the service applied the data, so hasData never shows its empty defaults
+        if (frame.rev > _rev) {
+            _rev = frame.rev;
+            _status = frame.status;
+            _source = frame.source;
+            _observedAt = frame.observed_at ?? 0;
+            _errorCode = frame.error?.code ?? "";
+            _errorMessage = frame.error?.message ?? "";
+            _errorReason = frame.error?.details?.reason ?? "";
+            _ops = frame.ops ?? [];
+            if (frame.data !== null && frame.data !== undefined) {
+                snapshot(frame.data);
+                _hasData = true; // after the service applied the data, so hasData never shows its empty defaults
+            }
         }
+        // Last, so a service sees synced only after it took the data. A frame from Backend's cache,
+        // given while axon is down, leaves the topic unsynced.
+        _synced = Backend.up;
     }
 
     function _unknown() { // the daemon listed this topic as unknown
@@ -80,12 +89,19 @@ QtObject {
     // Change handlers of bound properties run during creation, before every
     // property is set, so attaching waits for Component.onCompleted.
     onActiveChanged: {
+        if (!active)
+            _synced = false;
         if (!_completed)
             return;
         if (active)
             Backend._attach(root);
         else
             Backend._detach(root);
+    }
+
+    on_BackendUpChanged: {
+        if (!_backendUp)
+            _synced = false;
     }
 
     Component.onCompleted: {

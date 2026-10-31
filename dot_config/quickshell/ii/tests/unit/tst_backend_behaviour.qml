@@ -566,6 +566,60 @@ TestCase {
         verify(!topic.live);
     }
 
+    function frameOfRev(frameRev) {
+        return {
+            rev: frameRev,
+            status: "ok",
+            source: "live",
+            observed_at: 1000 * frameRev,
+            data: {
+                n: frameRev
+            }
+        };
+    }
+
+    // On subscribe axon sends the topic's current frame, which has the rev already applied while
+    // nothing changed. Dropped as not newer, it still says the data is current.
+    function test_topicSyncedAtTheFirstFrameEvenOfAnEqualRev() {
+        const topic = createTemporaryObject(topicComponent, tc);
+        verify(!topic.synced, "no frame yet");
+        let syncedDuringSnapshot = null;
+        topic.snapshot.connect(() => syncedDuringSnapshot = topic.synced);
+        topic._apply(frameOfRev(3));
+        verify(topic.synced);
+        compare(syncedDuringSnapshot, false, "synced only after the service took the data");
+
+        tc.panelOpen = false;
+        verify(!topic.synced, "inactive");
+        tc.panelOpen = true;
+        verify(!topic.synced, "a new subscription waits for its own frame");
+        topic._apply(frameOfRev(3));
+        compare(topic.observedAt, 3000, "the equal rev is dropped");
+        verify(topic.synced, "and still syncs the topic");
+    }
+
+    function test_topicSyncedClearsWhileAxonIsDown() {
+        const topic = createTemporaryObject(topicComponent, tc);
+        topic._apply(frameOfRev(3));
+        verify(topic.synced);
+        Backend.up = false;
+        verify(!topic.synced, "down");
+        Backend.up = true;
+        verify(!topic.synced, "the hello is not the subscription's frame");
+        topic._apply(frameOfRev(3));
+        verify(topic.synced);
+    }
+
+    // Backend hands a late attacher its cached frame also while axon is down. That frame is from
+    // before the drop.
+    function test_topicFrameTakenWhileDownLeavesItUnsynced() {
+        Backend.up = false;
+        const topic = createTemporaryObject(topicComponent, tc);
+        topic._apply(frameOfRev(3));
+        compare(topic.observedAt, 3000, "applied");
+        verify(!topic.synced);
+    }
+
     function test_topicUnknown() {
         const topic = createTemporaryObject(topicComponent, tc);
         topic._unknown();

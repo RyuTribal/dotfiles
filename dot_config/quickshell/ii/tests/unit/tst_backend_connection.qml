@@ -72,12 +72,12 @@ TestCase {
         return socket;
     }
 
-    function sendHello(socket) {
+    function sendHello(socket, instance) {
         socket.serverSends({
             t: "hello",
             proto: 1,
             server: "axond test",
-            instance: "i1"
+            instance: instance ?? "i1"
         });
     }
 
@@ -86,6 +86,22 @@ TestCase {
             t: "error",
             code: "shutting_down",
             message: "axond is stopping"
+        });
+    }
+
+    // The unsub frames the client wrote, in order.
+    function unsubsSent(socket) {
+        return socket.sentFrames().filter(frame => frame.t === "unsub");
+    }
+
+    function sendUnsubReply(socket, unsub) {
+        socket.serverSends({
+            t: "reply",
+            id: unsub.id,
+            ok: true,
+            result: {
+                unsubscribed: unsub.topics
+            }
         });
     }
 
@@ -198,8 +214,9 @@ TestCase {
         compare(broken.revs, [1, 2]);
     }
 
-    // F3, the attach path: a throw from the cached frame must not stop the subscription.
-    function test_attachSubscribesPastAThrowingTopic() {
+    // F3, the attach path: a throw from the cached frame must not stop the attach. While axon is down
+    // a late attacher still gets the frame from before the drop, and the next hello subscribes it.
+    function test_attachPastAThrowingTopic() {
         const backend = newBackend();
         const socket = connectUp(backend);
         const first = createTemporaryObject(topicComponent, tc, {
@@ -209,9 +226,6 @@ TestCase {
         socket.serverSends(snapshotFrame("system", 1));
         socket.peerClose(true);
         backend._detach(first); // while down: the cached frame stays for the next attacher
-        tryCompare(socket, "connectRequests", 2, 1000);
-        socket.accept();
-        sendHello(socket);
 
         const broken = createTemporaryObject(topicComponent, tc, {
             name: "system",
@@ -220,8 +234,142 @@ TestCase {
         ignoreWarning(/axon: topic system failed to apply a snapshot/);
         backend._attach(broken);
         compare(broken.revs, [1], "the cached frame was applied");
+        tryCompare(socket, "connectRequests", 2, 1000);
+        socket.accept();
+        sendHello(socket);
         const subscriptions = socket.sentFrames().filter(frame => frame.t === "sub");
-        compare(subscriptions.length, 2, "the first attach and this one");
+        compare(subscriptions.length, 2, "the first attach and the hello");
         compare(subscriptions[1].topics, ["system"]);
+    }
+
+    function test_everyHelloClearsTheFrameCache_data() {
+        return [
+            {
+                tag: "same instance",
+                instance: "i1"
+            },
+            {
+                tag: "new instance",
+                instance: "i2"
+            }
+        ];
+    }
+
+    // Another client may have changed a topic while the connection was down, also on the same
+    // instance. So an attacher after the hello gets no frame from before the drop; it waits for the
+    // frame of the subscription that hello sent.
+    function test_everyHelloClearsTheFrameCache(data) {
+        const backend = newBackend();
+        const socket = connectUp(backend);
+        const first = createTemporaryObject(topicComponent, tc, {
+            name: "system"
+        });
+        backend._attach(first);
+        socket.serverSends(snapshotFrame("system", 1));
+        socket.peerClose(true);
+        tryCompare(socket, "connectRequests", 2, 1000);
+        socket.accept();
+        sendHello(socket, data.instance);
+
+        const late = createTemporaryObject(topicComponent, tc, {
+            name: "system"
+        });
+        backend._attach(late);
+        compare(late.revs, [], "nothing from before the drop");
+        socket.serverSends(snapshotFrame("system", 2));
+        compare(late.revs, [2]);
+        compare(first.revs, [1, 2]);
+    }
+
+    function test_noFrameFromAnEndedSubscription_data() {
+        return [
+            {
+                tag: "attach again after the old frame came",
+                attachFirst: false
+            },
+            {
+                tag: "attach again before the old frame came",
+                attachFirst: true
+            }
+        ];
+    }
+
+    // axon writes the frames it had due before it reads an unsub, and they reach the client ahead of
+    // the unsub reply (section 20, "Ordering guarantees" 1 and 4). Such a frame is of the subscription
+    // that unsub ended, so neither the cache nor a new attacher gets it: an attacher's first frame is
+    // of its own subscription, which comes after the unsub reply.
+    function test_noFrameFromAnEndedSubscription(data) {
+        const backend = newBackend();
+        const socket = connectUp(backend);
+        const first = createTemporaryObject(topicComponent, tc, {
+            name: "sweep"
+        });
+        backend._attach(first);
+        socket.serverSends(snapshotFrame("sweep", 1));
+        backend._detach(first);
+        const unsub = unsubsSent(socket)[0];
+        compare(unsub.topics, ["sweep"]);
+
+        const next = createTemporaryObject(topicComponent, tc, {
+            name: "sweep"
+        });
+        if (data.attachFirst)
+            backend._attach(next);
+        socket.serverSends(snapshotFrame("sweep", 2)); // written before axon read the unsub
+        if (!data.attachFirst)
+            backend._attach(next);
+        compare(next.revs, [], "no frame of the ended subscription");
+        sendUnsubReply(socket, unsub);
+        socket.serverSends(snapshotFrame("sweep", 3)); // the first frame of next's subscription
+        compare(next.revs, [3]);
+        compare(first.revs, [1]);
+    }
+
+    // Two unsubs in flight: the subscription between them ended too, so its frame, which comes after
+    // the first unsub's reply, is dropped as well.
+    function test_onlyTheLatestUnsubEndsTheWait() {
+        const backend = newBackend();
+        const socket = connectUp(backend);
+        const first = createTemporaryObject(topicComponent, tc, {
+            name: "sweep"
+        });
+        backend._attach(first);
+        backend._detach(first);
+        backend._attach(first);
+        backend._detach(first);
+        const unsubs = unsubsSent(socket);
+        compare(unsubs.length, 2);
+
+        const next = createTemporaryObject(topicComponent, tc, {
+            name: "sweep"
+        });
+        backend._attach(next);
+        sendUnsubReply(socket, unsubs[0]);
+        socket.serverSends(snapshotFrame("sweep", 1)); // of the subscription the second unsub ended
+        compare(next.revs, [], "no frame of the ended subscription");
+        sendUnsubReply(socket, unsubs[1]);
+        socket.serverSends(snapshotFrame("sweep", 2));
+        compare(next.revs, [2]);
+    }
+
+    // An unsub whose reply never came, since the connection dropped, stops dropping the topic's
+    // frames: the next connection's subscription delivers them.
+    function test_theDropEndsTheWait() {
+        const backend = newBackend();
+        const socket = connectUp(backend);
+        const first = createTemporaryObject(topicComponent, tc, {
+            name: "sweep"
+        });
+        backend._attach(first);
+        backend._detach(first);
+        compare(unsubsSent(socket).length, 1);
+        socket.peerClose(true);
+        tryCompare(socket, "connectRequests", 2, 1000);
+        socket.accept();
+        sendHello(socket);
+
+        backend._attach(first);
+        socket.serverSends(snapshotFrame("sweep", 1));
+        compare(first.revs, [1]);
     }
 }

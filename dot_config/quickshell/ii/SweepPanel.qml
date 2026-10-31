@@ -6,24 +6,12 @@ import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import qs.modules.common
+import qs.services
 
 Scope {
     id: rootScope
 
     property bool panelVisible: false
-    property string scanPath: Quickshell.env("HOME")
-
-    // ---------- state mirrored from sweepd ----------
-    property bool scanning: false
-    property bool ready: false
-    property string curPath: ""
-    property int curId: 0
-    property var parentId: null
-    property string totalHuman: "0 B"
-    property int stagedCount: 0
-    property string stagedHuman: "0 B"
-    property string status: "connecting…"
-    property var entries: []
     property bool confirming: false
 
     IpcHandler {
@@ -35,107 +23,11 @@ Scope {
         function hide(): void { rootScope.panelVisible = false; }
     }
 
-    onPanelVisibleChanged: {
-        if (panelVisible && !sock.connected) sock.connected = true;
-    }
-
-    Socket {
-        id: sock
-        path: Quickshell.env("XDG_RUNTIME_DIR") + "/sweep.sock"
-        connected: false
-        parser: SplitParser {
-            onRead: msg => rootScope.handleMessage(msg)
-        }
-        onConnectionStateChanged: {
-            if (connected) {
-                rootScope.status = "connected";
-                rootScope.send({ op: "status" });
-            }
-        }
-        // sweepd.socket (systemd) owns the socket and starts the daemon on
-        // connect, so a failure here means that unit isn't running.
-        onError: {
-            rootScope.status = "can't reach sweepd (systemctl --user status sweepd.socket)";
-            retryTimer.start();
-        }
-    }
-
-    Timer {
-        id: retryTimer
-        interval: 500
-        onTriggered: if (rootScope.panelVisible) sock.connected = true
-    }
-
-    // Self-healing driver: while the panel is open, keep polling until we
-    // are connected, scanned, and have a listing.
-    Timer {
-        interval: 300
-        repeat: true
-        running: rootScope.panelVisible && (rootScope.scanning || !rootScope.ready)
-        onTriggered: {
-            if (!sock.connected) { sock.connected = true; return; }
-            rootScope.send({ op: "status" });
-        }
-    }
-
-    function send(obj) {
-        if (!sock.connected) return;
-        sock.write(JSON.stringify(obj) + "\n");
-        sock.flush();
-    }
-
-    function startScan(path) {
-        scanPath = path;
-        ready = false;
-        entries = [];
-        send({ op: "scan", path: path });
-    }
-
-    function handleMessage(msg) {
-        let r;
-        try { r = JSON.parse(msg); } catch (e) { return; }
-
-        if (r.error && !r.ok) { status = r.error; }
-
-        // status response
-        if (r.scanning !== undefined && r.ready !== undefined) {
-            scanning = r.scanning;
-            if (r.scanning) {
-                status = "scanning… " + r.files + " files, " + r.bytes_human;
-            } else if (r.ready) {
-                if (!ready) { ready = true; status = "ready"; send({ op: "ls" }); }
-            } else {
-                startScan(scanPath);
-            }
-            return;
-        }
-        // scan accepted
-        if (r.ok && r.scanning === true) { scanning = true; return; }
-        // ls response
-        if (r.entries !== undefined) {
-            curId = r.id;
-            parentId = r.parent;
-            curPath = r.path;
-            totalHuman = r.total_human;
-            stagedCount = r.staged_count;
-            stagedHuman = r.staged_human;
-            entries = r.entries;
-            return;
-        }
-        // mark/unmark response
-        if (r.marked !== undefined) { send({ op: "ls", id: curId }); return; }
-        // commit / restore response
-        if (r.deleted !== undefined) {
-            status = "freed " + r.freed_human;
-            confirming = false;
-            send({ op: "ls", id: curId });
-            return;
-        }
-        if (r.restored !== undefined) {
-            status = "restored " + r.restored + " item(s)";
-            send({ op: "ls", id: curId });
-            return;
-        }
+    // Sweep subscribes to axon's sweep topic only while the panel is open.
+    Binding {
+        target: Sweep
+        property: "panelOpen"
+        value: rootScope.panelVisible
     }
 
     LazyLoader {
@@ -166,13 +58,13 @@ Scope {
                     }
                     Text {
                         Layout.fillWidth: true
-                        text: rootScope.curPath || rootScope.scanPath
+                        text: Sweep.curPath || Sweep.scanPath
                         color: Appearance.colors.colSubtext
                         font { pixelSize: Appearance.font.pixelSize.smaller; family: Appearance.font.family.monospace }
                         elide: Text.ElideMiddle
                     }
                     Text {
-                        text: rootScope.totalHuman
+                        text: Sweep.totalHuman
                         color: Appearance.colors.colOnLayer0
                         font { pixelSize: Appearance.font.pixelSize.normal; family: Appearance.font.family.monospace; weight: Font.DemiBold }
                     }
@@ -185,25 +77,25 @@ Scope {
 
                     SweepButton {
                         label: "↑ up"
-                        enabled: rootScope.parentId !== null && rootScope.parentId !== undefined
-                        onClicked: rootScope.send({ op: "ls", id: rootScope.parentId })
+                        enabled: Sweep.parentId !== null
+                        onClicked: Sweep.up()
                     }
                     SweepButton {
                         label: "rescan"
-                        onClicked: rootScope.startScan(rootScope.scanPath)
+                        onClicked: Sweep.scan(Sweep.scanPath)
                     }
                     SweepButton {
                         label: "restore all"
-                        enabled: rootScope.stagedCount > 0
-                        onClicked: rootScope.send({ op: "restore_all" })
+                        enabled: Sweep.stagedCount > 0
+                        onClicked: Sweep.restoreAll()
                     }
                     Item { Layout.fillWidth: true }
                     SweepButton {
-                        label: rootScope.stagedCount > 0
-                            ? "delete " + rootScope.stagedCount + " (" + rootScope.stagedHuman + ")"
+                        label: Sweep.stagedCount > 0
+                            ? "delete " + Sweep.stagedCount + " (" + Sweep.stagedHuman + ")"
                             : "nothing staged"
                         danger: true
-                        enabled: rootScope.stagedCount > 0
+                        enabled: Sweep.stagedCount > 0 && Sweep.canStage
                         onClicked: rootScope.confirming = true
                     }
                 }
@@ -211,8 +103,8 @@ Scope {
                 // scanning indicator / status
                 Text {
                     Layout.fillWidth: true
-                    visible: rootScope.scanning || !rootScope.ready
-                    text: rootScope.status
+                    visible: Sweep.scanning || !Sweep.ready
+                    text: Sweep.status
                     color: Appearance.colors.colSubtext
                     font { pixelSize: Appearance.font.pixelSize.smaller; family: Appearance.font.family.main }
                 }
@@ -223,12 +115,17 @@ Scope {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     clip: true
-                    model: rootScope.entries
+                    model: ScriptModel {
+                        values: Sweep.entries
+                        objectProp: "id"
+                    }
                     spacing: 3
+                    // A directory with more than 100 children arrives in pages.
+                    onAtYEndChanged: if (atYEnd) Sweep.fetchMore()
 
                     property real maxSize: {
                         let m = 1;
-                        for (const e of rootScope.entries) if (e.size > m) m = e.size;
+                        for (const e of Sweep.entries) if (e.size > m) m = e.size;
                         return m;
                     }
 
@@ -275,6 +172,8 @@ Scope {
                             // mark / unmark
                             Rectangle {
                                 width: 30; height: 24
+                                enabled: Sweep.canStage
+                                opacity: enabled ? 1 : 0.45
                                 radius: Appearance.rounding.unsharpenmore
                                 color: markArea.containsMouse
                                     ? (row.modelData.marked ? Appearance.m3colors.m3secondaryContainer : Appearance.m3colors.m3errorContainer)
@@ -291,10 +190,12 @@ Scope {
                                     id: markArea
                                     anchors.fill: parent
                                     hoverEnabled: true
-                                    onClicked: rootScope.send({
-                                        op: row.modelData.marked ? "unmark" : "mark",
-                                        id: row.modelData.id
-                                    })
+                                    onClicked: {
+                                        if (row.modelData.marked)
+                                            Sweep.unmark(row.modelData.id);
+                                        else
+                                            Sweep.mark(row.modelData.id);
+                                    }
                                 }
                             }
                         }
@@ -306,19 +207,20 @@ Scope {
                             hoverEnabled: true
                             onClicked: {
                                 if (row.modelData.dir && !row.modelData.marked)
-                                    rootScope.send({ op: "ls", id: row.modelData.id });
+                                    Sweep.open(row.modelData.id);
                             }
                         }
                     }
                 }
 
-                // footer
+                // footer: axon down, the engine's own status, this view's own failure, the staged
+                // line (in the error colour) or the status, the first that applies
                 Text {
                     Layout.fillWidth: true
-                    text: rootScope.stagedCount > 0
-                        ? rootScope.stagedCount + " staged (" + rootScope.stagedHuman + ") — in trash until you delete"
-                        : rootScope.status
-                    color: rootScope.stagedCount > 0 ? Appearance.m3colors.m3error : Appearance.colors.colSubtext
+                    text: Sweep.footer
+                    color: Sweep.stagedLine !== "" && Sweep.footer === Sweep.stagedLine
+                        ? Appearance.m3colors.m3error
+                        : Appearance.colors.colSubtext
                     font { pixelSize: Appearance.font.pixelSize.smallest; family: Appearance.font.family.main }
                 }
             }
@@ -344,8 +246,8 @@ Scope {
                         spacing: 16
                         Text {
                             Layout.alignment: Qt.AlignHCenter
-                            text: "Permanently delete " + rootScope.stagedCount
-                                + " item(s), " + rootScope.stagedHuman + "?"
+                            text: "Permanently delete " + Sweep.stagedCount
+                                + " item(s), " + Sweep.stagedHuman + "?"
                             color: Appearance.colors.colOnLayer1
                             font { pixelSize: Appearance.font.pixelSize.normal; family: Appearance.font.family.main; weight: Font.DemiBold }
                         }
@@ -359,7 +261,10 @@ Scope {
                             SweepButton {
                                 label: "delete forever"
                                 danger: true
-                                onClicked: rootScope.send({ op: "commit" })
+                                onClicked: {
+                                    Sweep.commit();
+                                    rootScope.confirming = false;
+                                }
                             }
                         }
                     }

@@ -47,6 +47,7 @@ Singleton {
 
     property var _topics: ({})          // topic name -> the BackendTopics attached to it
     property var _last: ({})            // topic name -> its last snapshot frame, for late attachers
+    property var _unsubscribing: ({})   // topic name -> the id of its latest unsub, until that reply
     property var _pending: ({})         // request id -> { method, done, deadline }
     property var _failureLoggedAt: ({}) // "method code" -> when that failure was last logged
     property var _loggedErrors: ({})    // connection error texts already logged
@@ -88,7 +89,7 @@ Singleton {
         if (last !== undefined)
             _deliver(topic, last);
         if (_up && attached.length === 1)
-            _subscription("sub", [topic.name]);
+            _subscribe([topic.name]);
     }
 
     // A BackendTopic became inactive or was destroyed. The last one for a
@@ -101,7 +102,7 @@ Singleton {
         _topics[topic.name] = remaining;
         if (_up && remaining.length === 0) {
             delete _last[topic.name];
-            _subscription("unsub", [topic.name]);
+            _unsubscribe(topic.name);
         }
     }
 
@@ -121,9 +122,23 @@ Singleton {
         return id;
     }
 
-    function _subscription(kind, names) { // kind is "sub" or "unsub"
-        const id = _track(kind, root._onSubscribed);
-        _send({ t: kind, id: id, topics: names });
+    function _subscribe(names) {
+        const id = _track("sub", root._onSubscribed);
+        _send({ t: "sub", id: id, topics: names });
+    }
+
+    // Until the reply, axon may still send frames it had due before it read the unsub (section 20,
+    // "Ordering guarantees" 1 and 4). They are of the subscription this ends, so _onSnapshot drops
+    // them, also when the topic is attached again meanwhile: its new subscription's frames come
+    // after this reply. Only the name's latest unsub ends the wait, at its reply, its timeout or
+    // the drop.
+    function _unsubscribe(name) {
+        const id = _track("unsub", () => {
+            if (root._unsubscribing[name] === id)
+                delete root._unsubscribing[name];
+        });
+        _unsubscribing[name] = id;
+        _send({ t: "unsub", id: id, topics: [name] });
     }
 
     function _onSubscribed(reply) {
@@ -188,6 +203,8 @@ Singleton {
     }
 
     function _onSnapshot(frame) {
+        if (_unsubscribing[frame.topic] !== undefined)
+            return; // of the subscription an unsub ended (_unsubscribe)
         _last[frame.topic] = frame;
         for (const topic of _topics[frame.topic] ?? [])
             _deliver(topic, frame);
@@ -211,8 +228,10 @@ Singleton {
     function _onHello(frame) {
         helloTimeout.stop();
         _backoff = _minBackoffMs;
-        if (frame.instance !== _instance)
-            _last = ({}); // a new daemon: every rev restarted, and each BackendTopic resets itself
+        // Every hello, also from the same instance: a frame from before the drop can be older than what
+        // another client changed meanwhile, so a later _attach waits for this connection's frame. A new
+        // instance also restarted every rev, and each BackendTopic resets itself.
+        _last = ({});
         _instance = frame.instance;
         _lastError = "";
         _lastErrorFromServer = false;
@@ -221,7 +240,7 @@ Singleton {
         downDelay.stop();
         const wanted = Object.keys(_topics).filter(name => _topics[name].length > 0);
         if (wanted.length > 0)
-            _subscription("sub", wanted);
+            _subscribe(wanted);
     }
 
     function _onError(frame) { // a connection error: the server closes next

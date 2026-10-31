@@ -29,15 +29,12 @@ ContentPage {
         icon: "memory"
         title: Translation.tr("Resources")
 
-        ConfigSpinBox {
+        BackendSpinBox {
+            key: "resources.interval_ms"
             text: Translation.tr("Polling interval (ms)")
-            value: Config.options.resources.updateInterval
             from: 100
             to: 10000
             stepSize: 100
-            onValueChanged: {
-                Config.options.resources.updateInterval = value;
-            }
         }
     }
 

@@ -13,6 +13,9 @@
 # DateTime.qml from the same module; DateTime's Config comes from fakes/qs/modules/common.
 # tst_config_error_toast.qml loads ConfigErrorToast.qml from the same module, with the same Config.
 # tst_favicon_cache.qml loads FaviconCache.qml from it too, over fakes/Quickshell/Io/Process.qml.
+# tst_resource_usage.qml loads ResourceUsage.qml from the same module.
+# tst_sweep_service.qml loads Sweep.qml from it as SweepService, a copy without its `pragma Singleton`
+# line, so each test makes its own instance; sweep.js sits beside it. tst_sweep.qml needs nothing.
 # tst_config.qml tests the real modules/common/Config.qml, so it gets its own module, ConfigUnderTest:
 # Config.qml sits there beside fakes/Directories.qml, over the stand-in FileView of fakes/Quickshell/Io.
 
@@ -26,8 +29,10 @@ trap 'rm -rf "$imports"' EXIT
 module="$imports/ShellUnderTest"
 mkdir "$module"
 cp "$services/BackendTopic.qml" "$services/BackendList.qml" "$services/SystemInfo.qml" "$services/DateTime.qml" \
-    "$services/FaviconCache.qml" "$services/backend.js" "$here/../../ConfigErrorToast.qml" "$module/"
+    "$services/FaviconCache.qml" "$services/ResourceUsage.qml" "$services/backend.js" \
+    "$services/sweep.js" "$here/../../ConfigErrorToast.qml" "$module/"
 cp "$here/fakes/Backend.qml" "$module/"
+grep -v '^pragma Singleton$' "$services/Sweep.qml" > "$module/SweepService.qml"
 cat > "$module/qmldir" <<'EOF'
 module ShellUnderTest
 singleton Backend 1.0 Backend.qml
@@ -37,6 +42,8 @@ ConfigErrorToast 1.0 ConfigErrorToast.qml
 singleton SystemInfo 1.0 SystemInfo.qml
 singleton DateTime 1.0 DateTime.qml
 singleton FaviconCache 1.0 FaviconCache.qml
+singleton ResourceUsage 1.0 ResourceUsage.qml
+SweepService 1.0 SweepService.qml
 EOF
 
 config_module="$imports/ConfigUnderTest"
@@ -69,8 +76,47 @@ module qs.modules.common.functions
 singleton ColorUtils 1.0 ColorUtils.qml
 EOF
 
+# tst_backend_spin_box.qml loads the real modules/settings/BackendSpinBox.qml as qs.modules.settings, under
+# the names it imports: the real ConfigSpinBox.qml and the widgets it is built from as
+# qs.modules.common.widgets, beside fakes/spinbox/MaterialSymbol.qml, and the real AxonConfig.qml and
+# BackendTopic.qml as qs.services, beside fakes/Backend.qml. Appearance comes from fakes/qs/modules/common
+# and ColorUtils from the functions module above.
+widgets="$here/../../modules/common/widgets"
+widgets_module="$imports/qs/modules/common/widgets"
+mkdir "$widgets_module"
+cp "$widgets/ConfigSpinBox.qml" "$widgets/StyledSpinBox.qml" "$widgets/StyledTextInput.qml" "$widgets/StyledText.qml" \
+    "$widgets/OptionalMaterialSymbol.qml" "$here/fakes/spinbox/MaterialSymbol.qml" "$widgets_module/"
+cat > "$widgets_module/qmldir" <<'EOF'
+module qs.modules.common.widgets
+ConfigSpinBox 1.0 ConfigSpinBox.qml
+StyledSpinBox 1.0 StyledSpinBox.qml
+StyledTextInput 1.0 StyledTextInput.qml
+StyledText 1.0 StyledText.qml
+OptionalMaterialSymbol 1.0 OptionalMaterialSymbol.qml
+MaterialSymbol 1.0 MaterialSymbol.qml
+EOF
+services_module="$imports/qs/services"
+mkdir "$services_module"
+cp "$services/AxonConfig.qml" "$services/BackendTopic.qml" "$here/fakes/Backend.qml" "$services_module/"
+cat > "$services_module/qmldir" <<'EOF'
+module qs.services
+singleton Backend 1.0 Backend.qml
+singleton AxonConfig 1.0 AxonConfig.qml
+BackendTopic 1.0 BackendTopic.qml
+EOF
+settings_module="$imports/qs/modules/settings"
+mkdir "$settings_module"
+cp "$here/../../modules/settings/BackendSpinBox.qml" "$settings_module/"
+cat > "$settings_module/qmldir" <<'EOF'
+module qs.modules.settings
+BackendSpinBox 1.0 BackendSpinBox.qml
+EOF
+
 status=0
-for test in tst_backend.qml tst_backend_connection.qml tst_backend_behaviour.qml tst_system_clients.qml tst_config_error_toast.qml tst_config.qml tst_spin_box.qml tst_favicon_cache.qml; do
+for test in tst_backend.qml tst_backend_connection.qml tst_backend_behaviour.qml \
+    tst_system_clients.qml tst_config_error_toast.qml tst_config.qml tst_spin_box.qml \
+    tst_backend_spin_box.qml tst_favicon_cache.qml tst_resource_usage.qml tst_sweep.qml \
+    tst_sweep_service.qml; do
     QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -import "$here/fakes" -import "$imports" \
         -input "$here/$test" || status=1
 done

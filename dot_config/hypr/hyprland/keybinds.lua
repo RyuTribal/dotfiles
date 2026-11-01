@@ -10,8 +10,11 @@ hl.bind("SUPER + Space", hl.dsp.global("quickshell:overviewToggle"), { descripti
 -- bindid = Super, Super_R, Toggle overview, global, quickshell:overviewToggleRelease # [hidden] Toggle overview/launcher
 hl.bind("SUPER + Space", hl.dsp.exec_cmd("qs -c $qsConfig ipc call TEST_ALIVE || pkill fuzzel || fuzzel")) -- [hidden] Launcher (fallback)
 -- bind = Super, Super_R, exec, qs -c $qsConfig ipc call TEST_ALIVE || pkill fuzzel || fuzzel # [hidden] Launcher (fallback)
--- was `binditn = Super, catchall`: catchall is a bind option in Lua, not a keysym
-hl.bind("SUPER", hl.dsp.global("quickshell:overviewToggleReleaseInterrupt"), { catchall = true, non_consuming = true, transparent = true, ignore_mods = true }) -- [hidden]
+-- was `binditn = Super, catchall`. Since 0.57 catchall is a key and Hyprland allows it only inside a submap;
+-- submap_universal makes it match in the default submap too.
+hl.define_submap("global", function()
+    hl.bind("SUPER + catchall", hl.dsp.global("quickshell:overviewToggleReleaseInterrupt"), { submap_universal = true, non_consuming = true, transparent = true, ignore_mods = true }) -- [hidden]
+end)
 hl.bind("CTRL + Super_L", hl.dsp.global("quickshell:overviewToggleReleaseInterrupt")) -- [hidden]
 hl.bind("CTRL + Super_R", hl.dsp.global("quickshell:overviewToggleReleaseInterrupt")) -- [hidden]
 hl.bind("SUPER + mouse:272", hl.dsp.global("quickshell:overviewToggleReleaseInterrupt")) -- [hidden]

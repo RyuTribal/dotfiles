@@ -5,9 +5,9 @@
 -- The old `.conf` files are kept alongside for reference; Hyprland ignores them
 -- once hyprland.lua exists.
 --
--- The `submap = global` wrapper from the hyprlang config is gone: it only existed
--- so `binditn ... catchall` would work. In Lua, catchall is a bind option
--- (see hyprland/keybinds.lua), so the submap is unnecessary.
+-- The hyprlang config's `submap = global` wrapper existed so `binditn ... catchall`
+-- would work. Hyprland 0.57 again allows catchall only inside a submap, so that one
+-- bind sits in hl.define_submap("global", ...) in hyprland/keybinds.lua.
 
 -- Env vars must be real env vars, not Lua locals: the exec_cmd strings below
 -- rely on the shell expanding $qsConfig (e.g. `qs -c $qsConfig`).

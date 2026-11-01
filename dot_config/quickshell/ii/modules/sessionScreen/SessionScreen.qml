@@ -13,7 +13,7 @@ import Quickshell.Hyprland
 
 Scope {
     id: root
-    property var focusedScreen: Quickshell.screens.find(s => s.name === Hyprland.focusedMonitor?.name)
+    property var focusedScreen: Quickshell.screens.find(s => s.name === Hypr.focusedMonitorName)
     property bool packageManagerRunning: false
     property bool downloadRunning: false
 

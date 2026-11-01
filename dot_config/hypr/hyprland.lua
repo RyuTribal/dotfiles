@@ -61,3 +61,4 @@ hl.monitor({
 
 -- hyprmon: managed monitor profile include
 require("hyprmon")
+require("hyprland.theme")

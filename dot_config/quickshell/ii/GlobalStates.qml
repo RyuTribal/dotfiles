@@ -1,9 +1,7 @@
-import qs.modules.common
 import qs
 import QtQuick
 import Quickshell
 import Quickshell.Hyprland
-import Quickshell.Io
 pragma Singleton
 pragma ComponentBehavior: Bound
 
@@ -30,14 +28,6 @@ Singleton {
     property string topMenuTab: ""
     property bool workspaceShowNumbers: false
 
-    property real screenZoom: 1
-    onScreenZoomChanged: {
-        Quickshell.execDetached(["hyprctl", "eval", `hl.config({ cursor = { zoom_factor = ${root.screenZoom} } })`]);
-    }
-    Behavior on screenZoom {
-        animation: Appearance.animation.elementMoveFast.numberAnimation.createObject(this)
-    }
-
     GlobalShortcut {
         name: "workspaceNumber"
         description: "Hold to show workspace numbers, release to show icons"
@@ -49,16 +39,4 @@ Singleton {
             root.superDown = false
         }
     }
-
-    IpcHandler {
-		target: "zoom"
-
-		function zoomIn() {
-            screenZoom = Math.min(screenZoom + 0.4, 3.0)
-        }
-
-        function zoomOut() {
-            screenZoom = Math.max(screenZoom - 0.4, 1)
-        } 
-	}
 }

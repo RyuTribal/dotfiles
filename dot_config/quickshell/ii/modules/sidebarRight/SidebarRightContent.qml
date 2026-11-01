@@ -11,7 +11,6 @@ import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import Quickshell.Bluetooth
-import Quickshell.Hyprland
 
 Item {
     id: root
@@ -83,10 +82,8 @@ Item {
                     QuickToggleButton {
                         toggled: false
                         buttonIcon: "restart_alt"
-                        onClicked: {
-                            Hyprland.dispatch("reload");
-                            Quickshell.reload(true);
-                        }
+                        // The shell reloads once axon answered, so its reload never drops the request.
+                        onClicked: Hypr.reload(() => Quickshell.reload(true))
                         StyledToolTip {
                             content: Translation.tr("Reload Hyprland & Quickshell")
                         }
@@ -149,7 +146,7 @@ Item {
                 Layout.margins: 5
                 spacing: 8
 
-                property var focusedScreen: Quickshell.screens.find(s => s.name === Hyprland.focusedMonitor?.name)
+                property var focusedScreen: Quickshell.screens.find(s => s.name === Hypr.focusedMonitorName)
                 property var brightnessMonitor: Brightness.getMonitorForScreen(focusedScreen)
 
                 RowLayout { // Volume

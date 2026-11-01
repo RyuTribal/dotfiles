@@ -211,10 +211,8 @@ hl.bind("CTRL+SHIFT+ALT+SUPER + Delete", hl.dsp.exec_cmd("systemctl poweroff || 
 
 --#! Screen
 -- Zoom
-hl.bind("SUPER + Minus", hl.dsp.exec_cmd("qs -c $qsConfig ipc call zoom zoomOut"), { repeating = true }) -- Zoom out
-hl.bind("SUPER + Equal", hl.dsp.exec_cmd("qs -c $qsConfig ipc call zoom zoomIn"), { repeating = true }) -- Zoom in
-hl.bind("SUPER + Minus", hl.dsp.exec_cmd("qs -c $qsConfig ipc call TEST_ALIVE || ~/.config/hypr/hyprland/scripts/zoom.sh decrease 0.1"), { repeating = true }) -- [hidden] Zoom out
-hl.bind("SUPER + Equal", hl.dsp.exec_cmd("qs -c $qsConfig ipc call TEST_ALIVE || ~/.config/hypr/hyprland/scripts/zoom.sh increase 0.1"), { repeating = true }) -- [hidden] Zoom in
+hl.bind("SUPER + Minus", hl.dsp.exec_cmd("axon hypr.zoom delta=-0.4"), { repeating = true }) -- Zoom out
+hl.bind("SUPER + Equal", hl.dsp.exec_cmd("axon hypr.zoom delta=0.4"), { repeating = true }) -- Zoom in
 
 --#! Media
 hl.bind("SUPER+ALT + N", hl.dsp.exec_cmd("playerctl next || playerctl position `bc <<< \"100 * $(playerctl metadata mpris:length) / 1000000 / 100\"`"), { locked = true }) -- Next track

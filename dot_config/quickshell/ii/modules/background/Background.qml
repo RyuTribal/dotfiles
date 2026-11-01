@@ -10,7 +10,6 @@ import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
-import Quickshell.Hyprland
 
 
 Variants {
@@ -28,15 +27,15 @@ Variants {
         required property var modelData
 
         // Hide when fullscreen
-        property list<HyprlandWorkspace> workspacesForMonitor: Hyprland.workspaces.values.filter(workspace=>workspace.monitor && workspace.monitor.name == monitor.name)
-        property var activeWorkspaceWithFullscreen: workspacesForMonitor.filter(workspace=>((workspace.toplevels.values.filter(window=>window.wayland?.fullscreen)[0] != undefined) && workspace.active))[0]
-        visible: GlobalStates.screenLocked || (!(activeWorkspaceWithFullscreen != undefined)) || !Config?.options.background.hideWhenFullscreen
+        property bool activeWorkspaceHasFullscreen: Hypr.workspace(monitor?.active_workspace)?.has_fullscreen ?? false
+        visible: GlobalStates.screenLocked || !activeWorkspaceHasFullscreen || !Config?.options.background.hideWhenFullscreen
 
         // Workspaces
-        property HyprlandMonitor monitor: Hyprland.monitorFor(modelData)
-        property list<var> relevantWindows: HyprlandData.windowList.filter(win => win.monitor == monitor?.id && win.workspace.id >= 0).sort((a, b) => a.workspace.id - b.workspace.id)
-        property int firstWorkspaceId: relevantWindows[0]?.workspace.id || 1
-        property int lastWorkspaceId: relevantWindows[relevantWindows.length - 1]?.workspace.id || 10
+        property var monitor: Hypr.monitorFor(modelData)
+        // Windows on numbered workspaces only: a special or named workspace has no number (null).
+        property list<var> relevantWindows: Hypr.windows.filter(w => w.monitor === monitor?.id && w.workspace >= 1).sort((a, b) => a.workspace - b.workspace)
+        property int firstWorkspaceId: relevantWindows[0]?.workspace || 1
+        property int lastWorkspaceId: relevantWindows[relevantWindows.length - 1]?.workspace || 10
         // Wallpaper
         property bool wallpaperIsVideo: Config.options.background.wallpaperPath.endsWith(".mp4")
             || Config.options.background.wallpaperPath.endsWith(".webm")
@@ -186,7 +185,7 @@ Variants {
             property real valueX: {
                 let result = 0.5;
                 if (Config.options.background.parallax.enableWorkspace) {
-                    result = ((bgRoot.monitor.activeWorkspace?.id - lower) / range);
+                    result = (((bgRoot.monitor?.active_workspace ?? 1) - lower) / range);
                 }
                 if (Config.options.background.parallax.enableSidebar) {
                     result += (0.15 * GlobalStates.sidebarRightOpen);
@@ -211,8 +210,8 @@ Variants {
                 }
             }
             sourceSize {
-                width: bgRoot.screen.width * bgRoot.effectiveWallpaperScale * bgRoot.monitor.scale
-                height: bgRoot.screen.height * bgRoot.effectiveWallpaperScale * bgRoot.monitor.scale
+                width: bgRoot.screen.width * bgRoot.effectiveWallpaperScale * (bgRoot.monitor?.scale ?? 1)
+                height: bgRoot.screen.height * bgRoot.effectiveWallpaperScale * (bgRoot.monitor?.scale ?? 1)
             }
             width: bgRoot.wallpaperWidth / bgRoot.wallpaperToScreenRatio * bgRoot.effectiveWallpaperScale
             height: bgRoot.wallpaperHeight / bgRoot.wallpaperToScreenRatio * bgRoot.effectiveWallpaperScale

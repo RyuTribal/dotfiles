@@ -13,7 +13,7 @@ import Quickshell.Hyprland
 Scope {
     id: root
     property string protectionMessage: ""
-    property var focusedScreen: Quickshell.screens.find(s => s.name === Hyprland.focusedMonitor?.name)
+    property var focusedScreen: Quickshell.screens.find(s => s.name === Hypr.focusedMonitorName)
 
     function triggerOsd() {
         GlobalStates.osdVolumeOpen = true

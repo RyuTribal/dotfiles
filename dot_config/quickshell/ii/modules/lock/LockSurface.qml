@@ -197,7 +197,7 @@ MouseArea {
                 }
                 Loader {
                     sourceComponent: StyledText {
-                        text: HyprlandXkb.currentLayoutCode
+                        text: Input.currentLayoutCode
                         color: Appearance.colors.colOnSurfaceVariant
                         animateChange: true
                     }

@@ -1,3 +1,4 @@
+import "../../services/hypr.js" as H
 import qs.services
 import qs.modules.common
 import qs.modules.common.widgets
@@ -5,17 +6,17 @@ import qs
 import QtQuick
 import QtQuick.Layouts
 import Quickshell
-import Quickshell.Wayland
-import Quickshell.Hyprland
 
 Item {
     id: root
-    readonly property HyprlandMonitor monitor: Hyprland.monitorFor(root.QsWindow.window?.screen)
-    readonly property Toplevel activeWindow: ToplevelManager.activeToplevel
+    readonly property var monitor: Hypr.monitorFor(root.QsWindow.window?.screen)
+    readonly property var activeWindow: Hypr.activeWindow
 
-    property string activeWindowAddress: `0x${activeWindow?.HyprlandToplevel?.address}`
-    property bool focusingThisMonitor: HyprlandData.activeWorkspace?.monitor == monitor?.name
-    property var biggestWindow: HyprlandData.biggestWindowForWorkspace(HyprlandData.monitors[root.monitor?.id]?.activeWorkspace.id)
+    // The focused window when it is on this monitor, else the icon window of this monitor's
+    // workspace, else "Desktop" and the workspace (section 30, N30-5).
+    readonly property var barText: H.barTitle(root.activeWindow, root.monitor?.id,
+        Hypr.iconWindow(root.monitor?.active_workspace), Translation.tr("Desktop"),
+        Translation.tr("Workspace") + " " + (root.monitor?.active_workspace ?? 1))
 
     implicitWidth: colLayout.implicitWidth
 
@@ -32,9 +33,7 @@ Item {
             font.pixelSize: Appearance.font.pixelSize.smaller
             color: Appearance.colors.colSubtext
             elide: Text.ElideRight
-            text: root.focusingThisMonitor && root.activeWindow?.activated && root.biggestWindow ? 
-                root.activeWindow?.appId :
-                (root.biggestWindow?.class) ?? Translation.tr("Desktop")
+            text: root.barText.subtitle
 
         }
 
@@ -43,9 +42,7 @@ Item {
             font.pixelSize: Appearance.font.pixelSize.small
             color: Appearance.colors.colOnLayer0
             elide: Text.ElideRight
-            text: root.focusingThisMonitor && root.activeWindow?.activated && root.biggestWindow ? 
-                root.activeWindow?.title :
-                (root.biggestWindow?.title) ?? `${Translation.tr("Workspace")} ${monitor?.activeWorkspace?.id ?? 1}`
+            text: root.barText.title
         }
 
     }

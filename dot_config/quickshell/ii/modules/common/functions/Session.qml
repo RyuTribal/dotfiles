@@ -7,7 +7,7 @@ Singleton {
     id: root
 
     function closeAllWindows() {
-        HyprlandData.windowList.map(w => w.pid).forEach(pid => {
+        Hypr.windows.map(w => w.pid).forEach(pid => {
             Quickshell.execDetached(["kill", pid]);
         });
     }

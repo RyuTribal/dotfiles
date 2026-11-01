@@ -13,6 +13,13 @@ import Quickshell.Hyprland
 Scope {
     id: overviewScope
     property bool dontAutoCancelSearch: false
+
+    // Window rows carry `at` and `size` only while some client subscribes to this topic (section 30).
+    BackendTopic {
+        name: "hypr.geometry"
+        active: GlobalStates.overviewOpen
+    }
+
     Variants {
         id: overviewVariants
         model: Quickshell.screens
@@ -20,8 +27,8 @@ Scope {
             id: root
             required property var modelData
             property string searchingText: ""
-            readonly property HyprlandMonitor monitor: Hyprland.monitorFor(root.screen)
-            property bool monitorIsFocused: (Hyprland.focusedMonitor?.id == monitor?.id)
+            readonly property var monitor: Hypr.monitorFor(root.screen)
+            property bool monitorIsFocused: Hypr.focusedMonitorName === monitor?.id
             screen: modelData
             visible: GlobalStates.overviewOpen
 
@@ -122,10 +129,10 @@ Scope {
                         GlobalStates.overviewOpen = false;
                     } else if (event.key === Qt.Key_Left) {
                         if (!root.searchingText)
-                            Hyprland.dispatch("workspace r-1");
+                            Hypr.focusWorkspaceRelative(-1);
                     } else if (event.key === Qt.Key_Right) {
                         if (!root.searchingText)
-                            Hyprland.dispatch("workspace r+1");
+                            Hypr.focusWorkspaceRelative(1);
                     }
                 }
 
@@ -156,7 +163,7 @@ Scope {
         }
         for (let i = 0; i < overviewVariants.instances.length; i++) {
             let panelWindow = overviewVariants.instances[i];
-            if (panelWindow.modelData.name == Hyprland.focusedMonitor.name) {
+            if (panelWindow.modelData.name === Hypr.focusedMonitorName) {
                 overviewScope.dontAutoCancelSearch = true;
                 panelWindow.setSearchingText(Config.options.search.prefix.clipboard);
                 GlobalStates.overviewOpen = true;
@@ -172,7 +179,7 @@ Scope {
         }
         for (let i = 0; i < overviewVariants.instances.length; i++) {
             let panelWindow = overviewVariants.instances[i];
-            if (panelWindow.modelData.name == Hyprland.focusedMonitor.name) {
+            if (panelWindow.modelData.name === Hypr.focusedMonitorName) {
                 overviewScope.dontAutoCancelSearch = true;
                 panelWindow.setSearchingText(Config.options.search.prefix.emojis);
                 GlobalStates.overviewOpen = true;
@@ -188,7 +195,7 @@ Scope {
         }
         for (let i = 0; i < overviewVariants.instances.length; i++) {
             let panelWindow = overviewVariants.instances[i];
-            if (panelWindow.modelData.name == Hyprland.focusedMonitor.name) {
+            if (panelWindow.modelData.name === Hypr.focusedMonitorName) {
                 overviewScope.dontAutoCancelSearch = true;
                 // Assumes you have this prefix configured:
                 // Config.options.search.prefix.glyphs → e.g. ":glyph "

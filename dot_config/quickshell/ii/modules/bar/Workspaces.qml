@@ -7,8 +7,6 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import Quickshell
-import Quickshell.Wayland
-import Quickshell.Hyprland
 import Quickshell.Widgets
 import Qt5Compat.GraphicalEffects
 
@@ -16,11 +14,16 @@ Item {
     id: root
     property bool vertical: false
     property bool borderless: Config.options.bar.borderless
-    readonly property HyprlandMonitor monitor: Hyprland.monitorFor(root.QsWindow.window?.screen)
-    readonly property Toplevel activeWindow: ToplevelManager.activeToplevel
+    readonly property var monitor: Hypr.monitorFor(root.QsWindow.window?.screen)
+    readonly property var activeWindow: Hypr.activeWindow
     
-    readonly property int workspaceGroup: Math.floor((monitor?.activeWorkspace?.id - 1) / Config.options.bar.workspaces.shown)
-    property list<bool> workspaceOccupied: []
+    // A named workspace has no number (active_workspace null): the strip shows group 0 then.
+    readonly property int workspaceGroup: Math.floor(((monitor?.active_workspace ?? 1) - 1) / Config.options.bar.workspaces.shown)
+    // Whether each button's workspace exists (an empty one that exists counts). Hypr.workspace()
+    // reads Hypr's index of the workspaces, so this runs again when they or the group change.
+    readonly property list<bool> workspaceOccupied: Array.from({ length: Config.options.bar.workspaces.shown }, (_, buttonIndex) => {
+        return Hypr.workspace(workspaceGroup * Config.options.bar.workspaces.shown + buttonIndex + 1) !== null;
+    })
     property int widgetPadding: 4
     property int workspaceButtonWidth: 26
     property real activeWorkspaceMargin: 2
@@ -28,7 +31,7 @@ Item {
     property real workspaceIconSizeShrinked: workspaceButtonWidth * 0.55
     property real workspaceIconOpacityShrinked: 1
     property real workspaceIconMarginShrinked: -4
-    property int workspaceIndexInGroup: (monitor?.activeWorkspace?.id - 1) % Config.options.bar.workspaces.shown
+    property int workspaceIndexInGroup: ((monitor?.active_workspace ?? 1) - 1) % Config.options.bar.workspaces.shown
 
     property bool showNumbers: false
     Timer {
@@ -54,31 +57,6 @@ Item {
         }
     }
 
-    // Function to update workspaceOccupied
-    function updateWorkspaceOccupied() {
-        workspaceOccupied = Array.from({ length: Config.options.bar.workspaces.shown }, (_, i) => {
-            return Hyprland.workspaces.values.some(ws => ws.id === workspaceGroup * Config.options.bar.workspaces.shown + i + 1);
-        })
-    }
-
-    // Occupied workspace updates
-    Component.onCompleted: updateWorkspaceOccupied()
-    Connections {
-        target: Hyprland.workspaces
-        function onValuesChanged() {
-            updateWorkspaceOccupied();
-        }
-    }
-    Connections {
-        target: Hyprland
-        function onFocusedWorkspaceChanged() {
-            updateWorkspaceOccupied();
-        }
-    }
-    onWorkspaceGroupChanged: {
-        updateWorkspaceOccupied();
-    }
-
     implicitWidth: root.vertical ? Appearance.sizes.verticalBarWidth : backgroundLayout.implicitWidth
     implicitHeight: root.vertical ? backgroundLayout.implicitHeight : Appearance.sizes.barHeight
 
@@ -86,9 +64,9 @@ Item {
     WheelHandler {
         onWheel: (event) => {
             if (event.angleDelta.y < 0)
-                Hyprland.dispatch(`workspace r+1`);
+                Hypr.focusWorkspaceRelative(1);
             else if (event.angleDelta.y > 0)
-                Hyprland.dispatch(`workspace r-1`);
+                Hypr.focusWorkspaceRelative(-1);
         }
         acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
     }
@@ -98,7 +76,7 @@ Item {
         acceptedButtons: Qt.BackButton
         onPressed: (event) => {
             if (event.button === Qt.BackButton) {
-                Hyprland.dispatch(`togglespecialworkspace`);
+                Hypr.toggleSpecial("");
             } 
         }
     }
@@ -125,8 +103,8 @@ Item {
                 implicitWidth: workspaceButtonWidth
                 implicitHeight: workspaceButtonWidth
                 radius: (width / 2)
-                property var previousOccupied: (workspaceOccupied[index-1] && !(!activeWindow?.activated && monitor?.activeWorkspace?.id === index))
-                property var rightOccupied: (workspaceOccupied[index+1] && !(!activeWindow?.activated && monitor?.activeWorkspace?.id === index+2))
+                property var previousOccupied: (workspaceOccupied[index-1] && !(activeWindow === null && monitor?.active_workspace === index))
+                property var rightOccupied: (workspaceOccupied[index+1] && !(activeWindow === null && monitor?.active_workspace === index+2))
                 property var radiusPrev: previousOccupied ? 0 : (width / 2)
                 property var radiusNext: rightOccupied ? 0 : (width / 2)
 
@@ -136,7 +114,7 @@ Item {
                 bottomRightRadius: radiusNext
                 
                 color: ColorUtils.transparentize(Appearance.m3colors.m3secondaryContainer, 0.4)
-                opacity: (workspaceOccupied[index] && !(!activeWindow?.activated && monitor?.activeWorkspace?.id === index+1)) ? 1 : 0
+                opacity: (workspaceOccupied[index] && !(activeWindow === null && monitor?.active_workspace === index+1)) ? 1 : 0
 
                 Behavior on opacity {
                     animation: Appearance.animation.elementMove.numberAnimation.createObject(this)
@@ -215,7 +193,7 @@ Item {
                 property int workspaceValue: workspaceGroup * Config.options.bar.workspaces.shown + index + 1
                 Layout.fillHeight: !root.vertical
                 Layout.fillWidth: root.vertical
-                onPressed: Hyprland.dispatch(`workspace ${workspaceValue}`)
+                onPressed: Hypr.focusWorkspace(workspaceValue)
                 width: vertical ? undefined : workspaceButtonWidth
                 height: vertical ? workspaceButtonWidth : undefined
 
@@ -223,7 +201,7 @@ Item {
                     id: workspaceButtonBackground
                     implicitWidth: workspaceButtonWidth
                     implicitHeight: workspaceButtonWidth
-                    property var biggestWindow: HyprlandData.biggestWindowForWorkspace(button.workspaceValue)
+                    property var biggestWindow: Hypr.iconWindow(button.workspaceValue)
                     property var mainAppIconSource: Quickshell.iconPath(AppSearch.guessIcon(biggestWindow?.class), "image-missing")
 
                     StyledText { // Workspace number text
@@ -242,7 +220,7 @@ Item {
                         }
                         text: Config.options?.bar.workspaces.numberMap[button.workspaceValue - 1] || button.workspaceValue
                         elide: Text.ElideRight
-                        color: (monitor?.activeWorkspace?.id == button.workspaceValue) ? 
+                        color: (monitor?.active_workspace == button.workspaceValue) ? 
                             Appearance.m3colors.m3onPrimary : 
                             (workspaceOccupied[index] ? Appearance.m3colors.m3onSecondaryContainer : 
                                 Appearance.colors.colOnLayer1Inactive)
@@ -262,7 +240,7 @@ Item {
                         width: workspaceButtonWidth * 0.18
                         height: width
                         radius: width / 2
-                        color: (monitor?.activeWorkspace?.id == button.workspaceValue) ? 
+                        color: (monitor?.active_workspace == button.workspaceValue) ? 
                             Appearance.m3colors.m3onPrimary : 
                             (workspaceOccupied[index] ? Appearance.m3colors.m3onSecondaryContainer : 
                                 Appearance.colors.colOnLayer1Inactive)

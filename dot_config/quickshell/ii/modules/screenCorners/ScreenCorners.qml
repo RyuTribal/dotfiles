@@ -7,11 +7,10 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Wayland
-import Quickshell.Hyprland
 
 Scope {
     id: screenCorners
-    readonly property Toplevel activeWindow: ToplevelManager.activeToplevel
+    readonly property var activeWindow: Hypr.activeWindow
     property var actionForCorner: ({
         // Left corners no longer open a sidebar (left sidebar removed)
         [RoundCorner.CornerEnum.TopLeft]: () => {},
@@ -131,12 +130,10 @@ Scope {
         Scope {
             id: monitorScope
             required property var modelData
-            property HyprlandMonitor monitor: Hyprland.monitorFor(modelData)
+            property var monitor: Hypr.monitorFor(modelData)
 
             // Hide when fullscreen
-            property list<HyprlandWorkspace> workspacesForMonitor: Hyprland.workspaces.values.filter(workspace => workspace.monitor && workspace.monitor.name == monitor.name)
-            property var activeWorkspaceWithFullscreen: workspacesForMonitor.filter(workspace => ((workspace.toplevels.values.filter(window => window.wayland?.fullscreen)[0] != undefined) && workspace.active))[0]
-            property bool fullscreen: activeWorkspaceWithFullscreen != undefined
+            property bool fullscreen: Hypr.workspace(monitor?.active_workspace)?.has_fullscreen ?? false
 
             CornerPanelWindow {
                 screen: modelData

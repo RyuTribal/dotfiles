@@ -274,11 +274,11 @@ Item { // Bar content region
                         }
                     }
                     Loader {
-                        active: HyprlandXkb.layoutCodes.length > 1
+                        active: Input.layoutCodes.length > 1
                         visible: active
                         Layout.bottomMargin: indicatorsColumnLayout.realSpacing
                         sourceComponent: StyledText {
-                            text: HyprlandXkb.currentLayoutCode
+                            text: Input.currentLayoutCode
                             font.pixelSize: Appearance.font.pixelSize.small
                             color: rightSidebarButton.colText
                             animateChange: true

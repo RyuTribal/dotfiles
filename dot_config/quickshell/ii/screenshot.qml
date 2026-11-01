@@ -19,7 +19,6 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Widgets
 import Quickshell.Wayland
-import Quickshell.Hyprland
 
 ShellRoot {
     id: root
@@ -35,12 +34,20 @@ ShellRoot {
     property color imageFillColor: "#33f1d1ff"
     property color onBorderColor: "#ff000000"
     property real standardRounding: 4
-    readonly property var windows: HyprlandData.windowList
-    readonly property var layers: HyprlandData.layers
+    readonly property var windows: Hypr.windows
+    readonly property var layers: Hypr.layers // null until the geometry check below is armed
     readonly property real falsePositivePreventionRatio: 0.5
+
+    // Window rows carry `at` and `size`, and `layers` is a list, only while some client subscribes to
+    // this topic (section 30).
+    BackendTopic {
+        name: "hypr.geometry"
+        active: true
+    }
 
     // Force initialization of some singletons
     Component.onCompleted: {
+        Backend.clientName = "ii-screenshot";
         MaterialThemeLoader.reapplyTheme();
     }
 
@@ -104,11 +111,14 @@ ShellRoot {
         PanelWindow {
             id: panelWindow
             required property var modelData
-            readonly property HyprlandMonitor hyprlandMonitor: Hyprland.monitorFor(modelData)
-            readonly property real monitorScale: hyprlandMonitor.scale
-            readonly property real monitorOffsetX: hyprlandMonitor.x
-            readonly property real monitorOffsetY: hyprlandMonitor.y
-            property int activeWorkspaceId: hyprlandMonitor.activeWorkspace?.id ?? 0
+            readonly property var hyprlandMonitor: Hypr.monitorFor(modelData)
+            readonly property real monitorScale: hyprlandMonitor?.scale ?? 1
+            readonly property real monitorOffsetX: hyprlandMonitor?.x ?? 0
+            readonly property real monitorOffsetY: hyprlandMonitor?.y ?? 0
+            // 0 before the first snapshot and while the monitor shows a named workspace (no number).
+            // No window row has 0, so the windows of special and named workspaces, whose number is
+            // null, are never regions.
+            property int activeWorkspaceId: hyprlandMonitor?.active_workspace ?? 0
             property string screenshotPath: `${root.screenshotDir}/image-${modelData.name}`
             property real dragStartX: 0
             property real dragStartY: 0
@@ -121,7 +131,7 @@ ShellRoot {
             property var mouseButton: null
             property var imageRegions: []
             readonly property list<var> windowRegions: filterWindowRegionsByLayers(
-                root.windows.filter(w => w.workspace.id === panelWindow.activeWorkspaceId),
+                root.windows.filter(w => w.workspace === panelWindow.activeWorkspaceId && w.at),
                 panelWindow.layerRegions
             ).map(window => {
                 return {
@@ -132,8 +142,7 @@ ShellRoot {
                 }
             })
             readonly property list<var> layerRegions: {
-                const layersOfThisMonitor = root.layers[panelWindow.hyprlandMonitor.name]
-                const topLayers = layersOfThisMonitor?.levels?.["2"] ?? []
+                const topLayers = (root.layers ?? []).filter(layer => layer.monitor === panelWindow.hyprlandMonitor?.id && layer.level === 2)
                 const nonBarTopLayers = topLayers
                     .filter(layer => !(layer.namespace.includes(":bar") || layer.namespace.includes(":verticalBar") || layer.namespace.includes(":dock")))
                     .map(layer => {

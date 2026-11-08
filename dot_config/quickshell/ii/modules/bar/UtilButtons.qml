@@ -75,9 +75,9 @@ Item {
                 Layout.alignment: Qt.AlignVCenter
                 onClicked: event => {
                     if (Appearance.m3colors.darkmode) {
-                        Backend.call("theme.set_mode", { mode: "light" });
+                        Theme.setMode("light");
                     } else {
-                        Backend.call("theme.set_mode", { mode: "dark" });
+                        Theme.setMode("dark");
                     }
                 }
                 MaterialSymbol {

@@ -1,4 +1,4 @@
-fish_config theme choose "TokyoNight Night"
+fish_config theme choose axon-ansi
 function fish_prompt -d "Write out the prompt"
     # This shows up as USER@HOST /home/user/ >, with the directory colored
     # $USER and $hostname are set by fish, so you can just use them
@@ -17,9 +17,6 @@ if status is-interactive # Commands to run in interactive sessions can go here
 
     # Use starship
     starship init fish | source
-    if test -f ~/.local/state/quickshell/user/generated/terminal/sequences.txt
-        cat ~/.local/state/quickshell/user/generated/terminal/sequences.txt
-    end
 
     # Aliases
     # --icons takes an optional WHEN, so bare `--icons` swallows the next arg:

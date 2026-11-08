@@ -10,6 +10,7 @@ import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import "." // ensure Singleton NerdGlyphs is visible if it lives alongside this file
+import "../../services/theme.js" as ThemeLogic
 
 Item { // Wrapper
     id: root
@@ -151,23 +152,22 @@ Item { // Wrapper
         searchInput.selectAll();
     }
 
+    // accentcolor writes the active theme's seed knob, so it is listed only while that theme has one.
     property var searchActions: [
         {
             action: "accentcolor",
-            execute: args => {
-                Quickshell.execDetached([Directories.wallpaperSwitchScriptPath, "--noswitch", "--color", ...(args != '' ? [`${args}`] : [])]);
-            }
+            execute: args => root.setAccentColour(args.trim())
         },
         {
             action: "dark",
             execute: () => {
-                Quickshell.execDetached([Directories.wallpaperSwitchScriptPath, "--mode", "dark", "--noswitch"]);
+                Theme.setMode("dark");
             }
         },
         {
             action: "light",
             execute: () => {
-                Quickshell.execDetached([Directories.wallpaperSwitchScriptPath, "--mode", "light", "--noswitch"]);
+                Theme.setMode("light");
             }
         },
         {
@@ -195,7 +195,34 @@ Item { // Wrapper
                 GlobalStates.wallpaperSelectorOpen = true;
             }
         },
-    ]
+    ].filter(entry => entry.action !== "accentcolor" || Theme.hasSeedKnob)
+
+    // `#rrggbb` or six hex digits set the seed; no argument picks a colour on screen.
+    function setAccentColour(argument) {
+        if (argument === "") {
+            accentPicker.running = true;
+            return;
+        }
+        const colour = ThemeLogic.accentColour(argument);
+        if (colour === null) {
+            Quickshell.execDetached(["notify-send", Translation.tr("Accent color"), Translation.tr("Usage: <tt>%1accentcolor [#rrggbb]</tt>\nWithout a colour, pick one on screen").arg(Config.options.search.prefix.action), "-a", "Shell"]);
+            return;
+        }
+        Theme.setKnob("seed", colour);
+    }
+
+    Process {
+        id: accentPicker
+        command: ["hyprpicker", "--no-fancy"]
+        stdout: StdioCollector {
+            // Nothing is printed when the pick is cancelled.
+            onStreamFinished: {
+                const colour = ThemeLogic.accentColour(text.trim());
+                if (colour !== null)
+                    Theme.setKnob("seed", colour);
+            }
+        }
+    }
 
     function focusFirstItem() {
         appResults.currentIndex = 0;

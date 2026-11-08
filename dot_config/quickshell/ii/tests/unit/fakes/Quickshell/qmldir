@@ -5,3 +5,4 @@ Scope 1.0 Scope.qml
 LazyLoader 1.0 LazyLoader.qml
 FloatingWindow 1.0 FloatingWindow.qml
 ScriptModel 1.0 ScriptModel.qml
+ColorQuantizer 1.0 ColorQuantizer.qml

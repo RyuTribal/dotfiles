@@ -48,7 +48,7 @@ ShellRoot {
     // Force initialization of some singletons
     Component.onCompleted: {
         Backend.clientName = "ii-screenshot";
-        MaterialThemeLoader.reapplyTheme();
+        Theme.reload();
     }
 
     component TargetRegion: Rectangle {

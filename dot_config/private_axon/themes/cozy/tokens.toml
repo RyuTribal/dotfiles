@@ -1,0 +1,58 @@
+# Cozy's design tokens: today's Appearance.qml constants, so the shell can bind to iris.json
+# without a visible change. The Hyprland template takes its rounding and gaps from here.
+
+[rounding]                  # Appearance.qml:189-200
+unsharpen = 2
+unsharpenmore = 6
+verysmall = 8
+small = 12
+normal = 17
+large = 23
+verylarge = 30
+full = 9999
+screen = 23
+window = 18                 # also Hyprland decoration.rounding
+
+[font_size]                 # Appearance.qml pixelSize scale
+smallest = 10
+smaller = 12
+small = 15
+normal = 16
+large = 17
+larger = 19
+huge = 22
+hugeass = 23
+title = 22
+
+[sizes]
+gaps_in = 4                 # Hyprland general.gaps_in, snap.window_gap
+gaps_out = 5                # Hyprland gaps_out, snap.monitor_gap, Appearance.sizes.hyprlandGapsOut
+gaps_workspaces = 50
+border = 1
+elevation_margin = 10
+
+[motion.curves]             # Appearance.qml:225-237, animationCurves
+expressiveFastSpatial = [0.42, 1.67, 0.21, 0.90, 1, 1]
+expressiveDefaultSpatial = [0.38, 1.21, 0.22, 1.00, 1, 1]
+expressiveSlowSpatial = [0.39, 1.29, 0.35, 0.98, 1, 1]
+expressiveEffects = [0.34, 0.80, 0.34, 1.00, 1, 1]
+# QML writes these with fractions: 2 / 15, 1 / 6 and 5 / 24, each the nearest double here.
+emphasized = [0.05, 0, 0.13333333333333333, 0.06, 0.16666666666666666, 0.4,
+              0.20833333333333334, 0.82, 0.25, 1, 1, 1]
+emphasizedFirstHalf = [0.05, 0, 0.13333333333333333, 0.06, 0.16666666666666666, 0.4,
+                       0.20833333333333334, 0.82]
+emphasizedLastHalf = [0.20833333333333334, 0.82, 0.25, 1, 1, 1]
+emphasizedAccel = [0.3, 0, 0.8, 0.15, 1, 1]
+emphasizedDecel = [0.05, 0.7, 0.1, 1, 1, 1]
+standard = [0.2, 0, 0, 1, 1, 1]
+standardAccel = [0.3, 0, 1, 1, 1, 1]
+standardDecel = [0, 0, 0, 1, 1, 1]
+
+[motion.presets]            # Appearance.qml:244-327, animation
+elementMove = { duration = 500, curve = "expressiveDefaultSpatial", velocity = 650 }
+elementMoveEnter = { duration = 400, curve = "emphasizedDecel", velocity = 650 }
+elementMoveExit = { duration = 200, curve = "emphasizedAccel", velocity = 650 }
+elementMoveFast = { duration = 200, curve = "expressiveEffects", velocity = 850 }
+clickBounce = { duration = 200, curve = "expressiveFastSpatial", velocity = 850 }
+scroll = { duration = 200, curve = "standardDecel" }
+menuDecel = { duration = 350, easing = "OutExpo" }

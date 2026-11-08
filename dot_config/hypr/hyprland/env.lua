@@ -22,8 +22,5 @@ hl.env("XDG_MENU_PREFIX", "plasma-")
 -- ?
 -- env = WLR_NO_HARDWARE_CURSORS, 1
 
--- ######## Virtual envrionment #########
-hl.env("ILLOGICAL_IMPULSE_VIRTUAL_ENV", "~/.local/state/quickshell/.venv")
-
 -- ######## Terminal application #########
 hl.env("TERMINAL", "kitty -1")

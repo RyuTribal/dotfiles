@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import qs.modules.common.functions
+import qs.services
 pragma Singleton
 pragma ComponentBehavior: Bound
 
@@ -18,7 +19,7 @@ Singleton {
     // Transparency. The quadratic functions were derived from analysis of hand-picked transparency values.
     ColorQuantizer {
         id: wallColorQuant
-        source: Qt.resolvedUrl(Config.options.background.wallpaperPath)
+        source: Theme.wallpaperUrl
         depth: 0 // 2^0 = 1 color
         rescaleSize: 10
     }
@@ -97,6 +98,9 @@ Singleton {
         property color m3onSuccess: "#213528"
         property color m3successContainer: "#374B3E"
         property color m3onSuccessContainer: "#D1E9D6"
+        property color m3accent: "#FFB4AB"
+        property color m3onAccent: "#690005"
+        property color m3screenCorner: "#000000"
         property color term0: "#EDE4E4"
         property color term1: "#B52755"
         property color term2: "#A97363"
@@ -119,8 +123,8 @@ Singleton {
         property color colSubtext: m3colors.m3outline
         property color colLayer0: ColorUtils.mix(ColorUtils.transparentize(m3colors.m3background, root.backgroundTransparency), m3colors.m3primary, Config.options.appearance.extraBackgroundTint ? 0.99 : 1)
         property color colOnLayer0: m3colors.m3onBackground
-        property color colLayer0Hover: ColorUtils.transparentize(ColorUtils.mix(colLayer0, colOnLayer0, 0.9, root.contentTransparency))
-        property color colLayer0Active: ColorUtils.transparentize(ColorUtils.mix(colLayer0, colOnLayer0, 0.8, root.contentTransparency))
+        property color colLayer0Hover: ColorUtils.transparentize(ColorUtils.mix(colLayer0, colOnLayer0, 0.9), root.contentTransparency)
+        property color colLayer0Active: ColorUtils.transparentize(ColorUtils.mix(colLayer0, colOnLayer0, 0.8), root.contentTransparency)
         property color colLayer0Border: ColorUtils.mix(root.m3colors.m3outlineVariant, colLayer0, 0.4)
         property color colLayer1: ColorUtils.transparentize(m3colors.m3surfaceContainerLow, root.contentTransparency);
         property color colOnLayer1: m3colors.m3onSurfaceVariant;
@@ -184,6 +188,8 @@ Singleton {
         property color colErrorContainerHover: ColorUtils.mix(m3colors.m3errorContainer, m3colors.m3onErrorContainer, 0.90)
         property color colErrorContainerActive: ColorUtils.mix(m3colors.m3errorContainer, m3colors.m3onErrorContainer, 0.70)
         property color colOnErrorContainer: m3colors.m3onErrorContainer
+        property color colAccent: m3colors.m3accent
+        property color colOnAccent: m3colors.m3onAccent
     }
 
     rounding: QtObject {

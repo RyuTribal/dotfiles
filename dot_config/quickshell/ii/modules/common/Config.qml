@@ -116,20 +116,6 @@ Singleton {
                     property real backgroundTransparency: 0.11
                     property real contentTransparency: 0.57
                 }
-                property JsonObject wallpaperTheming: JsonObject {
-                    property bool enableAppsAndShell: true
-                    property bool enableQtApps: true
-                    property bool enableTerminal: true
-                    property JsonObject terminalGenerationProps: JsonObject {
-                        property real harmony: 0.8
-                        property real harmonizeThreshold: 100
-                        property real termFgBoost: 0.35
-                        property bool forceDarkMode: false
-                    }
-                }
-                property JsonObject palette: JsonObject {
-                    property string type: "auto" // Allowed: auto, scheme-content, scheme-expressive, scheme-fidelity, scheme-fruit-salad, scheme-monochrome, scheme-neutral, scheme-rainbow, scheme-tonal-spot
-                }
             }
 
             property JsonObject audio: JsonObject {
@@ -155,8 +141,6 @@ Singleton {
                 property real clockX: -500
                 property real clockY: -500
                 property bool showClock: true
-                property string wallpaperPath: ""
-                property string thumbnailPath: ""
                 property JsonObject parallax: JsonObject {
                     property bool enableWorkspace: true
                     property real workspaceZoom: 1.07 // Relative to your screen, not wallpaper size

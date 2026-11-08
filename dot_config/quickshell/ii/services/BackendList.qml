@@ -10,7 +10,7 @@ import "backend.js" as B
  * instance clears the list. Page 0 goes out once per cause: triggers in one
  * event loop turn share one request, and a collectionRev that arrives while
  * page 0 is in flight is checked against the reply instead of sending a
- * second request: a reply older than that rev is refetched once. Once, because
+ * second request: a reply whose rev differs from it is refetched once. Once, because
  * a topic restored from a persisted snapshot can carry a rev the running
  * engine never reaches.
  */
@@ -109,7 +109,7 @@ QtObject {
             _restart(); // the collection changed underneath: refetch from offset 0
             return;
         }
-        if (revMoved && collectionRev !== null && page.rev < collectionRev) {
+        if (revMoved && collectionRev !== null && page.rev !== collectionRev) {
             _restart(); // the topic moved ahead of this page while it was in flight
             return;
         }

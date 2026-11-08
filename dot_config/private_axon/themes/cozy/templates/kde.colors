@@ -1,0 +1,158 @@
+{#- A KDE colour scheme from the palette: kde-material-you-colors 2.2.0's role mapping
+    (schemeconfigs.py) in the layout of today's MaterialYouDark.colors. That tool makes its
+    link, negative, neutral, positive and visited colours from Breeze's text colours
+    harmonised toward the seed; here each takes the palette colour nearest today's in dark:
+    link blue, negative error, neutral yellow, positive cyan (the palette shifts it to green)
+    and visited red (it renders lilac), with their containers in [Colors:Selection]. The Qt
+    target copies this file into a slot and applies it with plasma-apply-colorscheme. -#}
+[ColorEffects:Disabled]
+Color={{ colors.surface_container.hex }}
+ColorAmount=0.5
+ColorEffect=3
+ContrastAmount=0
+ContrastEffect=0
+IntensityAmount=0
+IntensityEffect=0
+
+[ColorEffects:Inactive]
+ChangeSelectionColor=true
+Color={{ colors.surface_container_lowest.hex }}
+ColorAmount=0.025
+ColorEffect=0
+ContrastAmount=0.1
+ContrastEffect=0
+Enable={{ 'true' if is_dark else 'false' }}
+IntensityAmount=0
+IntensityEffect=0
+
+[Colors:Button]
+BackgroundAlternate={{ colors.surface_variant.hex }}
+BackgroundNormal={{ colors.surface_container_high.hex }}
+DecorationFocus={{ colors.primary.hex }}
+DecorationHover={{ colors.primary.hex }}
+ForegroundActive={{ colors.on_surface.hex }}
+ForegroundInactive={{ colors.outline.hex }}
+ForegroundLink={{ colors.blue.hex }}
+ForegroundNegative={{ colors.error.hex }}
+ForegroundNeutral={{ colors.yellow.hex }}
+ForegroundNormal={{ colors.on_surface.hex }}
+ForegroundPositive={{ colors.cyan.hex }}
+ForegroundVisited={{ colors.red.hex }}
+
+[Colors:Complementary]
+BackgroundAlternate={{ colors.surface.hex }}
+BackgroundNormal={{ colors.surface_container.hex }}
+DecorationFocus={{ colors.primary.hex }}
+DecorationHover={{ colors.primary.hex }}
+ForegroundActive={{ colors.inverse_surface.hex }}
+ForegroundInactive={{ colors.outline.hex }}
+ForegroundLink={{ colors.blue.hex }}
+ForegroundNegative={{ colors.error.hex }}
+ForegroundNeutral={{ colors.yellow.hex }}
+ForegroundNormal={{ colors.on_surface_variant.hex }}
+ForegroundPositive={{ colors.cyan.hex }}
+ForegroundVisited={{ colors.red.hex }}
+
+[Colors:Header]
+BackgroundAlternate={{ colors.surface_container.hex }}
+BackgroundNormal={{ colors.surface_container.hex }}
+DecorationFocus={{ colors.primary.hex }}
+DecorationHover={{ colors.primary.hex }}
+ForegroundActive={{ colors.inverse_surface.hex }}
+ForegroundInactive={{ colors.outline.hex }}
+ForegroundLink={{ colors.blue.hex }}
+ForegroundNegative={{ colors.error.hex }}
+ForegroundNeutral={{ colors.yellow.hex }}
+ForegroundNormal={{ colors.on_surface_variant.hex }}
+ForegroundPositive={{ colors.cyan.hex }}
+ForegroundVisited={{ colors.red.hex }}
+
+[Colors:Header][Inactive]
+BackgroundAlternate={{ colors.surface_container.hex }}
+BackgroundNormal={{ colors.surface_container.hex }}
+DecorationFocus={{ colors.primary.hex }}
+DecorationHover={{ colors.primary.hex }}
+ForegroundActive={{ colors.inverse_surface.hex }}
+ForegroundInactive={{ colors.outline.hex }}
+ForegroundLink={{ colors.blue.hex }}
+ForegroundNegative={{ colors.error.hex }}
+ForegroundNeutral={{ colors.yellow.hex }}
+ForegroundNormal={{ colors.on_surface_variant.hex }}
+ForegroundPositive={{ colors.cyan.hex }}
+ForegroundVisited={{ colors.red.hex }}
+
+[Colors:Selection]
+BackgroundAlternate={{ colors.primary.hex }}
+BackgroundNormal={{ colors.primary.hex }}
+DecorationFocus={{ colors.primary.hex }}
+DecorationHover={{ colors.secondary.hex }}
+ForegroundActive={{ colors.on_primary.hex }}
+ForegroundInactive={{ colors.on_primary.hex }}
+ForegroundLink={{ colors.blue_container.hex }}
+ForegroundNegative={{ colors.error_container.hex }}
+ForegroundNeutral={{ colors.yellow_container.hex }}
+ForegroundNormal={{ colors.on_primary.hex }}
+ForegroundPositive={{ colors.cyan_container.hex }}
+ForegroundVisited={{ colors.red_container.hex }}
+
+[Colors:Tooltip]
+BackgroundAlternate={{ colors.surface_variant.hex }}
+BackgroundNormal={{ colors.surface_container.hex }}
+DecorationFocus={{ colors.primary.hex }}
+DecorationHover={{ colors.primary.hex }}
+ForegroundActive={{ colors.on_surface.hex }}
+ForegroundInactive={{ colors.outline.hex }}
+ForegroundLink={{ colors.blue.hex }}
+ForegroundNegative={{ colors.error.hex }}
+ForegroundNeutral={{ colors.yellow.hex }}
+ForegroundNormal={{ colors.on_surface.hex }}
+ForegroundPositive={{ colors.cyan.hex }}
+ForegroundVisited={{ colors.red.hex }}
+
+[Colors:View]
+BackgroundAlternate={{ colors.surface_container.hex }}
+BackgroundNormal={{ colors.surface_dim.hex if is_dark else colors.surface_bright.hex }}
+DecorationFocus={{ colors.primary.hex }}
+#-----------------------------------------------
+DecorationHover={{ colors.inverse_primary.hex if is_dark else colors.secondary_fixed.hex }}
+ForegroundActive={{ colors.inverse_surface.hex }}
+ForegroundInactive={{ colors.outline.hex }}
+ForegroundLink={{ colors.blue.hex }}
+ForegroundNegative={{ colors.error.hex }}
+ForegroundNeutral={{ colors.yellow.hex }}
+ForegroundNormal={{ colors.on_surface.hex }}
+ForegroundPositive={{ colors.cyan.hex }}
+ForegroundVisited={{ colors.red.hex }}
+
+[Colors:Window]
+BackgroundAlternate={{ colors.surface_variant.hex }}
+BackgroundNormal={{ colors.surface_container.hex }}
+DecorationFocus={{ colors.primary.hex }}
+DecorationHover={{ colors.primary.hex }}
+ForegroundActive={{ colors.blue.hex }}
+ForegroundInactive={{ colors.outline.hex }}
+ForegroundLink={{ colors.blue.hex }}
+ForegroundNegative={{ colors.error.hex }}
+ForegroundNeutral={{ colors.yellow.hex }}
+#--- Window titles, context icons
+ForegroundNormal={{ colors.on_surface_variant.hex }}
+ForegroundPositive={{ colors.cyan.hex }}
+ForegroundVisited={{ colors.red.hex }}
+
+[General]
+ColorScheme={{ theme.name }}
+Name={{ theme.name }} ({{ mode }})
+shadeSortColumn=true
+
+[KDE]
+contrast=4
+frameContrast=0.2
+
+[WM]
+activeBackground=#ff{{ colors.surface_container_highest.hex_stripped }}
+activeBlend={{ '252,252,252' if is_dark else '227,229,231' }}
+activeForeground={{ colors.on_surface.hex }}
+inactiveBackground=#ff{{ colors.secondary_container.hex_stripped }}
+inactiveBlend={{ '161,169,177' if is_dark else '239,240,241' }}
+inactiveForeground={{ colors.on_secondary_container.hex if is_dark
+    else colors.on_surface_variant.hex }}

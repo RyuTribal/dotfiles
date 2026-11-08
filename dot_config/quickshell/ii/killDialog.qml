@@ -39,7 +39,8 @@ ApplicationWindow {
 
     Component.onCompleted: {
         Config.ready // Just read to force init
-        MaterialThemeLoader.reapplyTheme();
+        Backend.clientName = "ii-killdialog";
+        Theme.reload();
     }
 
     minimumWidth: 400

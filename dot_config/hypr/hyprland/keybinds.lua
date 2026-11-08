@@ -37,7 +37,7 @@ hl.bind("SUPER + H", hl.dsp.global("quickshell:cheatsheetToggle"), { description
 hl.bind("SUPER + P", hl.dsp.global("quickshell:mediaControlsToggle"), { description = "Toggle media controls" }) -- Toggle media controls
 hl.bind("CTRL+ALT + Delete", hl.dsp.global("quickshell:sessionToggle"), { description = "Toggle session menu" }) -- Toggle session menu
 hl.bind("SUPER+SHIFT + B", hl.dsp.global("quickshell:barToggle"), { description = "Toggle bar" }) -- Toggle bar
-hl.bind("CTRL+ALT + Delete", hl.dsp.exec_cmd("qs -c $qsConfig ipc call TEST_ALIVE || pkill wlogout || wlogout -p layer-shell")) -- [hidden] Session menu (fallback)
+hl.bind("CTRL+ALT + Delete", hl.dsp.exec_cmd("qs -c $qsConfig ipc call TEST_ALIVE || pkill wlogout || { f=$HOME/.local/state/axon/theme/current/wlogout.css; if [ -r \"$f\" ]; then wlogout -p layer-shell -C \"$f\"; else wlogout -p layer-shell; fi; }")) -- [hidden] Session menu (fallback)
 
 hl.bind("XF86MonBrightnessUp", hl.dsp.exec_cmd("qs -c $qsConfig ipc call brightness increment || brightnessctl s 5%+"), { locked = true, repeating = true }) -- [hidden]
 hl.bind("XF86MonBrightnessDown", hl.dsp.exec_cmd("qs -c $qsConfig ipc call brightness decrement || brightnessctl s 5%-"), { locked = true, repeating = true }) -- [hidden]
@@ -50,7 +50,6 @@ hl.bind("ALT + XF86AudioMute", hl.dsp.exec_cmd("wpctl set-mute @DEFAULT_SOURCE@ 
 hl.bind("XF86AudioMicMute", hl.dsp.exec_cmd("wpctl set-mute @DEFAULT_SOURCE@ toggle"), { locked = true }) -- [hidden]
 hl.bind("SUPER+ALT + M", hl.dsp.exec_cmd("wpctl set-mute @DEFAULT_SOURCE@ toggle"), { locked = true, description = "Toggle mic" }) -- [hidden]
 hl.bind("CTRL+SUPER + T", hl.dsp.global("quickshell:wallpaperSelectorToggle"), { description = "Toggle wallpaper selector" }) -- Wallpaper selector
-hl.bind("CTRL+SUPER + T", hl.dsp.exec_cmd("qs -c $qsConfig ipc call TEST_ALIVE || ~/.config/quickshell/$qsConfig/scripts/colors/switchwall.sh"), { description = "Change wallpaper" }) -- [hidden] Change wallpaper (fallback)
 hl.bind("CTRL+SUPER + R", hl.dsp.exec_cmd("killall ags agsv1 gjs qs quickshell; qs -c $qsConfig &")) -- Restart widgets
 
 --#! Utilities

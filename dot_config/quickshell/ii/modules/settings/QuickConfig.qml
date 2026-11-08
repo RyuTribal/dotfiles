@@ -20,7 +20,7 @@ ContentPage {
         toggled: Appearance.m3colors.darkmode === dark
         colBackground: Appearance.colors.colLayer2
         onClicked: {
-            Quickshell.execDetached(["bash", "-c", `${Directories.wallpaperSwitchScriptPath} --mode ${dark ? "dark" : "light"} --noswitch`]);
+            Theme.setMode(dark ? "dark" : "light");
         }
         contentItem: Item {
             anchors.centerIn: parent
@@ -62,7 +62,7 @@ ContentPage {
                     sourceSize.width: parent.implicitWidth
                     sourceSize.height: parent.implicitHeight
                     fillMode: Image.PreserveAspectCrop
-                    source: Config.options.background.wallpaperPath
+                    source: Theme.wallpaperUrl
                     layer.enabled: true
                     layer.effect: OpacityMask {
                         maskSource: Rectangle {
@@ -79,10 +79,12 @@ ContentPage {
                     Layout.fillWidth: true
                     materialIcon: "wallpaper"
                     StyledToolTip {
-                        content: Translation.tr("Pick wallpaper image on your system")
+                        content: Translation.tr("Pick a wallpaper of the active theme")
                     }
+                    // Settings is its own process, so it asks the shell to open the selector. The `--`
+                    // keeps Quickshell from reading the target as a subcommand of `ipc call`.
                     onClicked: {
-                        Quickshell.execDetached(`${Directories.wallpaperSwitchScriptPath}`);
+                        Quickshell.execDetached(["qs", "-c", "ii", "ipc", "call", "--", "wallpaperSelector", "open"]);
                     }
                     mainContentComponent: Component {
                         RowLayout {
@@ -140,50 +142,10 @@ ContentPage {
             }
         }
 
-        ConfigSelectionArray {
-            currentValue: Config.options.appearance.palette.type
-            onSelected: newValue => {
-                Config.options.appearance.palette.type = newValue;
-                Quickshell.execDetached(["bash", "-c", `${Directories.wallpaperSwitchScriptPath} --noswitch`]);
-            }
-            options: [
-                {
-                    "value": "auto",
-                    "displayName": Translation.tr("Auto")
-                },
-                {
-                    "value": "scheme-content",
-                    "displayName": Translation.tr("Content")
-                },
-                {
-                    "value": "scheme-expressive",
-                    "displayName": Translation.tr("Expressive")
-                },
-                {
-                    "value": "scheme-fidelity",
-                    "displayName": Translation.tr("Fidelity")
-                },
-                {
-                    "value": "scheme-fruit-salad",
-                    "displayName": Translation.tr("Fruit Salad")
-                },
-                {
-                    "value": "scheme-monochrome",
-                    "displayName": Translation.tr("Monochrome")
-                },
-                {
-                    "value": "scheme-neutral",
-                    "displayName": Translation.tr("Neutral")
-                },
-                {
-                    "value": "scheme-rainbow",
-                    "displayName": Translation.tr("Rainbow")
-                },
-                {
-                    "value": "scheme-tonal-spot",
-                    "displayName": Translation.tr("Tonal Spot")
-                }
-            ]
+        // The active theme's palette style, from its `scheme` knob; hidden for a theme without one.
+        ThemeKnobControl {
+            Layout.fillWidth: true
+            knobId: "scheme"
         }
     }
 

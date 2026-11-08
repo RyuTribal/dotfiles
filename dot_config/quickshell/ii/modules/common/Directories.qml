@@ -28,10 +28,11 @@ Singleton {
     property string shellConfigPath: `${Directories.shellConfig}/${Directories.shellConfigName}`
     property string todoPath: FileUtils.trimFileProtocol(`${Directories.state}/user/todo.json`)
     property string notificationsPath: FileUtils.trimFileProtocol(`${Directories.cache}/notifications/notifications.json`)
-    property string generatedMaterialThemePath: FileUtils.trimFileProtocol(`${Directories.state}/user/generated/colors.json`)
+    // axond's active theme generation, $XDG_STATE_HOME/axon/theme/current: the generic state dir, since
+    // `state` above carries the app name.
+    property string axonThemeCurrent: FileUtils.trimFileProtocol(`${StandardPaths.standardLocations(StandardPaths.GenericStateLocation)[0]}/axon/theme/current`)
     property string cliphistDecode: FileUtils.trimFileProtocol(`/tmp/quickshell/media/cliphist`)
     property string screenshotTemp: "/tmp/quickshell/media/screenshot"
-    property string wallpaperSwitchScriptPath: FileUtils.trimFileProtocol(`${Directories.scriptPath}/colors/switchwall.sh`)
     // Cleanup on init
     Component.onCompleted: {
         Quickshell.execDetached(["mkdir", "-p", `${shellConfig}`])

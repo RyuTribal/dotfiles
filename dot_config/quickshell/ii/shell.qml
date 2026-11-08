@@ -55,7 +55,8 @@ ShellRoot {
 
     // Force initialization of some singletons
     Component.onCompleted: {
-        MaterialThemeLoader.reapplyTheme()
+        Theme.reportsIris = true // the main shell alone reports its iris.json loads to axon
+        Theme.reload()
         Hyprsunset.load()
         ConflictKiller.load()
         Cliphist.refresh()

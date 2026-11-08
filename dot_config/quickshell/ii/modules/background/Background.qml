@@ -8,7 +8,6 @@ import qs.modules.common.functions as CF
 import QtQuick
 import QtQuick.Layouts
 import Quickshell
-import Quickshell.Io
 import Quickshell.Wayland
 
 
@@ -36,24 +35,17 @@ Variants {
         property list<var> relevantWindows: Hypr.windows.filter(w => w.monitor === monitor?.id && w.workspace >= 1).sort((a, b) => a.workspace - b.workspace)
         property int firstWorkspaceId: relevantWindows[0]?.workspace || 1
         property int lastWorkspaceId: relevantWindows[relevantWindows.length - 1]?.workspace || 10
-        // Wallpaper
-        property bool wallpaperIsVideo: Config.options.background.wallpaperPath.endsWith(".mp4")
-            || Config.options.background.wallpaperPath.endsWith(".webm")
-            || Config.options.background.wallpaperPath.endsWith(".mkv")
-            || Config.options.background.wallpaperPath.endsWith(".avi")
-            || Config.options.background.wallpaperPath.endsWith(".mov")
-        property string wallpaperPath: wallpaperIsVideo ? Config.options.background.thumbnailPath : Config.options.background.wallpaperPath
+        // Wallpaper: its pixel size comes from iris.json; the screen's size stands in until it is known.
         property real wallpaperToScreenRatio: Math.min(wallpaperWidth / screen.width, wallpaperHeight / screen.height)
         property real preferredWallpaperScale: Config.options.background.parallax.workspaceZoom
-        property real effectiveWallpaperScale: 1 // Some reasonable init value, to be updated
-        property int wallpaperWidth: modelData.width // Some reasonable init value, to be updated
-        property int wallpaperHeight: modelData.height // Some reasonable init value, to be updated
+        property real effectiveWallpaperScale: zoomScale(wallpaperWidth, wallpaperHeight, screen.width, screen.height, preferredWallpaperScale)
+        property int wallpaperWidth: Theme.wallpaper?.width ?? modelData.width
+        property int wallpaperHeight: Theme.wallpaper?.height ?? modelData.height
         property real movableXSpace: ((wallpaperWidth / wallpaperToScreenRatio * effectiveWallpaperScale) - screen.width) / 2
         property real movableYSpace: ((wallpaperHeight / wallpaperToScreenRatio * effectiveWallpaperScale) - screen.height) / 2
         // Position
-        // The clock is positioned by `least_busy_region.py` script. If the script fails 
-        // (e.g. due to missing dependencies like opencv-python), the clock will be placed
-        // in the center of the screen as a fallback.
+        // axon's theme.clock_spot places the clock in the wallpaper's least busy region. While it
+        // refuses (axon down, no wallpaper), the clock stays in the center of the screen.
         property real clockX: modelData.width / 2
         property real clockY: modelData.height / 2
         property var textHorizontalAlignment: clockX < screen.width / 3 ? Text.AlignLeft :
@@ -77,99 +69,56 @@ Variants {
         }
         color: "transparent"
 
-        onWallpaperPathChanged: {
-            bgRoot.updateZoomScale()
-            // Clock position gets updated after zoom scale is updated
+        // Wallpaper zoom scale, recomputed by its binding whenever the size or the screen changes
+        function zoomScale(width, height, screenWidth, screenHeight, preferredScale) {
+            if (width <= screenWidth || height <= screenHeight) { // Undersized/perfectly sized wallpapers
+                return Math.max(screenWidth / width, screenHeight / height);
+            }
+            // Oversized = can be zoomed for parallax, yay
+            return Math.min(preferredScale, width / screenWidth, height / screenHeight);
         }
 
-        // Wallpaper zoom scale
-        function updateZoomScale() {
-            getWallpaperSizeProc.path = bgRoot.wallpaperPath
-            getWallpaperSizeProc.running = true;
-        }
-        Process {
-            id: getWallpaperSizeProc
-            property string path: bgRoot.wallpaperPath
-            command: [ "magick", "identify", "-format", "%w %h", path ]
-            stdout: StdioCollector {
-                id: wallpaperSizeOutputCollector
-                onStreamFinished: {
-                    const output = wallpaperSizeOutputCollector.text
-                    const [width, height] = output.split(" ").map(Number);
-                    const [screenWidth, screenHeight] = [bgRoot.screen.width, bgRoot.screen.height];
-                    bgRoot.wallpaperWidth = width
-                    bgRoot.wallpaperHeight = height
-
-                    if (width <= screenWidth || height <= screenHeight) { // Undersized/perfectly sized wallpapers
-                        bgRoot.effectiveWallpaperScale = Math.max(screenWidth / width, screenHeight / height);
-                    } else { // Oversized = can be zoomed for parallax, yay
-                        bgRoot.effectiveWallpaperScale = Math.min(
-                            bgRoot.preferredWallpaperScale,
-                            width / screenWidth, height / screenHeight
-                        );
-                    }
-
-
-                    bgRoot.updateClockPosition()
-                }
+        // Clock positioning: a new wallpaper or scale, and every time axon's theme topic is synced again
+        // (a call made while axon is down is refused, as at shell start before the connection is up).
+        // Qt.callLater folds the triggers of one change into one call.
+        onEffectiveWallpaperScaleChanged: Qt.callLater(bgRoot.updateClockPosition)
+        Component.onCompleted: Qt.callLater(bgRoot.updateClockPosition)
+        Connections {
+            target: Theme
+            function onWallpaperUrlChanged() {
+                Qt.callLater(bgRoot.updateClockPosition);
             }
         }
-
-        // Clock positioning
+        Connections {
+            target: Theme.topic
+            function onSyncedChanged() {
+                if (Theme.topic.synced)
+                    Qt.callLater(bgRoot.updateClockPosition);
+            }
+        }
         function updateClockPosition() {
-            // Somehow all this manual setting is needed to make the proc correctly use the new values
-            leastBusyRegionProc.path = bgRoot.wallpaperPath
-            leastBusyRegionProc.contentWidth = clockLoader.implicitWidth + root.clockSizePadding * 2
-            leastBusyRegionProc.contentHeight = clockLoader.implicitHeight + root.clockSizePadding * 2
-            leastBusyRegionProc.horizontalPadding = bgRoot.movableXSpace + root.screenSizePadding * 2
-            leastBusyRegionProc.verticalPadding = bgRoot.movableYSpace + root.screenSizePadding * 2
-            leastBusyRegionProc.running = false;
-            leastBusyRegionProc.running = true;
-        }
-        Process {
-            id: leastBusyRegionProc
-            property string path: bgRoot.wallpaperPath
-            property int contentWidth: 300
-            property int contentHeight: 300
-            property int horizontalPadding: bgRoot.movableXSpace
-            property int verticalPadding: bgRoot.movableYSpace
-            command: [Quickshell.shellPath("scripts/images/least_busy_region.py"),
-                "--screen-width", Math.round(bgRoot.screen.width / bgRoot.effectiveWallpaperScale),
-                "--screen-height", Math.round(bgRoot.screen.height / bgRoot.effectiveWallpaperScale),
-                "--width", contentWidth,
-                "--height", contentHeight,
-                "--horizontal-padding", horizontalPadding,
-                "--vertical-padding", verticalPadding,
-                path, 
-                // "--visual-output",
-            ]
-            stdout: StdioCollector {
-                id: leastBusyRegionOutputCollector
-                onStreamFinished: {
-                    const output = leastBusyRegionOutputCollector.text
-                    if (output.length === 0) {
-                        return;
-                    }
-                    const parsedContent = JSON.parse(output)
-                    bgRoot.clockX = parsedContent.center_x * bgRoot.effectiveWallpaperScale
-                    bgRoot.clockY = parsedContent.center_y * bgRoot.effectiveWallpaperScale
-                    dominantColor = parsedContent.dominant_color || Appearance.colors.colPrimary
-                }
-            }
-            stderr: StdioCollector {
-                id: leastBusyRegionErrorCollector
-                onStreamFinished: {
-                    const output = leastBusyRegionErrorCollector.text
-                    if (output.length === 0) return;
-                }
-            }
+            const args = {
+                screen_w: Math.round(bgRoot.screen.width / bgRoot.effectiveWallpaperScale),
+                screen_h: Math.round(bgRoot.screen.height / bgRoot.effectiveWallpaperScale),
+                box_w: Math.round(clockLoader.implicitWidth + root.clockSizePadding * 2),
+                box_h: Math.round(clockLoader.implicitHeight + root.clockSizePadding * 2),
+                pad_x: Math.round(bgRoot.movableXSpace + root.screenSizePadding * 2),
+                pad_y: Math.round(bgRoot.movableYSpace + root.screenSizePadding * 2)
+            };
+            Theme.clockSpot(args, reply => {
+                if (!reply.ok)
+                    return;
+                bgRoot.clockX = reply.result.center_x * bgRoot.effectiveWallpaperScale;
+                bgRoot.clockY = reply.result.center_y * bgRoot.effectiveWallpaperScale;
+                bgRoot.dominantColor = reply.result.dominant_color || Appearance.colors.colPrimary;
+            });
         }
 
         // Wallpaper
         Image {
             id: wallpaper
             visible: opacity > 0
-            opacity: (status === Image.Ready && !bgRoot.wallpaperIsVideo) ? 1 : 0
+            opacity: status === Image.Ready ? 1 : 0
             Behavior on opacity {
                 animation: Appearance.animation.elementMoveEnter.numberAnimation.createObject(this)
             }
@@ -195,7 +144,7 @@ Variants {
             property real effectiveValueX: Math.max(0, Math.min(1, valueX))
             x: -(bgRoot.movableXSpace) - (effectiveValueX - 0.5) * 2 * bgRoot.movableXSpace
             y: -bgRoot.movableYSpace
-            source: bgRoot.wallpaperPath
+            source: Theme.wallpaperUrl
             fillMode: Image.PreserveAspectCrop
             Behavior on x {
                 NumberAnimation {

@@ -331,6 +331,34 @@ TestCase {
         compare(list.items.length, 2);
     }
 
+    // P19: a collection rev is a hash, so a reply whose rev is larger but not the topic's is stale too.
+    function test_replyWithAnotherHashRevIsRefetchedOnce() {
+        const list = createTemporaryObject(listComponent, tc);
+        wait(20);
+        tc.rev = 5;
+        wait(20);
+        reply(0, {
+            rev: 9,
+            total: 2,
+            offset: 0,
+            next: null,
+            items: rows(0, 2, 1)
+        });
+        wait(20);
+        compare(Backend.calls.length, 2, "one refetch for the rev the topic holds");
+        compare(Backend.calls[1].args.offset, 0);
+        reply(1, {
+            rev: 5,
+            total: 2,
+            offset: 0,
+            next: null,
+            items: rows(0, 2, 1)
+        });
+        wait(20);
+        compare(Backend.calls.length, 2, "the refetched page is kept");
+        compare(list.items.length, 2);
+    }
+
     function test_replyOlderThanTheTopicRevIsRefetched() {
         const list = createTemporaryObject(listComponent, tc);
         wait(20);

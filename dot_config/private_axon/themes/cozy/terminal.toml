@@ -1,0 +1,10 @@
+# The base 16 ANSI colours per mode, from scripts/colors/terminal/scheme-base.json (gruvbox-like
+# dark, monokai-like light). The palette harmonises them toward the wallpaper (40.4.4).
+
+[dark]
+ansi = ["#282828", "#CC241D", "#98971A", "#D79921", "#458588", "#B16286", "#689D6A", "#A89984",
+        "#928374", "#FB4934", "#B8BB26", "#FABD2F", "#83A598", "#D3869B", "#8EC07C", "#EBDBB2"]
+
+[light]
+ansi = ["#FDF9F3", "#FF6188", "#A9DC76", "#FC9867", "#FFD866", "#F47FD4", "#78DCE8", "#333034",
+        "#121212", "#FF6188", "#A9DC76", "#FC9867", "#FFD866", "#F47FD4", "#78DCE8", "#333034"]

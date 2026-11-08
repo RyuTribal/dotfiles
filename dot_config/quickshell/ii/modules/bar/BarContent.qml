@@ -427,7 +427,7 @@ Item { // Bar content region
                             height: width
                             radius: height / 2
 
-                            color: Appearance.colors.accent ?? "#ff5555"
+                            color: Appearance.colors.colAccent
                             border.color: Qt.rgba(0, 0, 0, 0.15)
                             border.width: 1
                             layer.enabled: true
@@ -442,7 +442,7 @@ Item { // Bar content region
                                 // keep this big, but it will now sit outside the bell
                                 font.pixelSize: Math.round(icon.iconSize * 0.62)
                                 font.bold: false
-                                color: "white"
+                                color: Appearance.colors.colOnAccent
                                 horizontalAlignment: Text.AlignHCenter
                                 verticalAlignment: Text.AlignVCenter
                                 renderType: Text.NativeRendering

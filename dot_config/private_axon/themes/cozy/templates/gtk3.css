@@ -1,0 +1,19 @@
+{#- GTK3 colour overrides, today's matugen gtk-colors.css. The GTK target writes them into
+    a slot behind the @import of the mode's [gtk] base. -#}
+@define-color accent_color {{ colors.primary.hex }};
+@define-color accent_fg_color {{ colors.on_primary.hex }};
+@define-color accent_bg_color {{ colors.primary.hex }};
+@define-color window_bg_color {{ colors.background.hex }};
+@define-color window_fg_color {{ colors.on_background.hex }};
+@define-color headerbar_bg_color {{ colors.surface_dim.hex }};
+@define-color headerbar_fg_color {{ colors.on_surface.hex }};
+@define-color popover_bg_color {{ colors.surface_dim.hex }};
+@define-color popover_fg_color {{ colors.on_surface.hex }};
+@define-color view_bg_color {{ colors.surface.hex }};
+@define-color view_fg_color {{ colors.on_surface.hex }};
+@define-color card_bg_color {{ colors.surface.hex }};
+@define-color card_fg_color {{ colors.on_surface.hex }};
+@define-color sidebar_bg_color @window_bg_color;
+@define-color sidebar_fg_color @window_fg_color;
+@define-color sidebar_border_color @window_bg_color;
+@define-color sidebar_backdrop_color @window_bg_color;

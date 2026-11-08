@@ -1,0 +1,68 @@
+# ~/.config/axon/themes/cozy/theme.toml
+schema = 1
+name = "Cozy"
+description = "Material You palette from the wallpaper"
+modes = ["dark", "light"]
+
+[palette]
+kind = "material"
+scheme = "fruit-salad"          # live value today (config.json appearance.palette.type)
+seed = ""
+harmony = 0.8                   # constants (ledger S4): the live terminalGenerationProps, all at their defaults
+harmonize_threshold = 100       # (VERIFIED config.json); no knob and no settings control reaches them
+term_fg_boost = 0.35
+terminal_force_dark = false
+terminal_base = "terminal.toml" # scripts/colors/terminal/scheme-base.json moved here
+
+[palette.custom]                # matugen.config.toml:45-71, read by the nvim template
+red = { color = "#ff0000", blend = true }
+green = { color = "#00ff00", blend = true }
+yellow = { color = "#ffff00", blend = true }
+blue = { color = "#0000ff", blend = true }
+magenta = { color = "#ff00ff", blend = true }
+cyan = { color = "#00ffff", blend = true }
+white = { color = "#ffffff", blend = true }
+
+[palette.aliases]
+accent = "error"                # notification badge, replaces the hardcoded #ff5555 (40.16)
+on_accent = "on_error"
+screen_corner = "shadow"        # screen corners; shadow is #000000 in today's colors.json, RoundCorner's default
+
+[knobs]
+scheme = { type = "enum", label = "Palette style" }
+seed = { type = "color", label = "Seed colour (empty: from wallpaper)" }
+
+[wallpaper]
+default = "Pastel-Window.png"
+
+[fonts]
+main = "Rubik"
+title = "Gabarito"
+expressive = "Space Grotesk"
+reading = "Readex Pro"
+monospace = "JetBrains Mono NF"
+icon_material = "Material Symbols Rounded"
+icon_nerd = "JetBrains Mono NF"
+terminal = { family = "JetBrains Mono Nerd Font", size = 11 }   # kitty.conf:2-3
+gtk = { family = "Adwaita Sans", size = 11 }                    # live gsettings font-name
+gtk_mono = { family = "Adwaita Mono", size = 11 }               # live gsettings monospace-font-name
+qt = { family = "Rubik", size = 11 }                            # kdeglobals:143
+qt_fixed = { family = "JetBrainsMono Nerd Font", size = 11 }    # kdeglobals:142
+launcher = { family = "Gabarito" }                              # fuzzel.ini:2
+lock = { family = "Rubik" }                                     # hyprlock colors template
+# Weight 600 like the DemiBold hyprlock asks for today, which fc-list does not find here.
+lock_clock = { family = "Space Grotesk", style = "SemiBold" }
+
+[gtk]
+base = { dark = "adw-gtk3-dark", light = "adw-gtk3" }           # switchwall.sh:41-50
+
+[qt]
+widget_style = "Breeze"         # effective style today (fill-1 §3, breeze6.so mapped in qs)
+
+[icons]
+theme = { dark = "breeze-plus-dark", light = "breeze-plus" }    # kde-material-you-colors config.conf
+
+[cursor]
+# Installed 2026-11-01. A theme without [cursor] gets axon.toml's [theme] default, Adwaita.
+theme = "Bibata-Modern-Classic"
+size = 24

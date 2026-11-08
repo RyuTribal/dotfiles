@@ -86,8 +86,8 @@ singleton Fuzzy 1.0 Fuzzy.qml
 singleton Levendist 1.0 Levendist.qml
 EOF
 
-# tst_backend_spin_box.qml loads the real modules/settings/BackendSpinBox.qml as qs.modules.settings, under
-# the names it imports: the real ConfigSpinBox.qml and the widgets it is built from as
+# tst_backend_spin_box.qml loads the real modules/settings/BackendSpinBox.qml as qs.modules.settings, beside
+# the real FollowedWrites.qml it writes through, under the names it imports: the real ConfigSpinBox.qml and the widgets it is built from as
 # qs.modules.common.widgets, beside fakes/spinbox/MaterialSymbol.qml, and the real AxonConfig.qml and
 # BackendTopic.qml as qs.services, beside fakes/Backend.qml. Appearance comes from fakes/qs/modules/common
 # and ColorUtils from the functions module above.
@@ -95,7 +95,9 @@ widgets="$here/../../modules/common/widgets"
 widgets_module="$imports/qs/modules/common/widgets"
 mkdir "$widgets_module"
 cp "$widgets/ConfigSpinBox.qml" "$widgets/StyledSpinBox.qml" "$widgets/StyledTextInput.qml" "$widgets/StyledText.qml" \
-    "$widgets/OptionalMaterialSymbol.qml" "$here/fakes/spinbox/MaterialSymbol.qml" "$widgets_module/"
+    "$widgets/OptionalMaterialSymbol.qml" "$widgets/StyledRectangularShadow.qml" "$here/fakes/spinbox/MaterialSymbol.qml" \
+    "$here/fakes/knobs/ConfigSwitch.qml" "$here/fakes/knobs/ConfigSelectionArray.qml" \
+    "$here/fakes/knobs/MaterialTextField.qml" "$widgets_module/"
 cat > "$widgets_module/qmldir" <<'EOF'
 module qs.modules.common.widgets
 ConfigSpinBox 1.0 ConfigSpinBox.qml
@@ -103,26 +105,36 @@ StyledSpinBox 1.0 StyledSpinBox.qml
 StyledTextInput 1.0 StyledTextInput.qml
 StyledText 1.0 StyledText.qml
 OptionalMaterialSymbol 1.0 OptionalMaterialSymbol.qml
+StyledRectangularShadow 1.0 StyledRectangularShadow.qml
 MaterialSymbol 1.0 MaterialSymbol.qml
+ConfigSwitch 1.0 ConfigSwitch.qml
+ConfigSelectionArray 1.0 ConfigSelectionArray.qml
+MaterialTextField 1.0 MaterialTextField.qml
 EOF
 services_module="$imports/qs/services"
 mkdir "$services_module"
 cp "$services/AxonConfig.qml" "$services/BackendTopic.qml" "$services/BackendList.qml" "$services/Sweep.qml" \
-    "$services/backend.js" "$services/sweep.js" "$here/fakes/Backend.qml" "$services_module/"
+    "$services/Theme.qml" "$services/Wallpapers.qml" "$services/backend.js" "$services/sweep.js" \
+    "$here/fakes/Backend.qml" "$services_module/"
 cat > "$services_module/qmldir" <<'EOF'
 module qs.services
 singleton Backend 1.0 Backend.qml
 singleton AxonConfig 1.0 AxonConfig.qml
 singleton Sweep 1.0 Sweep.qml
+singleton Theme 1.0 Theme.qml
+singleton Wallpapers 1.0 Wallpapers.qml
 BackendTopic 1.0 BackendTopic.qml
 BackendList 1.0 BackendList.qml
 EOF
 settings_module="$imports/qs/modules/settings"
 mkdir "$settings_module"
-cp "$here/../../modules/settings/BackendSpinBox.qml" "$settings_module/"
+cp "$here/../../modules/settings/BackendSpinBox.qml" "$here/../../modules/settings/ThemeKnobControl.qml" \
+    "$here/../../modules/settings/FollowedWrites.qml" "$settings_module/"
 cat > "$settings_module/qmldir" <<'EOF'
 module qs.modules.settings
 BackendSpinBox 1.0 BackendSpinBox.qml
+FollowedWrites 1.0 FollowedWrites.qml
+ThemeKnobControl 1.0 ThemeKnobControl.qml
 EOF
 
 # tst_sweep_panel.qml and tst_sweep_panel_toggle.qml load the real SweepPanel.qml from
@@ -137,11 +149,40 @@ module SweepPanelUnderTest
 SweepPanel 1.0 SweepPanel.qml
 EOF
 
+# tst_theme.qml loads the real services/Theme.qml as the Theme singleton of the qs.services module above,
+# over the stand-in Backend, the stand-in FileView of fakes/Quickshell/Io and the Appearance and Directories
+# of fakes/qs/modules/common, into which it writes the colours. For the hover colours it also loads the real
+# modules/common/Appearance.qml from AppearanceUnderTest, beside fakes/appearance/Config.qml (the keys
+# Appearance reads), with the stand-in ColorQuantizer of fakes/Quickshell and the real ColorUtils above.
+appearance_module="$imports/AppearanceUnderTest"
+mkdir "$appearance_module"
+cp "$here/../../modules/common/Appearance.qml" "$here/fakes/appearance/Config.qml" "$appearance_module/"
+cat > "$appearance_module/qmldir" <<'EOF'
+module AppearanceUnderTest
+singleton Appearance 1.0 Appearance.qml
+singleton Config 1.0 Config.qml
+EOF
+
+# tst_wallpapers.qml loads the real services/Wallpapers.qml as the Wallpapers singleton of the qs.services
+# module above, with GlobalStates from fakes/qs, the real modules/settings/ThemeKnobControl.qml from the
+# qs.modules.settings module above, over the stand-in ConfigSwitch, ConfigSelectionArray and
+# MaterialTextField of fakes/knobs, and the real modules/wallpaperSelector/WallpaperTile.qml from
+# qs.modules.wallpaperSelector, with the real StyledRectangularShadow of the widgets module above. It
+# imports services/theme.js by relative path.
+selector_module="$imports/qs/modules/wallpaperSelector"
+mkdir "$selector_module"
+cp "$here/../../modules/wallpaperSelector/WallpaperTile.qml" "$selector_module/"
+cat > "$selector_module/qmldir" <<'EOF'
+module qs.modules.wallpaperSelector
+WallpaperTile 1.0 WallpaperTile.qml
+EOF
+
 status=0
 for test in tst_backend.qml tst_backend_connection.qml tst_backend_behaviour.qml \
     tst_system_clients.qml tst_config_error_toast.qml tst_config.qml tst_spin_box.qml \
     tst_backend_spin_box.qml tst_favicon_cache.qml tst_resource_usage.qml tst_sweep.qml \
-    tst_sweep_service.qml tst_sweep_panel.qml tst_sweep_panel_toggle.qml tst_nerd_glyphs.qml; do
+    tst_sweep_service.qml tst_sweep_panel.qml tst_sweep_panel_toggle.qml tst_nerd_glyphs.qml \
+    tst_theme.qml tst_wallpapers.qml; do
     QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -import "$here/fakes" -import "$imports" \
         -input "$here/$test" || status=1
 done

@@ -24,6 +24,5 @@ hl.on("hyprland.start", function()
     hl.exec_cmd("hyprpm reload")
     hl.exec_cmd("wl-paste --type text --watch bash -c 'cliphist store && qs -c $qsConfig ipc call cliphistService update'")
     hl.exec_cmd("wl-paste --type image --watch bash -c 'cliphist store && qs -c $qsConfig ipc call cliphistService update'")
-    hl.exec_cmd("hyprctl setcursor Bibata-Modern-Classic 24")
 end)
 

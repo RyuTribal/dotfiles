@@ -63,6 +63,11 @@ Scope {
         function toggle(): void {
             GlobalStates.wallpaperSelectorOpen = !GlobalStates.wallpaperSelectorOpen
         }
+
+        // Settings' "Choose file" runs in its own process, so it opens the selector through this.
+        function open(): void {
+            GlobalStates.wallpaperSelectorOpen = true
+        }
     }
 
     GlobalShortcut {

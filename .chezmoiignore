@@ -33,3 +33,11 @@
 .config/axon/axon.toml
 # axon's machine data, including the deploy clone the bootstrap and sync scripts build from.
 .local/share/axon
+
+# Apps rewrite these at runtime: plasma-apply-colorscheme and the axon theme engine write kdeglobals
+# and kcminputrc, and Qt writes Trolltech.conf. gtk-3.0/gtk.css is not managed and must never come
+# back: it would mask the theme engine's GTK3 slot. Ignored so a broad `chezmoi add` cannot catch them.
+.config/kdeglobals
+.config/kcminputrc
+.config/Trolltech.conf
+.config/gtk-3.0/gtk.css

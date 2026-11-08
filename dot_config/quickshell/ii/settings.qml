@@ -71,7 +71,7 @@ ApplicationWindow {
 
     Component.onCompleted: {
         Backend.clientName = "ii-settings"
-        MaterialThemeLoader.reapplyTheme()
+        Theme.reload()
     }
 
     minimumWidth: 600

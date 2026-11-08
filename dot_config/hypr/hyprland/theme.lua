@@ -21,7 +21,8 @@ local function run(path, required)
   return nil
 end
 local errors = {}
-for _, item in ipairs({ { path = base .. "hypr/session.lua", required = false } }) do
+for _, item in ipairs({ { path = base .. "theme/current/hyprland.lua", required = true },
+                        { path = base .. "hypr/session.lua", required = false } }) do
   local item_error = run(item.path, item.required)
   if item_error then errors[#errors + 1] = item_error end
 end

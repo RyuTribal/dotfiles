@@ -14,13 +14,13 @@ if [[ ! $pin =~ ^[0-9a-f]{40}$ ]]; then
 fi
 
 missing=()
-for tool in git cargo clang pkgconf; do
+for tool in git cargo clang pkgconf magick lua5.5 luac5.5; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
 if command -v pkgconf >/dev/null 2>&1 && ! pkgconf --exists libpipewire-0.3; then missing+=("libpipewire"); fi
 if [ "${#missing[@]}" -gt 0 ]; then
     echo "axon bootstrap: missing ${missing[*]}." >&2
-    echo "Run: sudo pacman -S --needed git rust clang pkgconf libpipewire, then chezmoi apply again." >&2
+    echo "Run: sudo pacman -S --needed git rust clang pkgconf libpipewire imagemagick lua, then chezmoi apply again." >&2
     exit 1
 fi
 if [ ! -d "$repo/.git" ]; then

@@ -22,6 +22,18 @@ fi
 read -r _ _ installed < <("$axon" version) || installed=""
 [ "$installed" = "$pin" ] && exit 0
 
+# The theme engine's tests run ImageMagick and Lua 5.5, and install.sh runs the tests. The bootstrap checks these
+# too, but it exits at once where axon is installed, so a machine that already has axon is checked here.
+missing=()
+for tool in magick lua5.5 luac5.5; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+done
+if [ "${#missing[@]}" -gt 0 ]; then
+    echo "axon sync: missing ${missing[*]}." >&2
+    echo "Run: sudo pacman -S --needed imagemagick lua, then chezmoi apply again." >&2
+    exit 1
+fi
+
 # axon was installed from the development checkout, so the deploy clone may not exist yet: create it the way the bootstrap does.
 if [ ! -d "$repo/.git" ]; then
     mkdir -p "$(dirname "$repo")"

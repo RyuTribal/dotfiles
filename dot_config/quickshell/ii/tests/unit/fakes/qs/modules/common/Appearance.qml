@@ -9,6 +9,7 @@ import QtQuick
 // OptionalMaterialSymbol over it; it checks text, not colors, so the keys only those three read are
 // not here. tst_wallpapers.qml loads WallpaperTile.qml and ThemeKnobControl.qml over it: the tile's
 // colours and sizes are here, with each highlight colour distinct so the test can tell them apart.
+// tst_claude_panel.qml loads ClaudePanel.qml over it, which adds colOutlineVariant.
 QtObject {
     property var colors: ({
             colError: "#ffb4ab",
@@ -23,6 +24,7 @@ QtObject {
             colOnLayer2: "#e0e0e0",
             colOnPrimary: "#002f6a",
             colOnSecondaryContainer: "#f0f0f0",
+            colOutlineVariant: "#344a51",
             colPrimary: "#a0c0ff",
             colPrimaryContainer: "#284777",
             colSecondaryContainer: "#505050",

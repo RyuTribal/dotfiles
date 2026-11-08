@@ -19,6 +19,7 @@
 # tst_nerd_glyphs.qml loads NerdGlyphs.qml from it as NerdGlyphsService in the same way, over
 # fakes/Quickshell/Io/Process.qml and StdioCollector.qml, with the real Fuzzy and Levendist of the
 # functions module below.
+# tst_claude_usage.qml loads ClaudeUsage.qml as ClaudeUsageService the same way, beside claude.js and fakes/Translation.qml.
 # tst_config.qml tests the real modules/common/Config.qml, so it gets its own module, ConfigUnderTest:
 # Config.qml sits there beside fakes/Directories.qml, over the stand-in FileView of fakes/Quickshell/Io.
 
@@ -33,10 +34,11 @@ module="$imports/ShellUnderTest"
 mkdir "$module"
 cp "$services/BackendTopic.qml" "$services/BackendList.qml" "$services/SystemInfo.qml" "$services/DateTime.qml" \
     "$services/FaviconCache.qml" "$services/ResourceUsage.qml" "$services/backend.js" \
-    "$services/sweep.js" "$here/../../ConfigErrorToast.qml" "$module/"
-cp "$here/fakes/Backend.qml" "$module/"
+    "$services/sweep.js" "$services/claude.js" "$here/../../ConfigErrorToast.qml" "$module/"
+cp "$here/fakes/Backend.qml" "$here/fakes/Translation.qml" "$module/"
 grep -v '^pragma Singleton$' "$services/Sweep.qml" > "$module/SweepService.qml"
 grep -v '^pragma Singleton$' "$services/NerdGlyphs.qml" > "$module/NerdGlyphsService.qml"
+grep -v '^pragma Singleton$' "$services/ClaudeUsage.qml" > "$module/ClaudeUsageService.qml"
 cat > "$module/qmldir" <<'EOF'
 module ShellUnderTest
 singleton Backend 1.0 Backend.qml
@@ -49,6 +51,8 @@ singleton FaviconCache 1.0 FaviconCache.qml
 singleton ResourceUsage 1.0 ResourceUsage.qml
 SweepService 1.0 SweepService.qml
 NerdGlyphsService 1.0 NerdGlyphsService.qml
+ClaudeUsageService 1.0 ClaudeUsageService.qml
+singleton Translation 1.0 Translation.qml
 EOF
 
 config_module="$imports/ConfigUnderTest"
@@ -97,7 +101,7 @@ mkdir "$widgets_module"
 cp "$widgets/ConfigSpinBox.qml" "$widgets/StyledSpinBox.qml" "$widgets/StyledTextInput.qml" "$widgets/StyledText.qml" \
     "$widgets/OptionalMaterialSymbol.qml" "$widgets/StyledRectangularShadow.qml" "$here/fakes/spinbox/MaterialSymbol.qml" \
     "$here/fakes/knobs/ConfigSwitch.qml" "$here/fakes/knobs/ConfigSelectionArray.qml" \
-    "$here/fakes/knobs/MaterialTextField.qml" "$widgets_module/"
+    "$here/fakes/knobs/MaterialTextField.qml" "$here/fakes/progress/StyledProgressBar.qml" "$widgets_module/"
 cat > "$widgets_module/qmldir" <<'EOF'
 module qs.modules.common.widgets
 ConfigSpinBox 1.0 ConfigSpinBox.qml
@@ -110,16 +114,18 @@ MaterialSymbol 1.0 MaterialSymbol.qml
 ConfigSwitch 1.0 ConfigSwitch.qml
 ConfigSelectionArray 1.0 ConfigSelectionArray.qml
 MaterialTextField 1.0 MaterialTextField.qml
+StyledProgressBar 1.0 StyledProgressBar.qml
 EOF
 services_module="$imports/qs/services"
 mkdir "$services_module"
 cp "$services/AxonConfig.qml" "$services/BackendTopic.qml" "$services/BackendList.qml" "$services/Sweep.qml" \
-    "$services/Theme.qml" "$services/Wallpapers.qml" "$services/backend.js" "$services/sweep.js" \
-    "$here/fakes/Backend.qml" "$services_module/"
+    "$services/Theme.qml" "$services/Wallpapers.qml" "$services/ClaudeUsage.qml" "$services/backend.js" \
+    "$services/sweep.js" "$services/claude.js" "$here/fakes/Backend.qml" "$services_module/"
 cat > "$services_module/qmldir" <<'EOF'
 module qs.services
 singleton Backend 1.0 Backend.qml
 singleton AxonConfig 1.0 AxonConfig.qml
+singleton ClaudeUsage 1.0 ClaudeUsage.qml
 singleton Sweep 1.0 Sweep.qml
 singleton Theme 1.0 Theme.qml
 singleton Wallpapers 1.0 Wallpapers.qml
@@ -147,6 +153,22 @@ cp "$here/../../SweepPanel.qml" "$panel_module/"
 cat > "$panel_module/qmldir" <<'EOF'
 module SweepPanelUnderTest
 SweepPanel 1.0 SweepPanel.qml
+EOF
+
+# tst_claude_panel.qml loads the real modules/topMenu/ClaudePanel.qml as qs.modules.topMenu, where its
+# "../../services/claude.js" import reaches claude.js in the qs.services module above. The panel reads
+# the real services/ClaudeUsage.qml, the ClaudeUsage singleton there, over the stand-in Backend;
+# Translation comes from fakes/qs and StyledProgressBar from fakes/progress, in the widgets module above.
+# Its FittedText and RowLabel are the real files beside it.
+top_menu_module="$imports/qs/modules/topMenu"
+mkdir "$top_menu_module"
+cp "$here/../../modules/topMenu/ClaudePanel.qml" "$here/../../modules/topMenu/FittedText.qml" \
+    "$here/../../modules/topMenu/RowLabel.qml" "$top_menu_module/"
+cat > "$top_menu_module/qmldir" <<'EOF'
+module qs.modules.topMenu
+ClaudePanel 1.0 ClaudePanel.qml
+FittedText 1.0 FittedText.qml
+RowLabel 1.0 RowLabel.qml
 EOF
 
 # tst_theme.qml loads the real services/Theme.qml as the Theme singleton of the qs.services module above,
@@ -177,12 +199,20 @@ module qs.modules.wallpaperSelector
 WallpaperTile 1.0 WallpaperTile.qml
 EOF
 
+# ClaudeUsage.qml starts no process and reads no file; only grep's status 1 (no match) passes.
+status=0
+grep -nE 'Process|FileView|bunx|ccusage|stat ' "$services/ClaudeUsage.qml" || status=$?
+if [ "$status" -ne 1 ]; then
+    echo "ClaudeUsage.qml: Process/FileView/bunx/ccusage/stat found, or the file is unreadable (grep status $status)" >&2
+    exit 1
+fi
+
 status=0
 for test in tst_backend.qml tst_backend_connection.qml tst_backend_behaviour.qml \
     tst_system_clients.qml tst_config_error_toast.qml tst_config.qml tst_spin_box.qml \
     tst_backend_spin_box.qml tst_favicon_cache.qml tst_resource_usage.qml tst_sweep.qml \
     tst_sweep_service.qml tst_sweep_panel.qml tst_sweep_panel_toggle.qml tst_nerd_glyphs.qml \
-    tst_theme.qml tst_wallpapers.qml; do
+    tst_theme.qml tst_wallpapers.qml tst_claude.qml tst_claude_usage.qml tst_claude_panel.qml; do
     QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -import "$here/fakes" -import "$imports" \
         -input "$here/$test" || status=1
 done

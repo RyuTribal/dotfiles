@@ -9,6 +9,10 @@ TestCase {
     readonly property double hour: 60 * minute
     readonly property double day: 24 * hour
 
+    function tr(text) {
+        return text;
+    }
+
     function test_reuseRowsKeepsIdenticalObject() {
         const previous = B.reuseRows({}, [{ id: "a", rev: 1, name: "first" }]);
 
@@ -74,24 +78,36 @@ TestCase {
     function test_ageText() {
         const monday = new Date(2026, 9, 26, 12, 0, 0).getTime();
 
-        compare(B.ageText(4000, monday), "now");
-        compare(B.ageText(45000, monday), "45 s");
-        compare(B.ageText(12 * minute, monday), "12 min");
-        compare(B.ageText(3 * hour, monday), "3 h");
-        compare(B.ageText(30 * hour, monday), "since Sun");
+        compare(B.ageText(4000, monday, tr), "now");
+        compare(B.ageText(45000, monday, tr), "45 s");
+        compare(B.ageText(12 * minute, monday, tr), "12 min");
+        compare(B.ageText(3 * hour, monday, tr), "3 h");
+        compare(B.ageText(30 * hour, monday, tr), "since Sun");
+    }
+
+    // Every word goes through the caller's tr (D23), one template per text.
+    function test_ageTextThroughTr() {
+        const monday = new Date(2026, 9, 26, 12, 0, 0).getTime();
+        const marked = text => "<" + text + ">";
+
+        compare(B.ageText(4000, monday, marked), "<now>");
+        compare(B.ageText(45000, monday, marked), "<45 s>");
+        compare(B.ageText(12 * minute, monday, marked), "<12 min>");
+        compare(B.ageText(3 * hour, monday, marked), "<3 h>");
+        compare(B.ageText(30 * hour, monday, marked), "<since <Sun>>");
     }
 
     function test_ageTextBoundaries() {
         const monday = new Date(2026, 9, 26, 12, 0, 0).getTime();
 
-        compare(B.ageText(-5000, monday), "now");
-        compare(B.ageText(4999, monday), "now");
-        compare(B.ageText(5000, monday), "5 s");
-        compare(B.ageText(minute - 1, monday), "59 s");
-        compare(B.ageText(minute, monday), "1 min");
-        compare(B.ageText(hour - 1, monday), "59 min");
-        compare(B.ageText(day - 1, monday), "23 h");
-        compare(B.ageText(day, monday), "since Sun");
+        compare(B.ageText(-5000, monday, tr), "now");
+        compare(B.ageText(4999, monday, tr), "now");
+        compare(B.ageText(5000, monday, tr), "5 s");
+        compare(B.ageText(minute - 1, monday, tr), "59 s");
+        compare(B.ageText(minute, monday, tr), "1 min");
+        compare(B.ageText(hour - 1, monday, tr), "59 min");
+        compare(B.ageText(day - 1, monday, tr), "23 h");
+        compare(B.ageText(day, monday, tr), "since Sun");
     }
 
     function test_uptimeText() {

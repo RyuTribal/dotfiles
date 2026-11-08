@@ -1,3 +1,4 @@
+import "../../services/claude.js" as Claude
 import qs.modules.common
 import qs.modules.common.widgets
 import qs.services
@@ -7,38 +8,24 @@ import QtQuick.Layouts
 
 // Bar icon + label for the Claude Code 5-hour rate-limit window (see
 // services/ClaudeUsage.qml). Click jumps to the top menu's Stats tab, same
-// as the Resources area. Hovering shows a StyledPopup preview — the same
-// component ResourcesPopup/BatteryPopup use — rather than the StyledToolTip
-// batch 2 added, so the bar has one consistent hover-preview idiom instead
-// of two competing ones. ClaudeUsage's own FileView watch is always-on
-// already, so this widget adds no polling of its own — it only reads
-// properties ClaudeUsage already keeps live.
+// as the Resources area. Hovering shows a StyledPopup preview, the same
+// component ResourcesPopup/BatteryPopup use, as the bar's hover-preview idiom.
+// The one exception is the value's own StyledToolTip, which section 20's
+// stage 1 minimum asks for: while the topic is not live it says how old the
+// number is and why it is dimmed. ClaudeUsage's `claude` topic is
+// always subscribed, so this widget adds no polling of its own; opening the
+// popup asks axon for a probe when its newest reading is over a minute old.
+// Countdowns and ages read Backend.now.
 MouseArea {
     id: root
     implicitWidth: rowLayout.implicitWidth
     implicitHeight: Appearance.sizes.barHeight
     hoverEnabled: true
-    opacity: ClaudeUsage.live ? 1 : 0.5
+    opacity: ClaudeUsage.topic.live ? 1 : 0.5
 
-    readonly property bool valid: ClaudeUsage.live && ClaudeUsage.fiveHourPct >= 0
+    readonly property bool valid: ClaudeUsage.fiveHourPct >= 0 && !ClaudeUsage.fiveHourUnknown
     readonly property real clampedPct: Math.max(0, Math.min(100, ClaudeUsage.fiveHourPct))
-
-    // Local clock tick purely so the popup's countdown keeps counting down
-    // while hovered, mirroring ClaudePanel.qml's same trick.
-    property double nowMs: Date.now()
-    Timer {
-        interval: 30000
-        running: true
-        repeat: true
-        onTriggered: root.nowMs = Date.now()
-    }
-
-    function resetCountdown(resetsAt) {
-        if (resetsAt <= 0)
-            return Translation.tr("unknown");
-        const mins = Math.max(0, Math.round((resetsAt * 1000 - root.nowMs) / 60000));
-        return Translation.tr("%1m").arg(mins);
-    }
+    readonly property string ageLine: Claude.ageLine(ClaudeUsage.topic.ageMs, Backend.now, Translation.tr)
 
     onPressed: (event) => {
         if (event.button === Qt.LeftButton) {
@@ -61,11 +48,20 @@ MouseArea {
             text: root.valid ? `${Math.round(root.clampedPct)}%` : "--"
             font.pixelSize: Appearance.font.pixelSize.small
             color: Appearance.colors.colOnLayer1
+
+            StyledToolTip {
+                content: [root.ageLine, ClaudeUsage.statusLine].filter(line => line !== "").join("\n")
+                extraVisibleCondition: root.containsMouse && !ClaudeUsage.topic.live && content !== ""
+            }
         }
     }
 
     StyledPopup {
         hoverTarget: root
+        onActiveChanged: {
+            if (active)
+                ClaudeUsage.refreshIfOlder(60000);
+        }
 
         // anchors.centerIn: parent matches BatteryPopup/ResourcesPopup's
         // content root — without it, this ColumnLayout sat unanchored at
@@ -97,16 +93,16 @@ MouseArea {
                 }
             }
 
-            // Greyed-out placeholder when there's no live status file / it's
-            // gone stale (see ClaudeUsage.live) instead of showing zeros.
+            // What the topic's status says ("Waiting for the first reading"
+            // before any data), hidden while there is nothing to say.
             StyledText {
-                visible: !root.valid
-                text: Translation.tr("No active session")
+                visible: text !== ""
+                text: ClaudeUsage.statusLine
                 color: Appearance.colors.colSubtext
             }
 
             ColumnLayout {
-                visible: root.valid
+                visible: ClaudeUsage.topic.hasData
                 spacing: 4
 
                 RowLayout {
@@ -120,27 +116,18 @@ MouseArea {
                     StyledText {
                         horizontalAlignment: Text.AlignRight
                         color: Appearance.colors.colOnSurfaceVariant
-                        text: `${Math.round(root.clampedPct)}%`
+                        text: root.valid ? `${Math.round(root.clampedPct)}%` : "--"
                     }
                 }
 
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: 8
-                    StyledText {
-                        Layout.fillWidth: true
-                        text: Translation.tr("Resets in:")
-                        color: Appearance.colors.colOnSurfaceVariant
-                    }
-                    StyledText {
-                        horizontalAlignment: Text.AlignRight
-                        color: Appearance.colors.colOnSurfaceVariant
-                        text: root.resetCountdown(ClaudeUsage.fiveHourResetsAt)
-                    }
+                StyledText {
+                    visible: text !== ""
+                    color: Appearance.colors.colOnSurfaceVariant
+                    text: Claude.resetText(ClaudeUsage.fiveHourWindow, Backend.now, Claude.zoneTime, Translation.tr)
                 }
 
                 RowLayout {
-                    visible: ClaudeUsage.weeklyPct >= 0
+                    visible: ClaudeUsage.weeklyPct >= 0 || ClaudeUsage.weeklyUnknown
                     Layout.fillWidth: true
                     spacing: 8
                     StyledText {
@@ -151,8 +138,14 @@ MouseArea {
                     StyledText {
                         horizontalAlignment: Text.AlignRight
                         color: Appearance.colors.colOnSurfaceVariant
-                        text: `${Math.round(ClaudeUsage.weeklyPct)}%`
+                        text: ClaudeUsage.weeklyUnknown ? "--" : `${Math.round(ClaudeUsage.weeklyPct)}%`
                     }
+                }
+
+                StyledText {
+                    visible: text !== ""
+                    color: Appearance.colors.colSubtext
+                    text: root.ageLine
                 }
             }
         }

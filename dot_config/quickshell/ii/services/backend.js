@@ -62,16 +62,17 @@ function uptime(bootAt, now) {
 // How old a value is, for a widget that shows its last known value: "now",
 // "45 s", "12 min", "3 h", then the weekday it was known on ("since Sun").
 // Floors throughout; a negative age (the wall clock stepped back) is "now".
-function ageText(ms, now) {
+// Every word goes through the caller's tr (Translation.tr in the shell).
+function ageText(ms, now, tr) {
     if (ms < 5 * SECOND_MS)
-        return "now";
+        return tr("now");
     if (ms < MINUTE_MS)
-        return Math.floor(ms / SECOND_MS) + " s";
+        return tr("%1 s").arg(Math.floor(ms / SECOND_MS));
     if (ms < HOUR_MS)
-        return Math.floor(ms / MINUTE_MS) + " min";
+        return tr("%1 min").arg(Math.floor(ms / MINUTE_MS));
     if (ms < DAY_MS)
-        return Math.floor(ms / HOUR_MS) + " h";
-    return "since " + SHORT_WEEKDAYS[new Date(now - ms).getDay()];
+        return tr("%1 h").arg(Math.floor(ms / HOUR_MS));
+    return tr("since %1").arg(tr(SHORT_WEEKDAYS[new Date(now - ms).getDay()]));
 }
 
 // Uptime in the bar's format from before axon (DateTime.qml): "1d, 5m", "2h",

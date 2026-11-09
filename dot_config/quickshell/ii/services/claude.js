@@ -12,9 +12,12 @@ const HOUR_MS = 60 * MINUTE_MS;
 const DAY_MS = 24 * HOUR_MS;
 const AGE_HIDDEN_MS = 2 * MINUTE_MS;
 
-// Time left as "45m", "2h 13m" or "6d 7h", floored; nothing left is "0m".
+// Time left as "45m", "2h 13m" or "6d 7h", floored; under a minute, nothing left included, is
+// "<1m".
 function formatCountdown(ms, tr) {
     const left = Math.max(0, ms);
+    if (left < MINUTE_MS)
+        return tr("<1m");
     if (left < HOUR_MS)
         return tr("%1m").arg(Math.floor(left / MINUTE_MS));
     if (left < DAY_MS)

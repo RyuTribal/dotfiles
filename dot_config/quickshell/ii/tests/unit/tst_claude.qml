@@ -37,8 +37,10 @@ TestCase {
         compare(Claude.formatCountdown(45 * minuteMs, tr), "45m");
         compare(Claude.formatCountdown(2 * hourMs + 13 * minuteMs + 59 * 1000, tr), "2h 13m");
         compare(Claude.formatCountdown(6 * dayMs + 7 * hourMs + 30 * minuteMs, tr), "6d 7h");
-        compare(Claude.formatCountdown(-1, tr), "0m");
-        compare(Claude.formatCountdown(0, tr), "0m");
+        compare(Claude.formatCountdown(minuteMs, tr), "1m");
+        compare(Claude.formatCountdown(minuteMs - 1, tr), "<1m");
+        compare(Claude.formatCountdown(0, tr), "<1m");
+        compare(Claude.formatCountdown(-1, tr), "<1m");
     }
 
     function test_windowViewResetUnknownFromState() {

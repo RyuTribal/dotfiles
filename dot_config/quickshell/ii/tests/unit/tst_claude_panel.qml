@@ -308,6 +308,15 @@ TestCase {
         }
     }
 
+    // A 2.5-billion-token day shows as such, never wrapped through a 32-bit int to a negative count.
+    function test_todayAbove32BitsShowsItsTokens() {
+        const stats = statsData();
+        stats.today.tokens = 2500000000;
+        frame(ClaudeUsage.topic, "ok", null, usageData());
+        frame(ClaudeUsage.statsTopic, "ok", null, stats);
+        compare(textsStartingWith(panel, "2500.0M tokens").length, 1, "the day's tokens show");
+    }
+
     // With room to spare, all five top projects show.
     function test_everyTopProjectShowsWhenTheCardHasRoom() {
         host.height = 700;

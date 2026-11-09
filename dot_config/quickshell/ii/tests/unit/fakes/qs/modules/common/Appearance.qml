@@ -10,6 +10,8 @@ import QtQuick
 // not here. tst_wallpapers.qml loads WallpaperTile.qml and ThemeKnobControl.qml over it: the tile's
 // colours and sizes are here, with each highlight colour distinct so the test can tell them apart.
 // tst_claude_panel.qml loads ClaudePanel.qml over it, which adds colOutlineVariant.
+// tst_claude_indicator.qml loads ClaudeIndicator.qml and the real StyledToolTip.qml over it, which add
+// barHeight, colOnSurfaceVariant, the tooltip colours and the number animation.
 QtObject {
     property var colors: ({
             colError: "#ffb4ab",
@@ -24,6 +26,9 @@ QtObject {
             colOnLayer2: "#e0e0e0",
             colOnPrimary: "#002f6a",
             colOnSecondaryContainer: "#f0f0f0",
+            colOnSurfaceVariant: "#b2cad3",
+            colOnTooltip: "#ffffff",
+            colTooltip: "#3c4043",
             colOutlineVariant: "#344a51",
             colPrimary: "#a0c0ff",
             colPrimaryContainer: "#284777",
@@ -32,6 +37,7 @@ QtObject {
             colSubtext: "#a0a0a0"
         })
     property var sizes: ({
+            barHeight: 40,
             elevationMargin: 10,
             wallpaperSelectorItemMargins: 8,
             wallpaperSelectorItemPadding: 6
@@ -120,9 +126,15 @@ QtObject {
             duration: 0
         }
     }
+    property Component numberAnimation: Component {
+        NumberAnimation {
+            duration: 0
+        }
+    }
     property var animation: ({
             elementMoveFast: {
-                colorAnimation: colorAnimation
+                colorAnimation: colorAnimation,
+                numberAnimation: numberAnimation
             }
         })
 }

@@ -16,6 +16,12 @@ import QtQuick.Layouts
 // always subscribed, so this widget adds no polling of its own; opening the
 // popup asks axon for a probe when its newest reading is over a minute old.
 // Countdowns and ages read Backend.now.
+//
+// The engine's status message can run to a few hundred characters (a failed
+// probe's stderr line), and StyledPopup sizes itself from its content. So
+// the status, in the popup and in the tooltip, takes two lines at most of
+// the top menu panel's width, the rest elided; the age is its own line and
+// never cut.
 MouseArea {
     id: root
     implicitWidth: rowLayout.implicitWidth
@@ -26,6 +32,21 @@ MouseArea {
     readonly property bool valid: ClaudeUsage.fiveHourPct >= 0 && !ClaudeUsage.fiveHourUnknown
     readonly property real clampedPct: Math.max(0, Math.min(100, ClaudeUsage.fiveHourPct))
     readonly property string ageLine: Claude.ageLine(ClaudeUsage.topic.ageMs, Backend.now, Translation.tr)
+    // The widest a status line may be: ClaudePanel's width in its card.
+    readonly property real statusWidth: 390
+    // The tooltip's age line, then the status in two lines measured in the tooltip's font.
+    readonly property string toolTipText: {
+        const statusLines = Claude.twoLines(ClaudeUsage.statusLine, root.statusWidth, text => toolTipFont.advanceWidth(text), (text, width) => toolTipFont.elidedText(text, Qt.ElideRight, width));
+        return [root.ageLine].concat(statusLines).filter(line => line !== "").join("\n");
+    }
+
+    // StyledToolTip's text font, which the tooltip's lines are measured in.
+    FontMetrics {
+        id: toolTipFont
+        font.family: Appearance.font.family.main
+        font.pixelSize: Appearance.font.pixelSize.smaller
+        font.hintingPreference: Font.PreferNoHinting
+    }
 
     onPressed: (event) => {
         if (event.button === Qt.LeftButton) {
@@ -50,7 +71,7 @@ MouseArea {
             color: Appearance.colors.colOnLayer1
 
             StyledToolTip {
-                content: [root.ageLine, ClaudeUsage.statusLine].filter(line => line !== "").join("\n")
+                content: root.toolTipText
                 extraVisibleCondition: root.containsMouse && !ClaudeUsage.topic.live && content !== ""
             }
         }
@@ -94,9 +115,14 @@ MouseArea {
             }
 
             // What the topic's status says ("Waiting for the first reading"
-            // before any data), hidden while there is nothing to say.
+            // before any data), hidden while there is nothing to say: two
+            // lines at most, so a long message cannot widen the popup.
             StyledText {
+                Layout.maximumWidth: root.statusWidth
                 visible: text !== ""
+                wrapMode: Text.WordWrap
+                maximumLineCount: 2
+                elide: Text.ElideRight
                 text: ClaudeUsage.statusLine
                 color: Appearance.colors.colSubtext
             }

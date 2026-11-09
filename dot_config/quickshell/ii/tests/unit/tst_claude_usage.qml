@@ -179,8 +179,28 @@ TestCase {
         compare(usage.fiveHourResetsAt, -1);
         compare(usage.weeklyPct, 23);
         compare(usage.contextPct, -1);
-        compare(usage.sessionCostUsd, 0);
+        compare(usage.sessionCostUsd, -1);
         compare(usage.sessionLabel, "");
+    }
+
+    // A session that did not report its cost is -1, as contextPct, so the panel shows "--".
+    function test_sessionWithoutCostIsMinusOne() {
+        const usage = createTemporaryObject(usageComponent, tc);
+        const data = exampleData();
+        data.last_session.cost_usd = null;
+        frame(usage.topic, "ok", data);
+        compare(usage.sessionCostUsd, -1);
+        compare(usage.contextPct, 61);
+    }
+
+    // A day's tokens pass 2^31 on a heavy day; the count is not a 32-bit int.
+    function test_todayTokensAbove32Bits() {
+        const usage = createTemporaryObject(usageComponent, tc);
+        usage.pollingEnabled = true;
+        const stats = statsData();
+        stats.today.tokens = 2500000000;
+        frame(usage.statsTopic, "ok", stats);
+        compare(usage.todayTokens, 2500000000);
     }
 
     function test_noDataBeforeTheFirstFrame() {

@@ -99,7 +99,8 @@ widgets="$here/../../modules/common/widgets"
 widgets_module="$imports/qs/modules/common/widgets"
 mkdir "$widgets_module"
 cp "$widgets/ConfigSpinBox.qml" "$widgets/StyledSpinBox.qml" "$widgets/StyledTextInput.qml" "$widgets/StyledText.qml" \
-    "$widgets/OptionalMaterialSymbol.qml" "$widgets/StyledRectangularShadow.qml" "$here/fakes/spinbox/MaterialSymbol.qml" \
+    "$widgets/OptionalMaterialSymbol.qml" "$widgets/StyledRectangularShadow.qml" "$widgets/StyledToolTip.qml" \
+    "$here/fakes/spinbox/MaterialSymbol.qml" \
     "$here/fakes/knobs/ConfigSwitch.qml" "$here/fakes/knobs/ConfigSelectionArray.qml" \
     "$here/fakes/knobs/MaterialTextField.qml" "$here/fakes/progress/StyledProgressBar.qml" "$widgets_module/"
 cat > "$widgets_module/qmldir" <<'EOF'
@@ -110,6 +111,7 @@ StyledTextInput 1.0 StyledTextInput.qml
 StyledText 1.0 StyledText.qml
 OptionalMaterialSymbol 1.0 OptionalMaterialSymbol.qml
 StyledRectangularShadow 1.0 StyledRectangularShadow.qml
+StyledToolTip 1.0 StyledToolTip.qml
 MaterialSymbol 1.0 MaterialSymbol.qml
 ConfigSwitch 1.0 ConfigSwitch.qml
 ConfigSelectionArray 1.0 ConfigSelectionArray.qml
@@ -171,6 +173,19 @@ FittedText 1.0 FittedText.qml
 RowLabel 1.0 RowLabel.qml
 EOF
 
+# tst_claude_indicator.qml loads the real modules/bar/ClaudeIndicator.qml as qs.modules.bar, beside the
+# stand-in StyledPopup of fakes/bar, which lays the popup's content out in place. Its claude.js import
+# reaches the qs.services module above, as ClaudePanel's does; the real StyledToolTip and StyledText come
+# from the widgets module above, MaterialSymbol from fakes/spinbox, GlobalStates from fakes/qs.
+bar_module="$imports/qs/modules/bar"
+mkdir "$bar_module"
+cp "$here/../../modules/bar/ClaudeIndicator.qml" "$here/fakes/bar/StyledPopup.qml" "$bar_module/"
+cat > "$bar_module/qmldir" <<'EOF'
+module qs.modules.bar
+ClaudeIndicator 1.0 ClaudeIndicator.qml
+StyledPopup 1.0 StyledPopup.qml
+EOF
+
 # tst_theme.qml loads the real services/Theme.qml as the Theme singleton of the qs.services module above,
 # over the stand-in Backend, the stand-in FileView of fakes/Quickshell/Io and the Appearance and Directories
 # of fakes/qs/modules/common, into which it writes the colours. For the hover colours it also loads the real
@@ -212,7 +227,8 @@ for test in tst_backend.qml tst_backend_connection.qml tst_backend_behaviour.qml
     tst_system_clients.qml tst_config_error_toast.qml tst_config.qml tst_spin_box.qml \
     tst_backend_spin_box.qml tst_favicon_cache.qml tst_resource_usage.qml tst_sweep.qml \
     tst_sweep_service.qml tst_sweep_panel.qml tst_sweep_panel_toggle.qml tst_nerd_glyphs.qml \
-    tst_theme.qml tst_wallpapers.qml tst_claude.qml tst_claude_usage.qml tst_claude_panel.qml; do
+    tst_theme.qml tst_wallpapers.qml tst_claude.qml tst_claude_usage.qml tst_claude_panel.qml \
+    tst_claude_indicator.qml; do
     QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -import "$here/fakes" -import "$imports" \
         -input "$here/$test" || status=1
 done

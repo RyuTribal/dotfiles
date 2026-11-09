@@ -11,7 +11,8 @@ RowLayout {
     id: root
     spacing: 10
 
-    // Gate ccusage/status polling to when this tab is actually the selected
+    // Gate the claude.stats subscription and the status refresh (ClaudeUsage's
+    // pollingEnabled) to when this tab is actually the selected
     // SwipeView page AND the top menu itself is open. `root.visible` is NOT
     // enough on its own: SwipeView keeps every page instantiated and does
     // not clear a non-current page's `visible` (its pages just sit off to

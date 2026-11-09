@@ -36,11 +36,11 @@ Singleton {
     readonly property real weeklyPct: _weekly.pct
     readonly property real weeklyResetsAt: _weekly.resetsAt
     readonly property bool weeklyUnknown: _weekly.unknown
-    readonly property real sessionCostUsd: _session?.cost_usd ?? 0
+    readonly property real sessionCostUsd: _session?.cost_usd ?? -1 // -1 when the session reported none
     readonly property real contextPct: _session?.context_pct ?? -1
     readonly property string sessionLabel: _session === null ? "" : _session.name || Claude.basename(_session.cwd ?? "")
 
-    property int todayTokens: 0
+    property real todayTokens: 0 // a heavy day passes a 32-bit int's 2^31
     property real todayCostUsd: 0
     property var dailyTrend: [] // [{date, tokens, cost}], oldest first
     property var topProjects: [] // [{name, tokens, cost}]

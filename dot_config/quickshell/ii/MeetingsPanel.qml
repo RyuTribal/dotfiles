@@ -10,6 +10,7 @@
 // panel never writes a marker itself, it only polls for them.
 pragma ComponentBehavior: Bound
 import QtQuick
+import QtQuick.Controls
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
@@ -386,6 +387,23 @@ Scope {
                             elide: Text.ElideRight
                         }
                         MeetingsButton {
+                            id: copyButton
+                            property bool copied: false
+                            label: copyButton.copied ? "copied" : (rootScope.showTranscript ? "copy transcript" : "copy summary")
+                            onClicked: {
+                                const content = rootScope.showTranscript ? transcriptFile.text() : summaryFile.text();
+                                if (content.length === 0) return;
+                                Quickshell.clipboardText = content;
+                                copyButton.copied = true;
+                                copiedTimer.restart();
+                            }
+                            Timer {
+                                id: copiedTimer
+                                interval: 1500
+                                onTriggered: copyButton.copied = false
+                            }
+                        }
+                        MeetingsButton {
                             label: rootScope.showTranscript ? "show summary" : "show transcript"
                             onClicked: rootScope.showTranscript = !rootScope.showTranscript
                         }
@@ -398,16 +416,23 @@ Scope {
                         color: Appearance.colors.colLayer1
                         clip: true
 
-                        StyledFlickable {
+                        // ScrollView + read-only TextArea: wheel scrolls,
+                        // mouse drag selects text (Ctrl+C / Ctrl+A work).
+                        ScrollView {
                             anchors.fill: parent
                             anchors.margins: 12
-                            contentWidth: width
-                            contentHeight: detailText.implicitHeight
+                            ScrollBar.vertical: StyledScrollBar {}
 
-                            Text {
-                                id: detailText
-                                width: parent.width
-                                wrapMode: Text.Wrap
+                            StyledTextArea {
+                                readOnly: true
+                                selectByMouse: true
+                                wrapMode: TextEdit.Wrap
+                                // transcript.md is one speaker line per single
+                                // newline -- markdown would merge it into one
+                                // paragraph, so only the summary renders as md.
+                                textFormat: rootScope.showTranscript ? TextEdit.PlainText : TextEdit.MarkdownText
+                                background: null
+                                padding: 0
                                 text: rootScope.showTranscript
                                     ? (transcriptFile.text().length > 0 ? transcriptFile.text() : "loading transcript…")
                                     : (summaryFile.text().length > 0 ? summaryFile.text() : "loading summary…")

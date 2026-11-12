@@ -62,29 +62,6 @@ function sessionLine(label, costUsd, contextPct, tr) {
     return tr("%1 · session %2 · context %3").arg(label).arg(cost).arg(context);
 }
 
-// `text` in at most two lines no wider than `width`, as `advance(text)` measures a line: the first
-// takes whole words while they fit, the second the rest, through `elide(text, width)`. A first word
-// wider than the line leaves one elided line. For the bar's tooltip, whose text cannot be given a
-// width of its own.
-function twoLines(text, width, advance, elide) {
-    if (text === "")
-        return [];
-    const words = text.split(" ");
-    let first = "";
-    while (words.length > 0) {
-        const longer = first === "" ? words[0] : first + " " + words[0];
-        if (advance(longer) > width)
-            break;
-        first = longer;
-        words.shift();
-    }
-    if (first === "")
-        return [elide(text, width)];
-    if (words.length === 0)
-        return [first];
-    return [first, elide(words.join(" "), width)];
-}
-
 // A USD amount as the panel writes it, "$18.42".
 function formatCost(usd) {
     return "$" + usd.toFixed(2);

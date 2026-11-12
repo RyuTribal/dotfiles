@@ -7,8 +7,8 @@ import qs.services
 // Backend, with the stand-in StyledPopup of fakes/bar, which lays the popup's content out in place.
 // Once the probe runs, the engine's fetch_failed message can be about 270 characters ("Probe
 // failed, retrying at HH:MM: " and 200 characters of a stderr line). With such a message the popup
-// and the value's tooltip stay within the panel's 390 px, the status takes two lines at most, elided,
-// and the age shows whole. Run it through backend_tests.sh.
+// stays within the panel's 390 px, the status takes two lines at most, elided, the age shows whole,
+// and the value has no tooltip of its own. Run it through backend_tests.sh.
 TestCase {
     id: tc
     name: "ClaudeIndicator"
@@ -120,16 +120,11 @@ TestCase {
         verify(!ages[0].truncated, "the age is elided");
     }
 
-    function test_aLongStatusStaysWithinTheToolTipWidth() {
+    // The popup is the only hover surface: a tooltip on the value drew inside the bar strip over
+    // the widgets to its right and took their clicks (Ivan, 2026-11-12).
+    function test_theValueHasNoToolTip() {
         showLongFailure();
-        const toolTip = valueToolTip();
-        verify(toolTip !== null, "the value has a tooltip");
-        const lines = toolTip.content.split("\n");
-        compare(lines[0], "as of 12 min ago");
-        compare(lines.length, 3, "the age and two lines of status: " + toolTip.content);
-        verify(longMessage().startsWith(lines[1] + " "), "the first status line is a start of the message: " + lines[1]);
-        verify(lines[2].endsWith("…"), "the second status line is elided: " + lines[2]);
-        const padding = 2 * toolTip.horizontalPadding;
-        verify(toolTip.contentItem.implicitWidth <= tc.widthCap + padding + 0.5, "the tooltip is " + toolTip.contentItem.implicitWidth + " px wide");
+        compare(textsStartingWith(indicator, "41%").length > 0, true, "the value shows");
+        compare(valueToolTip(), null, "the value has no tooltip");
     }
 }

@@ -222,34 +222,6 @@ TestCase {
         compare(Claude.sessionLine("axon design", 0, 61, tr), "axon design · session $0.00 · context 61%");
     }
 
-    // Ten pixels a character, and an elide that keeps what fits before "…".
-    function advance(text) {
-        return text.length * 10;
-    }
-
-    function elide(text, width) {
-        return advance(text) <= width ? text : text.slice(0, Math.floor(width / 10) - 1) + "…";
-    }
-
-    function test_twoLinesKeepsAShortTextWhole() {
-        compare(Claude.twoLines("Rate-limited, retrying at 11:34", 400, advance, elide), ["Rate-limited, retrying at 11:34"]);
-        compare(Claude.twoLines("", 400, advance, elide), []);
-    }
-
-    // The first line takes whole words while they fit, the second the rest, elided.
-    function test_twoLinesWrapsAtAWordAndElidesTheRest() {
-        const lines = Claude.twoLines("aaaa bbbb cccc dddd eeee ffff", 100, advance, elide);
-        compare(lines, ["aaaa bbbb", "cccc dddd…"]);
-        for (const line of lines)
-            verify(advance(line) <= 100, line);
-        compare(Claude.twoLines("aaaa bbbb cccc", 100, advance, elide), ["aaaa bbbb", "cccc"]);
-    }
-
-    // A first word wider than the line leaves one elided line.
-    function test_twoLinesElidesAWordWiderThanTheLine() {
-        compare(Claude.twoLines("abcdefghijklmnop qr", 100, advance, elide), ["abcdefghi…"]);
-    }
-
     function test_basename() {
         compare(Claude.basename("/home/ryutribal/programming/axon"), "axon");
         compare(Claude.basename("/home/ryutribal/programming/axon/"), "axon");

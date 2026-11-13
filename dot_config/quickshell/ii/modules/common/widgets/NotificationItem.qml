@@ -6,7 +6,6 @@ import QtQuick
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Hyprland
-import Quickshell.Services.Notifications
 
 Item { // Notification item area
     id: root
@@ -138,7 +137,7 @@ Item { // Notification item area
         }
 
         color: (expanded && !onlyNotification) ? 
-            (notificationObject.urgency == NotificationUrgency.Critical) ? 
+            (notificationObject.urgency === "critical") ?
                 ColorUtils.mix(Appearance.colors.colSecondaryContainer, Appearance.colors.colLayer2, 0.35) :
                 (Appearance.colors.colLayer3) :
             ColorUtils.transparentize(Appearance.colors.colLayer3)
@@ -255,7 +254,7 @@ Item { // Notification item area
                             contentItem: MaterialSymbol {
                                 iconSize: Appearance.font.pixelSize.large
                                 horizontalAlignment: Text.AlignHCenter
-                                color: (notificationObject.urgency == NotificationUrgency.Critical) ? 
+                                color: (notificationObject.urgency === "critical") ?
                                     Appearance.m3colors.m3onSurfaceVariant : Appearance.m3colors.m3onSurface
                                 text: "close"
                             }
@@ -299,7 +298,7 @@ Item { // Notification item area
                                 id: copyIcon
                                 iconSize: Appearance.font.pixelSize.large
                                 horizontalAlignment: Text.AlignHCenter
-                                color: (notificationObject.urgency == NotificationUrgency.Critical) ? 
+                                color: (notificationObject.urgency === "critical") ?
                                     Appearance.m3colors.m3onSurfaceVariant : Appearance.m3colors.m3onSurface
                                 text: "content_copy"
                             }

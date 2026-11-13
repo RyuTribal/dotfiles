@@ -66,3 +66,8 @@ theme = { dark = "breeze-plus-dark", light = "breeze-plus" }    # kde-material-y
 # Installed 2026-11-01. A theme without [cursor] gets axon.toml's [theme] default, Adwaita.
 theme = "Bibata-Modern-Classic"
 size = 24
+
+[sounds]
+# Ocean's message-highlight (Ivan 2026-11-13); without ocean-sound-theme it falls back to freedesktop's message.
+theme = "ocean"
+default = "message-highlight"

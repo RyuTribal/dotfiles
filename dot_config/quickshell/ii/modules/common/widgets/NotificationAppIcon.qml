@@ -4,13 +4,12 @@ import Qt5Compat.GraphicalEffects
 import QtQuick
 import Quickshell
 import Quickshell.Widgets
-import Quickshell.Services.Notifications
 
 Rectangle { // App icon
     id: root
     property var appIcon: ""
     property var summary: ""
-    property var urgency: NotificationUrgency.Normal
+    property var urgency: "normal"
     property var image: ""
     property real scale: 1
     property real size: 38 * scale
@@ -33,11 +32,11 @@ Rectangle { // App icon
             text: {
                 const defaultIcon = NotificationUtils.findSuitableMaterialSymbol("")
                 const guessedIcon = NotificationUtils.findSuitableMaterialSymbol(root.summary)
-                return (root.urgency == NotificationUrgency.Critical && guessedIcon === defaultIcon) ?
+                return (root.urgency === "critical" && guessedIcon === defaultIcon) ?
                     "release_alert" : guessedIcon
             }
             anchors.fill: parent
-            color: (root.urgency == NotificationUrgency.Critical) ? 
+            color: (root.urgency === "critical") ? 
                 ColorUtils.mix(Appearance.m3colors.m3onSecondary, Appearance.m3colors.m3onSecondaryContainer, 0.1) :
                 Appearance.m3colors.m3onSecondaryContainer
             iconSize: root.materialIconSize

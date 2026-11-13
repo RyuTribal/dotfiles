@@ -39,56 +39,83 @@ ContentPage {
     }
 
     ContentSection {
+        id: notificationsSection
         icon: "notifications"
         title: Translation.tr("Notifications")
 
-        ConfigSwitch {
-            text: Translation.tr("Enable notification sounds")
-            checked: Config.options.notifications.sounds.enabled
-            onCheckedChanged: {
-                Config.options.notifications.sounds.enabled = checked;
-            }
+        property bool overridesInvalid: false // the overrides text is not JSON; it stays as typed
+
+        // The sound settings live in axon.toml ([notify.sounds], section 31); the sound theme and the
+        // default sound are the active theme's [sounds] (follow-up 10). Each control shows the
+        // value of axon's `config` topic and writes `config.set` on user action only, never when a
+        // snapshot moves the value. A refused write shows its error under the control, and until the
+        // first `config` snapshot the controls say axon is unreachable, as BackendSpinBox does.
+        FollowedWrites {
+            id: soundsEnabledWrites
+            topicValue: AxonConfig.value("notify.sounds.enabled")
+            send: (value, done) => AxonConfig.set("notify.sounds.enabled", value, done)
         }
 
-        MaterialTextArea {
-            Layout.fillWidth: true
-            placeholderText: Translation.tr("Default sound name or absolute file path")
-            text: Config.options.notifications.sounds.defaultSound
-            wrapMode: TextEdit.Wrap
-            onEditingFinished: {
-                Config.options.notifications.sounds.defaultSound = text;
+        // Holds the overrides as JSON text, so FollowedWrites compares them by value: an unrelated
+        // config snapshot makes a new array but the same text.
+        FollowedWrites {
+            id: overridesWrites
+            topicValue: JSON.stringify(AxonConfig.value("notify.sounds.overrides") ?? [])
+            send: (value, done) => AxonConfig.set("notify.sounds.overrides", JSON.parse(value), done)
+        }
+
+        ConfigSwitch {
+            text: Translation.tr("Enable notification sounds")
+            enabled: AxonConfig.writable
+            checked: soundsEnabledWrites.shown === true
+            // ConfigSwitch flips `checked` on a click, which drops the binding: bind it again.
+            onClicked: {
+                soundsEnabledWrites.write(!(soundsEnabledWrites.shown === true));
+                checked = Qt.binding(() => soundsEnabledWrites.shown === true);
             }
         }
 
         StyledText {
-            Layout.fillWidth: true
-            color: Appearance.colors.colSubtext
-            wrapMode: Text.Wrap
-            text: Translation.tr("Use a freedesktop sound name like <tt>message</tt> or <tt>message-new-instant</tt>, or an absolute file path like <tt>/home/me/Sounds/discord.oga</tt>.")
+            visible: text !== ""
+            color: Appearance.colors.colError
+            text: AxonConfig.known ? soundsEnabledWrites.errorText : "axon unreachable"
         }
 
         MaterialTextArea {
             Layout.fillWidth: true
             implicitHeight: 180
-            placeholderText: Translation.tr("[\n  {\"desktopEntry\": \"discord\", \"sound\": \"message-new-instant\"}\n]")
-            text: JSON.stringify(Config.options.notifications.sounds.overrides, null, 2)
+            enabled: AxonConfig.writable
+            placeholderText: Translation.tr("[\n  {\"desktop_entry\": \"discord\", \"sound\": \"message-new-instant\"}\n]")
+            text: JSON.stringify(JSON.parse(overridesWrites.shown), null, 2)
             wrapMode: TextEdit.Wrap
             onEditingFinished: {
+                let parsed;
                 try {
-                    const parsed = JSON.parse(text);
-                    if (Array.isArray(parsed)) {
-                        Config.options.notifications.sounds.overrides = parsed;
-                    }
+                    parsed = JSON.parse(text);
                 } catch (error) {
+                    // Text that is not JSON writes nothing and stays as typed, with a message under it.
+                    notificationsSection.overridesInvalid = true;
+                    return;
                 }
+                notificationsSection.overridesInvalid = false;
+                // Any JSON is sent; axon refuses what is not a list of overrides, and says why below.
+                if (JSON.stringify(parsed) !== overridesWrites.shown)
+                    overridesWrites.write(JSON.stringify(parsed));
+                text = Qt.binding(() => JSON.stringify(JSON.parse(overridesWrites.shown), null, 2));
             }
+        }
+
+        StyledText {
+            visible: text !== ""
+            color: Appearance.colors.colError
+            text: !AxonConfig.known ? "axon unreachable" : notificationsSection.overridesInvalid ? Translation.tr("Not valid JSON") : overridesWrites.errorText
         }
 
         StyledText {
             Layout.fillWidth: true
             color: Appearance.colors.colSubtext
             wrapMode: Text.Wrap
-            text: Translation.tr("Overrides match exact <tt>desktopEntry</tt> and/or <tt>appName</tt>. Example: <tt>{\"desktopEntry\": \"discord\", \"sound\": \"message-new-instant\"}</tt>. If an app sends <tt>sound-name</tt> or <tt>sound-file</tt>, that is used when no override matches.")
+            text: Translation.tr("Overrides match <tt>desktop_entry</tt> and/or <tt>app_name</tt>, ignoring case. Example: <tt>{\"desktop_entry\": \"discord\", \"sound\": \"message-new-instant\"}</tt>. Sound names are looked up in the active theme's sounds; an absolute file path plays that file. If an app sends <tt>sound-name</tt> or <tt>sound-file</tt>, that is used when no override matches; otherwise the active theme's default sound plays.")
         }
     }
 

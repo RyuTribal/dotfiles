@@ -58,7 +58,6 @@ ShellRoot {
         Theme.reportsIris = true // the main shell alone reports its iris.json loads to axon
         Theme.reload()
         Hyprsunset.load()
-        ConflictKiller.load()
         Cliphist.refresh()
         Idle.load()
     }

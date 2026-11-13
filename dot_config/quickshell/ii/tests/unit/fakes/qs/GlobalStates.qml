@@ -9,4 +9,8 @@ QtObject {
     property bool wallpaperSelectorOpen: false
     property bool topMenuOpen: false
     property string topMenuTab: ""
+    // tst_notifications_service.qml loads Notifications.qml over it: the sidebar hides and expires
+    // popups; the lock screen hides the popup window.
+    property bool sidebarRightOpen: false
+    property bool screenLocked: false
 }

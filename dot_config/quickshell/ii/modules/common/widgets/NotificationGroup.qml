@@ -40,14 +40,7 @@ MouseArea { // Notification group area
     onContainsMouseChanged: {
         if (!root.popup)
             return;
-        if (root.containsMouse)
-            root.notifications.forEach(notif => {
-                Notifications.cancelTimeout(notif.notificationId);
-            });
-        else
-            root.notifications.forEach(notif => {
-                Notifications.timeoutNotification(notif.notificationId);
-            });
+        Notifications.holdPopups(root.notifications.map(notif => notif.notificationId), root.containsMouse);
     }
 
     SequentialAnimation { // Drag finish animation

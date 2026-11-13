@@ -103,7 +103,7 @@ Item {
                 buttonText: Translation.tr("Silent")
                 toggled: Notifications.silent
                 onClicked: () => {
-                    Notifications.silent = !Notifications.silent;
+                    Notifications.setSilent(!Notifications.silent);
                 }
             }
             NotificationStatusButton {

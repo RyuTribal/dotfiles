@@ -161,13 +161,6 @@ hl.window_rule({
 
 hl.window_rule({
     match = {
-        title = ".*Shell conflicts.*",
-    },
-    float = true,
-})
-
-hl.window_rule({
-    match = {
         class = "org.freedesktop.impl.portal.desktop.kde",
     },
     float = true,

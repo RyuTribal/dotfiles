@@ -208,10 +208,6 @@ Singleton {
                 property int suspend: 3
             }
 
-            property JsonObject conflictKiller: JsonObject {
-                property bool autoKillNotificationDaemons: false
-            }
-
             property JsonObject dock: JsonObject {
                 property bool enable: false
                 property bool monochromeIcons: true
@@ -257,14 +253,6 @@ Singleton {
 
             property JsonObject networking: JsonObject {
                 property string userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-            }
-
-            property JsonObject notifications: JsonObject {
-                property JsonObject sounds: JsonObject {
-                    property bool enabled: true
-                    property string defaultSound: "message" // Theme event name or absolute file path
-                    property list<var> overrides: []
-                }
             }
 
             property JsonObject osd: JsonObject {

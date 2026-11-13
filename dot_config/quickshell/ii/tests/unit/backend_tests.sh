@@ -19,6 +19,9 @@
 # tst_nerd_glyphs.qml loads NerdGlyphs.qml from it as NerdGlyphsService in the same way, over
 # fakes/Quickshell/Io/Process.qml and StdioCollector.qml, with the real Fuzzy and Levendist of the
 # functions module below.
+# tst_notifications_service.qml loads Notifications.qml as NotificationsService the same way, beside
+# notifications.js, over fakes/qs/GlobalStates.qml and the iconPath of fakes/Quickshell/Quickshell.qml.
+# tst_notifications.qml tests notifications.js by its relative path and needs nothing.
 # tst_claude_usage.qml loads ClaudeUsage.qml as ClaudeUsageService the same way, beside claude.js and fakes/Translation.qml.
 # tst_config.qml tests the real modules/common/Config.qml, so it gets its own module, ConfigUnderTest:
 # Config.qml sits there beside fakes/Directories.qml, over the stand-in FileView of fakes/Quickshell/Io.
@@ -34,9 +37,10 @@ module="$imports/ShellUnderTest"
 mkdir "$module"
 cp "$services/BackendTopic.qml" "$services/BackendList.qml" "$services/SystemInfo.qml" "$services/DateTime.qml" \
     "$services/FaviconCache.qml" "$services/ResourceUsage.qml" "$services/backend.js" \
-    "$services/sweep.js" "$services/claude.js" "$here/../../ConfigErrorToast.qml" "$module/"
+    "$services/sweep.js" "$services/claude.js" "$services/notifications.js" "$here/../../ConfigErrorToast.qml" "$module/"
 cp "$here/fakes/Backend.qml" "$here/fakes/Translation.qml" "$module/"
 grep -v '^pragma Singleton$' "$services/Sweep.qml" > "$module/SweepService.qml"
+grep -v '^pragma Singleton$' "$services/Notifications.qml" > "$module/NotificationsService.qml"
 grep -v '^pragma Singleton$' "$services/NerdGlyphs.qml" > "$module/NerdGlyphsService.qml"
 grep -v '^pragma Singleton$' "$services/ClaudeUsage.qml" > "$module/ClaudeUsageService.qml"
 cat > "$module/qmldir" <<'EOF'
@@ -50,6 +54,7 @@ singleton DateTime 1.0 DateTime.qml
 singleton FaviconCache 1.0 FaviconCache.qml
 singleton ResourceUsage 1.0 ResourceUsage.qml
 SweepService 1.0 SweepService.qml
+NotificationsService 1.0 NotificationsService.qml
 NerdGlyphsService 1.0 NerdGlyphsService.qml
 ClaudeUsageService 1.0 ClaudeUsageService.qml
 singleton Translation 1.0 Translation.qml
@@ -214,11 +219,83 @@ module qs.modules.wallpaperSelector
 WallpaperTile 1.0 WallpaperTile.qml
 EOF
 
+# tst_notification_list.qml loads the real NotificationListView.qml, StyledListView.qml and
+# NotificationGroup.qml as qs.modules.common.widgets over the real services/Notifications.qml as
+# qs.services, fed `notify` frames through the stand-in Backend. Those names clash with the modules
+# above, so it runs over its own import root, which holds every module it needs. Its Appearance and
+# Config are fakes/notifications' (the real animation durations), its ScriptModel the keyed one there,
+# and the widgets that need Hyprland, Quickshell.Widgets or effects are the stand-ins there; DragManager,
+# StyledScrollBar and StyledText are real.
+list_root="$imports/notification-list"
+mkdir -p "$list_root/Quickshell" "$list_root/qs/modules/common/functions" "$list_root/qs/modules/common/widgets" \
+    "$list_root/qs/services"
+cp "$here/fakes/Quickshell/Quickshell.qml" "$here/fakes/Quickshell/Singleton.qml" \
+    "$here/fakes/notifications/ScriptModel.qml" "$list_root/Quickshell/"
+cat > "$list_root/Quickshell/qmldir" <<'EOF'
+module Quickshell
+singleton Quickshell 1.0 Quickshell.qml
+Singleton 1.0 Singleton.qml
+ScriptModel 1.0 ScriptModel.qml
+EOF
+cp "$here/fakes/qs/GlobalStates.qml" "$here/fakes/Translation.qml" "$list_root/qs/"
+cat > "$list_root/qs/qmldir" <<'EOF'
+module qs
+singleton GlobalStates 1.0 GlobalStates.qml
+singleton Translation 1.0 Translation.qml
+EOF
+cp "$here/fakes/notifications/Appearance.qml" "$here/fakes/notifications/Config.qml" "$list_root/qs/modules/common/"
+cat > "$list_root/qs/modules/common/qmldir" <<'EOF'
+module qs.modules.common
+singleton Appearance 1.0 Appearance.qml
+singleton Config 1.0 Config.qml
+EOF
+cp "$functions/ColorUtils.qml" "$list_root/qs/modules/common/functions/"
+cat > "$list_root/qs/modules/common/functions/qmldir" <<'EOF'
+module qs.modules.common.functions
+singleton ColorUtils 1.0 ColorUtils.qml
+EOF
+cp "$services/Notifications.qml" "$services/notifications.js" "$services/backend.js" "$services/BackendTopic.qml" \
+    "$here/fakes/Backend.qml" "$list_root/qs/services/"
+cat > "$list_root/qs/services/qmldir" <<'EOF'
+module qs.services
+singleton Backend 1.0 Backend.qml
+singleton Notifications 1.0 Notifications.qml
+BackendTopic 1.0 BackendTopic.qml
+EOF
+cp "$widgets/NotificationListView.qml" "$widgets/StyledListView.qml" "$widgets/NotificationGroup.qml" \
+    "$widgets/notification_utils.js" "$widgets/DragManager.qml" "$widgets/StyledScrollBar.qml" "$widgets/StyledText.qml" \
+    "$here/fakes/notifications/NotificationItem.qml" "$here/fakes/notifications/NotificationAppIcon.qml" \
+    "$here/fakes/notifications/NotificationGroupExpandButton.qml" "$here/fakes/notifications/StyledRectangularShadow.qml" \
+    "$here/fakes/notifications/StyledToolTip.qml" "$list_root/qs/modules/common/widgets/"
+cat > "$list_root/qs/modules/common/widgets/qmldir" <<'EOF'
+module qs.modules.common.widgets
+NotificationListView 1.0 NotificationListView.qml
+StyledListView 1.0 StyledListView.qml
+NotificationGroup 1.0 NotificationGroup.qml
+DragManager 1.0 DragManager.qml
+StyledScrollBar 1.0 StyledScrollBar.qml
+StyledText 1.0 StyledText.qml
+NotificationItem 1.0 NotificationItem.qml
+NotificationAppIcon 1.0 NotificationAppIcon.qml
+NotificationGroupExpandButton 1.0 NotificationGroupExpandButton.qml
+StyledRectangularShadow 1.0 StyledRectangularShadow.qml
+StyledToolTip 1.0 StyledToolTip.qml
+EOF
+
 # ClaudeUsage.qml starts no process and reads no file; only grep's status 1 (no match) passes.
 status=0
 grep -nE 'Process|FileView|bunx|ccusage|stat ' "$services/ClaudeUsage.qml" || status=$?
 if [ "$status" -ne 1 ]; then
     echo "ClaudeUsage.qml: Process/FileView/bunx/ccusage/stat found, or the file is unreadable (grep status $status)" >&2
+    exit 1
+fi
+
+# Notifications.qml is a thin client of axon: it runs no server, starts no process, reads no file and
+# declares no inline component; only grep's status 1 (no match) passes.
+status=0
+grep -nE 'NotificationServer|Services\.Notifications|canberra|FileView|Process|execDetached|component ' "$services/Notifications.qml" || status=$?
+if [ "$status" -ne 1 ]; then
+    echo "Notifications.qml: an old-path name was found, or the file is unreadable (grep status $status)" >&2
     exit 1
 fi
 
@@ -228,8 +305,10 @@ for test in tst_backend.qml tst_backend_connection.qml tst_backend_behaviour.qml
     tst_backend_spin_box.qml tst_favicon_cache.qml tst_resource_usage.qml tst_sweep.qml \
     tst_sweep_service.qml tst_sweep_panel.qml tst_sweep_panel_toggle.qml tst_nerd_glyphs.qml \
     tst_theme.qml tst_wallpapers.qml tst_claude.qml tst_claude_usage.qml tst_claude_panel.qml \
-    tst_claude_indicator.qml; do
+    tst_claude_indicator.qml tst_notifications.qml tst_notifications_service.qml; do
     QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -import "$here/fakes" -import "$imports" \
         -input "$here/$test" || status=1
 done
+QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -import "$list_root" \
+    -input "$here/tst_notification_list.qml" || status=1
 exit "$status"

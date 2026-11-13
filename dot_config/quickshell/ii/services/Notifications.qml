@@ -1,312 +1,153 @@
 pragma Singleton
 pragma ComponentBehavior: Bound
 
-import qs.modules.common
+import "backend.js" as B
+import "notifications.js" as N
 import qs
 import QtQuick
 import Quickshell
-import Quickshell.Io
-import Quickshell.Services.Notifications
-import "notificationSoundPolicy.js" as NotificationSoundPolicy
 
 /**
- * Provides extra features not in Quickshell.Services.Notifications:
- *  - Persistent storage
- *  - Popup notifications, with timeout
- *  - Notification groups by app
+ * The notifications for the sidebar, the popups and the bar, a thin client of axon's `notify` engine
+ * (section 31). axond owns the bus name, the history, the popup deadlines, Do Not Disturb and the
+ * sounds; this holds the mapped rows, the per-app groups the widgets read, the sidebar rule, and a
+ * one-shot timer that shows and ends popups at the instants the engine does not publish.
  */
 Singleton {
-	id: root
-    component Notif: QtObject {
-        id: wrapper
-        required property int notificationId // Could just be `id` but it conflicts with the default prop in QtObject
-        property Notification notification
-        property list<var> actions: notification?.actions.map((action) => ({
-            "identifier": action.identifier,
-            "text": action.text,
-        })) ?? []
-        property bool popup: false
-        property string appIcon: notification?.appIcon ?? ""
-        property string appName: notification?.appName ?? ""
-        property string body: notification?.body ?? ""
-        property string desktopEntry: notification?.desktopEntry ?? ""
-        property var hints: notification?.hints ?? ({})
-        property string image: notification?.image ?? ""
-        property string summary: notification?.summary ?? ""
-        property double time
-        property string urgency: notification?.urgency.toString() ?? "normal"
-        property Timer timer
+    id: root
 
-        onNotificationChanged: {
-            if (notification === null) {
-                root.discardNotification(notificationId);
-            }
+    readonly property BackendTopic topic: BackendTopic {
+        name: "notify"
+        onSnapshot: data => root._apply(data)
+    }
+
+    readonly property var list: _list // mapped rows, newest first (notifications.js mapRow)
+    // The rows showing as popups now: the sidebar hides them all (popupRows).
+    readonly property var popupList: N.popupRows(_list, _popupNow, GlobalStates.sidebarRightOpen)
+    readonly property bool silent: _dnd // Do Not Disturb; setSilent changes it
+    readonly property bool serverOwned: _serverOwned // axond owns org.freedesktop.Notifications
+    readonly property var latestTimeForApp: N.latestTimes(_list)
+    readonly property var groupsByAppName: N.groupsForList(_list, latestTimeForApp)
+    readonly property var popupGroupsByAppName: N.groupsForList(popupList, latestTimeForApp)
+    readonly property var appNameList: N.appNameListForGroups(groupsByAppName)
+    readonly property var popupAppNameList: N.appNameListForGroups(popupGroupsByAppName)
+
+    // The wall clock in ms, read through this one property so a test can drive it. Backend.now ticks
+    // once a second, which would show a new popup up to half a second after the engine's pop-time
+    // sound (section 20, "Client-side extrapolation").
+    property var wallClock: Date.now
+
+    property var _list: []
+    property var _rowIndex: ({}) // the mapped rows by id, which reuseRows keeps identical while the rev holds
+    property bool _dnd: false
+    property bool _serverOwned: false
+    // The wall time popupList is judged at: the wall clock as last read, at each frame, each timer fire
+    // and each Backend.now tick. Never held at an earlier high value, so a backward clock jump shows
+    // the rows the engine stamps with the new time.
+    property double _popupNow: 0
+    property bool _firstSnapshotSeen: false
+
+    // The only place _popupNow is set, called on every frame, every timer fire and every Backend.now
+    // tick: reads the wall clock, then arms the timer for the next instant a popup starts or ends
+    // (the engine publishes at neither), or stops it when there is none. A fire that read a time
+    // before the deadline finds the deadline still ahead and arms the timer for what is left.
+    function _armPopupTimer() {
+        _popupNow = wallClock();
+        const deadline = N.nextDeadline(_list, _popupNow);
+        if (deadline < 0) {
+            popupTimer.stop();
+            return;
+        }
+        popupTimer.interval = Math.max(1, deadline - _popupNow);
+        popupTimer.restart();
+    }
+
+    function _apply(data) {
+        const items = data.items ?? [];
+        const reused = B.reuseRows(_rowIndex, items.map(row => N.mapRow(row, name => Quickshell.iconPath(name))));
+        _rowIndex = reused.index;
+        _list = reused.rows;
+        _dnd = data.dnd ?? false;
+        _serverOwned = data.server?.owned ?? false;
+        _armPopupTimer();
+        if (!_firstSnapshotSeen) {
+            _firstSnapshotSeen = true;
+            _releaseHeldPopups(items);
         }
     }
 
-    function notifToJSON(notif) {
-        return {
-            "notificationId": notif.notificationId,
-            "actions": notif.actions,
-            "appIcon": notif.appIcon,
-            "appName": notif.appName,
-            "body": notif.body,
-            "image": notif.image,
-            "summary": notif.summary,
-            "time": notif.time,
-            "urgency": notif.urgency,
-        }
-    }
-    function notifToString(notif) {
-        return JSON.stringify(notifToJSON(notif), null, 2);
-    }
-
-    component NotifTimer: Timer {
-        required property int notificationId
-        interval: 5000
-        running: true
-        onTriggered: () => {
-            root.timeoutNotification(notificationId);
-            destroy()
-        }
-    }
-
-    property bool silent: false
-    property var filePath: Directories.notificationsPath
-    property list<Notif> list: []
-    property var popupList: list.filter((notif) => notif.popup);
-    property bool popupInhibited: (GlobalStates?.sidebarRightOpen ?? false) || silent
-    property var latestTimeForApp: ({})
-    Component {
-        id: notifComponent
-        Notif {}
-    }
-    Component {
-        id: notifTimerComponent
-        NotifTimer {}
-    }
-
-    function stringifyList(list) {
-        return JSON.stringify(list.map((notif) => notifToJSON(notif)), null, 2);
-    }
-    
-    onListChanged: {
-        // Update latest time for each app
-        root.list.forEach((notif) => {
-            if (!root.latestTimeForApp[notif.appName] || notif.time > root.latestTimeForApp[notif.appName]) {
-                root.latestTimeForApp[notif.appName] = Math.max(root.latestTimeForApp[notif.appName] || 0, notif.time);
-            }
-        });
-        // Remove apps that no longer have notifications
-        Object.keys(root.latestTimeForApp).forEach((appName) => {
-            if (!root.list.some((notif) => notif.appName === appName)) {
-                delete root.latestTimeForApp[appName];
-            }
-        });
-    }
-
-    function appNameListForGroups(groups) {
-        return Object.keys(groups).sort((a, b) => {
-            // Sort by time, descending
-            return groups[b].time - groups[a].time;
-        });
-    }
-
-    function groupsForList(list) {
-        const groups = {};
-        list.forEach((notif) => {
-            if (!groups[notif.appName]) {
-                groups[notif.appName] = {
-                    appName: notif.appName,
-                    appIcon: notif.appIcon,
-                    notifications: [],
-                    time: 0
-                };
-            }
-            groups[notif.appName].notifications.push(notif);
-            // Always set to the latest time in the group
-            groups[notif.appName].time = latestTimeForApp[notif.appName] || notif.time;
-        });
-        return groups;
-    }
-
-    property var groupsByAppName: groupsForList(root.list)
-    property var popupGroupsByAppName: groupsForList(root.popupList)
-    property var appNameList: appNameListForGroups(root.groupsByAppName)
-    property var popupAppNameList: appNameListForGroups(root.popupGroupsByAppName)
-
-    // Quickshell's notification IDs starts at 1 on each run, while saved notifications
-    // can already contain higher IDs. This is for avoiding id collisions
-    property int idOffset
-    signal initDone();
-    signal notify(notification: var);
-    signal discard(id: int);
-    signal discardAll();
-    signal timeout(id: var);
-
-	NotificationServer {
-        id: notifServer
-        // actionIconsSupported: true
-        actionsSupported: true
-        bodyHyperlinksSupported: true
-        bodyImagesSupported: true
-        bodyMarkupSupported: true
-        bodySupported: true
-        imageSupported: true
-        keepOnReload: false
-        persistenceSupported: true
-
-        onNotification: (notification) => {
-            notification.tracked = true
-            const newNotifObject = notifComponent.createObject(root, {
-                "notificationId": notification.id + root.idOffset,
-                "notification": notification,
-                "time": Date.now(),
-            });
-			root.list = [...root.list, newNotifObject];
-            root.playNotificationSound(notification);
-
-            // Popup
-            if (!root.popupInhibited) {
-                newNotifObject.popup = true;
-                if (notification.expireTimeout != 0) {
-                    newNotifObject.timer = notifTimerComponent.createObject(root, {
-                        "notificationId": newNotifObject.notificationId,
-                        "interval": notification.expireTimeout < 0 ? 5000 : notification.expireTimeout,
-                    });
-                }
-            }
-
-            root.notify(newNotifObject);
-            // console.log(notifToString(newNotifObject));
-            notifFileView.setText(stringifyList(root.list));
-        }
+    // A hold ends with the client that made it, so a popup the engine still lists as held belongs to
+    // a shell that is gone: resume them all once, from the first snapshot (D17).
+    function _releaseHeldPopups(items) {
+        const heldIds = N.heldIds(items);
+        if (heldIds.length > 0)
+            holdPopups(heldIds, false);
     }
 
     function discardNotification(id) {
-        console.log("[Notifications] Discarding notification with ID: " + id);
-        const index = root.list.findIndex((notif) => notif.notificationId === id);
-        const notifServerIndex = notifServer.trackedNotifications.values.findIndex((notif) => notif.id + root.idOffset === id);
-        if (index !== -1) {
-            root.list.splice(index, 1);
-            notifFileView.setText(stringifyList(root.list));
-            triggerListChange()
-        }
-        if (notifServerIndex !== -1) {
-            notifServer.trackedNotifications.values[notifServerIndex].dismiss()
-        }
-        root.discard(id); // Emit signal
-    }
-
-    function discardAllNotifications() {
-        root.list = []
-        triggerListChange()
-        notifFileView.setText(stringifyList(root.list));
-        notifServer.trackedNotifications.values.forEach((notif) => {
-            notif.dismiss()
-        })
-        root.discardAll();
-    }
-
-    function cancelTimeout(id) {
-        const index = root.list.findIndex((notif) => notif.notificationId === id);
-        if (root.list[index] != null)
-            root.list[index].timer.stop();
-    }
-
-    function timeoutNotification(id) {
-        const index = root.list.findIndex((notif) => notif.notificationId === id);
-        if (root.list[index] != null)
-            root.list[index].popup = false;
-        root.timeout(id);
-    }
-
-    function timeoutAll() {
-        root.popupList.forEach((notif) => {
-            root.timeout(notif.notificationId);
-        })
-        root.popupList.forEach((notif) => {
-            notif.popup = false;
+        Backend.call("notify.dismiss", {
+            id: id
         });
     }
 
-    function attemptInvokeAction(id, notifIdentifier) {
-        console.log("[Notifications] Attempting to invoke action with identifier: " + notifIdentifier + " for notification ID: " + id);
-        const notifServerIndex = notifServer.trackedNotifications.values.findIndex((notif) => notif.id + root.idOffset === id);
-        console.log("Notification server index: " + notifServerIndex);
-        if (notifServerIndex !== -1) {
-            const notifServerNotif = notifServer.trackedNotifications.values[notifServerIndex];
-            const action = notifServerNotif.actions.find((action) => action.identifier === notifIdentifier);
-            console.log("Action found: " + JSON.stringify(action));
-            action.invoke()
-        } 
-        else {
-            console.log("Notification not found in server: " + id)
+    function discardAllNotifications() {
+        Backend.call("notify.dismiss_all", {});
+    }
+
+    // Ends every popup now.
+    function timeoutAll() {
+        Backend.call("notify.expire_popups", {});
+    }
+
+    function attemptInvokeAction(id, action) {
+        Backend.call("notify.invoke_action", {
+            id: id,
+            action: action
+        });
+    }
+
+    // Freezes the popups of `ids` while the pointer is over them; `held` false resumes them.
+    function holdPopups(ids, held) {
+        Backend.call("notify.hold_popups", {
+            ids: ids,
+            held: held
+        });
+    }
+
+    function setSilent(on) {
+        Backend.call("notify.set_dnd", {
+            on: on
+        });
+    }
+
+    // Every open and every close of the sidebar ends the popups, so notifications that arrived while
+    // it was open never pop later (D21).
+    Connections {
+        target: GlobalStates
+
+        function onSidebarRightOpenChanged() {
+            root.timeoutAll();
         }
-        root.discardNotification(id);
     }
 
-    function triggerListChange() {
-        root.list = root.list.slice(0)
-    }
+    // The engine sends no frame at a popup's start or end, so after a wall-clock jump or a missed
+    // fire nothing else would correct the popups: every Backend.now tick reads the wall clock again
+    // and arms the timer from that reading (_armPopupTimer).
+    Connections {
+        target: Backend
 
-    function refresh() {
-        notifFileView.reload()
-    }
-
-    function playNotificationSound(notification) {
-        if (root.silent)
-            return;
-
-        const soundConfig = Config.options.notifications ? Config.options.notifications.sounds : null;
-        const sound = NotificationSoundPolicy.resolve(notification, soundConfig);
-        const command = NotificationSoundPolicy.buildCommand(sound);
-
-        if (command.length > 0) {
-            Quickshell.execDetached(command);
+        function onNowChanged() {
+            root._armPopupTimer();
         }
     }
 
-    Component.onCompleted: {
-        refresh()
-    }
-
-    FileView {
-        id: notifFileView
-        path: Qt.resolvedUrl(filePath)
-        onLoaded: {
-            const fileContents = notifFileView.text()
-            root.list = JSON.parse(fileContents).map((notif) => {
-                return notifComponent.createObject(root, {
-                    "notificationId": notif.notificationId,
-                    "actions": [], // Notification actions are meaningless if they're not tracked by the server or the sender is dead
-                    "appIcon": notif.appIcon,
-                    "appName": notif.appName,
-                    "body": notif.body,
-                    "image": notif.image,
-                    "summary": notif.summary,
-                    "time": notif.time,
-                    "urgency": notif.urgency,
-                });
-            });
-            // Find largest notificationId
-            let maxId = 0
-            root.list.forEach((notif) => {
-                maxId = Math.max(maxId, notif.notificationId)
-            })
-
-            console.log("[Notifications] File loaded")
-            root.idOffset = maxId
-            root.initDone()
-        }
-        onLoadFailed: (error) => {
-            if(error == FileViewError.FileNotFound) {
-                console.log("[Notifications] File not found, creating new file.")
-                root.list = []
-                notifFileView.setText(stringifyList(root.list));
-            } else {
-                console.log("[Notifications] Error loading file: " + error)
-            }
-        }
+    // One-shot, armed only by _armPopupTimer, never by a binding: a binding on `running` or
+    // `interval` does not re-evaluate when the deadline stays the same, which is the case after a
+    // fire that read the clock before the deadline, and a stopped Timer is not restarted by a new
+    // interval.
+    Timer {
+        id: popupTimer
+        repeat: false
+        onTriggered: root._armPopupTimer()
     }
 }

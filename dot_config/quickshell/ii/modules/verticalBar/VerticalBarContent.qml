@@ -2,7 +2,6 @@ import QtQuick
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Bluetooth
-import Quickshell.Services.UPower
 import qs
 import qs.services
 import qs.modules.common
@@ -138,11 +137,11 @@ Item { // Bar content region
             }
 
             HorizontalBarSeparator {
-                visible: UPower.displayDevice.isLaptopBattery
+                visible: Battery.available
             }
 
             BatteryIndicator {
-                visible: UPower.displayDevice.isLaptopBattery
+                visible: Battery.available
                 Layout.fillWidth: true
                 Layout.fillHeight: false
             }

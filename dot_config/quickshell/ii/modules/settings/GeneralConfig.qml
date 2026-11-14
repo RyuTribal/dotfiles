@@ -54,51 +54,58 @@ ContentPage {
         icon: "battery_android_full"
         title: Translation.tr("Battery")
 
+        // The thresholds and the automatic suspend live in axon's [power.battery] (section 30, "power"),
+        // which posts the warnings and suspends. Opening this page writes nothing: each control
+        // writes `config.set` on a user action only.
         ConfigRow {
             uniform: true
-            ConfigSpinBox {
+            BackendSpinBox {
+                key: "power.battery.low"
                 text: Translation.tr("Low warning")
-                value: Config.options.battery.low
-                from: 0
+                from: 1
                 to: 100
                 stepSize: 5
-                onValueChanged: {
-                    Config.options.battery.low = value;
-                }
             }
-            ConfigSpinBox {
+            BackendSpinBox {
+                key: "power.battery.critical"
                 text: Translation.tr("Critical warning")
-                value: Config.options.battery.critical
-                from: 0
+                from: 1
                 to: 100
                 stepSize: 5
-                onValueChanged: {
-                    Config.options.battery.critical = value;
-                }
             }
+        }
+        FollowedWrites {
+            id: autoSuspendWrites
+            topicValue: AxonConfig.value("power.battery.auto_suspend")
+            send: (value, done) => AxonConfig.set("power.battery.auto_suspend", value, done)
         }
         ConfigRow {
             uniform: true
             ConfigSwitch {
                 text: Translation.tr("Automatic suspend")
-                checked: Config.options.battery.automaticSuspend
-                onCheckedChanged: {
-                    Config.options.battery.automaticSuspend = checked;
+                enabled: AxonConfig.writable
+                checked: autoSuspendWrites.shown === true
+                // ConfigSwitch flips `checked` on a click, which drops the binding: bind it again.
+                onClicked: {
+                    autoSuspendWrites.write(!(autoSuspendWrites.shown === true));
+                    checked = Qt.binding(() => autoSuspendWrites.shown === true);
                 }
                 StyledToolTip {
                     content: Translation.tr("Automatically suspends the system when battery is low")
                 }
             }
-            ConfigSpinBox {
+            BackendSpinBox {
+                key: "power.battery.suspend"
                 text: Translation.tr("Suspend at")
-                value: Config.options.battery.suspend
-                from: 0
+                from: 1
                 to: 100
                 stepSize: 5
-                onValueChanged: {
-                    Config.options.battery.suspend = value;
-                }
             }
+        }
+        StyledText {
+            visible: text !== ""
+            color: Appearance.colors.colError
+            text: AxonConfig.known ? autoSuspendWrites.errorText : "axon unreachable"
         }
     }
 

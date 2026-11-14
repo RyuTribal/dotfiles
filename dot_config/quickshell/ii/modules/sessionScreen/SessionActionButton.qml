@@ -10,6 +10,11 @@ RippleButton {
     property string buttonText
     property bool keyboardDown: false
     property real size: 120
+    // Why the action cannot run on this machine. When set, the button is disabled and its tooltip
+    // says why.
+    property string unavailableText: ""
+
+    enabled: unavailableText === ""
 
     buttonRadius: (button.focus || button.down) ? size / 2 : Appearance.rounding.verylarge
     colBackground: button.keyboardDown ? Appearance.colors.colSecondaryContainerActive : 
@@ -52,7 +57,7 @@ RippleButton {
     }
 
     StyledToolTip {
-        content: buttonText
+        content: button.unavailableText !== "" ? button.unavailableText : buttonText
     }
 
 }

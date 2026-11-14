@@ -1,6 +1,5 @@
 import QtQuick
 import QtQuick.Layouts
-import Quickshell.Services.UPower
 import qs
 import qs.services
 import qs.modules.common
@@ -230,7 +229,7 @@ MouseArea {
         opacity: root.toolbarOpacity
 
         RowLayout {
-            visible: UPower.displayDevice.isLaptopBattery
+            visible: Battery.available
             spacing: 6
             Layout.fillHeight: true
             Layout.leftMargin: 10

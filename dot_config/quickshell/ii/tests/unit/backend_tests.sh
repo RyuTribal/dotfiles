@@ -23,6 +23,9 @@
 # notifications.js, over fakes/qs/GlobalStates.qml and the iconPath of fakes/Quickshell/Quickshell.qml.
 # tst_notifications.qml tests notifications.js by its relative path and needs nothing.
 # tst_claude_usage.qml loads ClaudeUsage.qml as ClaudeUsageService the same way, beside claude.js and fakes/Translation.qml.
+# tst_power_service.qml loads Battery.qml, Power.qml and Idle.qml as BatteryService, PowerService and
+# IdleService the same way, beside power.js. tst_power.qml tests power.js by its relative path and needs
+# nothing.
 # tst_config.qml tests the real modules/common/Config.qml, so it gets its own module, ConfigUnderTest:
 # Config.qml sits there beside fakes/Directories.qml, over the stand-in FileView of fakes/Quickshell/Io.
 
@@ -37,12 +40,16 @@ module="$imports/ShellUnderTest"
 mkdir "$module"
 cp "$services/BackendTopic.qml" "$services/BackendList.qml" "$services/SystemInfo.qml" "$services/DateTime.qml" \
     "$services/FaviconCache.qml" "$services/ResourceUsage.qml" "$services/backend.js" \
-    "$services/sweep.js" "$services/claude.js" "$services/notifications.js" "$here/../../ConfigErrorToast.qml" "$module/"
+    "$services/sweep.js" "$services/claude.js" "$services/notifications.js" "$services/power.js" \
+    "$here/../../ConfigErrorToast.qml" "$module/"
 cp "$here/fakes/Backend.qml" "$here/fakes/Translation.qml" "$module/"
 grep -v '^pragma Singleton$' "$services/Sweep.qml" > "$module/SweepService.qml"
 grep -v '^pragma Singleton$' "$services/Notifications.qml" > "$module/NotificationsService.qml"
 grep -v '^pragma Singleton$' "$services/NerdGlyphs.qml" > "$module/NerdGlyphsService.qml"
 grep -v '^pragma Singleton$' "$services/ClaudeUsage.qml" > "$module/ClaudeUsageService.qml"
+grep -v '^pragma Singleton$' "$services/Battery.qml" > "$module/BatteryService.qml"
+grep -v '^pragma Singleton$' "$services/Power.qml" > "$module/PowerService.qml"
+grep -v '^pragma Singleton$' "$services/Idle.qml" > "$module/IdleService.qml"
 cat > "$module/qmldir" <<'EOF'
 module ShellUnderTest
 singleton Backend 1.0 Backend.qml
@@ -57,6 +64,9 @@ SweepService 1.0 SweepService.qml
 NotificationsService 1.0 NotificationsService.qml
 NerdGlyphsService 1.0 NerdGlyphsService.qml
 ClaudeUsageService 1.0 ClaudeUsageService.qml
+BatteryService 1.0 BatteryService.qml
+PowerService 1.0 PowerService.qml
+IdleService 1.0 IdleService.qml
 singleton Translation 1.0 Translation.qml
 EOF
 
@@ -305,7 +315,8 @@ for test in tst_backend.qml tst_backend_connection.qml tst_backend_behaviour.qml
     tst_backend_spin_box.qml tst_favicon_cache.qml tst_resource_usage.qml tst_sweep.qml \
     tst_sweep_service.qml tst_sweep_panel.qml tst_sweep_panel_toggle.qml tst_nerd_glyphs.qml \
     tst_theme.qml tst_wallpapers.qml tst_claude.qml tst_claude_usage.qml tst_claude_panel.qml \
-    tst_claude_indicator.qml tst_notifications.qml tst_notifications_service.qml; do
+    tst_claude_indicator.qml tst_notifications.qml tst_notifications_service.qml tst_power.qml \
+    tst_power_service.qml; do
     QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -import "$here/fakes" -import "$imports" \
         -input "$here/$test" || status=1
 done

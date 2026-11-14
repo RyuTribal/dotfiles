@@ -39,30 +39,14 @@ Scope {
         }
     }
 
+    // axon looks for a running package manager or download (`power.session_busy`).
     function detectRunningStuff() {
         packageManagerRunning = false;
         downloadRunning = false;
-        detectPackageManagerProc.running = false;
-        detectPackageManagerProc.running = true;
-        detectDownloadProc.running = false;
-        detectDownloadProc.running = true;
-    }
-
-    Process {
-        id: detectPackageManagerProc
-        command: ["pidof", "pacman", "yay", "paru", "dnf", "zypper", "apt", "apx", "xbps", "flatpak", "snap", "apk",
-            "yum", "epsi", "pikman"]
-        onExited: (exitCode, exitStatus) => {
-            root.packageManagerRunning = (exitCode === 0);
-        }
-    }
-
-    Process {
-        id: detectDownloadProc
-        command: ["bash", "-c", "pidof curl wget aria2c yt-dlp || ls ~/Downloads | grep -E '\.crdownload$|\.part$'"]
-        onExited: (exitCode, exitStatus) => {
-            root.downloadRunning = (exitCode === 0);
-        }
+        Power.sessionBusy(flags => {
+            root.packageManagerRunning = flags.packageManagers;
+            root.downloadRunning = flags.downloads;
+        });
     }
 
     Loader {
@@ -193,6 +177,8 @@ Scope {
                         id: sessionHibernate
                         buttonIcon: "downloading"
                         buttonText: Translation.tr("Hibernate")
+                        // logind decides a "challenge"; axon refuses only "no" and "na".
+                        unavailableText: Power.canHibernate === "yes" || Power.canHibernate === "challenge" ? "" : Translation.tr("Hibernate is not available on this system")
                         onClicked:  { Session.hibernate(); sessionRoot.hide() }
                         onFocusChanged: { if (focus) sessionRoot.subtitle = buttonText }
                         KeyNavigation.up: sessionLock

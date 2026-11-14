@@ -176,7 +176,6 @@ Singleton {
                     property bool showColorPicker: false
                     property bool showMicToggle: false
                     property bool showDarkModeToggle: true
-                    property bool showPerformanceProfileToggle: false
                 }
                 property JsonObject tray: JsonObject {
                     property bool monochromeIcons: true
@@ -199,13 +198,6 @@ Singleton {
                     property bool useUSCS: false // Instead of metric (SI) units
                     property int fetchInterval: 10 // minutes
                 }
-            }
-
-            property JsonObject battery: JsonObject {
-                property int low: 20
-                property int critical: 5
-                property bool automaticSuspend: true
-                property int suspend: 3
             }
 
             property JsonObject dock: JsonObject {

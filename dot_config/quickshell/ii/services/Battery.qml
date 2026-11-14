@@ -1,56 +1,47 @@
 pragma Singleton
+pragma ComponentBehavior: Bound
 
-import qs
-import qs.modules.common
-import Quickshell
-import Quickshell.Services.UPower
+import "power.js" as P
 import QtQuick
-import Quickshell.Io
+import Quickshell
 
+/**
+ * The battery for the bar, the lock screen and the battery popup, a thin client of axon's
+ * `power.battery` topic (section 30, "power"). The low and critical notices and the automatic suspend
+ * run in axon, so they keep working while the shell is down. With axon down every property keeps its
+ * last value, and `available` follows the last status.
+ */
 Singleton {
-    property bool available: UPower.displayDevice.isLaptopBattery
-    property var chargeState: UPower.displayDevice.state
-    property bool isCharging: chargeState == UPowerDeviceState.Charging
-    property bool isPluggedIn: isCharging || chargeState == UPowerDeviceState.PendingCharge
-    property real percentage: UPower.displayDevice?.percentage ?? 1
-    readonly property bool allowAutomaticSuspend: Config.options.battery.automaticSuspend
+    id: root
 
-    property bool isLow: available && (percentage <= Config.options.battery.low / 100)
-    property bool isCritical: available && (percentage <= Config.options.battery.critical / 100)
-    property bool isSuspending: available && (percentage <= Config.options.battery.suspend / 100)
-
-    property bool isLowAndNotCharging: isLow && !isCharging
-    property bool isCriticalAndNotCharging: isCritical && !isCharging
-    property bool isSuspendingAndNotCharging: allowAutomaticSuspend && isSuspending && !isCharging
-
-    property real energyRate: UPower.displayDevice.changeRate
-    property real timeToEmpty: UPower.displayDevice.timeToEmpty
-    property real timeToFull: UPower.displayDevice.timeToFull
-
-    onIsLowAndNotChargingChanged: {
-        if (available && isLowAndNotCharging) Quickshell.execDetached([
-            "notify-send", 
-            Translation.tr("Low battery"), 
-            Translation.tr("Consider plugging in your device"), 
-            "-u", "critical",
-            "-a", "Shell"
-        ])
+    readonly property BackendTopic topic: BackendTopic {
+        name: "power.battery"
+        onSnapshot: data => root._apply(data)
     }
 
-    onIsCriticalAndNotChargingChanged: {
-        if (available && isCriticalAndNotCharging) Quickshell.execDetached([
-            "notify-send", 
-            Translation.tr("Critically low battery"), 
-            Translation.tr("Please charge!\nAutomatic suspend triggers at %1").arg(Config.options.battery.suspend), 
-            "-u", "critical",
-            "-a", "Shell"
-        ]);
-            
-    }
+    readonly property bool available: P.isAvailable(topic.status)
+    readonly property int chargeState: P.chargeStateNumber(_state) // UPower's numbers: 1 charging, 4 full
+    readonly property bool isCharging: _state === "charging"
+    readonly property bool isPluggedIn: P.isPluggedIn(_state)
+    readonly property real percentage: _percent / 100 // 0..1
+    readonly property real energyRate: _energyRate // W
+    readonly property real timeToEmpty: _timeToEmpty // s
+    readonly property real timeToFull: _timeToFull // s
+    readonly property bool isLow: _isLow // axon's threshold, false while on AC
 
-    onIsSuspendingAndNotChargingChanged: {
-        if (available && isSuspendingAndNotCharging) {
-            Quickshell.execDetached(["bash", "-c", `systemctl suspend || loginctl suspend`]);
-        }
+    property string _state: "unknown"
+    property real _percent: 100
+    property real _energyRate: 0
+    property real _timeToEmpty: 0
+    property real _timeToFull: 0
+    property bool _isLow: false
+
+    function _apply(data) {
+        _state = data.state;
+        _percent = data.percent;
+        _energyRate = data.energy_rate_w;
+        _timeToEmpty = data.time_to_empty_s;
+        _timeToFull = data.time_to_full_s;
+        _isLow = data.is_low;
     }
 }

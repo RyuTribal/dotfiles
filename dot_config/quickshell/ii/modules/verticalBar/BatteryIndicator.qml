@@ -12,7 +12,7 @@ MouseArea {
     readonly property bool isCharging: Battery.isCharging
     readonly property bool isPluggedIn: Battery.isPluggedIn
     readonly property real percentage: Battery.percentage
-    readonly property bool isLow: percentage <= Config.options.battery.low / 100
+    readonly property bool isLow: Battery.isLow
 
     implicitHeight: batteryProgress.implicitHeight
     hoverEnabled: true

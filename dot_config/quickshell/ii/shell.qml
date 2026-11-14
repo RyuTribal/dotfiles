@@ -59,7 +59,6 @@ ShellRoot {
         Theme.reload()
         Hyprsunset.load()
         Cliphist.refresh()
-        Idle.load()
     }
 
     LazyLoader { active: enableBar && Config.ready && !Config.options.bar.vertical; component: Bar {} }

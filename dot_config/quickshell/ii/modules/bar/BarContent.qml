@@ -2,7 +2,6 @@ import qs.modules.bar.weather
 import QtQuick
 import QtQuick.Layouts
 import Quickshell
-import Quickshell.Services.UPower
 import qs
 import qs.services
 import qs.modules.common
@@ -213,7 +212,7 @@ Item { // Bar content region
                 }
 
                 BatteryIndicator {
-                    visible: (root.useShortenedForm < 2 && UPower.displayDevice.isLaptopBattery)
+                    visible: (root.useShortenedForm < 2 && Battery.available)
                     Layout.alignment: Qt.AlignVCenter
                 }
 

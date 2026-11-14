@@ -229,14 +229,6 @@ ContentPage {
                     Config.options.bar.utilButtons.showDarkModeToggle = checked;
                 }
             }
-            ConfigSwitch {
-                buttonIcon: "speed"
-                text: Translation.tr("Performance Profile toggle")
-                checked: Config.options.bar.utilButtons.showPerformanceProfileToggle
-                onCheckedChanged: {
-                    Config.options.bar.utilButtons.showPerformanceProfileToggle = checked;
-                }
-            }
         }
     }
 

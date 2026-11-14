@@ -6,23 +6,17 @@ import qs.modules.common
 Singleton {
     id: root
 
-    function closeAllWindows() {
-        Hypr.windows.map(w => w.pid).forEach(pid => {
-            Quickshell.execDetached(["kill", pid]);
-        });
-    }
-
+    // The session actions run in axon (Power.qml); poweroff, reboot and logout close the windows first.
     function lock() {
-        Quickshell.execDetached(["loginctl", "lock-session"]);
+        Power.lock();
     }
 
     function suspend() {
-        Quickshell.execDetached(["bash", "-c", "systemctl suspend || loginctl suspend"]);
+        Power.suspend();
     }
 
     function logout() {
-        closeAllWindows();
-        Quickshell.execDetached(["pkill", "Hyprland"]);
+        Power.logout();
     }
 
     function launchTaskManager() {
@@ -30,21 +24,18 @@ Singleton {
     }
 
     function hibernate() {
-        Quickshell.execDetached(["bash", "-c", `systemctl hibernate || loginctl hibernate`]);
+        Power.hibernate();
     }
 
     function poweroff() {
-        closeAllWindows();
-        Quickshell.execDetached(["bash", "-c", `systemctl poweroff || loginctl poweroff`]);
+        Power.poweroff();
     }
 
     function reboot() {
-        closeAllWindows();
-        Quickshell.execDetached(["bash", "-c", `reboot || loginctl reboot`]);
+        Power.reboot();
     }
 
     function rebootToFirmware() {
-        closeAllWindows();
-        Quickshell.execDetached(["bash", "-c", `systemctl reboot --firmware-setup || loginctl reboot --firmware-setup`]);
+        Power.rebootToFirmware();
     }
 }

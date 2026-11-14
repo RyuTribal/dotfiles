@@ -1,63 +1,34 @@
-import qs
-import qs.modules.common
+pragma Singleton
+pragma ComponentBehavior: Bound
+
+import "power.js" as P
 import QtQuick
 import Quickshell
-import Quickshell.Wayland
-pragma Singleton
 
 /**
- * A nice wrapper for date and time strings.
+ * Keeping the system awake, a thin client of axon's `power.idle` topic (section 30, "power"). axon
+ * holds the inhibit on hypridle over D-Bus and keeps the wish across reboots.
  */
 Singleton {
     id: root
 
-    readonly property bool inhibit: Persistent.states.idle.inhibit
-
-    function load() {} // Dummy to force init
-
-    function toggleInhibit() {
-        Persistent.states.idle.inhibit = !Persistent.states.idle.inhibit
+    readonly property BackendTopic topic: BackendTopic {
+        name: "power.idle"
+        onSnapshot: data => root._apply(data)
     }
 
-    // One inhibitor per screen: a window dies with its screen, so a single one
-    // silently stops inhibiting after a monitor is unplugged.
-    Variants {
-        model: Quickshell.screens
+    readonly property bool inhibit: _inhibit // the wish, also while hypridle is not running
+    readonly property bool available: P.isAvailable(topic.status)
 
-        Scope {
-            id: perScreen
-            required property ShellScreen modelData
-            property bool mapped: false
+    property bool _inhibit: false
 
-            PanelWindow { // Inhibitor requires a visible surface
-                id: inhibitorWindow
-                screen: perScreen.modelData
-                implicitWidth: 1
-                implicitHeight: 1
-                color: "transparent"
-                anchors {
-                    right: true
-                    bottom: true
-                }
-                // Make it not interactable
-                mask: Region {
-                    item: null
-                }
-            }
+    function toggleInhibit() {
+        Backend.call("power.set_idle_inhibit", {
+            inhibit: !root.inhibit
+        });
+    }
 
-            // Hyprland checks an inhibitor's surface only when the inhibitor is
-            // created; one created before the surface is mapped is ignored until
-            // the next focus change. Wait for the map before creating it.
-            Timer {
-                running: inhibitorWindow.backingWindowVisible
-                interval: 1000
-                onTriggered: perScreen.mapped = true
-            }
-
-            IdleInhibitor {
-                enabled: root.inhibit && perScreen.mapped
-                window: inhibitorWindow
-            }
-        }
+    function _apply(data) {
+        _inhibit = data.inhibit;
     }
 }

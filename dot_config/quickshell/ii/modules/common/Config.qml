@@ -118,16 +118,6 @@ Singleton {
                 }
             }
 
-            property JsonObject audio: JsonObject {
-                // Values in %
-                property JsonObject protection: JsonObject {
-                    // Prevent sudden bangs
-                    property bool enable: false
-                    property real maxAllowedIncrease: 10
-                    property real maxAllowed: 99
-                }
-            }
-
             property JsonObject apps: JsonObject {
                 property string bluetooth: "kcmshell6 kcm_bluetooth"
                 property string network: "kitty -1 fish -c nmtui"

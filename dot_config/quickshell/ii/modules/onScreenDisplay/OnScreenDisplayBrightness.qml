@@ -30,10 +30,9 @@ Scope {
         }
     }
     
-    Connections {
-        target: Audio.sink?.audio ?? null
-        function onVolumeChanged() {
-            if (!Audio.ready) return
+    Connections { // A change that shows the volume OSD hides this one (D17, until brightness has its own osd_at)
+        target: Audio
+        function onOsdAtChanged() {
             GlobalStates.osdBrightnessOpen = false
         }
     }

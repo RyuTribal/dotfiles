@@ -158,13 +158,10 @@ Item {
                         text: Audio.materialSymbol
                         color: Appearance.colors.colOnLayer0
                     }
-                    StyledSlider {
+                    BackendSlider {
                         Layout.fillWidth: true
-                        value: Audio.ready ? Audio.sink.audio.volume : 0
-                        onValueChanged: {
-                            if (Audio.ready)
-                                Audio.setVolumeLinear(value);
-                        }
+                        serviceValue: Audio.sink.audio.volume
+                        onSend: value => Audio.setVolumeLinear(value)
                     }
                     QuickToggleButton {
                         toggled: false

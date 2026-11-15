@@ -4,7 +4,6 @@ import qs.modules.common.widgets
 import qs.services
 import QtQuick
 import QtQuick.Layouts
-import Quickshell.Services.Pipewire
 
 RippleButton {
     id: button
@@ -47,7 +46,7 @@ RippleButton {
                 Layout.fillWidth: true
                 elide: Text.ElideRight
                 font.pixelSize: Appearance.font.pixelSize.smaller
-                text: (input ? Pipewire.defaultAudioSource?.description : Pipewire.defaultAudioSink?.description) ?? Translation.tr("Unknown")
+                text: (input ? Audio.source.description : Audio.sink.description) ?? Translation.tr("Unknown")
                 color: Appearance.m3colors.m3outline
                 animateChange: true
             }

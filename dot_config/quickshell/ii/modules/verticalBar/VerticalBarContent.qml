@@ -8,6 +8,7 @@ import qs.modules.common
 import qs.modules.common.widgets
 import qs.modules.common.functions
 import qs.modules.bar as Bar
+import "../../services/audio.js" as A
 
 Item { // Bar content region
     id: root
@@ -162,17 +163,9 @@ Item { // Bar content region
         implicitWidth: Appearance.sizes.baseVerticalBarWidth
         implicitHeight: bottomSectionColumnLayout.implicitHeight
         
-        onScrollDown: {
-            const currentVolume = Audio.value;
-            const step = currentVolume < 0.1 ? 0.01 : 0.02 || 0.2;
-            Audio.sink.audio.volume -= step;
-        }
-        onScrollUp: {
-            const currentVolume = Audio.value;
-            const step = currentVolume < 0.1 ? 0.01 : 0.02 || 0.2;
-            Audio.sink.audio.volume = Math.min(1, Audio.sink.audio.volume + step);
-        }
-        onMovedAway: GlobalStates.osdVolumeOpen = false;
+        onScrollDown: Audio.nudgeVolume(-A.scrollStep(Audio.volumePercent))
+        onScrollUp: Audio.nudgeVolume(A.scrollStep(Audio.volumePercent))
+        onMovedAway: Audio.hideOsd()
         onPressed: event => {
             if (event.button === Qt.LeftButton) {
                 GlobalStates.sidebarRightOpen = !GlobalStates.sidebarRightOpen;

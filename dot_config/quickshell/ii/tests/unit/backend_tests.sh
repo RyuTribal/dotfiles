@@ -26,6 +26,9 @@
 # tst_power_service.qml loads Battery.qml, Power.qml and Idle.qml as BatteryService, PowerService and
 # IdleService the same way, beside power.js. tst_power.qml tests power.js by its relative path and needs
 # nothing.
+# tst_audio_service.qml loads Audio.qml as AudioService the same way, beside audio.js and backend.js, with
+# Config.options.osd.timeout from fakes/qs/modules/common. tst_audio.qml tests audio.js by its relative
+# path and needs nothing.
 # tst_config.qml tests the real modules/common/Config.qml, so it gets its own module, ConfigUnderTest:
 # Config.qml sits there beside fakes/Directories.qml, over the stand-in FileView of fakes/Quickshell/Io.
 
@@ -41,7 +44,7 @@ mkdir "$module"
 cp "$services/BackendTopic.qml" "$services/BackendList.qml" "$services/SystemInfo.qml" "$services/DateTime.qml" \
     "$services/FaviconCache.qml" "$services/ResourceUsage.qml" "$services/backend.js" \
     "$services/sweep.js" "$services/claude.js" "$services/notifications.js" "$services/power.js" \
-    "$here/../../ConfigErrorToast.qml" "$module/"
+    "$services/audio.js" "$here/../../ConfigErrorToast.qml" "$module/"
 cp "$here/fakes/Backend.qml" "$here/fakes/Translation.qml" "$module/"
 grep -v '^pragma Singleton$' "$services/Sweep.qml" > "$module/SweepService.qml"
 grep -v '^pragma Singleton$' "$services/Notifications.qml" > "$module/NotificationsService.qml"
@@ -50,6 +53,7 @@ grep -v '^pragma Singleton$' "$services/ClaudeUsage.qml" > "$module/ClaudeUsageS
 grep -v '^pragma Singleton$' "$services/Battery.qml" > "$module/BatteryService.qml"
 grep -v '^pragma Singleton$' "$services/Power.qml" > "$module/PowerService.qml"
 grep -v '^pragma Singleton$' "$services/Idle.qml" > "$module/IdleService.qml"
+grep -v '^pragma Singleton$' "$services/Audio.qml" > "$module/AudioService.qml"
 cat > "$module/qmldir" <<'EOF'
 module ShellUnderTest
 singleton Backend 1.0 Backend.qml
@@ -67,6 +71,7 @@ ClaudeUsageService 1.0 ClaudeUsageService.qml
 BatteryService 1.0 BatteryService.qml
 PowerService 1.0 PowerService.qml
 IdleService 1.0 IdleService.qml
+AudioService 1.0 AudioService.qml
 singleton Translation 1.0 Translation.qml
 EOF
 
@@ -110,12 +115,16 @@ EOF
 # qs.modules.common.widgets, beside fakes/spinbox/MaterialSymbol.qml, and the real AxonConfig.qml and
 # BackendTopic.qml as qs.services, beside fakes/Backend.qml. Appearance comes from fakes/qs/modules/common
 # and ColorUtils from the functions module above.
+# tst_backend_slider.qml loads the real BackendSlider.qml and the real StyledSlider.qml it is built on from
+# the same widgets module, beside the real StyledToolTip and StyledText. StyledSlider imports
+# Quickshell.Widgets, which only the qs binary can load, so fakes/Quickshell/Widgets stands in for it (it
+# uses none of its types); Appearance comes from fakes/qs/modules/common and qs.services from below.
 widgets="$here/../../modules/common/widgets"
 widgets_module="$imports/qs/modules/common/widgets"
 mkdir "$widgets_module"
 cp "$widgets/ConfigSpinBox.qml" "$widgets/StyledSpinBox.qml" "$widgets/StyledTextInput.qml" "$widgets/StyledText.qml" \
     "$widgets/OptionalMaterialSymbol.qml" "$widgets/StyledRectangularShadow.qml" "$widgets/StyledToolTip.qml" \
-    "$here/fakes/spinbox/MaterialSymbol.qml" \
+    "$widgets/StyledSlider.qml" "$widgets/BackendSlider.qml" "$here/fakes/spinbox/MaterialSymbol.qml" \
     "$here/fakes/knobs/ConfigSwitch.qml" "$here/fakes/knobs/ConfigSelectionArray.qml" \
     "$here/fakes/knobs/MaterialTextField.qml" "$here/fakes/progress/StyledProgressBar.qml" "$widgets_module/"
 cat > "$widgets_module/qmldir" <<'EOF'
@@ -127,6 +136,8 @@ StyledText 1.0 StyledText.qml
 OptionalMaterialSymbol 1.0 OptionalMaterialSymbol.qml
 StyledRectangularShadow 1.0 StyledRectangularShadow.qml
 StyledToolTip 1.0 StyledToolTip.qml
+StyledSlider 1.0 StyledSlider.qml
+BackendSlider 1.0 BackendSlider.qml
 MaterialSymbol 1.0 MaterialSymbol.qml
 ConfigSwitch 1.0 ConfigSwitch.qml
 ConfigSelectionArray 1.0 ConfigSelectionArray.qml
@@ -316,7 +327,7 @@ for test in tst_backend.qml tst_backend_connection.qml tst_backend_behaviour.qml
     tst_sweep_service.qml tst_sweep_panel.qml tst_sweep_panel_toggle.qml tst_nerd_glyphs.qml \
     tst_theme.qml tst_wallpapers.qml tst_claude.qml tst_claude_usage.qml tst_claude_panel.qml \
     tst_claude_indicator.qml tst_notifications.qml tst_notifications_service.qml tst_power.qml \
-    tst_power_service.qml; do
+    tst_power_service.qml tst_audio.qml tst_audio_service.qml tst_backend_slider.qml; do
     QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -import "$here/fakes" -import "$imports" \
         -input "$here/$test" || status=1
 done

@@ -7,6 +7,7 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Wayland
+import "../../services/audio.js" as A
 
 Scope {
     id: screenCorners
@@ -86,22 +87,16 @@ Scope {
                             return;
                         if (cornerWidget.isLeft)
                             cornerPanelWindow.brightnessMonitor.setBrightness(cornerPanelWindow.brightnessMonitor.brightness - 0.05);
-                        else {
-                            const currentVolume = Audio.value;
-                            const step = currentVolume < 0.1 ? 0.01 : 0.02 || 0.2;
-                            Audio.sink.audio.volume -= step;
-                        }
+                        else
+                            Audio.nudgeVolume(-A.scrollStep(Audio.volumePercent));
                     }
                     onScrollUp: {
                         if (!Config.options.sidebar.cornerOpen.valueScroll)
                             return;
                         if (cornerWidget.isLeft)
                             cornerPanelWindow.brightnessMonitor.setBrightness(cornerPanelWindow.brightnessMonitor.brightness + 0.05);
-                        else {
-                            const currentVolume = Audio.value;
-                            const step = currentVolume < 0.1 ? 0.01 : 0.02 || 0.2;
-                            Audio.sink.audio.volume = Math.min(1, Audio.sink.audio.volume + step);
-                        }
+                        else
+                            Audio.nudgeVolume(A.scrollStep(Audio.volumePercent));
                     }
                     onMovedAway: {
                         if (!Config.options.sidebar.cornerOpen.valueScroll)
@@ -109,7 +104,7 @@ Scope {
                         if (cornerWidget.isLeft)
                             GlobalStates.osdBrightnessOpen = false;
                         else
-                            GlobalStates.osdVolumeOpen = false;
+                            Audio.hideOsd();
                     }
 
                     Loader {

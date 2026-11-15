@@ -41,14 +41,14 @@ hl.bind("CTRL+ALT + Delete", hl.dsp.exec_cmd("qs -c $qsConfig ipc call TEST_ALIV
 
 hl.bind("XF86MonBrightnessUp", hl.dsp.exec_cmd("qs -c $qsConfig ipc call brightness increment || brightnessctl s 5%+"), { locked = true, repeating = true }) -- [hidden]
 hl.bind("XF86MonBrightnessDown", hl.dsp.exec_cmd("qs -c $qsConfig ipc call brightness decrement || brightnessctl s 5%-"), { locked = true, repeating = true }) -- [hidden]
-hl.bind("XF86AudioRaiseVolume", hl.dsp.exec_cmd("wpctl set-volume @DEFAULT_AUDIO_SINK@ 2%+"), { locked = true, repeating = true }) -- [hidden]
-hl.bind("XF86AudioLowerVolume", hl.dsp.exec_cmd("wpctl set-volume @DEFAULT_AUDIO_SINK@ 2%-"), { locked = true, repeating = true }) -- [hidden]
+hl.bind("XF86AudioRaiseVolume", hl.dsp.exec_cmd("axon audio.nudge target=sink delta=2"), { locked = true, repeating = true, description = "Volume up" }) -- [hidden]
+hl.bind("XF86AudioLowerVolume", hl.dsp.exec_cmd("axon audio.nudge target=sink delta=-2"), { locked = true, repeating = true, description = "Volume down" }) -- [hidden]
 
-hl.bind("XF86AudioMute", hl.dsp.exec_cmd("wpctl set-mute @DEFAULT_SINK@ toggle"), { locked = true }) -- [hidden]
-hl.bind("SUPER+SHIFT + M", hl.dsp.exec_cmd("wpctl set-mute @DEFAULT_SINK@ toggle"), { locked = true, description = "Toggle mute" }) -- [hidden]
-hl.bind("ALT + XF86AudioMute", hl.dsp.exec_cmd("wpctl set-mute @DEFAULT_SOURCE@ toggle"), { locked = true }) -- [hidden]
-hl.bind("XF86AudioMicMute", hl.dsp.exec_cmd("wpctl set-mute @DEFAULT_SOURCE@ toggle"), { locked = true }) -- [hidden]
-hl.bind("SUPER+ALT + M", hl.dsp.exec_cmd("wpctl set-mute @DEFAULT_SOURCE@ toggle"), { locked = true, description = "Toggle mic" }) -- [hidden]
+hl.bind("XF86AudioMute", hl.dsp.exec_cmd("axon audio.toggle_mute target=sink"), { locked = true, description = "Mute" }) -- [hidden]
+hl.bind("SUPER+SHIFT + M", hl.dsp.exec_cmd("axon audio.toggle_mute target=sink"), { locked = true, description = "Toggle mute" }) -- [hidden]
+hl.bind("ALT + XF86AudioMute", hl.dsp.exec_cmd("axon audio.toggle_mute target=source"), { locked = true, description = "Mic mute" }) -- [hidden]
+hl.bind("XF86AudioMicMute", hl.dsp.exec_cmd("axon audio.toggle_mute target=source"), { locked = true, description = "Mic mute" }) -- [hidden]
+hl.bind("SUPER+ALT + M", hl.dsp.exec_cmd("axon audio.toggle_mute target=source"), { locked = true, description = "Toggle mic" }) -- [hidden]
 hl.bind("CTRL+SUPER + T", hl.dsp.global("quickshell:wallpaperSelectorToggle"), { description = "Toggle wallpaper selector" }) -- Wallpaper selector
 hl.bind("CTRL+SUPER + R", hl.dsp.exec_cmd("killall ags agsv1 gjs qs quickshell; qs -c $qsConfig &")) -- Restart widgets
 

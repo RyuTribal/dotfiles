@@ -45,7 +45,7 @@ TestCase {
         signalName: "entryEndedUnchanged"
     }
 
-    // The numbers of the audio protection's maxAllowed box (GeneralConfig).
+    // The top and step of the Volume limit box (GeneralConfig, `audio.protection.max_volume`).
     StyledSpinBox {
         id: volumeSpin
         from: 0

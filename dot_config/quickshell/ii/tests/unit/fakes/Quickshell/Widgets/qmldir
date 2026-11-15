@@ -1,0 +1,5 @@
+# Stands in for Quickshell.Widgets, whose plugin only the qs binary loads. StyledSlider.qml imports it
+# and uses none of its types, so tst_backend_slider.qml needs only the module to resolve. Qt skips a
+# module that declares no type, so it declares the stand-in IconImage.
+module Quickshell.Widgets
+IconImage 1.0 IconImage.qml

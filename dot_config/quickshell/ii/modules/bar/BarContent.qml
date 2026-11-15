@@ -7,6 +7,7 @@ import qs.services
 import qs.modules.common
 import qs.modules.common.widgets
 import qs.modules.common.functions
+import "../../services/audio.js" as A
 
 Item { // Bar content region
     id: root
@@ -247,17 +248,9 @@ Item { // Bar content region
         implicitWidth: rightSectionRowLayout.implicitWidth
         implicitHeight: Appearance.sizes.baseBarHeight
 
-        onScrollDown: {
-            const currentVolume = Audio.value;
-            const step = currentVolume < 0.1 ? 0.01 : 0.02 || 0.2;
-            Audio.sink.audio.volume -= step;
-        }
-        onScrollUp: {
-            const currentVolume = Audio.value;
-            const step = currentVolume < 0.1 ? 0.01 : 0.02 || 0.2;
-            Audio.sink.audio.volume = Math.min(1, Audio.sink.audio.volume + step);
-        }
-        onMovedAway: GlobalStates.osdVolumeOpen = false
+        onScrollDown: Audio.nudgeVolume(-A.scrollStep(Audio.volumePercent))
+        onScrollUp: Audio.nudgeVolume(A.scrollStep(Audio.volumePercent))
+        onMovedAway: Audio.hideOsd()
         onPressed: event => {
             if (event.button === Qt.LeftButton) {
                 GlobalStates.sidebarRightOpen = !GlobalStates.sidebarRightOpen;
@@ -350,7 +343,7 @@ Item { // Bar content region
 
                         StyledToolTip {
                             // Your component reads parent.hovered via internalVisibleCondition
-                            content: Audio.isMuted ? "Muted" : `Volume ${Audio.volumePercent}%`
+                            content: A.tooltip(Audio.unavailable, Audio.ready, Audio.isMuted, Audio.volumePercent)
                         }
                     }
 

@@ -6,61 +6,24 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import Quickshell
-import Quickshell.Io
 import Quickshell.Wayland
-import Quickshell.Hyprland
 
+// Shows while Audio.osdVisible: axon's audio engine publishes the instant of each change that shows
+// the OSD (`osd_at`), and the Audio service keeps it on screen for Config.options.osd.timeout.
 Scope {
     id: root
-    property string protectionMessage: ""
     property var focusedScreen: Quickshell.screens.find(s => s.name === Hypr.focusedMonitorName)
-
-    function triggerOsd() {
-        GlobalStates.osdVolumeOpen = true
-        osdTimeout.restart()
-    }
-
-    Timer {
-        id: osdTimeout
-        interval: Config.options.osd.timeout
-        repeat: false
-        running: false
-        onTriggered: {
-            GlobalStates.osdVolumeOpen = false
-            root.protectionMessage = ""
-        }
-    }
 
     Connections {
         target: Brightness
         function onBrightnessChanged() {
-            GlobalStates.osdVolumeOpen = false
-        }
-    }
-
-    Connections { // Listen to volume changes
-        target: Audio.sink?.audio ?? null
-        function onVolumeChanged() {
-            if (!Audio.ready) return
-            root.triggerOsd()
-        }
-        function onMutedChanged() {
-            if (!Audio.ready) return
-            root.triggerOsd()
-        }
-    }
-
-    Connections { // Listen to protection triggers
-        target: Audio
-        function onSinkProtectionTriggered(reason) {
-            root.protectionMessage = reason;
-            root.triggerOsd()
+            Audio.hideOsd();
         }
     }
 
     Loader {
         id: osdLoader
-        active: GlobalStates.osdVolumeOpen
+        active: Audio.osdVisible
 
         sourceComponent: PanelWindow {
             id: osdRoot
@@ -107,7 +70,7 @@ Scope {
                     MouseArea {
                         anchors.fill: parent
                         hoverEnabled: true
-                        onEntered: GlobalStates.osdVolumeOpen = false
+                        onEntered: Audio.hideOsd()
                     }
 
                     ColumnLayout {
@@ -134,7 +97,7 @@ Scope {
                             implicitHeight: protectionMessageBackground.implicitHeight
                             implicitWidth: protectionMessageBackground.implicitWidth
                             Layout.alignment: Qt.AlignHCenter
-                            opacity: root.protectionMessage !== "" ? 1 : 0
+                            opacity: Audio.osdMessage !== "" ? 1 : 0
 
                             StyledRectangularShadow {
                                 target: protectionMessageBackground
@@ -162,7 +125,7 @@ Scope {
                                         horizontalAlignment: Text.AlignHCenter
                                         color: Appearance.m3colors.m3onError
                                         wrapMode: Text.Wrap
-                                        text: root.protectionMessage
+                                        text: Audio.osdMessage
                                     }
                                 }
                             }
@@ -172,37 +135,4 @@ Scope {
             }
         }
     }
-
-    IpcHandler {
-		target: "osdVolume"
-
-		function trigger() {
-            root.triggerOsd()
-        }
-
-        function hide() {
-            GlobalStates.osdVolumeOpen = false
-        }
-
-        function toggle() {
-            GlobalStates.osdVolumeOpen = !GlobalStates.osdVolumeOpen
-        }
-	}
-    GlobalShortcut {
-        name: "osdVolumeTrigger"
-        description: "Triggers volume OSD on press"
-
-        onPressed: {
-            root.triggerOsd()
-        }
-    }
-    GlobalShortcut {
-        name: "osdVolumeHide"
-        description: "Hides volume OSD on press"
-
-        onPressed: {
-            GlobalStates.osdVolumeOpen = false
-        }
-    }
-
 }

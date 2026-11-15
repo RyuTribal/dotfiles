@@ -9,21 +9,16 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import Quickshell
-import Quickshell.Services.Pipewire
 
 Item {
     id: root
     property bool showDeviceSelector: false
     property bool deviceSelectorInput
     property int dialogMargins: 16
-    property PwNode selectedDevice
-    readonly property list<PwNode> appPwNodes: Pipewire.nodes.values.filter(node => {
-        // return node.type == "21" // Alternative, not as clean
-        return node.isSink && node.isStream;
-    })
+    property string selectedDeviceId // a row id of Audio.sinks or Audio.sources, "" for none
 
     function showDeviceSelectorDialog(input: bool) {
-        root.selectedDevice = null;
+        root.selectedDeviceId = "";
         root.showDeviceSelector = true;
         root.deviceSelectorInput = input;
     }
@@ -43,7 +38,10 @@ Item {
             Layout.fillHeight: true
             StyledListView {
                 id: listView
-                model: root.appPwNodes
+                model: ScriptModel {
+                    values: Audio.streams
+                    objectProp: "id"
+                }
                 clip: true
                 anchors {
                     fill: parent
@@ -70,7 +68,7 @@ Item {
                 anchors.fill: listView
 
                 visible: opacity > 0
-                opacity: (root.appPwNodes.length === 0) ? 1 : 0
+                opacity: (Audio.streams.length === 0) ? 1 : 0
 
                 Behavior on opacity {
                     NumberAnimation {
@@ -209,12 +207,10 @@ Item {
 
                         Repeater {
                             model: ScriptModel {
-                                values: Pipewire.nodes.values.filter(node => {
-                                    return !node.isStream && node.isSink !== root.deviceSelectorInput && node.audio;
-                                })
+                                values: root.deviceSelectorInput ? Audio.sources : Audio.sinks
+                                objectProp: "id"
                             }
 
-                            // This could and should be refractored, but all data becomes null when passed wtf
                             delegate: StyledRadioButton {
                                 id: radioButton
                                 required property var modelData
@@ -223,20 +219,20 @@ Item {
                                 Layout.fillWidth: true
 
                                 description: modelData.description
-                                checked: modelData.id === Pipewire.defaultAudioSink?.id
+                                checked: modelData.isDefault
 
                                 Connections {
                                     target: root
                                     function onShowDeviceSelectorChanged() {
                                         if (!root.showDeviceSelector)
                                             return;
-                                        radioButton.checked = (modelData.id === Pipewire.defaultAudioSink?.id);
+                                        radioButton.checked = radioButton.modelData.isDefault;
                                     }
                                 }
 
                                 onCheckedChanged: {
                                     if (checked) {
-                                        root.selectedDevice = modelData;
+                                        root.selectedDeviceId = modelData.id;
                                     }
                                 }
                             }
@@ -272,13 +268,8 @@ Item {
                         buttonText: Translation.tr("OK")
                         onClicked: {
                             root.showDeviceSelector = false;
-                            if (root.selectedDevice) {
-                                if (root.deviceSelectorInput) {
-                                    Pipewire.preferredDefaultAudioSource = root.selectedDevice;
-                                } else {
-                                    Pipewire.preferredDefaultAudioSink = root.selectedDevice;
-                                }
-                            }
+                            if (root.selectedDeviceId !== "")
+                                Audio.setDefault(root.deviceSelectorInput ? "source" : "sink", root.selectedDeviceId);
                         }
                     }
                 }

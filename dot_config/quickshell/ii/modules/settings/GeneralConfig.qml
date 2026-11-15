@@ -15,37 +15,47 @@ ContentPage {
         icon: "volume_up"
         title: Translation.tr("Audio")
 
+        // The protection lives in axon's [audio.protection] (section 31, "Audio"), which reverts the
+        // jumps and shows the OSD. Opening this page writes nothing: each control writes `config.set`
+        // on a user action only.
+        FollowedWrites {
+            id: protectionWrites
+            topicValue: AxonConfig.value("audio.protection.enabled")
+            send: (value, done) => AxonConfig.set("audio.protection.enabled", value, done)
+        }
         ConfigSwitch {
             text: Translation.tr("Earbang protection")
-            checked: Config.options.audio.protection.enable
-            onCheckedChanged: {
-                Config.options.audio.protection.enable = checked;
+            enabled: AxonConfig.writable
+            checked: protectionWrites.shown === true
+            // ConfigSwitch flips `checked` on a click, which drops the binding: bind it again.
+            onClicked: {
+                protectionWrites.write(!(protectionWrites.shown === true));
+                checked = Qt.binding(() => protectionWrites.shown === true);
             }
             StyledToolTip {
                 content: Translation.tr("Prevents abrupt increments and restricts volume limit")
             }
         }
+        StyledText {
+            visible: text !== ""
+            color: Appearance.colors.colError
+            text: AxonConfig.known ? protectionWrites.errorText : "axon unreachable"
+        }
         ConfigRow {
             // uniform: true
-            ConfigSpinBox {
+            BackendSpinBox {
+                key: "audio.protection.max_step"
                 text: Translation.tr("Max allowed increase")
-                value: Config.options.audio.protection.maxAllowedIncrease
-                from: 0
+                from: 1
                 to: 100
                 stepSize: 2
-                onValueChanged: {
-                    Config.options.audio.protection.maxAllowedIncrease = value;
-                }
             }
-            ConfigSpinBox {
+            BackendSpinBox {
+                key: "audio.protection.max_volume"
                 text: Translation.tr("Volume limit")
-                value: Config.options.audio.protection.maxAllowed
-                from: 0
+                from: 1
                 to: 154 // pavucontrol allows up to 153%
                 stepSize: 2
-                onValueChanged: {
-                    Config.options.audio.protection.maxAllowed = value;
-                }
             }
         }
     }

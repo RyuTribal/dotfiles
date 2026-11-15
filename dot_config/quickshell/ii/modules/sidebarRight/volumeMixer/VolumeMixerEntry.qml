@@ -4,14 +4,10 @@ import qs.services
 import QtQuick
 import QtQuick.Layouts
 import Quickshell
-import Quickshell.Services.Pipewire
 
 Item {
     id: root
-    required property PwNode node
-    PwObjectTracker {
-        objects: [node]
-    }
+    required property var node // a row of Audio.streams (audio.js streamRow)
 
     implicitHeight: rowLayout.implicitHeight
 
@@ -28,10 +24,10 @@ Item {
             sourceSize.height: size
             source: {
                 let icon;
-                icon = AppSearch.guessIcon(root.node.properties["application.icon-name"]);
+                icon = AppSearch.guessIcon(root.node.iconName);
                 if (AppSearch.iconExists(icon))
                     return Quickshell.iconPath(icon, "image-missing");
-                icon = AppSearch.guessIcon(root.node.properties["node.name"]);
+                icon = AppSearch.guessIcon(root.node.nodeName);
                 return Quickshell.iconPath(icon, "image-missing");
             }
         }
@@ -46,17 +42,17 @@ Item {
                 color: Appearance.colors.colSubtext
                 elide: Text.ElideRight
                 text: {
-                    // application.name -> description -> name
-                    const app = root.node.properties["application.name"] ?? (root.node.description != "" ? root.node.description : root.node.name);
-                    const media = root.node.properties["media.name"];
-                    return media != undefined ? `${app} • ${media}` : app;
+                    // axon gives application.name, else node.description, else node.name
+                    const app = root.node.appName;
+                    const media = root.node.mediaName;
+                    return media ? `${app} • ${media}` : app;
                 }
             }
 
-            StyledSlider {
+            BackendSlider {
                 id: slider
-                value: root.node.audio.volume
-                onValueChanged: root.node.audio.volume = value
+                serviceValue: root.node.audio.volume
+                onSend: value => Audio.setStreamVolume(root.node.id, value)
             }
         }
     }

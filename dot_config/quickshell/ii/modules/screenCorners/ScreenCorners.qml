@@ -86,7 +86,7 @@ Scope {
                         if (!Config.options.sidebar.cornerOpen.valueScroll)
                             return;
                         if (cornerWidget.isLeft)
-                            cornerPanelWindow.brightnessMonitor.setBrightness(cornerPanelWindow.brightnessMonitor.brightness - 0.05);
+                            cornerPanelWindow.brightnessMonitor.stepBrightness(-5);
                         else
                             Audio.nudgeVolume(-A.scrollStep(Audio.volumePercent));
                     }
@@ -94,7 +94,7 @@ Scope {
                         if (!Config.options.sidebar.cornerOpen.valueScroll)
                             return;
                         if (cornerWidget.isLeft)
-                            cornerPanelWindow.brightnessMonitor.setBrightness(cornerPanelWindow.brightnessMonitor.brightness + 0.05);
+                            cornerPanelWindow.brightnessMonitor.stepBrightness(5);
                         else
                             Audio.nudgeVolume(A.scrollStep(Audio.volumePercent));
                     }
@@ -102,7 +102,7 @@ Scope {
                         if (!Config.options.sidebar.cornerOpen.valueScroll)
                             return;
                         if (cornerWidget.isLeft)
-                            GlobalStates.osdBrightnessOpen = false;
+                            Brightness.hideOsd();
                         else
                             Audio.hideOsd();
                     }

@@ -3,7 +3,6 @@ pragma ComponentBehavior: Bound
 
 import "audio.js" as A
 import "backend.js" as B
-import qs.modules.common
 import QtQuick
 import Quickshell
 
@@ -11,7 +10,7 @@ import Quickshell
  * The default sink and source, the device and stream lists and the volume OSD, a thin client of
  * axon's `audio` topic (section 31, "Audio"). axon owns the PipeWire connection, the volume
  * protection and the instant of the last change that shows the OSD (`osd_at`); this keeps the names
- * the widgets bind, the call functions and a one-shot timer that hides the OSD after
+ * the widgets bind, the call functions and an OsdDeadline that hides the OSD after
  * Config.options.osd.timeout.
  *
  * While the topic is ok with `sink: null` (the default names no present node, or one without a
@@ -24,6 +23,10 @@ Singleton {
     readonly property BackendTopic topic: BackendTopic {
         name: "audio"
         onSnapshot: data => root._apply(data)
+    }
+    readonly property OsdDeadline osd: OsdDeadline {
+        wallClock: root.wallClock
+        lastTrigger: root._lastTrigger
     }
 
     readonly property bool ready: topic.status === "ok" && _dataReady && _sinkPresent
@@ -56,9 +59,9 @@ Singleton {
     readonly property var sources: _sources // audio.js deviceRow
     readonly property var streams: _streams // audio.js streamRow
     readonly property double osdAt: _osdAt // 0 before the first change in this daemon instance
-    readonly property string osdReason: _osdReason // the protection reason of the current OSD run, or ""
-    readonly property string osdMessage: A.protectionText(_osdReason)
-    readonly property bool osdVisible: _osdVisible
+    readonly property string osdReason: osd.reason // the protection reason of the current OSD run, or ""
+    readonly property string osdMessage: A.protectionText(osdReason)
+    readonly property bool osdVisible: osd.visible
 
     // The wall clock in ms, read through this one property so a test can drive it.
     property var wallClock: Date.now
@@ -82,10 +85,6 @@ Singleton {
     property var _streamIndex: ({})
     property var _lastTrigger: null
     property double _osdAt: 0
-    property double _osdRunStart: 0
-    property double _osdHiddenAt: 0
-    property string _osdReason: ""
-    property bool _osdVisible: false
 
     function setVolumePercent(p) {
         Backend.call("audio.set_volume", {
@@ -145,25 +144,7 @@ Singleton {
 
     // Hides the OSD until the next change that shows it.
     function hideOsd() {
-        _osdHiddenAt = _osdAt;
-        _armOsdTimer();
-    }
-
-    // The only place osdVisible is set, called when osd_at changes, from hideOsd() and when the
-    // one-shot timer fires: reads the wall clock, then arms the timer for the deadline, or stops it
-    // when the OSD is hidden. A deadline already passed hides the OSD at once.
-    function _armOsdTimer() {
-        const now = wallClock();
-        const state = A.osdState(_osdAt, Config.options.osd.timeout, now, _osdRunStart, _osdHiddenAt, _lastTrigger);
-        _osdRunStart = state.runStart;
-        _osdReason = state.reason;
-        _osdVisible = state.visible;
-        if (!state.visible) {
-            osdTimer.stop();
-            return;
-        }
-        osdTimer.interval = Math.max(1, state.deadline - now);
-        osdTimer.restart();
+        osd.hide();
     }
 
     function _apply(data) {
@@ -196,20 +177,8 @@ Singleton {
         _lastTrigger = data.protection.last_trigger;
         const osdAt = data.osd_at ?? 0;
         if (osdAt !== _osdAt) {
-            // Settle the OSD run of the old osd_at at this instant first, so a run that ended while
-            // the timer had not fired yet (after a suspend) does not carry over into the new one.
-            _armOsdTimer();
             _osdAt = osdAt;
-            _armOsdTimer();
+            osd.moveTo(osdAt);
         }
-    }
-
-    // One-shot, armed only by _armOsdTimer, never by a binding: a binding on `running` or `interval`
-    // does not re-evaluate when the deadline stays the same, and a stopped Timer is not restarted by
-    // a new interval (the notify popup rule).
-    Timer {
-        id: osdTimer
-        repeat: false
-        onTriggered: root._armOsdTimer()
     }
 }

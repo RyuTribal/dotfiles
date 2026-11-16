@@ -307,7 +307,7 @@ TestCase {
         compare(audio.osdVisible, true);
         // The one-shot timer's handler, run at the deadline.
         tc.clock += 1000;
-        audio._armOsdTimer();
+        audio.osd._arm();
         compare(audio.osdVisible, false);
     }
 
@@ -353,7 +353,7 @@ TestCase {
         compare(audio.osdVisible, false);
         // The one-shot timer's handler, still inside the old timeout.
         tc.clock += 100;
-        audio._armOsdTimer();
+        audio.osd._arm();
         compare(audio.osdVisible, false);
         tc.clock += 100;
         frame(audio, "ok", audioData({
@@ -401,7 +401,7 @@ TestCase {
         // After the run ends, a new run without a trigger has no message.
         const triggerAt = tc.clock - 300;
         tc.clock += 1000;
-        audio._armOsdTimer();
+        audio.osd._arm();
         compare(audio.osdVisible, false);
         compare(audio.osdMessage, "");
         tc.clock += 500;

@@ -1,206 +1,129 @@
 pragma Singleton
 pragma ComponentBehavior: Bound
 
-// From https://github.com/caelestia-dots/shell with modifications.
-// License: GPLv3
-
-import Quickshell
-import Quickshell.Io
-import Quickshell.Hyprland
+import "brightness.js" as Br
 import QtQuick
+import Quickshell
 
 /**
- * For managing brightness of monitors. Supports both brightnessctl and ddcutil.
+ * The brightness of each output and the brightness OSD, a thin client of axon's `brightness` topic
+ * (section 30, "brightness"). axon reads the eDP backlight and the DDC displays, writes them and keeps
+ * the instant of the last change that shows the OSD (`osd_at`) per output; this hands out one
+ * BrightnessOutput per output name, steps the focused output, and keeps an OsdDeadline that shows the
+ * focused output's OSD for Config.options.osd.timeout.
+ *
+ * While the topic is unconfigured with reason `not_present` (no backlight and no DDC display) every
+ * monitor object is inert (D21). While axon is down the objects keep their last values.
  */
 Singleton {
     id: root
 
-    signal brightnessChanged()
-
-    property var ddcMonitors: []
-    readonly property list<BrightnessMonitor> monitors: Quickshell.screens.map(screen => monitorComp.createObject(root, {
-        screen
-    }))
-
-    function getMonitorForScreen(screen: ShellScreen): var {
-        return monitors.find(m => m.screen === screen);
+    readonly property BackendTopic topic: BackendTopic {
+        name: "brightness"
+        onSnapshot: data => root._apply(data)
+    }
+    readonly property OsdDeadline osd: OsdDeadline {
+        wallClock: root.wallClock
     }
 
-    function increaseBrightness(): void {
-        const focusedName = Hypr.focusedMonitorName;
-        const monitor = monitors.find(m => focusedName === m.screen.name);
-        if (monitor)
-            monitor.setBrightness(monitor.brightness + 0.05);
+    readonly property double osdAt: osd.osdAt // the focused output's osd_at, 0 when none
+    readonly property bool osdVisible: osd.visible
+
+    // The wall clock in ms, read through this one property so a test can drive it.
+    property var wallClock: Date.now
+
+    readonly property bool _notPresent: topic.status === "unconfigured" && topic.errorReason === "not_present"
+    // The topic's rows by output id, and the monitor objects handed out by name. Both change in place:
+    // getMonitorForScreen() runs inside the bindings that call it, which must not depend on them.
+    property var _rows: ({})
+    property var _outputs: ({})
+    // What a null screen gets.
+    readonly property BrightnessOutput _inert: BrightnessOutput {}
+
+    // The monitor object of `screen`'s output: the same object for the life of the shell, never null.
+    function getMonitorForScreen(screen) {
+        const name = screen?.name ?? "";
+        if (name === "")
+            return _inert;
+        let output = _outputs[name];
+        if (!output) {
+            output = outputComponent.createObject(root, {
+                name: name
+            }) as BrightnessOutput;
+            const row = _rows[name];
+            if (row)
+                output._update(Br.rowState(row));
+            _outputs[name] = output;
+        }
+        return output;
     }
 
-    function decreaseBrightness(): void {
-        const focusedName = Hypr.focusedMonitorName;
-        const monitor = monitors.find(m => focusedName === m.screen.name);
-        if (monitor)
-            monitor.setBrightness(monitor.brightness - 0.05);
+    // The focused monitor; axon picks it.
+    function increaseBrightness() {
+        Backend.call("brightness.step", {
+            delta: 5
+        });
     }
 
-    reloadableId: "brightness"
-
-    onMonitorsChanged: {
-        ddcMonitors = [];
-        ddcProc.running = true;
+    function decreaseBrightness() {
+        Backend.call("brightness.step", {
+            delta: -5
+        });
     }
 
-    Process {
-        id: ddcProc
-
-        command: ["ddcutil", "detect", "--brief"]
-        stdout: SplitParser {
-            splitMarker: "\n\n"
-            onRead: data => {
-                if (data.startsWith("Display ")) {
-                    const lines = data.split("\n").map(l => l.trim());
-                    root.ddcMonitors.push({
-                        model: lines.find(l => l.startsWith("Monitor:")).split(":")[2],
-                        busNum: lines.find(l => l.startsWith("I2C bus:")).split("/dev/i2c-")[1]
-                    });
-                }
-            }
-        }
-        onExited: root.ddcMonitorsChanged()
+    // Hides the OSD until the next change that shows it.
+    function hideOsd() {
+        osd.hide();
     }
 
-    component BrightnessMonitor: QtObject {
-        id: monitor
+    function _apply(data) {
+        _clearRows();
+        for (const row of data.outputs)
+            _rows[row.id] = row;
+        _feedOutputs();
+    }
 
-        required property ShellScreen screen
-        readonly property bool isDdc: root.ddcMonitors.some(m => m.model === screen.model)
-        readonly property string busNum: root.ddcMonitors.find(m => m.model === screen.model)?.busNum ?? ""
-        property int rawMaxBrightness: 100
-        property real brightness
-        property bool ready: false
+    function _clearRows() {
+        for (const name in _rows)
+            delete _rows[name];
+    }
 
-        // Coalescing state for hardware writes: pendingTarget/pendingValue is the
-        // latest value anyone has asked for (updated on every scroll tick);
-        // lastSentTarget/lastSentValue is what the in-flight/just-finished setProc
-        // call was asked to reach. When the pending and last-sent targets differ
-        // after a write completes, one more write is fired with the latest target,
-        // skipping every intermediate step from a fast scroll burst.
-        property int pendingTarget: -1
-        property real pendingValue: 0
-        property int lastSentTarget: -1
-        property real lastSentValue: 0
-
-        onBrightnessChanged: {
-            if (monitor.ready) {
-                root.brightnessChanged();
-            }
+    function _feedOutputs() {
+        for (const name in _outputs) {
+            const row = _rows[name];
+            if (row)
+                _outputs[name]._update(Br.rowState(row));
+            else
+                _outputs[name]._clear();
         }
+        _moveOsd();
+    }
 
-        function initialize() {
-            monitor.ready = false;
-            initProc.command = isDdc ? ["ddcutil", "-b", busNum, "getvcp", "10", "--brief"] : ["sh", "-c", `echo "a b c $(brightnessctl g) $(brightnessctl m)"`];
-            initProc.running = true;
-        }
+    // The OSD follows the focused output's osd_at.
+    function _moveOsd() {
+        const row = _rows[Hypr.focusedMonitorName];
+        const osdAt = row ? Br.rowState(row).osdAt : 0;
+        if (osdAt !== osd.osdAt)
+            osd.moveTo(osdAt);
+    }
 
-        readonly property Process initProc: Process {
-            stdout: SplitParser {
-                onRead: data => {
-                    const [, , , current, max] = data.split(" ");
-                    monitor.rawMaxBrightness = parseInt(max);
-                    monitor.brightness = parseInt(current) / monitor.rawMaxBrightness;
-                    monitor.ready = true;
-                }
-            }
-        }
+    // The data-null frame keeps the last data (section 20), so the reason is what clears the rows.
+    on_NotPresentChanged: {
+        if (!_notPresent)
+            return;
+        _clearRows();
+        _feedOutputs();
+    }
 
-        function writeToHardware(rounded: int, value: real): void {
-            monitor.lastSentTarget = rounded;
-            monitor.lastSentValue = value;
-            setProc.command = isDdc ? ["ddcutil", "-b", busNum, "setvcp", "10", rounded] : ["brightnessctl", "s", rounded, "--quiet"];
-            setProc.running = true;
-        }
-
-        function setBrightness(value: real): void {
-            value = Math.max(0.01, Math.min(1, value));
-            const rounded = Math.round(value * monitor.rawMaxBrightness);
-            if (Math.round(brightness * monitor.rawMaxBrightness) === rounded)
-                return;
-
-            monitor.pendingTarget = rounded;
-            monitor.pendingValue = value;
-
-            // DDC writes are slow (100-300ms of serialized I2C over ddcutil), so
-            // update the property optimistically: it (and anything bound to it,
-            // e.g. the OSD) moves instantly instead of crawling behind the writes.
-            // brightnessctl is effectively instant already, so that path is left
-            // to update brightness from the write itself, in onExited below.
-            if (monitor.isDdc)
-                brightness = value;
-
-            // Only one hardware write in flight at a time. If one is already
-            // running, its onExited handler will pick up the latest pendingTarget
-            // once it finishes instead of another process being spawned now.
-            if (setProc.running)
-                return;
-
-            monitor.writeToHardware(rounded, value);
-        }
-
-        readonly property Process setProc: Process {
-            onExited: (exitCode, exitStatus) => {
-                if (exitCode !== 0) {
-                    // Write failed, so the property may have diverged from
-                    // reality (optimistic update on the ddc path, or simply a
-                    // failed brightnessctl call). Re-read the actual hardware
-                    // state and correct it.
-                    monitor.initialize();
-                    return;
-                }
-
-                if (!monitor.isDdc) {
-                    // Non-ddc path: the property follows the write that just
-                    // actually completed, rather than being set ahead of it.
-                    monitor.brightness = monitor.lastSentValue;
-                }
-
-                if (monitor.pendingTarget !== -1 && monitor.pendingTarget !== monitor.lastSentTarget)
-                    monitor.writeToHardware(monitor.pendingTarget, monitor.pendingValue);
-            }
-        }
-
-        Component.onCompleted: {
-            initialize();
-        }
-
-        onBusNumChanged: {
-            initialize();
+    Connections {
+        target: Hypr
+        function onFocusedMonitorNameChanged() {
+            root._moveOsd();
         }
     }
 
     Component {
-        id: monitorComp
-
-        BrightnessMonitor {}
-    }
-
-    IpcHandler {
-        target: "brightness"
-
-        function increment() {
-            onPressed: root.increaseBrightness()
-        }
-
-        function decrement() {
-            onPressed: root.decreaseBrightness()
-        }
-    }
-
-    GlobalShortcut {
-        name: "brightnessIncrease"
-        description: "Increase brightness"
-        onPressed: root.increaseBrightness()
-    }
-
-    GlobalShortcut {
-        name: "brightnessDecrease"
-        description: "Decrease brightness"
-        onPressed: root.decreaseBrightness()
+        id: outputComponent
+        BrightnessOutput {}
     }
 }

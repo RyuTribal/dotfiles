@@ -176,19 +176,17 @@ Item {
                 RowLayout { // Brightness
                     Layout.fillWidth: true
                     spacing: 10
+                    visible: slidersColumn.brightnessMonitor.available
 
                     MaterialSymbol {
                         iconSize: Appearance.font.pixelSize.larger
                         text: "light_mode"
                         color: Appearance.colors.colOnLayer0
                     }
-                    StyledSlider {
+                    BackendSlider {
                         Layout.fillWidth: true
-                        value: slidersColumn.brightnessMonitor?.brightness ?? 0
-                        onValueChanged: {
-                            if (slidersColumn.brightnessMonitor?.ready)
-                                slidersColumn.brightnessMonitor.setBrightness(value);
-                        }
+                        serviceValue: slidersColumn.brightnessMonitor.brightness
+                        onSend: value => slidersColumn.brightnessMonitor.setBrightness(value)
                     }
                 }
             }

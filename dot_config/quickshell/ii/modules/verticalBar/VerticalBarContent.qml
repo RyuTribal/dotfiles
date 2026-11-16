@@ -54,9 +54,9 @@ Item { // Bar content region
         height: (root.height - middleSection.height) / 2
         width: Appearance.sizes.verticalBarWidth
 
-        onScrollDown: root.brightnessMonitor.setBrightness(root.brightnessMonitor.brightness - 0.05)
-        onScrollUp: root.brightnessMonitor.setBrightness(root.brightnessMonitor.brightness + 0.05)
-        onMovedAway: GlobalStates.osdBrightnessOpen = false
+        onScrollDown: root.brightnessMonitor.stepBrightness(-5)
+        onScrollUp: root.brightnessMonitor.stepBrightness(5)
+        onMovedAway: Brightness.hideOsd()
 
         ColumnLayout { // Content
             id: topSectionColumnLayout

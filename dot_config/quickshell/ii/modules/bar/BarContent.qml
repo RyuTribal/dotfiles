@@ -59,9 +59,9 @@ Item { // Bar content region
         implicitWidth: leftSectionRowLayout.implicitWidth
         implicitHeight: Appearance.sizes.baseBarHeight
 
-        onScrollDown: root.brightnessMonitor.setBrightness(root.brightnessMonitor.brightness - 0.05)
-        onScrollUp: root.brightnessMonitor.setBrightness(root.brightnessMonitor.brightness + 0.05)
-        onMovedAway: GlobalStates.osdBrightnessOpen = false
+        onScrollDown: root.brightnessMonitor.stepBrightness(-5)
+        onScrollUp: root.brightnessMonitor.stepBrightness(5)
+        onMovedAway: Brightness.hideOsd()
         // Left-click anywhere on the left strip opens/closes the top menu
         // (no tab jump — batch 2's plain-toggle header click).
         onPressed: event => {

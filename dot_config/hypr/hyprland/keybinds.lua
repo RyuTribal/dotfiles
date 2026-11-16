@@ -39,8 +39,8 @@ hl.bind("CTRL+ALT + Delete", hl.dsp.global("quickshell:sessionToggle"), { descri
 hl.bind("SUPER+SHIFT + B", hl.dsp.global("quickshell:barToggle"), { description = "Toggle bar" }) -- Toggle bar
 hl.bind("CTRL+ALT + Delete", hl.dsp.exec_cmd("qs -c $qsConfig ipc call TEST_ALIVE || pkill wlogout || { f=$HOME/.local/state/axon/theme/current/wlogout.css; if [ -r \"$f\" ]; then wlogout -p layer-shell -C \"$f\"; else wlogout -p layer-shell; fi; }")) -- [hidden] Session menu (fallback)
 
-hl.bind("XF86MonBrightnessUp", hl.dsp.exec_cmd("qs -c $qsConfig ipc call brightness increment || brightnessctl s 5%+"), { locked = true, repeating = true }) -- [hidden]
-hl.bind("XF86MonBrightnessDown", hl.dsp.exec_cmd("qs -c $qsConfig ipc call brightness decrement || brightnessctl s 5%-"), { locked = true, repeating = true }) -- [hidden]
+hl.bind("XF86MonBrightnessUp", hl.dsp.exec_cmd("axon brightness.step delta=5"), { locked = true, repeating = true, description = "Brightness up" }) -- [hidden]
+hl.bind("XF86MonBrightnessDown", hl.dsp.exec_cmd("axon brightness.step delta=-5"), { locked = true, repeating = true, description = "Brightness down" }) -- [hidden]
 hl.bind("XF86AudioRaiseVolume", hl.dsp.exec_cmd("axon audio.nudge target=sink delta=2"), { locked = true, repeating = true, description = "Volume up" }) -- [hidden]
 hl.bind("XF86AudioLowerVolume", hl.dsp.exec_cmd("axon audio.nudge target=sink delta=-2"), { locked = true, repeating = true, description = "Volume down" }) -- [hidden]
 

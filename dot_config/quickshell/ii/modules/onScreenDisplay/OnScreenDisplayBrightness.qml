@@ -6,48 +6,19 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import Quickshell
-import Quickshell.Io
-import Quickshell.Hyprland
 import Quickshell.Wayland
 
+// Shows while Brightness.osdVisible: axon's brightness engine publishes the instant of each change that
+// shows the OSD (`osd_at`) per output, and the Brightness service keeps the focused output's on screen
+// for Config.options.osd.timeout. Of this and the volume OSD only the later change shows.
 Scope {
     id: root
     property var focusedScreen: Quickshell.screens.find(s => s.name === Hypr.focusedMonitorName)
     property var brightnessMonitor: Brightness.getMonitorForScreen(focusedScreen)
 
-    function triggerOsd() {
-        GlobalStates.osdBrightnessOpen = true
-        osdTimeout.restart()
-    }
-
-    Timer {
-        id: osdTimeout
-        interval: Config.options.osd.timeout
-        repeat: false
-        running: false
-        onTriggered: {
-            GlobalStates.osdBrightnessOpen = false
-        }
-    }
-    
-    Connections { // A change that shows the volume OSD hides this one (D17, until brightness has its own osd_at)
-        target: Audio
-        function onOsdAtChanged() {
-            GlobalStates.osdBrightnessOpen = false
-        }
-    }
-
-    Connections {
-        target: Brightness
-        function onBrightnessChanged() {
-            if (!root.brightnessMonitor.ready) return
-            root.triggerOsd()
-        }
-    }
-
     Loader {
         id: osdLoader
-        active: GlobalStates.osdBrightnessOpen
+        active: Brightness.osdVisible && Brightness.osdAt > Audio.osdAt
 
         sourceComponent: PanelWindow {
             id: osdRoot
@@ -94,7 +65,7 @@ Scope {
                     MouseArea {
                         anchors.fill: parent
                         hoverEnabled: true
-                        onEntered: GlobalStates.osdBrightnessOpen = false
+                        onEntered: Brightness.hideOsd()
                     }
 
                     Behavior on implicitHeight {
@@ -108,7 +79,7 @@ Scope {
                         id: osdValues
                         anchors.fill: parent
                         anchors.margins: Appearance.sizes.elevationMargin
-                        value: root.brightnessMonitor?.brightness ?? 50
+                        value: root.brightnessMonitor.brightness
                         icon: "light_mode"
                         rotateIcon: true
                         scaleIcon: true
@@ -119,38 +90,4 @@ Scope {
 
         }
     }
-
-    IpcHandler {
-		target: "osdBrightness"
-
-		function trigger() {
-            root.triggerOsd()
-        }
-
-        function hide() {
-            GlobalStates.osdBrightnessOpen = false
-        }
-
-        function toggle() {
-            GlobalStates.osdBrightnessOpen = !GlobalStates.osdBrightnessOpen
-        }
-	}
-
-    GlobalShortcut {
-        name: "osdBrightnessTrigger"
-        description: "Triggers brightness OSD on press"
-
-        onPressed: {
-            root.triggerOsd()
-        }
-    }
-    GlobalShortcut {
-        name: "osdBrightnessHide"
-        description: "Hides brightness OSD on press"
-
-        onPressed: {
-            GlobalStates.osdBrightnessOpen = false
-        }
-    }
-
 }

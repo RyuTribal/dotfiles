@@ -9,21 +9,15 @@ import Quickshell
 import Quickshell.Wayland
 
 // Shows while Audio.osdVisible: axon's audio engine publishes the instant of each change that shows
-// the OSD (`osd_at`), and the Audio service keeps it on screen for Config.options.osd.timeout.
+// the OSD (`osd_at`), and the Audio service keeps it on screen for Config.options.osd.timeout. Of this
+// and the brightness OSD only the later change shows; a tie shows this one.
 Scope {
     id: root
     property var focusedScreen: Quickshell.screens.find(s => s.name === Hypr.focusedMonitorName)
 
-    Connections {
-        target: Brightness
-        function onBrightnessChanged() {
-            Audio.hideOsd();
-        }
-    }
-
     Loader {
         id: osdLoader
-        active: Audio.osdVisible
+        active: Audio.osdVisible && Audio.osdAt >= Brightness.osdAt
 
         sourceComponent: PanelWindow {
             id: osdRoot

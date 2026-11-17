@@ -1,6 +1,7 @@
 pragma Singleton
 pragma ComponentBehavior: Bound
 
+import "backend.js" as B
 import "power.js" as P
 import QtQuick
 import Quickshell
@@ -24,7 +25,7 @@ Singleton {
 
     readonly property string mode: _mode // lap, balanced or max
     readonly property int watts: _watts // the PL1 the machine runs at now
-    readonly property bool modeAvailable: P.isAvailable(topic.status)
+    readonly property bool modeAvailable: B.isAvailable(topic.status)
     // logind's answers: "yes", "no", "challenge", "na" or "inhibited"; empty before the first snapshot.
     readonly property string canSuspend: _canSuspend
     readonly property string canHibernate: _canHibernate

@@ -22,7 +22,7 @@ Singleton {
         onSnapshot: data => root._apply(data)
     }
 
-    // The start of the current minute; Hyprsunset and the clock tooltip read it.
+    // The start of the current minute; the clock tooltip reads it.
     readonly property QtObject clock: QtObject {
         readonly property date date: root._minute
         readonly property int hours: root._minute.getHours()

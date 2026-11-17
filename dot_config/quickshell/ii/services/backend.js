@@ -36,6 +36,13 @@ function mediaPosition(player, now) {
     return Math.max(0, capped);
 }
 
+// Whether a widget built on a topic shows: not before the first snapshot ("waiting") and not on a
+// machine without the thing ("unconfigured"). A stale, failed or erroring topic still shows its last
+// value.
+function isAvailable(status) {
+    return status !== "waiting" && status !== "unconfigured";
+}
+
 // Time left until an absolute deadline (pomodoro ends_at, claude resets_at).
 function remaining(endsAt, now) {
     return Math.max(0, endsAt - now);

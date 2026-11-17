@@ -33,6 +33,7 @@
 # BrightnessOutput.qml, brightness.js, OsdDeadline.qml and osd.js, with the stand-in Hypr singleton of
 # fakes/brightness. tst_brightness.qml and tst_osd.qml test brightness.js and osd.js by their relative
 # paths and need nothing.
+# tst_hyprsunset_service.qml loads Hyprsunset.qml as HyprsunsetService the same way, beside backend.js.
 # tst_config.qml tests the real modules/common/Config.qml, so it gets its own module, ConfigUnderTest:
 # Config.qml sits there beside fakes/Directories.qml, over the stand-in FileView of fakes/Quickshell/Io.
 
@@ -60,6 +61,7 @@ grep -v '^pragma Singleton$' "$services/Power.qml" > "$module/PowerService.qml"
 grep -v '^pragma Singleton$' "$services/Idle.qml" > "$module/IdleService.qml"
 grep -v '^pragma Singleton$' "$services/Audio.qml" > "$module/AudioService.qml"
 grep -v '^pragma Singleton$' "$services/Brightness.qml" > "$module/BrightnessService.qml"
+grep -v '^pragma Singleton$' "$services/Hyprsunset.qml" > "$module/HyprsunsetService.qml"
 cat > "$module/qmldir" <<'EOF'
 module ShellUnderTest
 singleton Backend 1.0 Backend.qml
@@ -81,6 +83,7 @@ AudioService 1.0 AudioService.qml
 OsdDeadline 1.0 OsdDeadline.qml
 BrightnessOutput 1.0 BrightnessOutput.qml
 BrightnessService 1.0 BrightnessService.qml
+HyprsunsetService 1.0 HyprsunsetService.qml
 singleton Hypr 1.0 Hypr.qml
 singleton Translation 1.0 Translation.qml
 EOF
@@ -338,7 +341,7 @@ for test in tst_backend.qml tst_backend_connection.qml tst_backend_behaviour.qml
     tst_theme.qml tst_wallpapers.qml tst_claude.qml tst_claude_usage.qml tst_claude_panel.qml \
     tst_claude_indicator.qml tst_notifications.qml tst_notifications_service.qml tst_power.qml \
     tst_power_service.qml tst_audio.qml tst_audio_service.qml tst_backend_slider.qml tst_osd.qml \
-    tst_brightness.qml tst_brightness_service.qml; do
+    tst_brightness.qml tst_brightness_service.qml tst_hyprsunset_service.qml; do
     QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -import "$here/fakes" -import "$imports" \
         -input "$here/$test" || status=1
 done

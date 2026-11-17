@@ -1,6 +1,6 @@
 .pragma library
 
-// Pure helpers for Battery.qml, Power.qml and Idle.qml, the thin clients of axon's power engine
+// Pure helpers for Battery.qml and Power.qml, the thin clients of axon's power engine
 // (section 30, "power").
 
 // UPower's State values in their numeric order, as `power.battery` names them. BatteryPopup and the
@@ -11,12 +11,6 @@ const CHARGE_STATES = ["unknown", "charging", "discharging", "empty", "fully_cha
 function chargeStateNumber(state) {
     const number = CHARGE_STATES.indexOf(state);
     return number < 0 ? 0 : number;
-}
-
-// Whether a power widget shows: not before the first snapshot ("waiting") and not on a machine
-// without the thing ("unconfigured"). A stale, failed or erroring topic still shows its last value.
-function isAvailable(status) {
-    return status !== "waiting" && status !== "unconfigured";
 }
 
 // Plugged in means charging or waiting to charge, as UPower's state says (the old Battery.qml rule).

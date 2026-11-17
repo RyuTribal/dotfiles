@@ -13,6 +13,13 @@ TestCase {
         return text;
     }
 
+    function test_isAvailable() {
+        compare(B.isAvailable("waiting"), false);
+        compare(B.isAvailable("unconfigured"), false);
+        for (const status of ["ok", "stale", "error", "starting", "failed"])
+            compare(B.isAvailable(status), true, status);
+    }
+
     function test_reuseRowsKeepsIdenticalObject() {
         const previous = B.reuseRows({}, [{ id: "a", rev: 1, name: "first" }]);
 

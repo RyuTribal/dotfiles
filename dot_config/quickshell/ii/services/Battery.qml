@@ -1,6 +1,7 @@
 pragma Singleton
 pragma ComponentBehavior: Bound
 
+import "backend.js" as B
 import "power.js" as P
 import QtQuick
 import Quickshell
@@ -19,7 +20,7 @@ Singleton {
         onSnapshot: data => root._apply(data)
     }
 
-    readonly property bool available: P.isAvailable(topic.status)
+    readonly property bool available: B.isAvailable(topic.status)
     readonly property int chargeState: P.chargeStateNumber(_state) // UPower's numbers: 1 charging, 4 full
     readonly property bool isCharging: _state === "charging"
     readonly property bool isPluggedIn: P.isPluggedIn(_state)

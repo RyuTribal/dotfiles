@@ -17,13 +17,6 @@ TestCase {
         compare(PowerJs.chargeStateNumber(undefined), 0);
     }
 
-    function test_isAvailable() {
-        compare(PowerJs.isAvailable("waiting"), false);
-        compare(PowerJs.isAvailable("unconfigured"), false);
-        for (const status of ["ok", "stale", "error", "starting", "failed"])
-            compare(PowerJs.isAvailable(status), true, status);
-    }
-
     function test_isPluggedIn() {
         compare(PowerJs.isPluggedIn("charging"), true);
         compare(PowerJs.isPluggedIn("pending_charge"), true);

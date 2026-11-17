@@ -1,7 +1,7 @@
 pragma Singleton
 pragma ComponentBehavior: Bound
 
-import "power.js" as P
+import "backend.js" as B
 import QtQuick
 import Quickshell
 
@@ -18,7 +18,7 @@ Singleton {
     }
 
     readonly property bool inhibit: _inhibit // the wish, also while hypridle is not running
-    readonly property bool available: P.isAvailable(topic.status)
+    readonly property bool available: B.isAvailable(topic.status)
 
     property bool _inhibit: false
 

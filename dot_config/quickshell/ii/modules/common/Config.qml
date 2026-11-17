@@ -219,15 +219,6 @@ Singleton {
                 property string ui: "auto" // UI language. "auto" for system locale, or specific language code like "zh_CN", "en_US"
             }
 
-            property JsonObject light: JsonObject {
-                property JsonObject night: JsonObject {
-                    property bool automatic: true
-                    property string from: "19:00" // Format: "HH:mm", 24-hour time
-                    property string to: "06:30"   // Format: "HH:mm", 24-hour time
-                    property int colorTemperature: 5000
-                }
-            }
-
             property JsonObject media: JsonObject {
                 // Attempt to remove dupes (the aggregator playerctl one and browsers' native ones when there's plasma browser integration)
                 property bool filterDuplicatePlayers: true

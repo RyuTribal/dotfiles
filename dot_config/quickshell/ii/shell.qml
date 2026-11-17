@@ -57,7 +57,6 @@ ShellRoot {
     Component.onCompleted: {
         Theme.reportsIris = true // the main shell alone reports its iris.json loads to axon
         Theme.reload()
-        Hyprsunset.load()
         Cliphist.refresh()
     }
 

@@ -7,18 +7,16 @@ import QtQuick
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
-import Quickshell.Services.Mpris
 import Quickshell.Wayland
 import Quickshell.Hyprland
 
 Scope {
     id: root
     property bool visible: false
-    readonly property MprisPlayer activePlayer: MprisController.activePlayer
-    // The player-list filtering pipeline (duplicate-player merge, real-player
-    // check, YouTube-preview exclusion) now lives in MprisController as
-    // meaningfulPlayers, shared with the topMenu Media tab. Kept as a local
-    // alias so the rest of this file reads exactly as it did before.
+    readonly property var activePlayer: MprisController.activePlayer
+    // axon filters and merges the players (section 31, media); MprisController
+    // maps them as meaningfulPlayers, shared with the topMenu Media tab. Kept as a
+    // local alias so the rest of this file reads exactly as it did before.
     readonly property var meaningfulPlayers: MprisController.meaningfulPlayers
     readonly property real osdWidth: Appearance.sizes.osdWidth
     readonly property real widgetWidth: Appearance.sizes.mediaControlsWidth
@@ -28,29 +26,21 @@ Scope {
     property real artRounding: Appearance.rounding.verysmall
     property list<real> visualizerPoints: []
 
-    Process {
-        id: cavaProc
-        running: mediaControlsLoader.active
-        onRunningChanged: {
-            if (!cavaProc.running) {
-                root.visualizerPoints = [];
-            }
-        }
-        command: ["cava", "-p", `${FileUtils.trimFileProtocol(Directories.scriptPath)}/cava/raw_output_config.txt`]
-        stdout: SplitParser {
-            onRead: data => {
-                // Parse `;`-separated values into the visualizerPoints array
-                let points = data.split(";").map(p => parseFloat(p.trim())).filter(p => !isNaN(p));
-                root.visualizerPoints = points;
-            }
-        }
+    // The waveform: axon's one shared spectrum, wanted while the popup is open (section 31,
+    // media.spectrum). The bars clear when it closes.
+    BackendTopic {
+        name: "media.spectrum"
+        active: mediaControlsLoader.active
+        onSnapshot: data => root.visualizerPoints = data.bars
+        onActiveChanged: if (!active)
+            root.visualizerPoints = []
     }
 
     Loader {
         id: mediaControlsLoader
         active: GlobalStates.mediaControlsOpen
         onActiveChanged: {
-            if (!mediaControlsLoader.active && Mpris.players.values.filter(player => MprisController.isRealPlayer(player)).length === 0) {
+            if (!mediaControlsLoader.active && root.meaningfulPlayers.length === 0) {
                 GlobalStates.mediaControlsOpen = false;
             }
         }
@@ -119,11 +109,11 @@ Scope {
 
                 Repeater {
                     model: ScriptModel {
-                        values: root.meaningfulPlayers
+                        values: MprisController.playerIds
                     }
                     delegate: PlayerControl {
-                        required property MprisPlayer modelData
-                        player: modelData
+                        required property string modelData
+                        player: MprisController.byId[modelData] ?? null
                         visualizerPoints: root.visualizerPoints
                         implicitWidth: widgetWidth
                         implicitHeight: widgetHeight

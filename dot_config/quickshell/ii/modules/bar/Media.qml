@@ -6,36 +6,32 @@ import qs.modules.common.functions
 
 import QtQuick
 import QtQuick.Layouts
-import Quickshell.Services.Mpris
 import Quickshell.Hyprland
 
 Item {
     id: root
     property bool borderless: Config.options.bar.borderless
-    readonly property MprisPlayer activePlayer: MprisController.activePlayer
+    readonly property var activePlayer: MprisController.activePlayer
     readonly property string cleanedTitle: StringUtils.cleanMusicTitle(activePlayer?.trackTitle) || Translation.tr("No media")
 
     Layout.fillHeight: true
     implicitWidth: rowLayout.implicitWidth + rowLayout.spacing * 2
     implicitHeight: Appearance.sizes.barHeight
 
-    Timer {
-        running: activePlayer?.playbackState == MprisPlaybackState.Playing
-        interval: 1000
-        repeat: true
-        onTriggered: activePlayer.positionChanged()
-    }
-
     MouseArea {
         anchors.fill: parent
         acceptedButtons: Qt.MiddleButton | Qt.BackButton | Qt.ForwardButton | Qt.RightButton | Qt.LeftButton
         onPressed: (event) => {
+            const id = activePlayer?.id;
             if (event.button === Qt.MiddleButton) {
-                activePlayer.togglePlaying();
+                if (id)
+                    MprisController.togglePlaying(id);
             } else if (event.button === Qt.BackButton) {
-                activePlayer.previous();
+                if (id)
+                    MprisController.previous(id);
             } else if (event.button === Qt.ForwardButton || event.button === Qt.RightButton) {
-                activePlayer.next();
+                if (id)
+                    MprisController.next(id);
             } else if (event.button === Qt.LeftButton) {
                 // Left click jumps to the top menu's Media tab (batch 2). The
                 // mediaControls popup this used to toggle is still reachable
@@ -57,7 +53,7 @@ Item {
             id: mediaCircProg
             Layout.alignment: Qt.AlignVCenter
             lineWidth: Appearance.rounding.unsharpen
-            value: activePlayer?.position / activePlayer?.length
+            value: activePlayer?.length > 0 ? MprisController.positionOf(activePlayer, Backend.now) / activePlayer.length : 0
             implicitSize: 20
             colPrimary: Appearance.colors.colOnSecondaryContainer
             enableAnimation: false

@@ -1,232 +1,151 @@
 pragma Singleton
 pragma ComponentBehavior: Bound
 
-// From https://git.outfoxxed.me/outfoxxed/nixnew
-// It does not have a license, but the author is okay with redistribution.
-
-import qs
-import qs.modules.common
-import QtQml.Models
+import "backend.js" as B
 import QtQuick
 import Quickshell
-import Quickshell.Io
-import Quickshell.Services.Mpris
 
 /**
- * A service that provides easy access to the active Mpris player.
+ * Media players, a thin client of axon's `media` topic (section 31, "media"). axon follows the
+ * MPRIS players, filters and merges them, picks the active one, keeps each player's position as an
+ * anchor and caches its cover art; this maps the rows to the field names the widgets read and
+ * sends the controls. A row is a plain object, identical while its `rev` holds (reuseRows).
  */
 Singleton {
-	id: root;
-	property MprisPlayer trackedPlayer: null;
-	property MprisPlayer activePlayer: trackedPlayer ?? Mpris.players.values[0] ?? null;
-	signal trackChanged(reverse: bool);
+    id: root
 
-	// Player-list filtering pipeline, lifted from MediaControls.qml so both
-	// the SUPER+M popup and the topMenu Media tab consume one shared list
-	// instead of keeping their own copies in sync by hand.
-	property bool hasPlasmaIntegration: false
-	Process {
-		id: plasmaIntegrationAvailabilityCheckProc
-		running: true
-		command: ["bash", "-c", "command -v plasma-browser-integration-host"]
-		onExited: (exitCode, exitStatus) => {
-			root.hasPlasmaIntegration = (exitCode === 0);
-		}
-	}
+    readonly property BackendTopic topic: BackendTopic {
+        name: "media"
+        onSnapshot: data => root._apply(data)
+    }
 
-	function isYouTubePreview(p) {
-		const u = (p.metadata["xesam:url"] || "").toString();
-		if (!(u.includes("youtube.com") || u.includes("youtu.be")))
-			return false;
+    readonly property var activePlayer: _index[_activeId] ?? null
+    readonly property var meaningfulPlayers: _players
+    // The rows' ids, for a Repeater's model: a row whose `rev` changed is a new object, while its
+    // id stays, so a delegate keyed by id lives on and binds its row from `byId`.
+    readonly property var playerIds: _ids
+    readonly property var byId: _index
 
-		// real watchables: watch/shorts/live/embed, and YT Music
-		const real = /youtube\.com\/(watch|shorts|live|embed)\b/.test(u) || /music\.youtube\.com\//.test(u) || /youtu\.be\//.test(u);
+    property var _players: []
+    property var _ids: []
+    property var _index: ({})
+    property string _activeId: ""
 
-		return !real;  // preview/home/feed/etc.
-	}
-	function isRealPlayer(player) {
-		if (!Config.options.media.filterDuplicatePlayers) {
-			return true;
-		}
-		return (
-			// Remove unecessary native buses from browsers if there's plasma integration
-			!(root.hasPlasmaIntegration && player.dbusName.startsWith('org.mpris.MediaPlayer2.firefox')) && !(root.hasPlasmaIntegration && player.dbusName.startsWith('org.mpris.MediaPlayer2.chromium')) &&
-			// playerctld just copies other buses and we don't need duplicates
-			!player.dbusName?.startsWith('org.mpris.MediaPlayer2.playerctld') &&
-			// Non-instance mpd bus
-			!(player.dbusName?.endsWith('.mpd') && !player.dbusName.endsWith('MediaPlayer2.mpd')));
-	}
-	function filterDuplicatePlayers(players) {
-		let filtered = [];
-		let used = new Set();
+    // The position of `player`, a mapped row, at `nowMs`, in seconds.
+    function positionOf(player, nowMs) {
+        return player ? B.mediaPosition(player, nowMs) / 1000 : 0;
+    }
 
-		for (let i = 0; i < players.length; ++i) {
-			if (used.has(i))
-				continue;
-			let p1 = players[i];
-			let group = [i];
+    function togglePlaying(id) {
+        _send("media.play_pause", id, {});
+    }
 
-			// Find duplicates by trackTitle prefix
-			for (let j = i + 1; j < players.length; ++j) {
-				let p2 = players[j];
-				if (p1.trackTitle && p2.trackTitle && (p1.trackTitle.includes(p2.trackTitle) || p2.trackTitle.includes(p1.trackTitle)) || (Math.abs(p1.position - p2.position) <= 2 && Math.abs(p1.length - p2.length) <= 2)) {
-					group.push(j);
-				}
-			}
+    function play(id) {
+        _send("media.play", id, {});
+    }
 
-			// Pick the one with non-empty trackArtUrl, or fallback to the first
-			let chosenIdx = group.find(idx => players[idx].trackArtUrl && players[idx].trackArtUrl.length > 0);
-			if (chosenIdx === undefined)
-				chosenIdx = group[0];
+    function pause(id) {
+        _send("media.pause", id, {});
+    }
 
-			filtered.push(players[chosenIdx]);
-			group.forEach(idx => used.add(idx));
-		}
-		return filtered;
-	}
-	readonly property var realPlayers: Mpris.players.values.filter(player => root.isRealPlayer(player) && player.playbackState !== MprisPlaybackState.Stopped && !root.isYouTubePreview(player))
-	readonly property var meaningfulPlayers: root.filterDuplicatePlayers(root.realPlayers)
+    function next(id) {
+        _send("media.next", id, {});
+    }
 
-	property bool __reverse: false;
+    function previous(id) {
+        _send("media.previous", id, {});
+    }
 
-	property var activeTrack;
+    // Moves by `sec` seconds, back for a negative one.
+    function seek(id, sec) {
+        _send("media.seek", id, {
+            offset_ms: Math.round(sec * 1000)
+        });
+    }
 
-	Instantiator {
-		model: Mpris.players;
+    // Moves to `sec` seconds into the track.
+    function setPosition(id, sec) {
+        _send("media.set_position", id, {
+            position_ms: Math.max(0, Math.round(sec * 1000))
+        });
+    }
 
-		Connections {
-			required property MprisPlayer modelData;
-			target: modelData;
+    // `state` is "none", "track" or "playlist".
+    function setLoopState(id, state) {
+        _send("media.set_loop", id, {
+            loop: state
+        });
+    }
 
-			Component.onCompleted: {
-				if (root.trackedPlayer == null || modelData.isPlaying) {
-					root.trackedPlayer = modelData;
-				}
-			}
+    function setShuffle(id, on) {
+        _send("media.set_shuffle", id, {
+            on: on
+        });
+    }
 
-			Component.onDestruction: {
-				if (root.trackedPlayer == null || !root.trackedPlayer.isPlaying) {
-					for (const player of Mpris.players.values) {
-						if (player.playbackState.isPlaying) {
-							root.trackedPlayer = player;
-							break;
-						}
-					}
+    function setActivePlayer(id) {
+        Backend.call("media.set_active", {
+            player: id
+        });
+    }
 
-					if (trackedPlayer == null && Mpris.players.values.length != 0) {
-						trackedPlayer = Mpris.players.values[0];
-					}
-				}
-			}
+    function _send(method, id, args) {
+        Backend.call(method, Object.assign({
+            player: id
+        }, args));
+    }
 
-			function onPlaybackStateChanged() {
-				if (root.trackedPlayer !== modelData) root.trackedPlayer = modelData;
-			}
-		}
-	}
+    // A `media` row with the widgets' player field names, seconds for `length`, plus the anchor fields
+    // backend.js mediaPosition reads.
+    function _row(p) {
+        return {
+            id: p.id,
+            rev: p.rev,
+            dbusName: p.bus_name,
+            identity: p.identity,
+            desktopEntry: p.desktop_entry,
+            trackTitle: p.title,
+            trackArtist: p.artist,
+            trackAlbum: p.album,
+            url: p.url,
+            artPath: p.art_path ?? "",
+            artState: p.art_state,
+            playbackState: p.status,
+            isPlaying: p.status === "playing",
+            length: p.length_ms === null ? 0 : p.length_ms / 1000,
+            length_ms: p.length_ms,
+            position_ms: p.position_ms,
+            sampled_at: p.sampled_at,
+            rate: p.rate,
+            canControl: p.can_control,
+            canPlay: p.can_play,
+            canPause: p.can_pause,
+            canTogglePlaying: p.can_play || p.can_pause,
+            canGoNext: p.can_go_next,
+            canGoPrevious: p.can_go_previous,
+            canSeek: p.can_seek,
+            positionSupported: p.can_seek && p.length_ms !== null,
+            loopSupported: p.loop !== null,
+            loopState: p.loop ?? "none",
+            shuffleSupported: p.shuffle !== null,
+            shuffle: p.shuffle === true,
+            volume: p.volume,
+            lastStartedAt: p.last_started_at
+        };
+    }
 
-	Connections {
-		target: activePlayer
-
-		function onPostTrackChanged() {
-			root.updateTrack();
-		}
-
-		function onTrackArtUrlChanged() {
-			// console.log("arturl:", activePlayer.trackArtUrl)
-			// root.updateTrack();
-			if (root.activePlayer.uniqueId == root.activeTrack.uniqueId && root.activePlayer.trackArtUrl != root.activeTrack.artUrl) {
-				// cantata likes to send cover updates *BEFORE* updating the track info.
-				// as such, art url changes shouldn't be able to break the reverse animation
-				const r = root.__reverse;
-				root.updateTrack();
-				root.__reverse = r;
-
-			}
-		}
-	}
-
-	onActivePlayerChanged: this.updateTrack();
-
-	function updateTrack() {
-		//console.log(`update: ${this.activePlayer?.trackTitle ?? ""} : ${this.activePlayer?.trackArtists}`)
-		this.activeTrack = {
-			uniqueId: this.activePlayer?.uniqueId ?? 0,
-			artUrl: this.activePlayer?.trackArtUrl ?? "",
-			title: this.activePlayer?.trackTitle || Translation.tr("Unknown Title"),
-			artist: this.activePlayer?.trackArtist || Translation.tr("Unknown Artist"),
-			album: this.activePlayer?.trackAlbum || Translation.tr("Unknown Album"),
-		};
-
-		this.trackChanged(__reverse);
-		this.__reverse = false;
-	}
-
-	property bool isPlaying: this.activePlayer && this.activePlayer.isPlaying;
-	property bool canTogglePlaying: this.activePlayer?.canTogglePlaying ?? false;
-	function togglePlaying() {
-		if (this.canTogglePlaying) this.activePlayer.togglePlaying();
-	}
-
-	property bool canGoPrevious: this.activePlayer?.canGoPrevious ?? false;
-	function previous() {
-		if (this.canGoPrevious) {
-			this.__reverse = true;
-			this.activePlayer.previous();
-		}
-	}
-
-	property bool canGoNext: this.activePlayer?.canGoNext ?? false;
-	function next() {
-		if (this.canGoNext) {
-			this.__reverse = false;
-			this.activePlayer.next();
-		}
-	}
-
-	property bool canChangeVolume: this.activePlayer && this.activePlayer.volumeSupported && this.activePlayer.canControl;
-
-	property bool loopSupported: this.activePlayer && this.activePlayer.loopSupported && this.activePlayer.canControl;
-	property var loopState: this.activePlayer?.loopState ?? MprisLoopState.None;
-	function setLoopState(loopState: var) {
-		if (this.loopSupported) {
-			this.activePlayer.loopState = loopState;
-		}
-	}
-
-	property bool shuffleSupported: this.activePlayer && this.activePlayer.shuffleSupported && this.activePlayer.canControl;
-	property bool hasShuffle: this.activePlayer?.shuffle ?? false;
-	function setShuffle(shuffle: bool) {
-		if (this.shuffleSupported) {
-			this.activePlayer.shuffle = shuffle;
-		}
-	}
-
-	function setActivePlayer(player: MprisPlayer) {
-		const targetPlayer = player ?? Mpris.players[0];
-		console.log(`[Mpris] Active player ${targetPlayer} << ${activePlayer}`)
-
-		if (targetPlayer && this.activePlayer) {
-			this.__reverse = Mpris.players.indexOf(targetPlayer) < Mpris.players.indexOf(this.activePlayer);
-		} else {
-			// always animate forward if going to null
-			this.__reverse = false;
-		}
-
-		this.trackedPlayer = targetPlayer;
-	}
-
-	IpcHandler {
-		target: "mpris"
-
-		function pauseAll(): void {
-			for (const player of Mpris.players.values) {
-				if (player.canPause) player.pause();
-			}
-		}
-
-		function playPause(): void { root.togglePlaying(); }
-		function previous(): void { root.previous(); }
-		function next(): void { root.next(); }
-	}
+    // No change notification may list an id without its row in `byId`: the ids that leave go
+    // before the index loses their rows, and the ids that arrive come after it has them.
+    function _apply(data) {
+        const rows = B.reuseRows(_index, data.players.map(_row));
+        const ids = rows.rows.map(row => row.id);
+        const kept = _ids.filter(id => rows.index[id] !== undefined);
+        if (kept.length !== _ids.length)
+            _ids = kept;
+        _index = rows.index;
+        _players = rows.rows;
+        if (ids.join("\n") !== _ids.join("\n"))
+            _ids = ids;
+        _activeId = data.active_id ?? "";
+    }
 }

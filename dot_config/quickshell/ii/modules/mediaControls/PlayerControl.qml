@@ -7,18 +7,13 @@ import QtQuick
 import QtQuick.Effects
 import QtQuick.Layouts
 import Quickshell
-import Quickshell.Io
-import Quickshell.Services.Mpris
 
 Item { // Player instance
     id: playerController
-    required property MprisPlayer player
-    property var artUrl: player?.trackArtUrl
-    property string artDownloadLocation: Directories.coverArt
-    property string artFileName: Qt.md5(artUrl) + ".jpg"
-    property string artFilePath: `${artDownloadLocation}/${artFileName}`
+    required property var player // a row of MprisController.meaningfulPlayers
+    // axon's cached cover, written whole before the row names it (section 31, Cover art).
+    property string artSource: player?.artPath ? "file://" + player.artPath : ""
     property color artDominantColor: ColorUtils.mix((colorQuantizer?.colors[0] ?? Appearance.colors.colPrimary), Appearance.colors.colPrimaryContainer, 0.8) || Appearance.m3colors.m3secondaryContainer
-    property bool downloaded: false
     property list<real> visualizerPoints: []
     property real maxVisualizerValue: 1000 // Max value in the data points
     property int visualizerSmoothing: 2 // Number of points to average for smoothing
@@ -27,7 +22,7 @@ Item { // Player instance
     property real seekPreview: 0
 
     property bool isYouTube: {
-        const url = (playerController.player?.metadata["xesam:url"] || "").toString();
+        const url = playerController.player?.url || "";
         const id = (playerController.player?.identity || "").toLowerCase();
         return /youtube\.com|youtu\.be/.test(url) || id.includes("youtube");
     }
@@ -60,54 +55,9 @@ Item { // Player instance
         }
     }
 
-    Timer {
-        // Force update for prevision
-        running: playerController.player?.playbackState == MprisPlaybackState.Playing
-        interval: 1000
-        repeat: true
-        onTriggered: {
-            playerController.player.positionChanged();
-        }
-    }
-
-    function refreshArt() {
-        const url = playerController.player?.trackArtUrl || "";
-        if (!url)
-            return;
-        downloaded = false;      // important: gate images/quantizer until new file lands
-        coverArtDownloader.targetFile = url;
-        coverArtDownloader.running = true;
-    }
-    Connections {
-        target: playerController.player
-        function onTrackChanged() {
-            playerController.refreshArt();
-        }          // fires every song
-        function onTrackArtUrlChanged() {
-            playerController.refreshArt();
-        }    // some players change URL too
-        function onUniqueIdChanged() {
-            playerController.refreshArt();
-        }
-    }
-
-    onArtUrlChanged: playerController.refreshArt()
-
-    Process {
-        id: coverArtDownloader
-        property string targetFile: playerController.artUrl
-        // overwrite every time
-        command: ["bash", "-c", `curl -fsSL '${targetFile}' -o '${playerController.artFilePath}'`]
-        onExited: code => playerController.downloaded = (code === 0)
-    }
-    property int _quantBust: 0
-    onDownloadedChanged: if (downloaded)
-        _quantBust++   // bump when new art is in place
-
     ColorQuantizer {
         id: colorQuantizer
-        // cache-bust just like the Image
-        source: playerController.downloaded ? Qt.resolvedUrl(playerController.artFilePath) + "?r=" + playerController._quantBust : ""
+        source: playerController.artSource
         depth: 0
         rescaleSize: 1
     }
@@ -150,17 +100,12 @@ Item { // Player instance
         Image {
             id: blurredArt
             anchors.fill: parent
-            source: playerController.downloaded ? (Qt.resolvedUrl(playerController.artFilePath) + "?r=" + __bust) : ""
+            source: playerController.artSource
             sourceSize.width: background.width
             sourceSize.height: background.height
             fillMode: Image.PreserveAspectCrop
-            cache: false
             antialiasing: true
             asynchronous: true
-
-            property int __bust: 0
-            property int __retry: 0
-            property int __retryMax: 6
 
             layer.enabled: true
             layer.effect: MultiEffect {
@@ -169,25 +114,6 @@ Item { // Player instance
                 blurEnabled: true
                 blurMax: 100
                 blur: 1
-            }
-
-            onStatusChanged: {
-                if (status === Image.Error && __retry < __retryMax && source !== "") {
-                    __retry++;
-                    retryTimer.interval = Math.min(2000, 150 * Math.pow(2, __retry - 1));
-                    retryTimer.restart();
-                } else if (status === Image.Ready) {
-                    __retry = 0;
-                }
-            }
-
-            Timer {
-                id: retryTimer
-                repeat: false
-                onTriggered: {
-                    // force Qt to reload by changing the URL string
-                    blurredArt.__bust++;
-                }
             }
 
             Rectangle {
@@ -233,34 +159,10 @@ Item { // Player instance
                     property int size: parent.height
                     anchors.fill: parent
 
-                    property int __bust: 0
-                    property int __retry: 0
-                    property int __retryMax: 6
-
-                    // if you gate on `downloaded`, keep it; just add the cache buster
-                    source: playerController.downloaded ? (Qt.resolvedUrl(playerController.artFilePath) + "?r=" + __bust) : ""
+                    source: playerController.artSource
                     fillMode: Image.PreserveAspectCrop
-                    cache: false
                     antialiasing: true
                     asynchronous: true
-
-                    onStatusChanged: {
-                        if (status === Image.Error && __retry < __retryMax && source !== "") {
-                            __retry++;
-                            mediaArtRetryTimer.interval = Math.min(2000, 150 * Math.pow(2, __retry - 1));
-                            mediaArtRetryTimer.restart();
-                        } else if (status === Image.Ready) {
-                            __retry = 0;
-                        }
-                    }
-
-                    Timer {
-                        id: mediaArtRetryTimer
-                        repeat: false
-                        onTriggered: {
-                            mediaArt.__bust++;
-                        }
-                    }
 
                     width: size
                     height: size
@@ -311,7 +213,7 @@ Item { // Player instance
                         font.pixelSize: Appearance.font.pixelSize.small
                         color: blendedColors.colSubtext
                         elide: Text.ElideRight
-                        text: `${StringUtils.friendlyTimeForSeconds(playerController.player?.position)} / ${StringUtils.friendlyTimeForSeconds(playerController.player?.length)}`
+                        text: `${StringUtils.friendlyTimeForSeconds(MprisController.positionOf(playerController.player, Backend.now))} / ${StringUtils.friendlyTimeForSeconds(playerController.player?.length)}`
                     }
                     RowLayout {
                         id: sliderRow
@@ -326,7 +228,7 @@ Item { // Player instance
                             enabled: playerController.canPrevBtn
                             opacity: enabled ? 1.0 : 0.35
                             onClicked: if (enabled)
-                                playerController.player.previous()
+                                MprisController.previous(playerController.player.id)
                         }
                         Item {
                             id: progressBarContainer
@@ -342,7 +244,7 @@ Item { // Player instance
                                 // show live position unless we're dragging; then show the preview
                                 value: {
                                     const len = playerController.player?.length || 0;
-                                    const pos = playerController.seeking ? playerController.seekPreview : (playerController.player?.position || 0);
+                                    const pos = playerController.seeking ? playerController.seekPreview : MprisController.positionOf(playerController.player, Backend.now);
                                     return len > 0 ? pos / len : 0;
                                 }
 
@@ -374,12 +276,8 @@ Item { // Player instance
                                 onReleased: mouse => {
                                     const newPos = posFromX(mouse.x);
                                     playerController.seeking = false;
-                                    if (playerController.player?.canSeek && playerController.player?.positionSupported) {
-                                        // Set absolute position
-                                        playerController.player.position = newPos;
-                                        // force a UI tick so the bar updates immediately
-                                        playerController.player.positionChanged();
-                                    }
+                                    if (playerController.player?.canSeek && playerController.player?.positionSupported)
+                                        MprisController.setPosition(playerController.player.id, newPos);
                                 }
                                 onWheel: wheel => {
                                     if (!(playerController.player?.canSeek && playerController.player?.positionSupported))
@@ -387,8 +285,7 @@ Item { // Player instance
                                     // ~5s per wheel notch; use MPRIS relative seek
                                     const step = 5;
                                     const delta = wheel.angleDelta.y !== 0 ? wheel.angleDelta.y : wheel.angleDelta.x;
-                                    playerController.player.seek(delta > 0 ? step : -step);
-                                    playerController.player.positionChanged();
+                                    MprisController.seek(playerController.player.id, delta > 0 ? step : -step);
                                     wheel.accepted = true;
                                 }
                             }
@@ -399,7 +296,7 @@ Item { // Player instance
                             enabled: playerController.canNextBtn
                             opacity: enabled ? 1.0 : 0.35
                             onClicked: if (enabled)
-                                playerController.player.next()
+                                MprisController.next(playerController.player.id)
                         }
                     }
 
@@ -425,7 +322,7 @@ Item { // Player instance
                                 }
                             }
                             onClicked: if (playerController.shuffleAvail)
-                                playerController.player.shuffle = !playerController.player.shuffle
+                                MprisController.setShuffle(playerController.player.id, !playerController.player.shuffle)
                         }
 
                         // Repeat (cycle None → Playlist → Track)
@@ -435,8 +332,8 @@ Item { // Player instance
                                 iconSize: Appearance.font.pixelSize.huge
                                 fill: 1
                                 horizontalAlignment: Text.AlignHCenter
-                                color: playerController.player?.loopState === MprisLoopState.None ? blendedColors.colOnPrimary : blendedColors.colOnSecondaryContainer
-                                text: playerController.player?.loopState === MprisLoopState.Track ? "repeat_one" : "repeat"
+                                color: playerController.player?.loopState === "none" ? blendedColors.colOnPrimary : blendedColors.colOnSecondaryContainer
+                                text: playerController.player?.loopState === "track" ? "repeat_one" : "repeat"
 
                                 Behavior on color {
                                     animation: Appearance.animation.elementMoveFast.colorAnimation.createObject(this)
@@ -447,8 +344,8 @@ Item { // Player instance
                                 if (!playerController.loopAvail)
                                     return;
                                 const s = playerController.player.loopState;
-                                const next = (s === MprisLoopState.None) ? MprisLoopState.Playlist : (s === MprisLoopState.Playlist) ? MprisLoopState.Track : MprisLoopState.None;
-                                playerController.player.loopState = next;
+                                const next = (s === "none") ? "playlist" : (s === "playlist") ? "track" : "none";
+                                MprisController.setLoopState(playerController.player.id, next);
                             }
                         }
                     }
@@ -461,7 +358,7 @@ Item { // Player instance
                         property real size: 44
                         implicitWidth: size
                         implicitHeight: size
-                        onClicked: playerController.player.togglePlaying()
+                        onClicked: MprisController.togglePlaying(playerController.player.id)
 
                         buttonRadius: playerController.player?.isPlaying ? Appearance?.rounding.normal : size / 2
                         colBackground: playerController.player?.isPlaying ? blendedColors.colPrimary : blendedColors.colSecondaryContainer

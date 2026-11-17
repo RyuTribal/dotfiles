@@ -6,36 +6,32 @@ import qs.modules.common.functions
 
 import QtQuick
 import QtQuick.Layouts
-import Quickshell.Services.Mpris
 
 import qs.modules.bar as Bar
 
 MouseArea {
     id: root
     property bool borderless: Config.options.bar.borderless
-    readonly property MprisPlayer activePlayer: MprisController.activePlayer
+    readonly property var activePlayer: MprisController.activePlayer
     readonly property string cleanedTitle: StringUtils.cleanMusicTitle(activePlayer?.trackTitle) || Translation.tr("No media")
 
     Layout.fillHeight: true
     implicitHeight: mediaCircProg.implicitHeight
     implicitWidth: Appearance.sizes.verticalBarWidth
 
-    Timer {
-        running: activePlayer?.playbackState == MprisPlaybackState.Playing
-        interval: 1000
-        repeat: true
-        onTriggered: activePlayer.positionChanged()
-    }
-
     acceptedButtons: Qt.MiddleButton | Qt.BackButton | Qt.ForwardButton | Qt.RightButton | Qt.LeftButton
     hoverEnabled: true
     onPressed: (event) => {
+        const id = activePlayer?.id;
         if (event.button === Qt.MiddleButton) {
-            activePlayer.togglePlaying();
+            if (id)
+                MprisController.togglePlaying(id);
         } else if (event.button === Qt.BackButton) {
-            activePlayer.previous();
+            if (id)
+                MprisController.previous(id);
         } else if (event.button === Qt.ForwardButton || event.button === Qt.RightButton) {
-            activePlayer.next();
+            if (id)
+                MprisController.next(id);
         } else if (event.button === Qt.LeftButton) {
             GlobalStates.mediaControlsOpen = !GlobalStates.mediaControlsOpen
         }
@@ -47,7 +43,7 @@ MouseArea {
         implicitSize: 20
 
         lineWidth: Appearance.rounding.unsharpen
-        value: activePlayer?.position / activePlayer?.length
+        value: activePlayer?.length > 0 ? MprisController.positionOf(activePlayer, Backend.now) / activePlayer.length : 0
         colPrimary: Appearance.colors.colOnSecondaryContainer
         enableAnimation: false
 

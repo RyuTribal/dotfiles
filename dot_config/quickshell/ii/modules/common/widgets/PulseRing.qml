@@ -2,7 +2,7 @@ import qs.modules.common
 import QtQuick
 
 // A ring of short radial bars around a circular piece of art, each bar's
-// length driven by one cava visualizerPoints bin - a circular cousin of
+// length driven by one visualizerPoints bin of axon's spectrum - a circular cousin of
 // WaveVisualizer.qml's linear waveform. Reuses that same data shape and
 // moving-average smoothing idiom (see WaveVisualizer.qml) rather than
 // inventing a different one, just maps the result to an angle+radius
@@ -71,7 +71,7 @@ Canvas {
         for (var k = 0; k < n; ++k) {
             var angle = (k / n) * Math.PI * 2 - Math.PI / 2;
             var norm = Math.max(0, Math.min(1, root.smoothPoints[k] / maxVal));
-            // Non-linear (^0.6) boost: cava's raw magnitudes are small during
+            // Non-linear (^0.6) boost: the spectrum's raw magnitudes are small during
             // quiet passages, and a plain linear map left the ring barely
             // moving except on loud peaks. Sub-1 exponents on a 0..1 value
             // push small inputs up disproportionately more than large ones

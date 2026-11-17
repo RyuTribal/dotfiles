@@ -7,88 +7,63 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import Quickshell
-import Quickshell.Io
-import Quickshell.Services.Mpris
 
 Item {
     id: root
 
-    // The player shown in the big left-hand card. `: MprisController.activePlayer`
-    // is a live QML binding, and that's intentional: until the first manual
-    // selection, this is meant to track whatever MprisController considers
-    // active (e.g. as playback switches players). Clicking a card in the
-    // "Players" list on the right does a plain imperative assignment
-    // (`root.selectedPlayer = modelData` below), which severs the binding
-    // from then on, so a manual selection stops following activePlayer.
-    // Typed (not `property var`) so QML's automatic QObject-destruction
-    // guard applies to it directly, as defense-in-depth alongside the
-    // Connections fallback below, which handles the same case (selected
-    // player disappearing) via the meaningfulPlayers list instead.
-    property MprisPlayer selectedPlayer: MprisController.activePlayer
+    // The player shown in the big left-hand card. Until the first manual
+    // selection this follows whatever axon considers active (e.g. as playback
+    // switches players). Clicking a card in the "Players" list on the right
+    // sets selectedId, and from then on the card shows that player. A row is a
+    // plain object that is replaced when anything in it changes, so the choice
+    // is kept as the player's id, never as the row.
+    property string selectedId: ""
+    readonly property var selectedPlayer: (selectedId !== "" ? MprisController.byId[selectedId] : null) ?? MprisController.activePlayer
+    readonly property string shownId: selectedPlayer?.id ?? ""
     property list<real> visualizerPoints: []
 
-    // If the selected player disappears (closed, or filtered out by the
-    // duplicate/YouTube-preview pipeline), fall back to whatever is active
-    // instead of pointing at a stale MprisPlayer.
+    // If the selected player disappears (closed, or filtered out by axon),
+    // fall back to whatever is active.
     Connections {
         target: MprisController
-        function onMeaningfulPlayersChanged() {
-            if (MprisController.meaningfulPlayers.indexOf(root.selectedPlayer) === -1) {
-                root.selectedPlayer = MprisController.activePlayer;
+        function onPlayerIdsChanged() {
+            if (root.selectedId !== "" && MprisController.playerIds.indexOf(root.selectedId) === -1) {
+                root.selectedId = "";
             }
         }
     }
 
-    // MediaTabPlayer's internals (art download/state, ColorQuantizer-derived
-    // colors, the animated title/artist StyledText labels) are modeled on
-    // PlayerControl.qml, which always gets exactly one MprisPlayer for its
-    // whole lifetime - the popup's Repeater creates a fresh PlayerControl
-    // per player and never reassigns its `player` property afterward. This
-    // pane instead reused a single persistent MediaTabPlayer and reassigned
-    // `player` on every card click, which exercised a code path none of
-    // that machinery was built or tested for: stale art/downloaded state,
-    // a stale ColorQuantizer source, and (per the animated StyledText's own
-    // internal x/y Behavior, which caches its "resting" position once at
-    // Component.onCompleted) a stale title position all surviving a swap of
-    // the underlying player object, rather than being freshly (re)computed
-    // for it. Fixed by recreating the whole pane instead of reusing it:
-    // toggling a Loader's `active` off then back on forces Qt to destroy
-    // the old item and instantiate a brand-new one from sourceComponent,
-    // exactly once per player-identity change, giving every player its own
-    // one-per-lifetime MediaTabPlayer instance just like the popup does.
-    Connections {
-        target: root
-        function onSelectedPlayerChanged() {
-            mainPlayerLoader.active = false;
-            mainPlayerLoader.active = true;
-        }
+    // MediaTabPlayer's internals (ColorQuantizer-derived colors, the animated
+    // title/artist StyledText labels) are modeled on PlayerControl.qml, which
+    // always shows exactly one player for its whole lifetime - the popup's
+    // Repeater creates a fresh PlayerControl per player. A single persistent
+    // MediaTabPlayer switched between players kept a stale ColorQuantizer
+    // source and (per the animated StyledText's own internal x/y Behavior,
+    // which caches its "resting" position once at Component.onCompleted) a
+    // stale title position. So the pane is recreated whenever it switches to
+    // another player: toggling a Loader's `active` off then back on forces Qt
+    // to destroy the old item and instantiate a brand-new one from
+    // sourceComponent, once per player id. A new row of the same player only
+    // updates the existing pane.
+    onShownIdChanged: {
+        mainPlayerLoader.active = false;
+        mainPlayerLoader.active = true;
     }
 
-    // Same cava process MediaControls.qml runs for its waveform background,
-    // copied so the embedded card gets the same audio-reactive visualizer
-    // instead of a flat one. Gated the same way StatsTab gates its polling:
-    // root.SwipeView.isCurrentItem AND GlobalStates.topMenuOpen, so it
-    // doesn't run while the menu is closed OR while Media sits off to the
-    // side of a SwipeView showing Calendar/Todo/Timer/Stats (SwipeView keeps
-    // every page instantiated and does not clear a non-current page's
-    // `visible`, so gating on topMenuOpen alone would leave this running
-    // whenever the menu is open regardless of which tab is selected).
-    Process {
-        id: cavaProc
-        running: root.SwipeView.isCurrentItem && GlobalStates.topMenuOpen
-        onRunningChanged: {
-            if (!cavaProc.running) {
-                root.visualizerPoints = [];
-            }
-        }
-        command: ["cava", "-p", `${FileUtils.trimFileProtocol(Directories.scriptPath)}/cava/raw_output_config.txt`]
-        stdout: SplitParser {
-            onRead: data => {
-                // Parse `;`-separated values into the visualizerPoints array
-                let points = data.split(";").map(p => parseFloat(p.trim())).filter(p => !isNaN(p));
-                root.visualizerPoints = points;
-            }
-        }
+    // axon's one shared spectrum, the same topic MediaControls.qml shows, so
+    // the embedded card gets the same audio-reactive visualizer. Wanted the
+    // way StatsTab gates its polling: root.SwipeView.isCurrentItem AND
+    // GlobalStates.topMenuOpen, so it is not wanted while the menu is closed
+    // OR while Media sits off to the side of a SwipeView showing
+    // Calendar/Todo/Timer/Stats (SwipeView keeps every page instantiated and
+    // does not clear a non-current page's `visible`). The bars clear when it
+    // stops being wanted.
+    BackendTopic {
+        name: "media.spectrum"
+        active: root.SwipeView.isCurrentItem && GlobalStates.topMenuOpen
+        onSnapshot: data => root.visualizerPoints = data.bars
+        onActiveChanged: if (!active)
+            root.visualizerPoints = []
     }
 
     // Empty state: no players at all. This is the tab's previous single
@@ -152,8 +127,8 @@ Item {
                 player: root.selectedPlayer
                 visualizerPoints: root.visualizerPoints
                 radius: Appearance.rounding.normal
-                // Same gate as the cava Process above: only run the position
-                // interpolation timers while this tab is actually the one on
+                // Same gate as the spectrum topic above: only run the position
+                // tick while this tab is actually the one on
                 // screen with the menu open, not whenever this Item merely
                 // exists off to the side of the SwipeView.
                 isTabActive: root.SwipeView.isCurrentItem && GlobalStates.topMenuOpen
@@ -188,13 +163,13 @@ Item {
 
                     Repeater {
                         model: ScriptModel {
-                            values: MprisController.meaningfulPlayers
+                            values: MprisController.playerIds
                         }
                         delegate: OtherPlayerCard {
-                            required property MprisPlayer modelData
-                            player: modelData
-                            selected: modelData === root.selectedPlayer
-                            onSelectedRequested: root.selectedPlayer = modelData
+                            required property string modelData
+                            player: MprisController.byId[modelData] ?? null
+                            selected: modelData === root.shownId
+                            onSelectedRequested: root.selectedId = modelData
                         }
                     }
                 }

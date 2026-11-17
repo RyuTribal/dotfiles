@@ -8,8 +8,6 @@ import QtQuick
 import QtQuick.Effects
 import QtQuick.Layouts
 import Quickshell
-import Quickshell.Io
-import Quickshell.Services.Mpris
 
 // A row in the Media tab's "Players" list: its own small blurred-art
 // background (same MultiEffect blur + scrim + OpacityMask rounding
@@ -19,7 +17,7 @@ import Quickshell.Services.Mpris
 // selected player.
 RippleButton {
     id: root
-    required property MprisPlayer player
+    required property var player // a row of MprisController.meaningfulPlayers
     property bool selected: false
     signal selectedRequested
 
@@ -38,47 +36,11 @@ RippleButton {
 
     onClicked: root.selectedRequested()
 
-    property var artUrl: player?.trackArtUrl
-    property string artFileName: artUrl ? (Qt.md5(artUrl) + ".jpg") : ""
-    property string artFilePath: artFileName ? `${Directories.coverArt}/${artFileName}` : ""
-    property bool downloaded: false
-    property int _bust: 0
+    // axon's cached cover, written whole before the row names it (section 31, Cover art).
+    property string artSource: player?.artPath ? "file://" + player.artPath : ""
 
     HoverHandler {
         id: cardHover
-    }
-
-    function refreshArt() {
-        const url = root.artUrl || "";
-        if (!url) {
-            root.downloaded = false;
-            return;
-        }
-        root.downloaded = false;
-        thumbDownloader.targetFile = url;
-        thumbDownloader.running = true;
-    }
-    onArtUrlChanged: root.refreshArt()
-    Component.onCompleted: root.refreshArt()
-
-    // Every card downloads the same URL MediaTabPlayer may be fetching at the
-    // same moment for the selected player (they can point at the same track),
-    // both writing to the same Qt.md5(artUrl)-named cache file. Two plain
-    // `curl -o` writes to one path can interleave and tear whichever read
-    // loses the race. Guarded here on the card's side two ways: skip the
-    // fetch entirely if the file is already there (same URL means it's the
-    // same content, however it got written), and when a fetch is needed,
-    // write to a private per-process temp file and atomically `mv` it into
-    // place, so this card's own contribution to the shared path is always
-    // either absent or a complete file, never a torn one.
-    Process {
-        id: thumbDownloader
-        property string targetFile: root.artUrl
-        command: ["bash", "-c", `test -f '${root.artFilePath}' || { tmp='${root.artFilePath}.tmp.'$$; curl -fsSL '${targetFile}' -o "$tmp" && mv -f "$tmp" '${root.artFilePath}'; }`]
-        onExited: code => {
-            root.downloaded = (code === 0);
-            root._bust++;
-        }
     }
 
     contentItem: Item {
@@ -107,8 +69,8 @@ RippleButton {
             Image {
                 id: cardBlurredArt
                 anchors.fill: parent
-                visible: root.downloaded
-                source: root.downloaded ? (Qt.resolvedUrl(root.artFilePath) + "?r=" + root._bust) : ""
+                visible: root.artSource !== ""
+                source: root.artSource
                 // Decode small regardless of the card's actual (fillWidth,
                 // so potentially quite wide) on-screen size: MultiEffect
                 // blurs this so hard that decoding at full card resolution
@@ -121,7 +83,6 @@ RippleButton {
                 sourceSize.width: 56
                 sourceSize.height: 56
                 fillMode: Image.PreserveAspectCrop
-                cache: false
                 asynchronous: true
 
                 layer.enabled: true
@@ -178,40 +139,12 @@ RippleButton {
                 Image {
                     id: thumbArt
                     anchors.fill: parent
-                    visible: root.downloaded && status === Image.Ready
-                    source: root.downloaded ? (Qt.resolvedUrl(root.artFilePath) + "?r=" + root._bust) : ""
+                    visible: root.artSource !== "" && status === Image.Ready
+                    source: root.artSource
                     fillMode: Image.PreserveAspectCrop
-                    cache: false
                     asynchronous: true
                     sourceSize.width: 44
                     sourceSize.height: 44
-
-                    // Same retry-on-error loop PlayerControl.qml/MediaTabPlayer.qml
-                    // use for their art Images: a single failed load (e.g. this
-                    // card's read landing between another writer's temp-file
-                    // download and its rename) shouldn't permanently pin the
-                    // music_note fallback, so re-attempt with backoff before
-                    // giving up.
-                    property int __retry: 0
-                    property int __retryMax: 6
-
-                    onStatusChanged: {
-                        if (status === Image.Error && __retry < __retryMax && source !== "") {
-                            __retry++;
-                            thumbArtRetryTimer.interval = Math.min(2000, 150 * Math.pow(2, __retry - 1));
-                            thumbArtRetryTimer.restart();
-                        } else if (status === Image.Ready) {
-                            __retry = 0;
-                        }
-                    }
-
-                    Timer {
-                        id: thumbArtRetryTimer
-                        repeat: false
-                        onTriggered: {
-                            root._bust++;
-                        }
-                    }
                 }
 
                 MaterialSymbol {

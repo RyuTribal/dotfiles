@@ -214,15 +214,15 @@ hl.bind("SUPER + Minus", hl.dsp.exec_cmd("axon hypr.zoom delta=-0.4"), { repeati
 hl.bind("SUPER + Equal", hl.dsp.exec_cmd("axon hypr.zoom delta=0.4"), { repeating = true }) -- Zoom in
 
 --#! Media
-hl.bind("SUPER+ALT + N", hl.dsp.exec_cmd("playerctl next || playerctl position `bc <<< \"100 * $(playerctl metadata mpris:length) / 1000000 / 100\"`"), { locked = true }) -- Next track
-hl.bind("XF86AudioNext", hl.dsp.exec_cmd("playerctl next || playerctl position `bc <<< \"100 * $(playerctl metadata mpris:length) / 1000000 / 100\"`"), { locked = true }) -- [hidden]
-hl.bind("XF86AudioPrev", hl.dsp.exec_cmd("playerctl previous"), { locked = true }) -- [hidden]
-hl.bind("SUPER+SHIFT+ALT + mouse:275", hl.dsp.exec_cmd("playerctl previous")) -- [hidden]
-hl.bind("SUPER+SHIFT+ALT + mouse:276", hl.dsp.exec_cmd("playerctl next || playerctl position `bc <<< \"100 * $(playerctl metadata mpris:length) / 1000000 / 100\"`")) -- [hidden]
-hl.bind("SUPER+ALT + B", hl.dsp.exec_cmd("playerctl previous"), { locked = true }) -- Previous track
-hl.bind("SUPER+ALT + P", hl.dsp.exec_cmd("playerctl play-pause"), { locked = true }) -- Play/pause media
-hl.bind("XF86AudioPlay", hl.dsp.exec_cmd("playerctl play-pause"), { locked = true }) -- [hidden]
-hl.bind("XF86AudioPause", hl.dsp.exec_cmd("playerctl play-pause"), { locked = true }) -- [hidden]
+hl.bind("SUPER+ALT + N", hl.dsp.exec_cmd("axon media.next"), { locked = true, description = "Next track" }) -- Next track
+hl.bind("XF86AudioNext", hl.dsp.exec_cmd("axon media.next"), { locked = true, description = "Next track" }) -- [hidden]
+hl.bind("XF86AudioPrev", hl.dsp.exec_cmd("axon media.previous"), { locked = true, description = "Previous track" }) -- [hidden]
+hl.bind("SUPER+SHIFT+ALT + mouse:275", hl.dsp.exec_cmd("axon media.previous"), { description = "Previous track" }) -- [hidden]
+hl.bind("SUPER+SHIFT+ALT + mouse:276", hl.dsp.exec_cmd("axon media.next"), { description = "Next track" }) -- [hidden]
+hl.bind("SUPER+ALT + B", hl.dsp.exec_cmd("axon media.previous"), { locked = true, description = "Previous track" }) -- Previous track
+hl.bind("SUPER+ALT + P", hl.dsp.exec_cmd("axon media.play_pause"), { locked = true, description = "Play/pause media" }) -- Play/pause media
+hl.bind("XF86AudioPlay", hl.dsp.exec_cmd("axon media.play_pause"), { locked = true, description = "Play/pause media" }) -- [hidden]
+hl.bind("XF86AudioPause", hl.dsp.exec_cmd("axon media.play_pause"), { locked = true, description = "Play/pause media" }) -- [hidden]
 
 --#! Apps
 hl.bind("SUPER + C", hl.dsp.exec_cmd("~/.config/hypr/hyprland/scripts/launch_first_available.sh \"${TERMINAL}\" \"kitty -1\" \"foot\" \"alacritty\" \"wezterm\" \"konsole\" \"kgx\" \"uxterm\" \"xterm\"")) -- Terminal

@@ -98,9 +98,9 @@ Item { // Notification item area
         }
 
         onDragReleased: (diffX, diffY) => {
-            if (diffX > root.dragConfirmThreshold)
+            if (dragManager.throwsRight(diffX, root.dragConfirmThreshold))
                 root.destroyWithAnimation();
-            else 
+            else
                 dragManager.resetDrag();
         }
     }

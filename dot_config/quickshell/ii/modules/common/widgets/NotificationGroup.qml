@@ -24,9 +24,11 @@ MouseArea { // Notification group area
 
     property real dragConfirmThreshold: 70 // Drag further to discard notification
     property real dismissOvershoot: 20 // Account for gaps and bouncy animations
-    property var qmlParent: root.parent.parent // There's something between this and the parent ListView
-    property var parentDragIndex: qmlParent.dragIndex
-    property var parentDragDistance: qmlParent.dragDistance
+    // The list that holds this group. Its parent is the list's contentItem, and that parent is null
+    // while the group is destroyed, so parent.parent threw a TypeError for every group that left.
+    property var qmlParent: root.ListView.view
+    property var parentDragIndex: qmlParent?.dragIndex ?? -1
+    property var parentDragDistance: qmlParent?.dragDistance ?? 0
     property var dragIndexDiff: Math.abs(parentDragIndex - index)
     property real xOffset: dragIndexDiff == 0 ? Math.max(0, parentDragDistance) : parentDragDistance > dragConfirmThreshold ? 0 : dragIndexDiff == 1 ? Math.max(0, parentDragDistance * 0.3) : dragIndexDiff == 2 ? Math.max(0, parentDragDistance * 0.1) : 0
 
@@ -97,7 +99,7 @@ MouseArea { // Notification group area
         }
 
         onDragReleased: (diffX, diffY) => {
-            if (diffX > root.dragConfirmThreshold)
+            if (dragManager.throwsRight(diffX, root.dragConfirmThreshold))
                 root.destroyWithAnimation();
             else
                 dragManager.resetDrag();

@@ -422,7 +422,8 @@ Item { // Wrapper
                 onAtYEndChanged: if (atYEnd && !loadMoreThrottle.running)
                     loadMoreThrottle.start()
                 onContentYChanged: {
-                    const nearEnd = (contentY + height) >= (contentHeight * 0.85);
+                    // The rows start at originY, not at 0.
+                    const nearEnd = (contentY - originY + height) >= (contentHeight * 0.85);
                     if (nearEnd && !loadMoreThrottle.running)
                         loadMoreThrottle.start();
                 }

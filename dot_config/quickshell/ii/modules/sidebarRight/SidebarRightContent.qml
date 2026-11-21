@@ -10,7 +10,6 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
-import Quickshell.Bluetooth
 
 Item {
     id: root
@@ -19,6 +18,11 @@ Item {
     property string settingsQmlPath: Quickshell.shellPath("settings.qml")
     property bool showWifiDialog: false
     property bool showBluetoothDialog: false
+    // axon runs Bluetooth discovery while this is held, so while the dialog is open (section 31).
+    BackendTopic {
+        name: "bluetooth.discovery"
+        active: root.showBluetoothDialog
+    }
     Connections {
         target: GlobalStates
         function onSidebarRightOpenChanged() {
@@ -125,11 +129,9 @@ Item {
                         })
                 }
                 BluetoothToggle {
+                    visible: BluetoothStatus.present
                     altAction: () => {
-                        if (Bluetooth.defaultAdapter) {
-                            Bluetooth.defaultAdapter.enabled = true;
-                            Bluetooth.defaultAdapter.discovering = true;
-                        }
+                        BluetoothStatus.setEnabled(true);
                         root.showBluetoothDialog = true;
                     }
                 }
@@ -228,8 +230,6 @@ Item {
     onShowBluetoothDialogChanged: {
         if (showBluetoothDialog)
             bluetoothDialogLoader.active = true;
-        else if (Bluetooth.defaultAdapter)
-            Bluetooth.defaultAdapter.discovering = false;
     }
     Loader {
         id: bluetoothDialogLoader

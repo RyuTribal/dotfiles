@@ -1,7 +1,6 @@
 import QtQuick
 import QtQuick.Layouts
 import Quickshell
-import Quickshell.Bluetooth
 import qs
 import qs.services
 import qs.modules.common
@@ -283,6 +282,7 @@ Item { // Bar content region
                         color: rightSidebarButton.colText
                     }
                     MaterialSymbol {
+                        visible: BluetoothStatus.present
                         text: BluetoothStatus.connected ? "bluetooth_connected" : BluetoothStatus.enabled ? "bluetooth" : "bluetooth_disabled"
                         iconSize: Appearance.font.pixelSize.larger
                         color: rightSidebarButton.colText

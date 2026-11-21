@@ -36,7 +36,8 @@
 # tst_hyprsunset_service.qml loads Hyprsunset.qml as HyprsunsetService the same way, beside backend.js.
 # tst_mpris_controller.qml loads MprisController.qml as MprisControllerService the same way, beside
 # backend.js. tst_network_service.qml loads Network.qml as NetworkService the same way, beside
-# backend.js.
+# backend.js. tst_bluetooth_service.qml loads BluetoothStatus.qml as BluetoothStatusService the same
+# way, beside backend.js.
 # tst_config.qml tests the real modules/common/Config.qml, so it gets its own module, ConfigUnderTest:
 # Config.qml sits there beside fakes/Directories.qml, over the stand-in FileView of fakes/Quickshell/Io.
 
@@ -67,6 +68,7 @@ grep -v '^pragma Singleton$' "$services/Brightness.qml" > "$module/BrightnessSer
 grep -v '^pragma Singleton$' "$services/Hyprsunset.qml" > "$module/HyprsunsetService.qml"
 grep -v '^pragma Singleton$' "$services/MprisController.qml" > "$module/MprisControllerService.qml"
 grep -v '^pragma Singleton$' "$services/Network.qml" > "$module/NetworkService.qml"
+grep -v '^pragma Singleton$' "$services/BluetoothStatus.qml" > "$module/BluetoothStatusService.qml"
 cat > "$module/qmldir" <<'EOF'
 module ShellUnderTest
 singleton Backend 1.0 Backend.qml
@@ -91,6 +93,7 @@ BrightnessService 1.0 BrightnessService.qml
 HyprsunsetService 1.0 HyprsunsetService.qml
 MprisControllerService 1.0 MprisControllerService.qml
 NetworkService 1.0 NetworkService.qml
+BluetoothStatusService 1.0 BluetoothStatusService.qml
 singleton Hypr 1.0 Hypr.qml
 singleton Translation 1.0 Translation.qml
 EOF
@@ -330,12 +333,14 @@ EOF
 # The widgets are the stand-ins of fakes/network, MaterialSymbol, MaterialTextField and StyledToolTip
 # the ones of fakes/spinbox, fakes/knobs and fakes/notifications; QuickToggleButton stands beside the
 # toggle, which finds it in its own directory. Quickshell is fakes/network's, whose execDetached only
-# records. The modules the toggle imports and does not use hold only fakes/network/Unused.qml.
+# records; its ScriptModel is fakes/scriptmodel's, with the real model's update rules, under the dialog's
+# RowModel, the real services/RowModel.qml. The modules the toggle imports and does not use hold only
+# fakes/network/Unused.qml.
 views_root="$imports/network-views"
 mkdir -p "$views_root/Quickshell/Io" "$views_root/Quickshell/Hyprland" "$views_root/qs/modules/common/functions" \
     "$views_root/qs/modules/common/widgets" "$views_root/qs/modules/sidebarRight" "$views_root/qs/services" \
     "$views_root/NetworkViewsUnderTest"
-cp "$here/fakes/network/Quickshell.qml" "$here/fakes/Quickshell/Singleton.qml" "$here/fakes/Quickshell/ScriptModel.qml" \
+cp "$here/fakes/network/Quickshell.qml" "$here/fakes/Quickshell/Singleton.qml" "$here/fakes/scriptmodel/ScriptModel.qml" \
     "$views_root/Quickshell/"
 cat > "$views_root/Quickshell/qmldir" <<'EOF'
 module Quickshell
@@ -375,13 +380,14 @@ MaterialSymbol 1.0 MaterialSymbol.qml
 MaterialTextField 1.0 MaterialTextField.qml
 StyledToolTip 1.0 StyledToolTip.qml
 EOF
-cp "$services/Network.qml" "$services/BackendTopic.qml" "$services/backend.js" "$here/fakes/Backend.qml" \
-    "$views_root/qs/services/"
+cp "$services/Network.qml" "$services/BackendTopic.qml" "$services/RowModel.qml" "$services/backend.js" \
+    "$here/fakes/Backend.qml" "$views_root/qs/services/"
 cat > "$views_root/qs/services/qmldir" <<'EOF'
 module qs.services
 singleton Backend 1.0 Backend.qml
 singleton Network 1.0 Network.qml
 BackendTopic 1.0 BackendTopic.qml
+RowModel 1.0 RowModel.qml
 EOF
 network_views="$here/../../modules/sidebarRight"
 cp "$network_views/wifiNetworks/WifiDialog.qml" "$network_views/wifiNetworks/WifiNetworkItem.qml" \
@@ -392,6 +398,88 @@ module NetworkViewsUnderTest
 WifiDialog 1.0 WifiDialog.qml
 WifiNetworkItem 1.0 WifiNetworkItem.qml
 NetworkToggle 1.0 NetworkToggle.qml
+QuickToggleButton 1.0 QuickToggleButton.qml
+EOF
+
+# tst_bluetooth_views.qml loads the real BluetoothDialog.qml, BluetoothDeviceItem.qml and
+# BluetoothToggle.qml from BluetoothViewsUnderTest over the real services/BluetoothStatus.qml as the
+# BluetoothStatus singleton of qs.services, fed `bluetooth` frames through the stand-in Backend, over
+# its own import root for the reason tst_network_views.qml has one. Appearance, Config, DialogButton,
+# DialogListItem and StyledListView are the stand-ins of fakes/bluetooth; Icons is the real
+# modules/common/Icons.qml; WindowDialog and the widgets standing in as a plain row or text are
+# fakes/network's, MaterialSymbol, MaterialTextField and StyledToolTip the ones of fakes/spinbox,
+# fakes/knobs and fakes/notifications. Quickshell and QuickToggleButton are fakes/network's, whose
+# execDetached only records. ScriptModel is fakes/scriptmodel's, which keeps the real model's update
+# rules (a moved row keeps the object the model held), and the dialog's RowModel is the real
+# services/RowModel.qml over it. The modules the views import and do not use hold only
+# fakes/network/Unused.qml.
+bluetooth_root="$imports/bluetooth-views"
+mkdir -p "$bluetooth_root/Quickshell" "$bluetooth_root/qs/modules/common/widgets" "$bluetooth_root/qs/services" \
+    "$bluetooth_root/BluetoothViewsUnderTest"
+cp "$here/fakes/network/Quickshell.qml" "$here/fakes/Quickshell/Singleton.qml" "$here/fakes/scriptmodel/ScriptModel.qml" \
+    "$bluetooth_root/Quickshell/"
+cat > "$bluetooth_root/Quickshell/qmldir" <<'EOF'
+module Quickshell
+singleton Quickshell 1.0 Quickshell.qml
+Singleton 1.0 Singleton.qml
+ScriptModel 1.0 ScriptModel.qml
+EOF
+for unused in Quickshell/Io Quickshell/Wayland Quickshell/Hyprland qs/modules/common/functions; do
+    mkdir -p "$bluetooth_root/$unused"
+    cp "$here/fakes/network/Unused.qml" "$bluetooth_root/$unused/"
+    printf 'module %s\nUnused 1.0 Unused.qml\n' "$(echo "$unused" | tr / .)" > "$bluetooth_root/$unused/qmldir"
+done
+cp "$here/fakes/qs/GlobalStates.qml" "$here/fakes/Translation.qml" "$bluetooth_root/qs/"
+cat > "$bluetooth_root/qs/qmldir" <<'EOF'
+module qs
+singleton GlobalStates 1.0 GlobalStates.qml
+singleton Translation 1.0 Translation.qml
+EOF
+cp "$here/fakes/bluetooth/Appearance.qml" "$here/fakes/bluetooth/Config.qml" "$here/../../modules/common/Icons.qml" \
+    "$bluetooth_root/qs/modules/common/"
+cat > "$bluetooth_root/qs/modules/common/qmldir" <<'EOF'
+module qs.modules.common
+singleton Appearance 1.0 Appearance.qml
+singleton Config 1.0 Config.qml
+singleton Icons 1.0 Icons.qml
+EOF
+cp "$here/fakes/network/widgets/WindowDialog.qml" "$here/fakes/network/widgets/Spacer.qml" \
+    "$here/fakes/network/widgets/StyledText.qml" "$here"/fakes/bluetooth/widgets/*.qml \
+    "$here/fakes/spinbox/MaterialSymbol.qml" "$here/fakes/knobs/MaterialTextField.qml" \
+    "$here/fakes/notifications/StyledToolTip.qml" "$bluetooth_root/qs/modules/common/widgets/"
+cat > "$bluetooth_root/qs/modules/common/widgets/qmldir" <<'EOF'
+module qs.modules.common.widgets
+WindowDialog 1.0 WindowDialog.qml
+WindowDialogTitle 1.0 StyledText.qml
+WindowDialogSeparator 1.0 Spacer.qml
+WindowDialogButtonRow 1.0 Spacer.qml
+StyledIndeterminateProgressBar 1.0 Spacer.qml
+StyledListView 1.0 StyledListView.qml
+DialogListItem 1.0 DialogListItem.qml
+DialogButton 1.0 DialogButton.qml
+StyledText 1.0 StyledText.qml
+MaterialSymbol 1.0 MaterialSymbol.qml
+MaterialTextField 1.0 MaterialTextField.qml
+StyledToolTip 1.0 StyledToolTip.qml
+EOF
+cp "$services/BluetoothStatus.qml" "$services/BackendTopic.qml" "$services/RowModel.qml" "$services/backend.js" \
+    "$here/fakes/Backend.qml" "$bluetooth_root/qs/services/"
+cat > "$bluetooth_root/qs/services/qmldir" <<'EOF'
+module qs.services
+singleton Backend 1.0 Backend.qml
+singleton BluetoothStatus 1.0 BluetoothStatus.qml
+BackendTopic 1.0 BackendTopic.qml
+RowModel 1.0 RowModel.qml
+EOF
+bluetooth_views="$here/../../modules/sidebarRight"
+cp "$bluetooth_views/bluetoothDevices/BluetoothDialog.qml" "$bluetooth_views/bluetoothDevices/BluetoothDeviceItem.qml" \
+    "$bluetooth_views/quickToggles/BluetoothToggle.qml" "$here/fakes/network/QuickToggleButton.qml" \
+    "$bluetooth_root/BluetoothViewsUnderTest/"
+cat > "$bluetooth_root/BluetoothViewsUnderTest/qmldir" <<'EOF'
+module BluetoothViewsUnderTest
+BluetoothDialog 1.0 BluetoothDialog.qml
+BluetoothDeviceItem 1.0 BluetoothDeviceItem.qml
+BluetoothToggle 1.0 BluetoothToggle.qml
 QuickToggleButton 1.0 QuickToggleButton.qml
 EOF
 
@@ -420,6 +508,15 @@ if [ "$network_guard" -ne 1 ]; then
     echo "Network.qml: an old-path name was found, or the file is unreadable (grep status $network_guard)" >&2
 fi
 
+# Bluetooth comes from axon: no file under services/ or modules/ imports Quickshell's Bluetooth module
+# or types a property as its device; only grep's status 1 (no match) passes. A failure here still runs
+# the suites below, then fails the run.
+bluetooth_guard=0
+grep -rnE 'Quickshell\.Bluetooth|BluetoothDevice ' "$services" "$here/../../modules" || bluetooth_guard=$?
+if [ "$bluetooth_guard" -ne 1 ]; then
+    echo "services/ or modules/: an import of Quickshell's Bluetooth module or its device type was found, or a file is unreadable (grep status $bluetooth_guard)" >&2
+fi
+
 status=0
 for test in tst_backend.qml tst_backend_connection.qml tst_backend_behaviour.qml \
     tst_system_clients.qml tst_config_error_toast.qml tst_config.qml tst_spin_box.qml \
@@ -429,7 +526,7 @@ for test in tst_backend.qml tst_backend_connection.qml tst_backend_behaviour.qml
     tst_claude_indicator.qml tst_notifications.qml tst_notifications_service.qml tst_power.qml \
     tst_power_service.qml tst_audio.qml tst_audio_service.qml tst_backend_slider.qml tst_osd.qml \
     tst_brightness.qml tst_brightness_service.qml tst_hyprsunset_service.qml \
-    tst_mpris_controller.qml tst_network_service.qml; do
+    tst_mpris_controller.qml tst_network_service.qml tst_bluetooth_service.qml; do
     QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -import "$here/fakes" -import "$imports" \
         -input "$here/$test" || status=1
 done
@@ -437,7 +534,9 @@ QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -import "$list_root" \
     -input "$here/tst_notification_list.qml" || status=1
 QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -import "$views_root" \
     -input "$here/tst_network_views.qml" || status=1
-if [ "$network_guard" -ne 1 ]; then
+QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -import "$bluetooth_root" \
+    -input "$here/tst_bluetooth_views.qml" || status=1
+if [ "$network_guard" -ne 1 ] || [ "$bluetooth_guard" -ne 1 ]; then
     status=1
 fi
 exit "$status"

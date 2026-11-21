@@ -11,9 +11,36 @@ DialogListItem {
     // A row of Network.wifiNetworks.
     required property var wifiNetwork
 
+    readonly property string rowId: wifiNetwork?.id ?? ""
+    // NetworkManager asks for this row's password. The field and its buttons act only while it is true,
+    // so a typed password can never go to another network.
+    readonly property bool prompting: Network.passwordApId !== "" && Network.passwordApId === rowId
+
     active: (Network.passwordApId === wifiNetwork?.id || wifiNetwork?.active) ?? false
     onClicked: {
         Network.connectToWifiNetwork(wifiNetwork);
+    }
+    onPromptingChanged: root.resetPrompt()
+    onRowIdChanged: root.resetPrompt()
+
+    // The prompt closed, opened or now belongs to another row: what was typed goes, with the focus.
+    function resetPrompt() {
+        passwordField.text = "";
+        passwordField.focus = false;
+    }
+
+    // Whether the prompt is open here for this row. An action from a prompt that is not is a mistake:
+    // it is refused loudly, never sent.
+    function promptOpen(action) {
+        if (prompting)
+            return true;
+        console.warn(`WifiNetworkItem: ${action} for ${rowId || "no row"} not sent: its prompt is not open`);
+        return false;
+    }
+
+    function submitPassword() {
+        if (promptOpen("password"))
+            Network.changePassword(root.wifiNetwork, passwordField.text);
     }
 
     contentItem: ColumnLayout {
@@ -54,10 +81,11 @@ DialogListItem {
             id: passwordPrompt
             objectName: "passwordPrompt"
             Layout.topMargin: 8
-            visible: Network.passwordApId !== "" && Network.passwordApId === root.wifiNetwork?.id
+            visible: root.prompting
 
             MaterialTextField {
                 id: passwordField
+                objectName: "passwordField"
                 Layout.fillWidth: true
                 placeholderText: Translation.tr("Password")
 
@@ -65,9 +93,7 @@ DialogListItem {
                 echoMode: TextInput.Password
                 inputMethodHints: Qt.ImhSensitiveData
 
-                onAccepted: {
-                    Network.changePassword(root.wifiNetwork, passwordField.text);
-                }
+                onAccepted: root.submitPassword()
             }
 
             RowLayout {
@@ -81,15 +107,14 @@ DialogListItem {
                     objectName: "cancelButton"
                     buttonText: Translation.tr("Cancel")
                     onClicked: {
-                        Network.cancelPassword(root.wifiNetwork.id);
+                        if (root.promptOpen("cancel"))
+                            Network.cancelPassword(root.rowId);
                     }
                 }
 
                 DialogButton {
                     buttonText: Translation.tr("Connect")
-                    onClicked: {
-                        Network.changePassword(root.wifiNetwork, passwordField.text);
-                    }
+                    onClicked: root.submitPassword()
                 }
             }
         }

@@ -57,11 +57,14 @@ WindowDialog {
 
         clip: true
         spacing: 0
+        // No current item, so a row moving cannot take focus from a password being typed (RowModel).
+        currentIndex: -1
 
-        // axon sends the rows in display order (section 31), so the view does not sort.
-        model: ScriptModel {
-            values: Network.wifiNetworks
-            objectProp: "id"
+        // axon sends the rows in display order (section 31), so the view does not sort. RowModel, not a
+        // bare ScriptModel: a network that is joined or changes strength bucket moves, and its delegate
+        // must see its new row.
+        model: RowModel {
+            rows: Network.wifiNetworks
         }
         delegate: WifiNetworkItem {
             required property var modelData

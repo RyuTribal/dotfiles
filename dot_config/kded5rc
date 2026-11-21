@@ -1,2 +1,5 @@
 [Module-networkmanagement]
 autoload=false
+
+[Module-bluedevil]
+autoload=false

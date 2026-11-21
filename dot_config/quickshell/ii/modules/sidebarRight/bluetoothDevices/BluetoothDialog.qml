@@ -8,7 +8,6 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import Qt5Compat.GraphicalEffects
 import Quickshell.Io
-import Quickshell.Bluetooth
 import Quickshell
 import Quickshell.Wayland
 import Quickshell.Hyprland
@@ -16,14 +15,39 @@ import Quickshell.Hyprland
 WindowDialog {
     id: root
 
+    // The last failed pair or connect, as one line: "<device>: <what went wrong>".
+    function errorLine(error) {
+        if (!error)
+            return "";
+        const reasons = {
+            rejected: Translation.tr("Pairing was rejected"),
+            auth_failed: Translation.tr("Authentication failed"),
+            timeout: Translation.tr("Timed out"),
+            failed: Translation.tr("Could not connect")
+        };
+        const name = BluetoothStatus.devices.find(device => device.id === error.device_id)?.name ?? error.device_id;
+        return Translation.tr("%1: %2").arg(name).arg(reasons[error.code] ?? error.message);
+    }
+
     WindowDialogTitle {
         text: Translation.tr("Bluetooth devices")
     }
+    StyledText {
+        objectName: "lastErrorLine"
+        visible: BluetoothStatus.lastError !== null
+        Layout.fillWidth: true
+        wrapMode: Text.NoWrap
+        elide: Text.ElideRight
+        color: Appearance.colors.colError
+        text: root.errorLine(BluetoothStatus.lastError)
+    }
     WindowDialogSeparator {
-        visible: !(Bluetooth.defaultAdapter?.discovering ?? false)
+        objectName: "discoverySeparator"
+        visible: !BluetoothStatus.discovering
     }
     StyledIndeterminateProgressBar {
-        visible: Bluetooth.defaultAdapter?.discovering ?? false
+        objectName: "discoveryProgress"
+        visible: BluetoothStatus.discovering
         Layout.fillWidth: true
         Layout.topMargin: -8
         Layout.bottomMargin: -8
@@ -31,6 +55,7 @@ WindowDialog {
         Layout.rightMargin: -Appearance.rounding.large
     }
     StyledListView {
+        objectName: "deviceList"
         Layout.fillHeight: true
         Layout.fillWidth: true
         Layout.topMargin: -15
@@ -41,25 +66,16 @@ WindowDialog {
         clip: true
         spacing: 0
         animateAppearance: false
+        // No current item, so a row moving cannot take focus from a PIN being typed (RowModel).
+        currentIndex: -1
 
-        model: ScriptModel {
-            values: [...Bluetooth.devices.values].sort((a, b) => {
-                // Connected -> paired -> others
-                let conn = (b.connected - a.connected) || (b.paired - a.paired);
-                if (conn !== 0) return conn;
-
-                // Ones with meaningful names before MAC addresses
-                const macRegex = /^([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}$/;
-                const aIsMac = macRegex.test(a.name);
-                const bIsMac = macRegex.test(b.name);
-                if (aIsMac !== bIsMac) return aIsMac ? 1 : -1;
-
-                // Alphabetical by name
-                return a.name.localeCompare(b.name);
-            })
+        // axon sends the rows in display order (section 31), so the view does not sort. RowModel, not a
+        // bare ScriptModel: a device that pairs moves up, and its delegate must see its new row.
+        model: RowModel {
+            rows: BluetoothStatus.devices
         }
         delegate: BluetoothDeviceItem {
-            required property BluetoothDevice modelData
+            required property var modelData
             device: modelData
             anchors {
                 left: parent?.left
@@ -70,6 +86,7 @@ WindowDialog {
     WindowDialogSeparator {}
     WindowDialogButtonRow {
         DialogButton {
+            objectName: "detailsButton"
             buttonText: Translation.tr("Details")
             onClicked: {
                 Quickshell.execDetached(["bash", "-c", `${Config.options.apps.bluetooth}`]);

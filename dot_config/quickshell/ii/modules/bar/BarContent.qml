@@ -363,6 +363,7 @@ Item { // Bar content region
                         }
                     }
                     MaterialSymbol {
+                        visible: BluetoothStatus.present
                         Layout.rightMargin: indicatorsRowLayout.realSpacing
                         text: BluetoothStatus.connected ? "bluetooth_connected" : BluetoothStatus.enabled ? "bluetooth" : "bluetooth_disabled"
                         iconSize: Appearance.font.pixelSize.larger
@@ -373,7 +374,7 @@ Item { // Bar content region
                         }
 
                         StyledToolTip {
-                            content: BluetoothStatus.connected ? `BT: ${BluetoothStatus.deviceName}` : BluetoothStatus.enabled ? "Bluetooth: On" : "Bluetooth: Off"
+                            content: BluetoothStatus.statusLine
                         }
                     }
                     Item {

@@ -2,15 +2,16 @@ import qs
 import qs.modules.common
 import qs.modules.common.widgets
 import qs.services
-import qs.services.network
 import QtQuick
 import QtQuick.Layouts
+import Quickshell
 
 DialogListItem {
     id: root
-    required property WifiAccessPoint wifiNetwork
+    // A row of Network.wifiNetworks.
+    required property var wifiNetwork
 
-    active: (wifiNetwork?.askingPassword || wifiNetwork?.active) ?? false
+    active: (Network.passwordApId === wifiNetwork?.id || wifiNetwork?.active) ?? false
     onClicked: {
         Network.connectToWifiNetwork(wifiNetwork);
     }
@@ -41,8 +42,9 @@ DialogListItem {
                 text: root.wifiNetwork?.ssid ?? Translation.tr("Unknown")
             }
             MaterialSymbol {
+                objectName: "stateSymbol"
                 visible: (root.wifiNetwork?.isSecure || root.wifiNetwork?.active) ?? false
-                text: root.wifiNetwork?.active ? "check" : Network.wifiConnectTarget === root.wifiNetwork ? "settings_ethernet" : "lock"
+                text: root.wifiNetwork?.active ? "check" : Network.connectingApId === root.wifiNetwork?.id ? "settings_ethernet" : "lock"
                 iconSize: Appearance.font.pixelSize.larger
                 color: Appearance.colors.colOnSurfaceVariant
             }
@@ -50,8 +52,9 @@ DialogListItem {
 
         ColumnLayout { // Password
             id: passwordPrompt
+            objectName: "passwordPrompt"
             Layout.topMargin: 8
-            visible: root.wifiNetwork?.askingPassword ?? false
+            visible: Network.passwordApId !== "" && Network.passwordApId === root.wifiNetwork?.id
 
             MaterialTextField {
                 id: passwordField
@@ -75,9 +78,10 @@ DialogListItem {
                 }
 
                 DialogButton {
+                    objectName: "cancelButton"
                     buttonText: Translation.tr("Cancel")
                     onClicked: {
-                        root.wifiNetwork.askingPassword = false;
+                        Network.cancelPassword(root.wifiNetwork.id);
                     }
                 }
 
@@ -92,19 +96,21 @@ DialogListItem {
 
         ColumnLayout { // Public wifi login page
             id: publicWifiPortal
+            objectName: "publicWifiPortal"
             Layout.topMargin: 8
-            visible: (root.wifiNetwork?.active && (root.wifiNetwork?.security ?? "").trim().length === 0) ?? false
+            visible: (root.wifiNetwork?.active && Network.portalDetected) ?? false
 
             RowLayout {
                 DialogButton {
+                    objectName: "portalButton"
                     Layout.fillWidth: true
                     buttonText: Translation.tr("Open network portal")
                     colBackground: Appearance.colors.colLayer4
                     colBackgroundHover: Appearance.colors.colLayer4Hover
                     colRipple: Appearance.colors.colLayer4Active
                     onClicked: {
-                        Network.openPublicWifiPortal()
-                        GlobalStates.sidebarRightOpen = false
+                        Quickshell.execDetached(["xdg-open", Network.portalUrl]);
+                        GlobalStates.sidebarRightOpen = false;
                     }
                 }
             }

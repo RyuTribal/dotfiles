@@ -7,7 +7,7 @@ import Quickshell.Io
 import QtQuick
 
 /**
- * Network service with nmcli.
+ * Bluetooth state for the bar and the sidebar toggle.
  */
 Singleton {
     id: root

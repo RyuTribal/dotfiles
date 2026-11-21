@@ -35,6 +35,7 @@
 # paths and need nothing.
 # tst_hyprsunset_service.qml loads Hyprsunset.qml as HyprsunsetService the same way, beside backend.js.
 # tst_mpris_controller.qml loads MprisController.qml as MprisControllerService the same way, beside
+# backend.js. tst_network_service.qml loads Network.qml as NetworkService the same way, beside
 # backend.js.
 # tst_config.qml tests the real modules/common/Config.qml, so it gets its own module, ConfigUnderTest:
 # Config.qml sits there beside fakes/Directories.qml, over the stand-in FileView of fakes/Quickshell/Io.
@@ -65,6 +66,7 @@ grep -v '^pragma Singleton$' "$services/Audio.qml" > "$module/AudioService.qml"
 grep -v '^pragma Singleton$' "$services/Brightness.qml" > "$module/BrightnessService.qml"
 grep -v '^pragma Singleton$' "$services/Hyprsunset.qml" > "$module/HyprsunsetService.qml"
 grep -v '^pragma Singleton$' "$services/MprisController.qml" > "$module/MprisControllerService.qml"
+grep -v '^pragma Singleton$' "$services/Network.qml" > "$module/NetworkService.qml"
 cat > "$module/qmldir" <<'EOF'
 module ShellUnderTest
 singleton Backend 1.0 Backend.qml
@@ -88,6 +90,7 @@ BrightnessOutput 1.0 BrightnessOutput.qml
 BrightnessService 1.0 BrightnessService.qml
 HyprsunsetService 1.0 HyprsunsetService.qml
 MprisControllerService 1.0 MprisControllerService.qml
+NetworkService 1.0 NetworkService.qml
 singleton Hypr 1.0 Hypr.qml
 singleton Translation 1.0 Translation.qml
 EOF
@@ -320,6 +323,78 @@ StyledRectangularShadow 1.0 StyledRectangularShadow.qml
 StyledToolTip 1.0 StyledToolTip.qml
 EOF
 
+# tst_network_views.qml loads the real WifiDialog.qml, WifiNetworkItem.qml and NetworkToggle.qml from
+# NetworkViewsUnderTest over the real services/Network.qml as the Network singleton of qs.services,
+# fed `network` frames through the stand-in Backend. The views import Network, Config, Appearance and
+# the dialog widgets by name, so it runs over its own import root, as tst_notification_list.qml does.
+# The widgets are the stand-ins of fakes/network, MaterialSymbol, MaterialTextField and StyledToolTip
+# the ones of fakes/spinbox, fakes/knobs and fakes/notifications; QuickToggleButton stands beside the
+# toggle, which finds it in its own directory. Quickshell is fakes/network's, whose execDetached only
+# records. The modules the toggle imports and does not use hold only fakes/network/Unused.qml.
+views_root="$imports/network-views"
+mkdir -p "$views_root/Quickshell/Io" "$views_root/Quickshell/Hyprland" "$views_root/qs/modules/common/functions" \
+    "$views_root/qs/modules/common/widgets" "$views_root/qs/modules/sidebarRight" "$views_root/qs/services" \
+    "$views_root/NetworkViewsUnderTest"
+cp "$here/fakes/network/Quickshell.qml" "$here/fakes/Quickshell/Singleton.qml" "$here/fakes/Quickshell/ScriptModel.qml" \
+    "$views_root/Quickshell/"
+cat > "$views_root/Quickshell/qmldir" <<'EOF'
+module Quickshell
+singleton Quickshell 1.0 Quickshell.qml
+Singleton 1.0 Singleton.qml
+ScriptModel 1.0 ScriptModel.qml
+EOF
+for unused in Quickshell/Io Quickshell/Hyprland qs/modules/common/functions qs/modules/sidebarRight; do
+    cp "$here/fakes/network/Unused.qml" "$views_root/$unused/"
+    printf 'module %s\nUnused 1.0 Unused.qml\n' "$(echo "$unused" | tr / .)" > "$views_root/$unused/qmldir"
+done
+cp "$here/fakes/qs/GlobalStates.qml" "$here/fakes/Translation.qml" "$views_root/qs/"
+cat > "$views_root/qs/qmldir" <<'EOF'
+module qs
+singleton GlobalStates 1.0 GlobalStates.qml
+singleton Translation 1.0 Translation.qml
+EOF
+cp "$here/fakes/network/Appearance.qml" "$here/fakes/network/Config.qml" "$views_root/qs/modules/common/"
+cat > "$views_root/qs/modules/common/qmldir" <<'EOF'
+module qs.modules.common
+singleton Appearance 1.0 Appearance.qml
+singleton Config 1.0 Config.qml
+EOF
+cp "$here"/fakes/network/widgets/*.qml "$here/fakes/spinbox/MaterialSymbol.qml" "$here/fakes/knobs/MaterialTextField.qml" \
+    "$here/fakes/notifications/StyledToolTip.qml" "$views_root/qs/modules/common/widgets/"
+cat > "$views_root/qs/modules/common/widgets/qmldir" <<'EOF'
+module qs.modules.common.widgets
+WindowDialog 1.0 WindowDialog.qml
+WindowDialogTitle 1.0 StyledText.qml
+WindowDialogSeparator 1.0 Spacer.qml
+WindowDialogButtonRow 1.0 Spacer.qml
+StyledIndeterminateProgressBar 1.0 Spacer.qml
+DialogListItem 1.0 DialogListItem.qml
+DialogButton 1.0 DialogButton.qml
+StyledText 1.0 StyledText.qml
+MaterialSymbol 1.0 MaterialSymbol.qml
+MaterialTextField 1.0 MaterialTextField.qml
+StyledToolTip 1.0 StyledToolTip.qml
+EOF
+cp "$services/Network.qml" "$services/BackendTopic.qml" "$services/backend.js" "$here/fakes/Backend.qml" \
+    "$views_root/qs/services/"
+cat > "$views_root/qs/services/qmldir" <<'EOF'
+module qs.services
+singleton Backend 1.0 Backend.qml
+singleton Network 1.0 Network.qml
+BackendTopic 1.0 BackendTopic.qml
+EOF
+network_views="$here/../../modules/sidebarRight"
+cp "$network_views/wifiNetworks/WifiDialog.qml" "$network_views/wifiNetworks/WifiNetworkItem.qml" \
+    "$network_views/quickToggles/NetworkToggle.qml" "$here/fakes/network/QuickToggleButton.qml" \
+    "$views_root/NetworkViewsUnderTest/"
+cat > "$views_root/NetworkViewsUnderTest/qmldir" <<'EOF'
+module NetworkViewsUnderTest
+WifiDialog 1.0 WifiDialog.qml
+WifiNetworkItem 1.0 WifiNetworkItem.qml
+NetworkToggle 1.0 NetworkToggle.qml
+QuickToggleButton 1.0 QuickToggleButton.qml
+EOF
+
 # ClaudeUsage.qml starts no process and reads no file; only grep's status 1 (no match) passes.
 status=0
 grep -nE 'Process|FileView|bunx|ccusage|stat ' "$services/ClaudeUsage.qml" || status=$?
@@ -337,6 +412,14 @@ if [ "$status" -ne 1 ]; then
     exit 1
 fi
 
+# Network.qml is a thin client of axon: no nmcli, no process, no shell, no row type; only grep's
+# status 1 (no match) passes. A failure here still runs the suites below, then fails the run.
+network_guard=0
+grep -nE 'nmcli|Process|SplitParser|StdioCollector|bash|WifiAccessPoint' "$services/Network.qml" || network_guard=$?
+if [ "$network_guard" -ne 1 ]; then
+    echo "Network.qml: an old-path name was found, or the file is unreadable (grep status $network_guard)" >&2
+fi
+
 status=0
 for test in tst_backend.qml tst_backend_connection.qml tst_backend_behaviour.qml \
     tst_system_clients.qml tst_config_error_toast.qml tst_config.qml tst_spin_box.qml \
@@ -346,10 +429,15 @@ for test in tst_backend.qml tst_backend_connection.qml tst_backend_behaviour.qml
     tst_claude_indicator.qml tst_notifications.qml tst_notifications_service.qml tst_power.qml \
     tst_power_service.qml tst_audio.qml tst_audio_service.qml tst_backend_slider.qml tst_osd.qml \
     tst_brightness.qml tst_brightness_service.qml tst_hyprsunset_service.qml \
-    tst_mpris_controller.qml; do
+    tst_mpris_controller.qml tst_network_service.qml; do
     QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -import "$here/fakes" -import "$imports" \
         -input "$here/$test" || status=1
 done
 QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -import "$list_root" \
     -input "$here/tst_notification_list.qml" || status=1
+QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -import "$views_root" \
+    -input "$here/tst_network_views.qml" || status=1
+if [ "$network_guard" -ne 1 ]; then
+    status=1
+fi
 exit "$status"

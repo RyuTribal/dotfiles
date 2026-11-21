@@ -119,11 +119,10 @@ Item {
                 color: Appearance.colors.colLayer1
 
                 NetworkToggle {
-                    altAction: () => {
-                        Network.enableWifi();
-                        Network.rescanWifi();
-                        root.showWifiDialog = true;
-                    }
+                    id: networkToggle
+                    altAction: () => Network.sidebarAltAction(networkToggle, () => {
+                            root.showWifiDialog = true;
+                        })
                 }
                 BluetoothToggle {
                     altAction: () => {

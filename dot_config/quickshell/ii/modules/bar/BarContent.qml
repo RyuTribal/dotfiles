@@ -359,9 +359,7 @@ Item { // Bar content region
                         }
 
                         StyledToolTip {
-                            content: Network.statusText ?? `Network: ${Network.networkName}`
-                            // You can also add extra conditions:
-                            // extraVisibleCondition: Network.connected
+                            content: Network.statusLine
                         }
                     }
                     MaterialSymbol {
